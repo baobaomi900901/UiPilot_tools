@@ -9,11 +9,11 @@ Two mainResult commands share one offline Runtime, one prefix setting and one pl
 
 Each invocation keeps internal spaces. The configured prefix (default `[demo] `) is added after conversion. Both commands return the same response-local result ID, text-copy, with a host-owned copyText action. Their shared invocation-count and last-command storage demonstrate package ownership; the counter appears in the result subtitle. Storage writes are separate operations, not a multi-key transaction, and live invocations may be cancelled by newer input.
 
-## Task 7 release boundary
+## Host 0.5 release boundary
 
-Manifest/API remain 1; this commands package requires Host 0.5.0+. Internal state schema is 2, inventory/report schemas remain 1, and the CLI npm package version is independently 0.1.0. Current Host and production CLI target remain 0.4.0 through Task 7 and **reject this fixture**. No current pack or installation success is claimed.
+Manifest/API remain 1; this commands package requires Host 0.5.0+. Internal state schema is 2, inventory/report schemas remain 1, and the CLI npm package version is independently 0.1.0. Current Host and production CLI target are 0.5.0. Production CLI validation and packing are covered by local automated checks; final independent release review and native Host acceptance remain separate gates.
 
-The complete installable fixture lives only at `tests/fixtures/multi-package/`. Node and Rust tests read its real bytes. Its directory deliberately is not named package, so the verification coordinator discovers these tests and SDK contract without treating it as a released 0.4 reference package. Task 8 will move this directory atomically to `package/`, update paths, and verify unchanged package content/hash; it will not add another runtime copy or discovery whitelist.
+The complete installable package lives at `package/`. Node and Rust tests read its real bytes. The original reviewed fixture was moved without changing its manifest or runtime bytes. Normal reference discovery includes this package, its Node tests and its strict SDK contract.
 
 ## Offline verification
 
@@ -27,9 +27,9 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib public_plugins::tests --of
 
 Runtime tests use frozen synthetic invocations and a fake settings/storage Host. They cover both outputs, requestId ownership, explicit missing/unknown ID rejection, changed versions/names/order and an in-memory constructor ID variant. The fixture itself has only two product commands and exactly one runtime.js. Rust staging tests use an explicit 0.5.0 Host to validate both the real directory and a temporary archive; they also stage the unchanged return/panel/window/Pomodoro packages. The new staging checks never start Runtime/WebViews or install into user data. The exact legacy invocation key golden remains a separate Host serialization test.
 
-## Pack after release alignment
+## Local static pack
 
-After Task 8, use a CLI whose declared Host target is 0.5.0+ (the npm package's own version does not establish that target). From the repository root, with the release package now at package/ and an existing output directory outside it:
+Use a CLI whose declared Host target is 0.5.0+ (the npm package's own version does not establish that target). From the repository root, with an existing output directory outside package/:
 
 ```powershell
 uipilot-plugin validate examples/public-plugins/com.uipilot.demo-multi/package --platform windows
@@ -37,13 +37,13 @@ uipilot-plugin pack examples/public-plugins/com.uipilot.demo-multi/package --out
 uipilot-plugin validate ./com.uipilot.demo-multi.uipilot-plugin --platform windows
 ```
 
-Before the move, an explicitly 0.5.0-targeted test tool can use tests/fixtures/multi-package as the source. The current production CLI has no Host-version override flag and rejects that source; do not lower minimumHostVersion to bypass the gate. All packing is local and static; it neither installs nor executes the plugin.
+Historical 0.4.0 Hosts reject both multi-item and single-item commands arrays; do not lower minimumHostVersion to bypass that boundary. The CLI has no Host-version override flag. All packing is local and static; it neither installs nor executes the plugin.
 
 ## Host 0.5.0 manual acceptance
 
-These steps are user-operated after release alignment; they have not been performed by the automated tests.
+These steps are user-operated; they have not been performed by the automated tests.
 
-1. Open Host 0.5.0+ Settings > Plugins > Public plugins. Choose the example's release package/ development directory, or the validated archive above. Review and grant clipboard.write. Before Task 8 only an explicitly configured test Host can use tests/fixtures/multi-package/.
+1. Open Host 0.5.0+ Settings > Plugins > Public plugins. Choose the example's release package/ development directory, or the validated archive above. Review and grant clipboard.write.
 2. Search for demo-upper and demo-lower independently. Enter `/demo-upper I am  Jack`: after the live debounce, expect `[demo] I AM  JACK`. Select its result and press Enter to copy through the Host.
 3. Enter `/demo-lower I am  Jack` and press Enter: expect `[demo] i am  jack`. Press Enter again to copy. Confirm that the shared subtitle counter progresses across both commands; do not assume exact counts during live typing.
 4. Change Result prefix once in package settings and invoke both commands; both must use the new prefix. Disable/re-enable the package and verify both entries follow the same switch.

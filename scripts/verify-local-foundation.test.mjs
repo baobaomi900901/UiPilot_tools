@@ -204,12 +204,27 @@ test('unreleased multi-package fixture adds tests and SDK contracts without rele
   assert.ok(stages[8].commands.every(item => !item.args.includes(pkg)));
 });
 
-test('Task 7 repository inventory includes unreleased demo tests but ten release packages', () => {
+test('release repository inventory includes the complete multi-command package', () => {
   const found = discover(repositoryRoot);
   assert.equal(found.tests.length, 13);
   assert.equal(found.contracts.length, 10);
-  assert.equal(found.packages.length, 10);
+  assert.equal(found.packages.length, 11);
   assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-multi')));
   assert.ok(found.contracts.some(file => file.includes('com.uipilot.demo-multi')));
-  assert.ok(found.packages.every(file => !file.includes('com.uipilot.demo-multi')));
+  assert.ok(found.packages.some(file => file.includes('com.uipilot.demo-multi')));
+});
+
+
+test('Host release versions agree while the CLI package version stays independent', () => {
+  const read = name => readFileSync(path.join(repositoryRoot, name), 'utf8').replaceAll('\r\n', '\n');
+  const root = JSON.parse(read('package.json'));
+  const lock = JSON.parse(read('package-lock.json'));
+  assert.equal(root.version, '0.5.0');
+  assert.equal(lock.version, root.version);
+  assert.equal(lock.packages[''].version, root.version);
+  assert.equal(JSON.parse(read('src-tauri/tauri.conf.json')).version, root.version);
+  assert.match(read('src-tauri/Cargo.toml'), /\[package\][\s\S]*?\nversion = "0\.5\.0"/);
+  assert.match(read('src-tauri/Cargo.lock'), /name = "uipilot"\nversion = "0\.5\.0"/);
+  assert.equal(JSON.parse(read('packages/plugin-cli/package.json')).version, '0.1.0');
+  assert.equal(lock.packages['packages/plugin-cli'].version, '0.1.0');
 });

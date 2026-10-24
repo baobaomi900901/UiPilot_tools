@@ -2,7 +2,7 @@
 
 Validate and pack UiPilot public plugins locally without installing UiPilot or Rust.
 
-The package version is `0.1.0`; its current validation target is UiPilot Host `0.4.0`, API v1. Windows bearer credential references require `minimumHostVersion >= 0.4.0` and exact declared secret/host bindings; the CLI validates metadata and never reads stored credentials. Historical feature minima remain unchanged.
+The package version is `0.1.0`; its current validation target is UiPilot Host `0.5.0`, API v1. Windows bearer credential references require `minimumHostVersion >= 0.4.0` and exact declared secret/host bindings; the CLI validates metadata and never reads stored credentials. Historical feature minima remain unchanged.
 
 The package requires Node.js 20 or newer. Install the supplied npm tarball:
 
@@ -31,3 +31,8 @@ Use `--json` for stable reports. Validate returns `PluginValidationReportV1` unc
 `timer.control` is accepted only for a Windows `submit + window` plugin with a window entry, `ui.window`, `notifications.publish`, and the fixed validated `assets/sounds/timer-alarm.wav` resource.
 
 The package is not yet published to the npm Registry. Registry installation instructions will be added only after publication. These commands support local packaging, validation and installation, without online publishing.
+
+
+The 0.5.0 Host target accepts both legacy `command` packages and new `commands` arrays (1–16 mainResult commands, including a one-item array). Commands packages require minimumHostVersion >= 0.5.0. The offline multi demo is included in reference-package verification; isolated consumer smoke compares its freshly packed bytes and SHA-256 to the tracked Rust staging fixture. This is local static release verification; actual Host interaction and final independent release review are separate gates.
+
+New Hosts support old packages and validated package rollback. After a normal transaction or required recovery writes internal state schema 2, older schema-1-only Host binaries are not guaranteed to read that data directory. CLI validation does not migrate Host state or promise binary downgrade compatibility. Unified actions/onAction, per-command shortcuts, independent alias collections, multi-command panel/window and M3 remain outside M2-A.

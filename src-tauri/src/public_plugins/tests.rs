@@ -1763,15 +1763,18 @@ fn repository_demo_examples_stage_as_independently_removable_public_plugins() {
 }
 
 #[test]
-fn repository_multi_demo_stages_real_directory_and_archive_only_on_explicit_0_5_host() {
+fn repository_multi_demo_stages_real_directory_and_archive_on_current_and_rejects_0_4_host() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let source = workspace
-        .join("examples/public-plugins/com.uipilot.demo-multi/tests/fixtures/multi-package");
+    let source = workspace.join("examples/public-plugins/com.uipilot.demo-multi/package");
     let new_host = PublicPluginHost {
         version: [0, 5, 0],
         ..host()
     };
-    assert_eq!(host().version, [0, 4, 0]);
+    assert_eq!(host().version, [0, 5, 0]);
+    let historical_host = PublicPluginHost {
+        version: [0, 4, 0],
+        ..host()
+    };
     for archive in [false, true] {
         let root = TestRoot::new(if archive {
             "multi-demo-archive"
@@ -1786,7 +1789,8 @@ fn repository_multi_demo_stages_real_directory_and_archive_only_on_explicit_0_5_
             PublicPackageSource::DevelopmentDirectory(source.clone())
         };
         assert_eq!(
-            stage_public_package(package_source.clone(), &root.staging(), &host()).unwrap_err(),
+            stage_public_package(package_source.clone(), &root.staging(), &historical_host)
+                .unwrap_err(),
             PublicPackageError::IncompatibleApi
         );
         let prepared = stage_public_package(package_source, &root.staging(), &new_host).unwrap();
@@ -1905,11 +1909,15 @@ fn repository_credential_demo_stages_on_0_4_0_and_rejects_0_3_4_without_cli_buil
         Err(PublicPackageError::IncompatibleApi)
     ));
     let root = TestRoot::new("credential-demo-current-host");
-    assert_eq!(host().version, [0, 4, 0]);
+    assert_eq!(host().version, [0, 5, 0]);
+    let credential_host = PublicPluginHost {
+        version: [0, 4, 0],
+        ..host()
+    };
     let prepared = stage_public_package(
         PublicPackageSource::DevelopmentDirectory(source.clone()),
         &root.staging(),
-        &host(),
+        &credential_host,
     )
     .unwrap();
     assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-credentials");
@@ -2173,6 +2181,21 @@ fn multi_command_normalization_preserves_wire_and_identity() {
             &host,
         )
         .unwrap();
+        if manifest.is_multi_command() {
+            let historical_host = PublicPluginHost {
+                version: [0, 4, 0],
+                ..host
+            };
+            assert_eq!(
+                super::manifest::parse_manifest(
+                    &serde_json::to_vec(&fixture["manifest"]).unwrap(),
+                    &historical_host
+                ),
+                Err(PublicPackageError::IncompatibleApi),
+                "historical Host must reject {}",
+                fixture["name"]
+            );
+        }
         let expected = fixture["manifest"]["commands"]
             .as_array()
             .map(|items| {
@@ -2240,4 +2263,71 @@ fn multi_command_manifest_rejects_duplicate_json_fields() {
             Err(PublicPackageError::InvalidPackage)
         );
     }
+}
+
+#[test]
+fn cli_multi_command_pack_fixture_stages_on_0_5_0() {
+    let root = TestRoot::new("cli-multi-command-pack-fixture");
+    let archive = root.0.join("multi-command.uipilot-plugin");
+    fs::write(
+        &archive,
+        include_bytes!("../../../tests/fixtures/public-plugin-pack/multi-command.uipilot-plugin"),
+    )
+    .unwrap();
+    assert_eq!(host().version, [0, 5, 0]);
+    let prepared = package::stage(
+        PublicPackageSource::Archive(archive.clone()),
+        &root.staging(),
+        &host(),
+    )
+    .unwrap();
+    assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-multi");
+    assert!(prepared.manifest.is_multi_command());
+    assert!(prepared.manifest.legacy_command().is_none());
+    let commands = prepared.manifest.normalized_commands().collect::<Vec<_>>();
+    assert_eq!(
+        commands.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec!["upper", "lower"]
+    );
+    assert_eq!(commands[0].1.activation_mode, PublicActivationMode::Live);
+    assert_eq!(commands[1].1.activation_mode, PublicActivationMode::Submit);
+    assert!(commands
+        .iter()
+        .all(|(_, command)| command.output_mode == PublicOutputMode::MainResult));
+    assert_eq!(
+        prepared
+            .resources
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["dist/runtime.js", "plugin.json"]
+    );
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("examples/public-plugins/com.uipilot.demo-multi/package");
+    assert_eq!(
+        serde_json::to_value(&prepared.manifest).unwrap(),
+        serde_json::from_slice::<Value>(&fs::read(source.join("plugin.json")).unwrap()).unwrap()
+    );
+    for file in ["plugin.json", "dist/runtime.js"] {
+        assert_eq!(
+            fs::read(prepared.package_root.join(file)).unwrap(),
+            fs::read(source.join(file)).unwrap()
+        );
+    }
+    assert_eq!(prepared.revalidate(), Ok(()));
+    let historical_host = PublicPluginHost {
+        version: [0, 4, 0],
+        ..host()
+    };
+    assert_eq!(
+        package::stage(
+            PublicPackageSource::Archive(archive),
+            &root.staging(),
+            &historical_host
+        )
+        .unwrap_err(),
+        PublicPackageError::IncompatibleApi
+    );
 }

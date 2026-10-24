@@ -37,7 +37,7 @@ const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
 const TOTAL_DEADLINE: Duration = Duration::from_secs(10);
-const USER_AGENT: &str = "UiPilot-Plugin/0.4.0";
+const USER_AGENT: &str = "UiPilot-Plugin/0.5.0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
@@ -145,6 +145,10 @@ pub(crate) struct PreparedPluginNetworkCall {
 
 #[cfg(test)]
 impl PreparedPluginNetworkCall {
+    pub(crate) fn cancellation_witness_for_test(&self) -> tokio_util::sync::CancellationToken {
+        self.call.cancellation().clone()
+    }
+
     pub(crate) fn is_cancelled_for_test(&self) -> bool {
         self.call.cancellation().is_cancelled()
     }
@@ -989,7 +993,7 @@ mod tests {
         assert!(sent.iter().all(|request| request
             .headers
             .iter()
-            .any(|(name, value)| name == "user-agent" && value == b"UiPilot-Plugin/0.4.0")));
+            .any(|(name, value)| name == "user-agent" && value == b"UiPilot-Plugin/0.5.0")));
     }
 
     #[tokio::test]

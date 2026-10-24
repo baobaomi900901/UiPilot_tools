@@ -129,7 +129,7 @@ describe('validatePackage', () => {
 })
 
 
-it('preserves new declared metadata across directory and archive sources while production rejects it', async () => {
+it('preserves new declared metadata across directory and archive sources on production Host 0.5', async () => {
   const base = await root()
   const value = JSON.parse(manifest().toString('utf8'))
   value.minimumHostVersion = '0.5.0'
@@ -147,8 +147,10 @@ it('preserves new declared metadata across directory and archive sources while p
   ]))
   const directoryReport = await validatePackage({ source: directory, platform: 'windows' }, { hostPlatform: 'linux' })
   const archiveReport = await validatePackage({ source: archive, platform: 'windows' }, { hostPlatform: 'linux' })
-  expect(directoryReport.valid).toBe(false)
-  expect(directoryReport.issues.map((issue) => issue.code)).toEqual(['API_INCOMPATIBLE'])
+  expect(directoryReport.valid).toBe(true)
+  expect(archiveReport.valid).toBe(true)
+  expect(directoryReport.issues).toEqual([])
+  expect(directoryReport.target.hostVersion).toBe('0.5.0')
   expect(archiveReport.plugin).toEqual(directoryReport.plugin)
   expect(directoryReport.plugin).toEqual({ pluginId: value.pluginId, version: '1.0.0', outputMode: 'mainResult',
     commands: [{ commandId: 'constructor', defaultName: 'result', activationMode: 'submit', outputMode: 'mainResult' }],

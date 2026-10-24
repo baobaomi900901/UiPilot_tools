@@ -23,9 +23,10 @@ fn main() {
             println!(
                 "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
             );
-            // The app already embeds Tauri's complete manifest via resource.lib.
+            // Ordinary binaries already embed Tauri's manifest via resource.lib.
             // Keep that resource instead of generating a second manifest with ID 1.
             println!("cargo:rustc-link-arg-bin=uipilot=/MANIFEST:NO");
+            println!("cargo:rustc-link-arg-bin=generate_public_plugin_schema=/MANIFEST:NO");
         }
     }
     if helper_build {

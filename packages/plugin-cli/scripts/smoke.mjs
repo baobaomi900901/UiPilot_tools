@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -130,6 +131,7 @@ try {
 
   const examples = [
     'com.uipilot.demo-return',
+    'com.uipilot.demo-multi',
     'com.uipilot.demo-win',
     'com.uipilot.demo-panel',
     'com.uipilot.demo-credentials',
@@ -147,14 +149,38 @@ try {
   for (const source of examples.map((name) => join(fixturesDirectory, name))) {
     validateWithArtifact(cli, trap, source, 0)
   }
-  for (const name of ['com.uipilot.demo-return', 'com.uipilot.demo-panel', 'com.uipilot.pomodoro', 'com.uipilot.demo-credentials']) {
+  for (const name of ['com.uipilot.demo-return', 'com.uipilot.demo-multi', 'com.uipilot.demo-panel', 'com.uipilot.pomodoro', 'com.uipilot.demo-credentials']) {
     const source = join(fixturesDirectory, name)
     const output = join(outputDirectory, name + ' local.uipilot-plugin')
     const packedReport = packWithArtifact(cli, trap, source, output)
     assert.equal(packedReport.output.path, output)
     assert.match(packedReport.output.sha256, /^[a-f0-9]{64}$/u)
     assert.equal(packedReport.validation.valid, true)
-    validateWithArtifact(cli, trap, output, 0)
+    const archiveReport = validateWithArtifact(cli, trap, output, 0)
+    const directoryReport = validateWithArtifact(cli, trap, source, 0)
+    assert.deepEqual({ ...archiveReport, source: directoryReport.source }, directoryReport)
+    assert.deepEqual(packedReport.validation, directoryReport)
+    if (name === 'com.uipilot.demo-multi') {
+      assert.deepEqual(directoryReport.target, { platform: 'windows', hostVersion: '0.5.0', apiVersion: 1 })
+      assert.deepEqual(directoryReport.plugin.commands, [
+        { commandId: 'upper', defaultName: 'demo-upper', activationMode: 'live', outputMode: 'mainResult' },
+        { commandId: 'lower', defaultName: 'demo-lower', activationMode: 'submit', outputMode: 'mainResult' },
+      ])
+      const bytes = await readFile(output)
+      const sha256 = createHash('sha256').update(bytes).digest('hex')
+      assert.equal(packedReport.output.sha256, sha256)
+      const tracked = await readFile(join(repositoryRoot, 'tests/fixtures/public-plugin-pack/multi-command.uipilot-plugin'))
+      assert.deepEqual(bytes, tracked)
+      assert.equal(sha256, createHash('sha256').update(tracked).digest('hex'))
+      const secondOutput = join(outputDirectory, name + ' repeated.uipilot-plugin')
+      const second = packWithArtifact(cli, trap, source, secondOutput)
+      assert.deepEqual(await readFile(secondOutput), bytes)
+      assert.equal(second.output.sha256, sha256)
+      const refused = packWithArtifact(cli, trap, source, output, 1)
+      assert.equal(refused.error.code, 'OUTPUT_EXISTS')
+      assert.deepEqual(await readFile(output), bytes)
+      console.log(`multi-command fixture: fresh installed CLI bytes equal tracked Rust fixture; SHA-256 ${sha256}`)
+    }
     if (name === 'com.uipilot.demo-return') {
       const before = await readFile(output)
       const repeated = packWithArtifact(cli, trap, source, output, 1)
@@ -162,6 +188,18 @@ try {
       assert.deepEqual(await readFile(output), before)
     }
   }
+  // A one-item commands array remains the new form and must pass the production CLI too.
+  const single = join(fixturesDirectory, 'single-command')
+  await cp(join(fixturesDirectory, 'com.uipilot.demo-multi'), single, { recursive: true })
+  const singleManifest = JSON.parse(await readFile(join(single, 'plugin.json'), 'utf8'))
+  singleManifest.commands = singleManifest.commands.slice(0, 1)
+  await writeFile(join(single, 'plugin.json'), JSON.stringify(singleManifest) + '\n')
+  const singleReport = validateWithArtifact(cli, trap, single, 0)
+  assert.equal(singleReport.plugin.commands.length, 1)
+  const singleOutput = join(outputDirectory, 'single-command.uipilot-plugin')
+  const singlePack = packWithArtifact(cli, trap, single, singleOutput)
+  assert.deepEqual(singlePack.validation, singleReport)
+  assert.deepEqual({ ...validateWithArtifact(cli, trap, singleOutput, 0), source: singleReport.source }, singleReport)
   validateWithArtifact(cli, trap, join(fixturesDirectory, 'com.uipilot.pomodoro'), 1, 'macos')
 
   const invalidManifest = join(fixturesDirectory, 'invalid-manifest')
@@ -171,6 +209,10 @@ try {
   await writeFile(join(invalidManifest, 'plugin.json'), `${JSON.stringify(manifest)}\n`, 'utf8')
   const manifestReport = validateWithArtifact(cli, trap, invalidManifest, 1)
   assert.ok(manifestReport.issues.some(({ code }) => code === 'MANIFEST_SCHEMA_INVALID'))
+  const invalidOutput = join(outputDirectory, 'invalid.uipilot-plugin')
+  const failedPack = packWithArtifact(cli, trap, invalidManifest, invalidOutput, 1)
+  assert.equal(failedPack.error.code, 'PACKAGE_INVALID')
+  await assert.rejects(readFile(invalidOutput), { code: 'ENOENT' })
 
   const invalidTimer = join(fixturesDirectory, 'invalid-timer')
   await cp(join(fixturesDirectory, 'com.uipilot.pomodoro'), invalidTimer, { recursive: true })

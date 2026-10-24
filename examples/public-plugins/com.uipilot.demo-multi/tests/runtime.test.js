@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile, readdir } from 'node:fs/promises'
 import test from 'node:test'
 
-const packageRoot = new URL('./fixtures/multi-package/', import.meta.url)
+const packageRoot = new URL('../package/', import.meta.url)
 const runtimeUrl = new URL('dist/runtime.js', packageRoot)
 const manifest = async () => JSON.parse(await readFile(new URL('plugin.json', packageRoot), 'utf8'))
 const loadRuntime = async (transform = source => source) => {

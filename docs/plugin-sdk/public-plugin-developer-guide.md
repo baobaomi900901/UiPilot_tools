@@ -11,7 +11,7 @@
 仓库中的完整参考实现：
 
 - [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：旧形态单命令主界面结果与复制。
-- [`com.uipilot.demo-multi`](../../examples/public-plugins/com.uipilot.demo-multi)：Host `0.5.0+` 的双 mainResult 命令、一个 Runtime 与共享设置/存储；Task 8 发布前仅保留测试 fixture。
+- [`com.uipilot.demo-multi`](../../examples/public-plugins/com.uipilot.demo-multi)：Host `0.5.0+` 的双 mainResult 命令、一个 Runtime 与共享设置/存储；完整可安装目录为 package/。
 - [`com.uipilot.demo-win`](../../examples/public-plugins/com.uipilot.demo-win)：单例子窗口。
 - [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)：启动器内嵌面板。
 - [`com.uipilot.demo-credentials`](../../examples/public-plugins/com.uipilot.demo-credentials)：Windows Host `0.4.0+` 的 bearer 凭据引用与离线假服务测试。
@@ -141,7 +141,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 这是字段片段；完整离线包见 [demo-multi](../../examples/public-plugins/com.uipilot.demo-multi/README.md)。数组限 1–16 项，每项必填唯一 id，匹配 `^[a-z][a-z0-9-]{0,31}$`；defaultName 也须包内唯一。合法 ID 包含 constructor，勿用继承属性进行分派。每项只支持 mainResult，不能声明 window/panel 及 ui.window、ui.panel、timer.control、clipboard.history.* 权限。任一项无效则整包拒绝，不能忽略或退回第一项。
 
-Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。Task 7 的 current Host 和 CLI Host target 仍为 0.4.0，会拒绝这个包；Task 8 才对齐到 0.5.0，测试通过不表示当前生产目标已开放。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
+Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.5.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
 
 ### 分支 B：子窗口型 Manifest
 

@@ -160,6 +160,7 @@ describe('packPackage', () => {
 it('embeds the same per-command directory diagnostics and metadata in a production-incompatible pack', async () => {
   const request = await setup()
   const manifest = multiCommandManifest()
+  manifest.minimumHostVersion = '0.6.0'
   manifest.commands[0].summary = ''
   manifest.commands[1].inputRequired = true
   await writeFile(join(request.source, 'plugin.json'), JSON.stringify(manifest))
@@ -172,4 +173,24 @@ it('embeds the same per-command directory diagnostics and metadata in a producti
   expect(result.validation).toEqual(expected)
   expect(result.validation?.issues.map(issue => issue.commandId)).toEqual(['upper', 'constructor', undefined])
   expect(await readdir(request.root)).toEqual(['source'])
+})
+
+
+it.each([false, true])('production Host 0.5 packs complete commands arrays (single: %s)', async (single) => {
+  const request = await setup()
+  const manifest = multiCommandManifest()
+  if (single) manifest.commands = manifest.commands.slice(0, 1)
+  await writeFile(join(request.source, 'plugin.json'), JSON.stringify(manifest))
+  const result = await packPackage(request, options)
+  expect(result).toMatchObject({ created: true, validation: { valid: true, target: { hostVersion: '0.5.0' } } })
+  if (!result.created) throw new Error('Expected production pack success')
+  expect(result.validation?.plugin?.commands?.map(command => command.commandId)).toEqual(manifest.commands.map(command => command.id))
+  const bytes = await readFile(request.output)
+  const archive = validateSnapshot(readArchiveSnapshot(bytes), request.output, 'windows')
+  expect({ ...archive, source: result.validation?.source }).toEqual(result.validation)
+  const second = await packPackage({ ...request, output: join(request.root, 'second.uipilot-plugin') }, options)
+  expect(second.created).toBe(true)
+  if (!second.created) throw new Error('Expected repeated pack success')
+  expect(await readFile(join(request.root, 'second.uipilot-plugin'))).toEqual(bytes)
+  expect(second.output.sha256).toBe(result.output.sha256)
 })

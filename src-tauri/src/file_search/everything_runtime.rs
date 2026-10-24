@@ -2309,7 +2309,17 @@ mod tests {
     fn stale_generation_failure_cannot_evict_the_published_replacement() {
         let (first_plan, first_process) = ready_plan(1);
         let (second_plan, _second_process) = ready_plan(1);
-        let (third_plan, _third_process) = ready_plan(1);
+        let third_entered = Arc::new(Barrier::new(2));
+        let third_release = Arc::new(Barrier::new(2));
+        let third_plan = StartPlan::Ready {
+            client: BarrierClient::new(
+                0,
+                Arc::clone(&third_entered),
+                Arc::clone(&third_release),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            process: Box::new(FakeProcess(Arc::new(ProcessControl::default()))),
+        };
         let backend = FakeBackend::new(vec![first_plan, second_plan, third_plan]);
         let runtime = supervisor(backend as Arc<dyn RuntimeBackend>);
         runtime.start_async();
@@ -2327,14 +2337,19 @@ mod tests {
         assert_eq!(second.generation(), 2);
 
         runtime.invalidate_if_current(2);
-        assert!(matches!(
-            second.query(probe_spec()),
-            Err(EverythingClientError::ClientClosed)
-        ));
-        assert!(matches!(
+        third_entered.wait();
+        let retired_query = second.query(probe_spec());
+        let replacement_is_starting = matches!(
             runtime.ready_client(),
             Err(EverythingRuntimeStatus::Starting)
+        );
+        // Release before asserting so a failed assertion cannot strand the worker.
+        third_release.wait();
+        assert!(matches!(
+            retired_query,
+            Err(EverythingClientError::ClientClosed)
         ));
+        assert!(replacement_is_starting);
         wait_until(|| runtime.ready_client().map(|lease| lease.generation()).ok() == Some(3));
         runtime.shutdown();
     }

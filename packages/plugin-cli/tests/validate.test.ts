@@ -63,10 +63,10 @@ function networkSnapshot() {
 }
 
 describe('validateSnapshot', () => {
-  it('reports Host 0.4.0 for a valid network Manifest', () => {
+  it('reports Host 0.5.0 for a valid network Manifest', () => {
     const report = validateSnapshot(networkSnapshot(), 'network-package', 'windows')
     expect(report.valid).toBe(true)
-    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.4.0', apiVersion: 1 })
+    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.5.0', apiVersion: 1 })
   })
 
   it('accepts the complete Timer package on Windows', () => {
@@ -105,7 +105,7 @@ describe('validateSnapshot', () => {
 })
 
 
-it('reports declared commands in order with fixed aggregate mode even on compatibility and semantic failure', async () => {
+it('reports declared commands in order with fixed aggregate mode on production success and semantic failure', async () => {
   const fixtures = JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/multi-command-manifest-fixtures.json'), 'utf8'))
   for (const name of ['two-commands', 'single-command', 'reordered', 'constructor', 'duplicate-name', 'empty']) {
     const fixture = fixtures.find((item: any) => item.name === name)
@@ -113,15 +113,15 @@ it('reports declared commands in order with fixed aggregate mode even on compati
     builder.addFile('plugin.json', Buffer.from(JSON.stringify(fixture.manifest)))
     builder.addFile('dist/runtime.js', Buffer.from('export {}'))
     const report = validateSnapshot(builder.finish(), 'multi-package', 'windows')
-    expect(report.valid, name).toBe(false)
-    expect(report.target.hostVersion).toBe('0.4.0')
+    expect(report.valid, name).toBe(!['duplicate-name', 'empty'].includes(name))
+    expect(report.target.hostVersion).toBe('0.5.0')
     if (fixture.schemaValid) {
       expect(report.plugin).toEqual({ pluginId: fixture.manifest.pluginId, version: fixture.manifest.version,
         outputMode: 'mainResult', commands: fixture.manifest.commands.map((command: any) => ({
           commandId: command.id, defaultName: command.defaultName, activationMode: command.activationMode, outputMode: 'mainResult',
         })),
       })
-      expect(report.issues.map((issue) => issue.code)).toContain('API_INCOMPATIBLE')
+      expect(report.issues.map((issue) => issue.code)).not.toContain('API_INCOMPATIBLE')
     } else expect(report.plugin).toBeUndefined()
   }
 })
@@ -130,6 +130,7 @@ it('reports declared commands in order with fixed aggregate mode even on compati
 
 it('forwards command identities while leaving shared failures unowned and preserving phase order', () => {
   const value = multiCommandManifest()
+  value.minimumHostVersion = '0.6.0'
   value.commands[0].inputRequired = true
   value.commands[1].summary = ''
   value.permissions = ['clipboard.read']
@@ -148,6 +149,7 @@ it('forwards command identities while leaving shared failures unowned and preser
 
 it('caps mixed command/resource findings at the same smallest 100 keys with stable phases', () => {
   const value = multiCommandManifest()
+  value.minimumHostVersion = '0.6.0'
   value.commands[0].summary = ''
   value.commands[1].inputRequired = true
   const builder = new SnapshotBuilder('directory')

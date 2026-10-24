@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.4.1'
+    tooNewHost.minimumHostVersion = '0.5.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -425,7 +425,7 @@ function credentialManifest() {
 
 describe('credential manifest contract', () => {
   const future = (v: unknown) => validateManifest(Buffer.from(JSON.stringify(v)), 'windows', [0, 4, 0])
-  it('accepts on current 0.4.0 and rejects explicit 0.3.4 while canonicalizing', () => {
+  it('accepts on explicit 0.4.0 and rejects explicit 0.3.4 while canonicalizing', () => {
     const v = credentialManifest()
     const result = future(v)
     expect(result.ok).toBe(true)
@@ -586,4 +586,13 @@ describe('multi-command diagnostics', () => {
       code: 'MANIFEST_JSON_INVALID', message: 'plugin.json is not strict JSON.', location: { kind: 'byteOffset', value: '14' },
     }] })
   })
+})
+
+
+it('historical Host 0.4 rejects both two-item and single-item commands arrays', () => {
+  const value = multiCommandManifest()
+  for (const commands of [value.commands, value.commands.slice(0, 1)]) {
+    expect(validateManifest(Buffer.from(JSON.stringify({ ...value, commands })), 'windows', [0, 4, 0]))
+      .toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+  }
 })

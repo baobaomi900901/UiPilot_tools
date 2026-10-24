@@ -5959,6 +5959,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(manager.network_authority.global_active_for_test(), 1);
+            let cancellation = call.cancellation_witness_for_test();
             let pending = tokio::spawn({
                 let network_authority = Arc::clone(&manager.network_authority);
                 let scheduler = Arc::clone(&manager.scheduler);
@@ -5968,7 +5969,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            let transition_started = Instant::now();
             match transition {
                 TestedNetworkLifecycleTransition::Completion
                 | TestedNetworkLifecycleTransition::Failure => {
@@ -6017,9 +6017,15 @@ mod tests {
                     manager.uninstall("com.example.network", false).unwrap();
                 }
             }
+            // The current-thread runtime has not polled the blocked transport again:
+            // management must signal cancellation and return before that future settles.
             assert!(
-                transition_started.elapsed() < Duration::from_millis(500),
-                "{transition:?} must not wait for the network deadline"
+                cancellation.is_cancelled(),
+                "{transition:?} must cancel the call"
+            );
+            assert!(
+                !pending.is_finished(),
+                "management must return before transport settlement"
             );
 
             assert_eq!(
@@ -6363,6 +6369,7 @@ mod tests {
             .unwrap();
         write_network_package(&dir.source(), "1.1.0", &["api.example.com"]);
         let update = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let cancellation = call.cancellation_witness_for_test();
         let pending = tokio::spawn({
             let network_authority = Arc::clone(&manager.network_authority);
             let scheduler = Arc::clone(&manager.scheduler);
@@ -6381,7 +6388,6 @@ mod tests {
                 .join();
         });
 
-        let commit_started = Instant::now();
         assert!(matches!(
             manager.commit_with_readiness(
                 "main",
@@ -6392,7 +6398,10 @@ mod tests {
             ),
             Err(PublicPluginManagementError::Unavailable)
         ));
-        assert!(commit_started.elapsed() < Duration::from_millis(500));
+        // Disk persistence has no artificial wall-clock budget. Cancellation must
+        // already be signalled while the current-thread transport is still pending.
+        assert!(cancellation.is_cancelled());
+        assert!(!pending.is_finished());
         assert_eq!(
             tokio::time::timeout(Duration::from_millis(500), pending)
                 .await

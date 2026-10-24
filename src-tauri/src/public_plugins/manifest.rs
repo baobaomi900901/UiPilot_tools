@@ -1459,7 +1459,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 4, 0]
+            [0, 5, 0]
         );
     }
 
