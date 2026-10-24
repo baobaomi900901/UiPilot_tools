@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令实施计划
 
-状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Task 3 已完成并通过独立规格/质量评审（`bd8707a`）；Tasks 4–8 待执行，M2-A 尚未完成。
+状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Task 3 已完成并通过独立规格/质量评审（`bd8707a`）；Task 4 已完成并通过独立规格/质量评审（实现 `2f8a5aa`，并发事务修正 `40e89de`）；Tasks 5–8 待执行，M2-A 尚未完成。
 
 > **For agentic workers:** 使用 `subagent-driven-development`；单写者顺序实施，每任务通过独立 Spec 与 Quality 双门禁后才可开始下一任务。
 
@@ -89,9 +89,9 @@
 
 **Dependencies:** Task 3；设计 §6–8、§10–11、§16.6–7/9/13。首先对照 M4 最终 `retire_plugin_requests`, `ManagementEffects`, `settle_management_effects`, checked authority publication 的实际实现；复用而非创建第二状态机。
 
-- [ ] 将 manager rename 从会丢 running 槽的 invalidate 路径切到同 Runtime 请求失效；所有 running/waiting 精确 context/token 进入 effects。通过 service 执行并在成功/错误出口都 settle 后才返回；commands 不再直接调用 manager 然后提前 ? 丢失 effects。
-- [ ] 真实 override 变化按包保守失效请求、网络 context 和结果句柄；完全相同的存储 override 才 no-op。不因 effectiveName 相同省略 durable commit；favorite 不误取消有效请求。仅 destroy/rebuild 才能释放 running 占用。
-- [ ] 审计本切片接触的 enable/install/upgrade/network/settings/secret/recovery/timeout/rename/favorite/迁移/rollback 的实际 authority 发布调用；全部复用 confirmed bundle/durable state/runtime/secret 的 checked 通道和 reservation/terminal 检查，close-only 路径不调用 reopen helper。
+- [x] 将 manager rename 从会丢 running 槽的 invalidate 路径切到同 Runtime 请求失效；所有 running/waiting 精确 context/token 进入 effects。通过 service 执行并在成功/错误出口都 settle 后才返回；commands 不再直接调用 manager 然后提前 ? 丢失 effects。
+- [x] 真实 override 变化按包保守失效请求、网络 context 和结果句柄；完全相同的存储 override 才 no-op。不因 effectiveName 相同省略 durable commit；favorite 不误取消有效请求。仅 destroy/rebuild 才能释放 running 占用。
+- [x] 审计本切片接触的 enable/install/upgrade/network/settings/secret/recovery/timeout/rename/favorite/迁移/rollback 的实际 authority 发布调用；全部复用 confirmed bundle/durable state/runtime/secret 的 checked 通道和 reservation/terminal 检查，close-only 路径不调用 reopen helper。
 
 **Distinct test coverage:** A non-cooperative running、旧 waiting→改 A 或兄弟 B→提交 B/input：旧 running non-current 仍占槽、旧 waiting 精确结算、B 未提前 dispatch；旧 completion 丢业务结果但推进已保存 B，另一序列旧 handler 永不完成则既有 deadline/rebuild 推进 B。改名前旧网络 context 与复制 handle 均失效；service 在 post-durable 错误/Unknown 关闭已发生 effects 后仍结算全部 token，不误结算新 submission。default old/override custom→升级 default custom→clear 存储 null→重启/再升级 default new 跟随 new；反向 null→显式同名覆盖真实持久化并失效，重复目标 no-op 不写盘/迁移/取消。RESERVED/COMMITTING/DURABLE 各 barrier 均阻止 checked reopen；成功先 state、后 bundle/清 reservation、再 reopen；Unknown/复核失败不从旧快照复活。shutdown 先发生，随后延迟 rename/favorite/迁移/修复/包回退完成仍无 admission/delivery；只允许未来新请求，旧 context 永不复活。
 
