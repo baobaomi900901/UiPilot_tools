@@ -975,3 +975,16 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] Runtime 测试通过。
 - [ ] 开发目录和最终 `.uipilot-plugin` 均通过 `uipilot-plugin validate`。
 - [ ] 开发目录和最终 `.uipilot-plugin` 都完成安装验收。
+
+
+## Panel Runtime actions (Windows Host 0.6.0+)
+
+Legacy `command` packages with `activationMode: "submit"`, `outputMode: "panel"`, granted `ui.panel`, Windows-only `supportedPlatforms`, and `minimumHostVersion: "0.6.0"` or later may declare `panel.runtimeActions: true`. Absent or false preserves the existing API; null is invalid. Opt-in requires an exported `onPanelAction` function during Runtime readiness. CLI validates the declaration, not JavaScript exports. API v1 and historical version minima are unchanged.
+
+Use capability detection: `if (window.uipilotPluginPanel.request) { ... }`. `await panel.request({action: "preview", payload: {...}})` invokes this panel's existing Runtime, whose `onPanelAction(invocation, api)` returns `{requestId: invocation.requestId, data: ...}`. The Promise resolves with frozen `data`; action replies do not call `onUpdate` or publish launcher results. Each invocation and its API are new and deeply frozen. Existing storage/settings/notification/optional HTTPS permissions and expiry checks apply. Direct content networking remains forbidden.
+
+Action names match `^[a-z][a-z0-9.-]{0,63}$`. Payload is required (explicit null is allowed); extra envelope fields reject. Both directions accept finite JSON primitives, dense arrays and plain data records only. Cycles, accessors, symbols, undefined, functions, BigInt, nonfinite numbers and record keys `__proto__`, `prototype`, `constructor` reject without executing getters/toJSON. Each compact UTF-8 envelope is at most 64 KiB, nesting at most 32, and at most 4096 values. Reply ID must match exactly; no truncation.
+
+One unresolved call and one physical Runtime slot per plugin are enforced by Host. Busy rejects rather than queueing/retrying. Do not await requests inside `onUpdate` or `onHostKey`; wait until Ready. Host command submission cancels action ownership but waits for the running handler to finish or its original 30-second deadline before dispatching another handler. Close, reload, replacement, disable, permission/credential changes and faults revoke the exact old API context. Already-admitted effects may finish: cancellation after save does not mean “not saved”; reload before deliberate retry.
+
+Fixed Error.name values: `InvalidPanelRequestError`, `PanelRequestBusyError`, `ExpiredPanelSession`, `PanelRequestCancelledError`, `PanelRequestTimeoutError`, `InvalidPanelResponseError`, `PanelRequestFailedError`, `PanelRequestUnavailableError`. Business validation belongs in ordinary data (for example `{ok:false, code:"missing-variable"}`); unexpected handler errors expose no plugin stack or arbitrary native text. There is no Window RPC, multi-command panel, streaming, AbortSignal or new clipboard API.

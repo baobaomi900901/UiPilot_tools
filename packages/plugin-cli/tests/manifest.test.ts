@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.5.1'
+    tooNewHost.minimumHostVersion = '0.6.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -595,4 +595,31 @@ it('historical Host 0.4 rejects both two-item and single-item commands arrays', 
     expect(validateManifest(Buffer.from(JSON.stringify({ ...value, commands })), 'windows', [0, 4, 0]))
       .toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
   }
+})
+
+
+describe('panel Runtime action opt-in', () => {
+  it('enforces booleans, minimum version and Windows-only declaration', () => {
+    const value: any = timerManifest()
+    value.command.outputMode = 'panel'
+    value.minimumHostVersion = '0.6.0'
+    value.permissions = ['ui.panel']
+    delete value.window
+    value.panel = { entry: 'dist/panel.html' }
+    expect(validate(value).ok).toBe(true)
+    for (const opt of [false, true]) {
+      value.panel.runtimeActions = opt
+      expect(validate(value).ok).toBe(true)
+    }
+    for (const opt of [null, 1, 'true']) {
+      value.panel.runtimeActions = opt
+      expect(validate(value).ok).toBe(false)
+    }
+    value.panel.runtimeActions = true
+    value.minimumHostVersion = '0.5.0'
+    expect(validate(value).ok).toBe(false)
+    value.minimumHostVersion = '0.6.0'
+    value.supportedPlatforms = ['windows', 'macos']
+    expect(validate(value).ok).toBe(false)
+  })
 })

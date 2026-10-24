@@ -48,6 +48,7 @@ interface PublicManifestBase {
     entry: string
     hostKeys?: PanelHostKeyDeclaration[]
     hostKeyFocus?: PanelHostKeyFocus
+    runtimeActions?: boolean
   } | null
   network?: PublicNetworkV1
   permissions: PublicPermission[]
@@ -494,6 +495,7 @@ function validateParsedManifest(
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
+    (manifest.panel?.runtimeActions === true && (versionGreater([0, 6, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     versionGreater(minimumHost, hostVersion) ||
     (manifest.commands !== undefined && versionGreater(MULTI_COMMAND_MIN_HOST, minimumHost)) ||
     (manifest.command?.outputMode === 'panel' && versionGreater([0, 3, 0], minimumHost)) ||

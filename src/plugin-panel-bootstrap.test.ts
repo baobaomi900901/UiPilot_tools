@@ -21,6 +21,9 @@ function panelBootstrapSource(): string {
   const template = rust.match(/PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"([\s\S]*?)"#;/u)?.[1]
   if (!template) throw new Error('panel bootstrap template is missing')
   return template
+    .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
+    .replace('__PANEL_ACTIONS__', 'false')
+    .replace('__RUNTIME_ACTIONS__', 'false')
     .replaceAll('__SESSION_EPOCH__', '7')
     .replace('__HOST_KEYS__', '["ArrowDown"]')
 }
@@ -38,6 +41,7 @@ function executePanelBootstrap(
   }
   vm.runInNewContext(panelBootstrapSource(), {
     document,
+    TextEncoder,
     clearInterval,
     queueMicrotask,
     setInterval,

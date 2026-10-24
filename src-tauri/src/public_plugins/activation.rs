@@ -247,6 +247,7 @@ pub(crate) struct PublicRuntimeCandidate {
     pub(crate) label: String,
     pub(crate) runtime_entry: String,
     pub(crate) network_https_declared: bool,
+    pub(crate) panel_actions: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,6 +444,11 @@ impl RuntimeSnapshot {
             runtime_recovery_needed,
             label: self.label.clone(),
             runtime_entry: self.manifest.runtime.entry.clone(),
+            panel_actions: self
+                .manifest
+                .panel
+                .as_ref()
+                .is_some_and(|p| p.runtime_actions),
             network_https_declared: self
                 .manifest
                 .permissions
@@ -514,7 +520,7 @@ struct TimerClaimDispatch {
 
 #[derive(Default)]
 pub(crate) struct ManagementEffects {
-    pub(crate) retired: Vec<(PluginRequestContext, String)>,
+    pub(crate) retired: Vec<(PluginRequestContext, Option<String>)>,
     pub(crate) changed: bool,
 }
 
@@ -3808,6 +3814,150 @@ impl PublicPluginManager {
         Ok(outcome)
     }
 
+    pub(crate) fn panel_actions_enabled(
+        &self,
+        identity: &crate::plugin_panel::PanelSessionIdentity,
+    ) -> bool {
+        self.bundles
+            .confirmed_bundle(&identity.plugin_id)
+            .ok()
+            .flatten()
+            .is_some_and(|b| {
+                b.config.installed
+                    && b.config.enabled
+                    && b.config.fault.is_none()
+                    && b.config.active_generation == identity.generation
+                    && !b.runtime_recovery_needed
+                    && b.config
+                        .permission_grants
+                        .contains(&PublicPermission::UiPanel)
+                    && b.runtime
+                        .manifest
+                        .permissions
+                        .contains(&PublicPermission::UiPanel)
+                    && b.runtime.generation == identity.generation
+                    && b.activation_id == identity.activation_id
+                    && b.admission_epoch == identity.admission_epoch
+                    && b.runtime
+                        .manifest
+                        .panel
+                        .as_ref()
+                        .is_some_and(|p| p.runtime_actions)
+            })
+    }
+
+    pub(crate) fn admit_panel_action(
+        &self,
+        identity: &crate::plugin_panel::PanelSessionIdentity,
+        request: super::panel_action::PanelActionRequest,
+        now: Instant,
+    ) -> Result<ScheduledPluginRequest, super::panel_action::PanelActionError> {
+        use super::panel_action::PanelActionError as E;
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| E::PanelRequestUnavailableError)?;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(&identity.plugin_id)
+            .map_err(|_| E::PanelRequestUnavailableError)?
+            .ok_or(E::ExpiredPanelSession)?;
+        let config = &bundle.config;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || config.active_generation != identity.generation
+            || bundle.runtime.generation != identity.generation
+            || bundle.activation_id != identity.activation_id
+            || bundle.admission_epoch != identity.admission_epoch
+            || !config
+                .permission_grants
+                .contains(&PublicPermission::UiPanel)
+            || !bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::UiPanel)
+            || !bundle
+                .runtime
+                .manifest
+                .panel
+                .as_ref()
+                .is_some_and(|p| p.runtime_actions)
+        {
+            return Err(E::ExpiredPanelSession);
+        }
+        if bundle.runtime_recovery_needed {
+            return Err(E::PanelRequestBusyError);
+        }
+        let command = bundle
+            .runtime
+            .manifest
+            .legacy_command()
+            .ok_or(E::ExpiredPanelSession)?;
+        if command.output_mode != PublicOutputMode::Panel
+            || command.activation_mode != PublicActivationMode::Submit
+        {
+            return Err(E::ExpiredPanelSession);
+        }
+        request.validate()?;
+        let reserved = self
+            .scheduler
+            .reserve(super::PluginRequestCandidate {
+                command_id: "default".into(),
+                plugin_id: identity.plugin_id.clone(),
+                plugin_generation: identity.generation,
+                activation_id: identity.activation_id,
+                admission_epoch: identity.admission_epoch,
+                activation_mode: PublicActivationMode::Submit,
+                input: String::new(),
+                owner: super::PluginRequestOwner::PanelAction {
+                    content_label: identity.content_label.clone(),
+                    session_epoch: identity.session_epoch,
+                    request,
+                },
+            })
+            .map_err(|_| E::PanelRequestUnavailableError)?;
+        match self.enqueue_reserved(reserved, now) {
+            Ok(PluginScheduleOutcome::Dispatched(request)) => Ok(request),
+            Err(PluginScheduleError::Busy) => Err(E::PanelRequestBusyError),
+            _ => Err(E::PanelRequestUnavailableError),
+        }
+    }
+
+    pub(crate) fn discard_panel_completion(&self, context: &PluginRequestContext) {
+        let _transition = self.network_authority.begin_transition();
+        self.scheduler.discard_panel_completion(context);
+    }
+
+    pub(crate) fn claim_panel_completion(
+        &self,
+        identity: &crate::plugin_panel::PanelSessionIdentity,
+        context: &PluginRequestContext,
+    ) -> Result<(), super::panel_action::PanelActionError> {
+        use super::panel_action::PanelActionError as E;
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| E::PanelRequestUnavailableError)?;
+        if !self.panel_actions_enabled(identity) {
+            return Err(E::ExpiredPanelSession);
+        }
+        let _transition = self
+            .network_authority
+            .begin_transition()
+            .map_err(|_| E::PanelRequestUnavailableError)?;
+        self.scheduler.claim_panel_completion(context)
+    }
+
+    pub(crate) fn retire_panel_action(&self, context: &PluginRequestContext) {
+        if let Ok(transition) = self.network_authority.begin_transition() {
+            let _ = self.scheduler.retire_context(context);
+            transition.invalidate_context(context);
+        } else {
+            // Network poisoning already rejects network calls; storage authority must also close.
+            let _ = self.scheduler.retire_context(context);
+        }
+    }
+
     pub(crate) fn cancel_scheduled_request(
         &self,
         context: &PluginRequestContext,
@@ -5258,11 +5408,13 @@ mod tests {
                     admission_epoch: bundle.admission_epoch,
                     activation_mode: PublicActivationMode::Live,
                     input: String::new(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 1,
-                        control_value: String::new(),
-                        submission_token: format!("network-{}", bundle.admission_epoch),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 1,
+                            control_value: String::new(),
+                            submission_token: format!("network-{}", bundle.admission_epoch),
+                        },
+                    ),
                 },
                 Instant::now(),
             )
@@ -6235,11 +6387,11 @@ mod tests {
                 admission_epoch: running.candidate.admission_epoch,
                 activation_mode: running.candidate.activation_mode,
                 input: "replacement".into(),
-                owner: PluginSubmissionOwner {
+                owner: crate::public_plugins::PluginRequestOwner::Command(PluginSubmissionOwner {
                     ui_intent_epoch: 2,
                     control_value: "replacement".into(),
                     submission_token: "network-replacement".into(),
-                },
+                }),
             })
             .unwrap();
         let pending = tokio::spawn({
@@ -8433,11 +8585,13 @@ mod tests {
                     admission_epoch: route.admission_epoch,
                     activation_mode: route.activation_mode,
                     input: route.input,
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 1,
-                        control_value: "/activation value".into(),
-                        submission_token: "runtime-data-lease".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 1,
+                            control_value: "/activation value".into(),
+                            submission_token: "runtime-data-lease".into(),
+                        },
+                    ),
                 },
                 now,
             )
@@ -8552,11 +8706,13 @@ mod tests {
                     admission_epoch,
                     activation_mode: PublicActivationMode::Live,
                     input: "storage".into(),
-                    owner: crate::public_plugins::PluginSubmissionOwner {
-                        ui_intent_epoch: 1,
-                        control_value: "/activation storage".into(),
-                        submission_token: "window-storage".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        crate::public_plugins::PluginSubmissionOwner {
+                            ui_intent_epoch: 1,
+                            control_value: "/activation storage".into(),
+                            submission_token: "window-storage".into(),
+                        },
+                    ),
                 },
                 now,
             )

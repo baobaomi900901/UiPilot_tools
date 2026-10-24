@@ -27,6 +27,9 @@ function runtimeBootstrapSource(
   )?.[1]
   if (!template) throw new Error('runtime bootstrap template is missing')
   return template
+    .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
+    .replace('__PANEL_ACTIONS__', 'false')
+    .replace('__RUNTIME_ACTIONS__', 'false')
     .replace('__NETWORK_HTTPS__', networkEnabled ? 'true' : 'false')
     .replace(
       /const entry = document\.documentElement\.dataset\.runtimeEntry;[\s\S]*?document\.title = 'uipilot-public-plugin-ready';/u,
@@ -65,6 +68,7 @@ async function executeRuntimeBootstrap(
   }
   vm.runInNewContext(runtimeBootstrapSource(networkEnabled), {
     document,
+    TextEncoder,
     Error,
     Object,
     Promise,
@@ -296,6 +300,7 @@ describe('public plugin Runtime network bootstrap', () => {
     `
     vm.runInNewContext(runtimeBootstrapSource(true, moduleBody), {
       document,
+    TextEncoder,
       setTimeout,
       window: hostWindow,
     })

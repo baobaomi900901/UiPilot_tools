@@ -191,6 +191,10 @@
           "maxItems": 8,
           "type": "array",
           "uniqueItems": true
+        },
+        "runtimeActions": {
+          "default": false,
+          "type": "boolean"
         }
       },
       "required": [

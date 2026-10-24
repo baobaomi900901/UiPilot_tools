@@ -12,7 +12,9 @@ use tauri::{
 };
 
 #[cfg(windows)]
-use webview2_com::FocusChangedEventHandler;
+use webview2_com::{
+    FocusChangedEventHandler, ProcessFailedEventHandler, WindowCloseRequestedEventHandler,
+};
 
 use crate::public_plugins::{
     inert_url, prepare_windows_webview, verify_windows_webview_muted, PanelHostKeyDeclaration,
@@ -372,6 +374,13 @@ struct LiveSession {
     content_focused: bool,
     content_visible: bool,
     host_key_route: HostKeyRouteState,
+    runtime_request: Option<crate::public_plugins::PanelActionRegistration>,
+}
+
+fn invalidate_session_locked(core: &mut ControllerCore) -> Option<LiveSession> {
+    let mut session = core.session.take()?;
+    session.runtime_request.take();
+    Some(session)
 }
 
 #[derive(Default)]
@@ -422,6 +431,8 @@ pub(crate) struct PluginPanelUpdate {
 pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 (() => {
   'use strict';
+  __PANEL_JSON__
+  const runtimeActions = __RUNTIME_ACTIONS__;
   let handler = null;
   let hostKeyHandler = null;
   let hostKeyRegistrationViolation = false;
@@ -717,7 +728,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       });
     });
   };
-  const api = deepFreeze({
+  const apiShape = {
     onUpdate(next) {
       if (handler || typeof next !== 'function') throw new TypeError('one onUpdate handler required');
       handler = next;
@@ -746,7 +757,31 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     requestHide() { return requestPanelHide(); },
     get storage() { return storageSession ? storageSession.storage : expiredStorage; },
     get clipboardHistory() { return clipboardHistorySession ? clipboardHistorySession.facade : expiredClipboardHistory; },
-  });
+  };
+  if (runtimeActions) {
+    let pending = false;
+    const makeRequest = (epoch) => async function(input) {
+      if (epoch !== liveSessionEpoch || !invoke) throw panelJson.error('ExpiredPanelSession');
+      let request;
+      try {
+        if (arguments.length !== 1) throw new Error();
+        request = panelJson.snapshot(input, ['action', 'payload']);
+        if (!panelJson.validAction(request.action)) throw panelJson.error('InvalidPanelRequestError');
+      } catch (_) { throw panelJson.error('InvalidPanelRequestError'); }
+      if (pending) throw panelJson.error('PanelRequestBusyError');
+      pending = true;
+      try {
+        const data = await invoke('plugin_panel_request', { sessionEpoch: epoch, request });
+        if (epoch !== liveSessionEpoch) throw panelJson.error('ExpiredPanelSession');
+        return panelJson.reply(data);
+      } catch (error) {
+        if (epoch !== liveSessionEpoch) throw panelJson.error('ExpiredPanelSession');
+        throw panelJson.error(panelJson.errorName(error));
+      } finally { pending = false; }
+    };
+    Object.defineProperty(apiShape, 'request', { enumerable: true, get() { return makeRequest(liveSessionEpoch); } });
+  }
+  const api = deepFreeze(apiShape);
   Object.defineProperty(window, 'uipilotPluginPanel', { value: api, configurable: false });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_PREPARE__', {
     configurable: false,
@@ -823,8 +858,24 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 })();
 "#;
 
+#[cfg(test)]
 fn panel_bootstrap(session_epoch: u64, host_keys: &[PanelHostKeyDeclaration]) -> String {
+    panel_bootstrap_with_actions(session_epoch, host_keys, false)
+}
+fn panel_bootstrap_with_actions(
+    session_epoch: u64,
+    host_keys: &[PanelHostKeyDeclaration],
+    actions: bool,
+) -> String {
     PUBLIC_PANEL_BOOTSTRAP_TEMPLATE
+        .replace(
+            "__PANEL_JSON__",
+            crate::public_plugins::panel_action::JSON_BOOTSTRAP,
+        )
+        .replace(
+            "__RUNTIME_ACTIONS__",
+            if actions { "true" } else { "false" },
+        )
         .replace("__SESSION_EPOCH__", &session_epoch.to_string())
         .replace(
             "__HOST_KEYS__",
@@ -1016,6 +1067,7 @@ impl PluginPanelController {
             host_key_focus: owner.host_key_focus,
         };
         let show_generation = core.show_generation;
+        invalidate_session_locked(&mut core);
         core.session = Some(LiveSession {
             identity: identity.clone(),
             show_generation,
@@ -1026,6 +1078,7 @@ impl PluginPanelController {
             content_focused: false,
             content_visible: false,
             host_key_route: HostKeyRouteState::default(),
+            runtime_request: None,
         });
         core.hide_ticket = None;
         core.host_input_focus = None;
@@ -1624,14 +1677,16 @@ impl PluginPanelController {
     }
 
     pub(crate) fn host_hidden(&self) {
-        let Ok(mut core) = self.core.lock() else {
-            return;
-        };
+        // Recovery is only for revocation. New admission continues to fail on poison.
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         core.focus_revision = core.focus_revision.saturating_add(1);
         core.show_generation = core.show_generation.saturating_add(1);
         core.main_content_focused = false;
         core.internal_blur_until = None;
-        core.session = None;
+        invalidate_session_locked(&mut core);
         core.hide_ticket = None;
         core.host_input_focus = None;
         self.changed.notify_all();
@@ -2309,6 +2364,118 @@ impl PluginPanelController {
         }
     }
 
+    pub(crate) fn admit_panel_action(
+        self: &Arc<Self>,
+        service: &Arc<PublicPluginService>,
+        label: &str,
+        epoch: u64,
+        request: crate::public_plugins::panel_action::PanelActionRequest,
+    ) -> Result<
+        (
+            crate::public_plugins::ScheduledPluginRequest,
+            mpsc::Receiver<Result<Value, crate::public_plugins::panel_action::PanelActionError>>,
+        ),
+        crate::public_plugins::panel_action::PanelActionError,
+    > {
+        use crate::public_plugins::panel_action::PanelActionError as E;
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| E::PanelRequestUnavailableError)?;
+        let session = core.session.as_mut().ok_or(E::ExpiredPanelSession)?;
+        if session.identity.content_label != label || session.identity.session_epoch != epoch {
+            return Err(E::ExpiredPanelSession);
+        }
+        if session.phase != PanelPhase::Ready
+            || session.pending.is_some()
+            || session.host_key_route.in_flight.is_some()
+            || session.runtime_request.as_ref().is_some_and(|r| r.active())
+        {
+            return Err(E::PanelRequestBusyError);
+        }
+        session.runtime_request.take();
+        let (dispatch, registration, receiver) =
+            service.prepare_panel_action(self, &session.identity, request)?;
+        session.runtime_request = Some(registration);
+        Ok((dispatch, receiver))
+    }
+
+    pub(crate) fn finish_panel_action(
+        &self,
+        identity: &PanelSessionIdentity,
+        context: &crate::public_plugins::PluginRequestContext,
+        claim_authority: impl FnOnce() -> Result<
+            (),
+            crate::public_plugins::panel_action::PanelActionError,
+        >,
+    ) -> Result<(), crate::public_plugins::panel_action::PanelActionError> {
+        use crate::public_plugins::panel_action::PanelActionError as E;
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| E::PanelRequestUnavailableError)?;
+        let session = core
+            .session
+            .as_mut()
+            .filter(|s| s.identity == *identity)
+            .ok_or(E::ExpiredPanelSession)?;
+        if !session
+            .runtime_request
+            .as_ref()
+            .is_some_and(|r| r.matches(context) && r.active())
+        {
+            return Err(E::ExpiredPanelSession);
+        }
+        let result = claim_authority();
+        if let Some(registration) = session.runtime_request.take() {
+            registration.disarm();
+        }
+        result
+    }
+
+    pub(crate) fn teardown_generation(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Option<PanelSessionIdentity> {
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if core.session.as_ref().is_none_or(|s| {
+            s.identity.plugin_id != plugin_id || s.identity.generation != generation
+        }) {
+            return None;
+        }
+        let session = invalidate_session_locked(&mut core)?;
+        core.host_input_focus = None;
+        core.hide_ticket = None;
+        self.changed.notify_all();
+        Some(session.identity)
+    }
+
+    pub(crate) fn retire_content_request(&self, label: &str) {
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = core
+            .session
+            .as_mut()
+            .filter(|s| s.identity.content_label == label)
+        {
+            session.runtime_request.take();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_core_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.core.lock().unwrap();
+            panic!("synthetic controller poison");
+        }));
+    }
+
     pub(crate) fn begin_content_call(
         &self,
         content_label: &str,
@@ -2354,14 +2521,18 @@ impl PluginPanelController {
         &self,
         session_epoch: Option<u64>,
     ) -> Option<PanelSessionIdentity> {
-        let mut core = self.core.lock().ok()?;
-        let session = core.session.take()?;
-        if let Some(expected) = session_epoch {
-            if session.identity.session_epoch != expected {
-                core.session = Some(session);
-                return None;
-            }
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if session_epoch.is_some_and(|epoch| {
+            core.session
+                .as_ref()
+                .is_none_or(|s| s.identity.session_epoch != epoch)
+        }) {
+            return None;
         }
+        let session = invalidate_session_locked(&mut core)?;
         core.internal_blur_until = Instant::now().checked_add(INTERNAL_BLUR_GRACE);
         core.host_input_focus = None;
         core.hide_ticket = None;
@@ -2370,7 +2541,10 @@ impl PluginPanelController {
     }
 
     pub(crate) fn teardown_plugin(&self, plugin_id: &str) -> Option<PanelSessionIdentity> {
-        let mut core = self.core.lock().ok()?;
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if core
             .session
             .as_ref()
@@ -2378,7 +2552,7 @@ impl PluginPanelController {
         {
             return None;
         }
-        let identity = core.session.take()?.identity;
+        let identity = invalidate_session_locked(&mut core)?.identity;
         core.internal_blur_until = Instant::now().checked_add(INTERNAL_BLUR_GRACE);
         core.host_input_focus = None;
         core.hide_ticket = None;
@@ -2392,7 +2566,10 @@ impl PluginPanelController {
         request_id: &str,
         submission_token: &str,
     ) -> Option<PanelSessionIdentity> {
-        let mut core = self.core.lock().ok()?;
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = core.session.as_ref().is_some_and(|session| {
             session.identity.session_epoch == session_epoch
                 && session.current_request_id == request_id
@@ -2401,7 +2578,7 @@ impl PluginPanelController {
         if !current {
             return None;
         }
-        let identity = core.session.take()?.identity;
+        let identity = invalidate_session_locked(&mut core)?.identity;
         core.internal_blur_until = Instant::now().checked_add(INTERNAL_BLUR_GRACE);
         core.host_input_focus = None;
         core.hide_ticket = None;
@@ -2481,6 +2658,15 @@ pub(crate) fn content_ack(
 }
 
 pub(crate) fn destroy_content(app: &AppHandle, content_label: &str) {
+    if let Some(controller) = app.try_state::<Arc<PluginPanelController>>() {
+        controller.retire_content_request(content_label);
+        if let Some(identity) = controller
+            .live_identity()
+            .filter(|i| i.content_label == content_label)
+        {
+            controller.teardown_session(Some(identity.session_epoch));
+        }
+    }
     if let Some(webview) = app.get_webview(content_label) {
         let _ = webview.close();
     }
@@ -2712,11 +2898,34 @@ fn mount_webview(
     ))
     .map_err(|_| PublicPluginManagementError::Unavailable)?;
     let inert = inert_url().map_err(|_| PublicPluginManagementError::Unavailable)?;
+    let navigation_controller = Arc::clone(&controller);
+    let navigation_epoch = identity.session_epoch;
+    let navigation_app = app.clone();
+    let navigation_label = identity.content_label.clone();
+    let navigated = std::sync::atomic::AtomicBool::new(false);
     let content = WebviewBuilder::new(
         identity.content_label.clone(),
         WebviewUrl::CustomProtocol(inert),
     )
-    .on_navigation(|url| {
+    .on_navigation(move |url| {
+        if url.path() == "/__uipilot_inert.html"
+            && !navigated.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return matches!(url.scheme(), "uipilot-public-plugin" | "http")
+                && url.port().is_none()
+                && url.host_str().is_some_and(|h| {
+                    h.eq_ignore_ascii_case("localhost")
+                        || h.eq_ignore_ascii_case("uipilot-public-plugin.localhost")
+                });
+        }
+        if navigated.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            navigation_controller.teardown_session(Some(navigation_epoch));
+            let cleanup_app = navigation_app.clone();
+            let cleanup_label = navigation_label.clone();
+            let _ = navigation_app
+                .run_on_main_thread(move || destroy_content(&cleanup_app, &cleanup_label));
+            return false;
+        }
         matches!(url.scheme(), "uipilot-public-plugin" | "http")
             && url.host_str().is_some_and(|host| {
                 host.eq_ignore_ascii_case("localhost")
@@ -2754,8 +2963,9 @@ fn mount_webview(
     let guard_controller = Arc::clone(&controller);
     let guard_app = app.clone();
     let guard_label = identity.content_label.clone();
+    let guard_epoch = identity.session_epoch;
     let on_unmuted = Arc::new(move |_owner| {
-        let _ = guard_controller.teardown_session(None);
+        let _ = guard_controller.teardown_session(Some(guard_epoch));
         destroy_content(&guard_app, &guard_label);
     });
 
@@ -2767,7 +2977,13 @@ fn mount_webview(
             plugin_id: identity.plugin_id.clone(),
             session_generation: identity.session_epoch,
         },
-        panel_bootstrap(identity.session_epoch, &identity.host_keys),
+        panel_bootstrap_with_actions(
+            identity.session_epoch,
+            &identity.host_keys,
+            app.state::<Arc<PublicPluginService>>()
+                .manager()?
+                .panel_actions_enabled(identity),
+        ),
         content_url,
         on_unmuted,
         CONTENT_READY_TIMEOUT,
@@ -2866,8 +3082,19 @@ fn register_content_focus_events(
     let lost_label = identity.content_label.clone();
     let lost_epoch = identity.session_epoch;
     let lost_app = app.clone();
+    let failed_controller = Arc::clone(&controller);
+    let closed_controller = Arc::clone(&controller);
+    let ended_epoch = identity.session_epoch;
     content
         .with_webview(move |platform| {
+            let failed = ProcessFailedEventHandler::create(Box::new(move |_, _| {
+                failed_controller.teardown_session(Some(ended_epoch));
+                Ok(())
+            }));
+            let closed = WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                closed_controller.teardown_session(Some(ended_epoch));
+                Ok(())
+            }));
             let got = FocusChangedEventHandler::create(Box::new(move |_, _| {
                 let accepted = got_controller.content_got_focus(&got_label, got_epoch);
                 trace_panel_focus(
@@ -2900,9 +3127,16 @@ fn register_content_focus_events(
             let mut got_token = 0;
             let mut lost_token = 0;
             let native = platform.controller();
+            let mut failed_token = 0;
+            let mut closed_token = 0;
             let result = unsafe {
                 native
-                    .add_GotFocus(&got, &mut got_token)
+                    .CoreWebView2()
+                    .and_then(|core| {
+                        core.add_ProcessFailed(&failed, &mut failed_token)
+                            .and_then(|_| core.add_WindowCloseRequested(&closed, &mut closed_token))
+                    })
+                    .and_then(|_| native.add_GotFocus(&got, &mut got_token))
                     .and_then(|_| native.add_LostFocus(&lost, &mut lost_token))
             }
             .map_err(|_| ());
@@ -5443,12 +5677,9 @@ mod tests {
     fn panel_bootstrap_exposes_host_keys_focus_update_and_storage() {
         let bootstrap = panel_bootstrap(42, &[PanelHostKeyDeclaration::ArrowDown]);
         let api_body = bootstrap
-            .split("const api = deepFreeze({\n")
+            .split("const apiShape = {\n")
             .nth(1)
-            .and_then(|tail| {
-                tail.split("\n  });\n  Object.defineProperty(window, 'uipilotPluginPanel'")
-                    .next()
-            })
+            .and_then(|tail| tail.split("\n  };\n  if (runtimeActions)").next())
             .expect("public panel API object is missing");
         let public_members = api_body
             .lines()
@@ -5579,7 +5810,7 @@ mod tests {
             "WebviewBuilder::new(",
             "WebviewUrl::CustomProtocol(inert)",
             "prepare_windows_webview(",
-            "panel_bootstrap(",
+            "panel_bootstrap_with_actions(",
             ".on_navigation(",
             ".on_new_window(|_, _| NewWindowResponse::Deny)",
             ".on_download(|_, _| false)",

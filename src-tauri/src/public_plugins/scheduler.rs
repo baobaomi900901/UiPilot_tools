@@ -41,6 +41,26 @@ pub(crate) struct PluginSubmissionOwner {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PluginRequestOwner {
+    Command(PluginSubmissionOwner),
+    PanelAction {
+        content_label: String,
+        session_epoch: u64,
+        request: super::panel_action::PanelActionRequest,
+    },
+}
+impl PluginRequestOwner {
+    pub(crate) fn command(&self) -> Option<&PluginSubmissionOwner> {
+        match self {
+            Self::Command(owner) => Some(owner),
+            _ => None,
+        }
+    }
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.command().map(|owner| owner.submission_token.as_str())
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginRequestCandidate {
     pub(crate) command_id: String,
     pub(crate) plugin_id: String,
@@ -49,7 +69,7 @@ pub(crate) struct PluginRequestCandidate {
     pub(crate) admission_epoch: u64,
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) input: String,
-    pub(crate) owner: PluginSubmissionOwner,
+    pub(crate) owner: PluginRequestOwner,
 }
 
 impl PluginRequestCandidate {
@@ -61,8 +81,21 @@ impl PluginRequestCandidate {
             && self.admission_epoch != 0
             && self.input.len() <= 64 * 1024
             && !self.input.contains('\0')
-            && self.owner.ui_intent_epoch != 0
-            && !self.owner.submission_token.is_empty()
+            && match &self.owner {
+                PluginRequestOwner::Command(owner) => {
+                    owner.ui_intent_epoch != 0 && !owner.submission_token.is_empty()
+                }
+                PluginRequestOwner::PanelAction {
+                    content_label,
+                    session_epoch,
+                    request,
+                } => {
+                    *session_epoch != 0
+                        && !content_label.is_empty()
+                        && request.validate().is_ok()
+                        && self.activation_mode == PublicActivationMode::Submit
+                }
+            }
     }
 }
 
@@ -83,6 +116,7 @@ pub(crate) struct ReservedPluginRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PluginScheduleError {
     InvalidCandidate,
+    Busy,
     GenerationMismatch,
     GenerationExhausted,
     RequestExhausted,
@@ -173,6 +207,10 @@ struct PluginQueue {
     running: Option<RunningRequest>,
     waiting: Option<ReservedPluginRequest>,
     rebuilding: bool,
+    panel_completion: Option<(
+        PluginRequestContext,
+        Option<super::panel_action::PanelActionError>,
+    )>,
     issued: HashSet<PluginRequestContext>,
     issued_order: VecDeque<PluginRequestContext>,
 }
@@ -186,6 +224,7 @@ impl PluginQueue {
             running: None,
             waiting: None,
             rebuilding: false,
+            panel_completion: None,
             issued: HashSet::new(),
             issued_order: VecDeque::new(),
         }
@@ -297,12 +336,43 @@ impl PluginRequestScheduler {
         {
             return Err(PluginScheduleError::GenerationMismatch);
         }
+        if matches!(
+            reserved.candidate.owner,
+            PluginRequestOwner::PanelAction { .. }
+        ) && (queue.rebuilding || queue.running.is_some() || queue.waiting.is_some())
+        {
+            return Err(PluginScheduleError::Busy);
+        }
+        match &reserved.candidate.owner {
+            PluginRequestOwner::Command(_) => {
+                if let Some((_, reason)) = queue.panel_completion.as_mut() {
+                    *reason =
+                        Some(super::panel_action::PanelActionError::PanelRequestCancelledError);
+                }
+            }
+            PluginRequestOwner::PanelAction { .. } => {
+                if queue
+                    .panel_completion
+                    .as_ref()
+                    .is_some_and(|(_, reason)| reason.is_none())
+                {
+                    return Err(PluginScheduleError::Busy);
+                }
+                queue.panel_completion = None;
+            }
+        }
         queue.remember(reserved.context.clone());
         if queue.rebuilding {
-            let replaced_submission_token = queue
-                .waiting
-                .replace(reserved.clone())
-                .map(|request| request.candidate.owner.submission_token);
+            let replaced_submission_token =
+                queue.waiting.replace(reserved.clone()).map(|request| {
+                    request
+                        .candidate
+                        .owner
+                        .command()
+                        .expect("waiting request is a command")
+                        .submission_token
+                        .clone()
+                });
             let expired = queue
                 .running
                 .as_ref()
@@ -317,10 +387,16 @@ impl PluginRequestScheduler {
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
             let expired = running.request.context.clone();
-            let replaced_submission_token = queue
-                .waiting
-                .replace(reserved.clone())
-                .map(|request| request.candidate.owner.submission_token);
+            let replaced_submission_token =
+                queue.waiting.replace(reserved.clone()).map(|request| {
+                    request
+                        .candidate
+                        .owner
+                        .command()
+                        .expect("waiting request is a command")
+                        .submission_token
+                        .clone()
+                });
             return Ok(PluginScheduleOutcome::Waiting {
                 expired,
                 request_context: reserved.context,
@@ -357,6 +433,14 @@ impl PluginRequestScheduler {
             });
         }
         let accepted = running.current;
+        if accepted
+            && matches!(
+                running.request.candidate.owner,
+                PluginRequestOwner::PanelAction { .. }
+            )
+        {
+            queue.panel_completion = Some((context.clone(), None));
+        }
         let next = if queue.rebuilding {
             None
         } else if let Some(candidate) = queue.waiting.take() {
@@ -388,6 +472,69 @@ impl PluginRequestScheduler {
         } else {
             PluginContextStatus::Invalid
         }
+    }
+
+    // The physical handler is finished, but its response still needs a live-owner claim.
+    pub(crate) fn discard_panel_completion(&self, context: &PluginRequestContext) {
+        if let Ok(mut state) = self.lock() {
+            if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
+                if queue
+                    .panel_completion
+                    .as_ref()
+                    .is_some_and(|(c, _)| c == context)
+                {
+                    queue.panel_completion = None;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn claim_panel_completion(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), super::panel_action::PanelActionError> {
+        use super::panel_action::PanelActionError as E;
+        let mut state = self.lock().map_err(|_| E::PanelRequestUnavailableError)?;
+        let queue = state
+            .by_plugin
+            .get_mut(&context.plugin_id)
+            .ok_or(E::ExpiredPanelSession)?;
+        if !queue
+            .panel_completion
+            .as_ref()
+            .is_some_and(|(c, _)| c == context)
+        {
+            return Err(E::ExpiredPanelSession);
+        }
+        let (_, reason) = queue
+            .panel_completion
+            .take()
+            .ok_or(E::ExpiredPanelSession)?;
+        reason.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn retire_context(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), PluginScheduleError> {
+        let mut state = self.lock()?;
+        if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
+            if let Some((_, reason)) = queue
+                .panel_completion
+                .as_mut()
+                .filter(|(c, _)| c == context)
+            {
+                *reason = Some(super::panel_action::PanelActionError::ExpiredPanelSession);
+            }
+            if let Some(running) = queue
+                .running
+                .as_mut()
+                .filter(|r| r.request.context == *context)
+            {
+                running.current = false;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn cancel(
@@ -543,21 +690,28 @@ impl PluginRequestScheduler {
     pub(crate) fn retire_plugin_requests(
         &self,
         plugin_id: &str,
-    ) -> Result<Vec<(PluginRequestContext, String)>, PluginScheduleError> {
+    ) -> Result<Vec<(PluginRequestContext, Option<String>)>, PluginScheduleError> {
         let mut state = self.lock()?;
         let Some(queue) = state.by_plugin.get_mut(plugin_id) else {
             return Ok(Vec::new());
         };
         let mut retired = Vec::new();
+        if let Some((context, reason)) = queue.panel_completion.as_mut() {
+            *reason = Some(super::panel_action::PanelActionError::ExpiredPanelSession);
+            retired.push((context.clone(), None));
+        }
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
             retired.push((
                 running.request.context.clone(),
-                running.request.candidate.owner.submission_token.clone(),
+                running.request.candidate.owner.token().map(str::to_owned),
             ));
         }
         if let Some(waiting) = queue.waiting.take() {
-            retired.push((waiting.context, waiting.candidate.owner.submission_token));
+            retired.push((
+                waiting.context,
+                waiting.candidate.owner.token().map(str::to_owned),
+            ));
         }
         Ok(retired)
     }
@@ -680,7 +834,7 @@ mod tests {
             admission_epoch: 23,
             activation_mode: mode,
             input: value.into(),
-            owner: owner(value),
+            owner: crate::public_plugins::PluginRequestOwner::Command(owner(value)),
         }
     }
 
@@ -784,8 +938,8 @@ mod tests {
             .retire_plugin_requests("com.example.scheduler")
             .unwrap();
         assert_eq!(retired.len(), 2);
-        assert_eq!(retired[0].1, "submission-old");
-        assert_eq!(retired[1].1, "submission-discarded");
+        assert_eq!(retired[0].1.as_deref(), Some("submission-old"));
+        assert_eq!(retired[1].1.as_deref(), Some("submission-discarded"));
         assert!(matches!(
             scheduler
                 .enqueue(candidate("next", 1, PublicActivationMode::Submit), now)
@@ -812,7 +966,14 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(next.candidate.owner.submission_token, "submission-next");
+        assert_eq!(
+            next.candidate
+                .owner
+                .command()
+                .expect("waiting request is a command")
+                .submission_token,
+            "submission-next"
+        );
         assert_eq!(next.context.plugin_generation, 2);
     }
 
@@ -1072,7 +1233,7 @@ mod tests {
             admission_epoch: generation + 20,
             activation_mode: PublicActivationMode::Live,
             input: value.into(),
-            owner: owner(value),
+            owner: crate::public_plugins::PluginRequestOwner::Command(owner(value)),
         };
         let failed = match scheduler
             .enqueue(candidate("com.example.failed", "A", 1), start)

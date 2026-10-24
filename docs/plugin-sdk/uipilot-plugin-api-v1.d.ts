@@ -127,7 +127,23 @@ export type PluginHandler = (
   api: Readonly<UiPilotPluginApiV1>,
 ) => Promise<PluginResponse>
 
+export interface PluginPanelRequest { action: string; payload: JsonValue }
+export interface PluginPanelActionInvocation {
+  apiVersion: 1
+  requestId: string
+  action: string
+  payload: JsonValue
+  context: { platform: 'windows'; theme: 'dark' | 'light'; invokedAt: string }
+}
+export interface PluginPanelActionResponse { requestId: string; data: JsonValue }
+export type PluginPanelActionHandler = (
+  invocation: Readonly<PluginPanelActionInvocation>,
+  api: Readonly<UiPilotPluginApiV1>,
+) => Promise<PluginPanelActionResponse>
+
 export interface PluginRuntimeModule {
+  /** Required at readiness only when panel.runtimeActions is true (Windows Host 0.6.0+). */
+  onPanelAction?: PluginPanelActionHandler
   onCommand: PluginHandler
 }
 
@@ -272,6 +288,10 @@ export interface PluginPanelHostKeyEvent {
 }
 
 export interface UiPilotPluginPanelApiV1 {
+  /** Present only with panel.runtimeActions. Fresh frozen JSON; one idle-only call, no retry.
+   * Do not await inside onUpdate/onHostKey. Cancellation may follow a committed write: reload.
+   */
+  readonly request?: (input: Readonly<PluginPanelRequest>) => Promise<JsonValue>
   onUpdate(
     handler: (update: Readonly<PluginPanelUpdate>) => void | Promise<void>,
   ): () => void

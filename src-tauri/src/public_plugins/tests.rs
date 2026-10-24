@@ -182,7 +182,14 @@ fn save_plugin_settings_service_settles_exact_tokens_and_preserves_execution_slo
         let completed = manager.scheduler().complete(&running.context, now).unwrap();
         assert!(!completed.accepted);
         assert_eq!(
-            completed.next.unwrap().candidate.owner.submission_token,
+            completed
+                .next
+                .unwrap()
+                .candidate
+                .owner
+                .command()
+                .expect("waiting request is a command")
+                .submission_token,
             next.token
         );
     }
@@ -244,7 +251,14 @@ fn save_plugin_network_toggle_settles_waiting_but_noop_preserves_it() {
     let completed = manager.scheduler().complete(&running.context, now).unwrap();
     assert!(!completed.accepted);
     assert_eq!(
-        completed.next.unwrap().candidate.owner.submission_token,
+        completed
+            .next
+            .unwrap()
+            .candidate
+            .owner
+            .command()
+            .expect("waiting request is a command")
+            .submission_token,
         next.token
     );
 }
@@ -519,7 +533,14 @@ fn rename_retains_running_until_completion_or_timeout_and_preserves_saved_siblin
             };
             assert_eq!(next.candidate.command_id, "constructor");
             assert_eq!(next.candidate.input, "B  saved");
-            assert_eq!(next.candidate.owner.submission_token, b.token);
+            assert_eq!(
+                next.candidate
+                    .owner
+                    .command()
+                    .expect("waiting request is a command")
+                    .submission_token,
+                b.token
+            );
             assert_eq!(
                 manager.invocation_command_id(&next).unwrap().as_deref(),
                 Some("constructor")
@@ -819,7 +840,15 @@ fn request_scoped_abort_promotes_and_binds_a_newer_waiting_submission() {
         .unwrap()
         .expect("the waiting request must be promoted");
 
-    assert_eq!(promoted.candidate.owner.submission_token, second_token);
+    assert_eq!(
+        promoted
+            .candidate
+            .owner
+            .command()
+            .expect("waiting request is a command")
+            .submission_token,
+        second_token
+    );
     assert_eq!(
         manager.scheduler().context_status(&promoted.context),
         super::PluginContextStatus::Current
@@ -2329,5 +2358,512 @@ fn cli_multi_command_pack_fixture_stages_on_0_5_0() {
         )
         .unwrap_err(),
         PublicPackageError::IncompatibleApi
+    );
+}
+
+fn panel_action_fixture(
+    name: &str,
+) -> (
+    TestRoot,
+    Arc<PublicPluginService>,
+    Arc<PublicPluginManager>,
+    Arc<crate::plugin_panel::PluginPanelController>,
+    crate::plugin_panel::PanelSessionIdentity,
+) {
+    let root = TestRoot::new(name);
+    let source = root.package();
+    let mut value = manifest("panel");
+    value["minimumHostVersion"] = json!("0.6.0");
+    value["panel"]["runtimeActions"] = json!(true);
+    value["settings"] = json!([{ "key":"synthetic", "label":"Synthetic", "type":"secret" }]);
+    write_package(&source, &value);
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            PublicPluginHost::current(PublicPlatform::Windows),
+            [],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let prepared = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness(
+            "main",
+            &prepared.token,
+            BTreeSet::from([PublicPermission::UiPanel]),
+            now,
+            |_| true,
+        )
+        .unwrap();
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(manager.clone()).is_ok());
+    let route = manager.route("/demo").unwrap().unwrap();
+    let controller = Arc::new(crate::plugin_panel::PluginPanelController::default());
+    let identity = controller
+        .open_session(crate::plugin_panel::PanelOwner {
+            plugin_id: route.plugin_id,
+            plugin_generation: route.generation,
+            activation_id: route.activation_id,
+            admission_epoch: route.admission_epoch,
+            command_label: "demo".into(),
+            request_id: "initial".into(),
+            submission_token: "initial-command".into(),
+            argument: String::new(),
+            host_keys: vec![],
+            host_key_focus: super::PanelHostKeyFocus::Content,
+        })
+        .unwrap();
+    assert!(controller.mark_ready(
+        &identity.content_label,
+        identity.session_epoch,
+        false,
+        false
+    ));
+    (root, service, manager, controller, identity)
+}
+fn panel_action_input() -> super::panel_action::PanelActionRequest {
+    super::panel_action::PanelActionRequest {
+        action: "save".into(),
+        payload: json!({"title":"draft"}),
+    }
+}
+
+#[test]
+fn panel_action_busy_does_not_replace_running_command_or_waiter() {
+    let (_root, service, manager, controller, identity) = panel_action_fixture("panel-action-busy");
+    let now = Instant::now();
+    let first = service
+        .schedule_command(
+            manager.route("/demo first").unwrap().unwrap(),
+            1,
+            "/demo first".into(),
+            now,
+        )
+        .unwrap();
+    let waiting = service
+        .schedule_command(
+            manager.route("/demo waiting").unwrap().unwrap(),
+            2,
+            "/demo waiting".into(),
+            now,
+        )
+        .unwrap();
+    let error = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .err();
+    assert_eq!(
+        error,
+        Some(super::panel_action::PanelActionError::PanelRequestBusyError)
+    );
+    let completed = manager
+        .scheduler()
+        .complete(&first.dispatch.unwrap().context, now)
+        .unwrap();
+    assert!(!completed.accepted);
+    assert_eq!(
+        completed.next.unwrap().candidate.owner.token(),
+        Some(waiting.token.as_str())
+    );
+}
+
+#[test]
+fn panel_action_close_barrier_revokes_late_storage_and_keeps_physical_deadline() {
+    use super::{runtime::PluginApiOperation, PluginApiRequest, PluginContextStatus};
+    use std::sync::Barrier;
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture("panel-action-close");
+    for (label, epoch) in [
+        ("main", identity.session_epoch),
+        (identity.content_label.as_str(), identity.session_epoch + 1),
+    ] {
+        assert_eq!(
+            controller
+                .admit_panel_action(&service, label, epoch, panel_action_input())
+                .err(),
+            Some(super::panel_action::PanelActionError::ExpiredPanelSession)
+        );
+    }
+    let mut wrong_activation = identity.clone();
+    wrong_activation.activation_id += 1;
+    assert_eq!(
+        manager
+            .admit_panel_action(&wrong_activation, panel_action_input(), Instant::now())
+            .err(),
+        Some(super::panel_action::PanelActionError::ExpiredPanelSession)
+    );
+    let (request, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    let context = request.context.clone();
+    let label = super::runtime_label(&context.plugin_id, context.plugin_generation).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let late_barrier = barrier.clone();
+    let late_manager = manager.clone();
+    let late_context = context.clone();
+    let late = std::thread::spawn(move || {
+        late_barrier.wait();
+        late_manager
+            .execute_api(
+                &label,
+                PluginApiRequest {
+                    context: late_context,
+                    operation: PluginApiOperation::StorageSet,
+                    key: Some("late".into()),
+                    value: Some(json!(true)),
+                    notification: None,
+                },
+            )
+            .result
+    });
+    controller.host_hidden();
+    barrier.wait();
+    assert_eq!(
+        late.join().unwrap(),
+        Err(PluginRuntimeError::ExpiredRequest)
+    );
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            super::panel_action::PanelActionError::ExpiredPanelSession
+        ))
+    );
+    assert_eq!(
+        manager.scheduler().context_status(&context),
+        PluginContextStatus::Expired
+    );
+    assert_eq!(
+        controller
+            .admit_panel_action(
+                &service,
+                &identity.content_label,
+                identity.session_epoch,
+                panel_action_input()
+            )
+            .err(),
+        Some(super::panel_action::PanelActionError::ExpiredPanelSession)
+    );
+    let command = service
+        .schedule_command(
+            manager.route("/demo next").unwrap().unwrap(),
+            1,
+            "/demo next".into(),
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(
+        command.dispatch.is_none(),
+        "retired handler still occupies Runtime"
+    );
+    assert!(manager
+        .expire_network_timeouts(request.deadline - Duration::from_millis(1))
+        .unwrap()
+        .is_empty());
+    let outcome = manager
+        .scheduler()
+        .complete(&context, Instant::now())
+        .unwrap();
+    assert!(!outcome.accepted);
+    assert_eq!(
+        outcome.next.unwrap().candidate.owner.token(),
+        Some(command.token.as_str())
+    );
+    assert!(manager
+        .scheduler()
+        .complete(&context, Instant::now())
+        .is_err());
+}
+
+#[test]
+fn panel_action_host_submit_cancels_once_and_late_completion_cannot_publish() {
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture("panel-action-host-submit");
+    let (action, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    let command = service
+        .schedule_command(
+            manager.route("/demo next").unwrap().unwrap(),
+            1,
+            "/demo next".into(),
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(command.dispatch.is_none());
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            super::panel_action::PanelActionError::PanelRequestCancelledError
+        ))
+    );
+    assert!(!service.settle_panel_action(&action.context, Ok(json!("late")), true));
+    let completed = manager
+        .scheduler()
+        .complete(&action.context, Instant::now())
+        .unwrap();
+    assert!(!completed.accepted);
+    assert_eq!(
+        completed.next.unwrap().candidate.owner.token(),
+        Some(command.token.as_str())
+    );
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn panel_action_completion_rechecks_replacement_and_old_timeout_preserves_new_generation() {
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture("panel-action-replace");
+    let (action, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    assert!(
+        manager
+            .scheduler()
+            .complete(&action.context, Instant::now())
+            .unwrap()
+            .accepted
+    );
+    // This replacement wins the controller lock before settlement. Old success must become expiry.
+    let replacement = controller
+        .open_session(crate::plugin_panel::PanelOwner {
+            plugin_id: identity.plugin_id.clone(),
+            plugin_generation: identity.generation + 1,
+            activation_id: identity.activation_id + 1,
+            admission_epoch: identity.admission_epoch + 1,
+            command_label: "demo".into(),
+            request_id: "replacement".into(),
+            submission_token: "replacement".into(),
+            argument: String::new(),
+            host_keys: vec![],
+            host_key_focus: super::PanelHostKeyFocus::Content,
+        })
+        .unwrap();
+    assert!(!service.settle_panel_action(&action.context, Ok(json!("late")), true));
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            super::panel_action::PanelActionError::ExpiredPanelSession
+        ))
+    );
+    assert!(controller
+        .teardown_generation(&identity.plugin_id, identity.generation)
+        .is_none());
+    assert_eq!(controller.live_identity(), Some(replacement));
+}
+
+#[test]
+fn panel_action_completed_response_is_retired_by_credential_change_before_settlement() {
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture("panel-action-completed-credential");
+    let (action, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    assert!(
+        manager
+            .scheduler()
+            .complete(&action.context, Instant::now())
+            .unwrap()
+            .accepted
+    );
+    let mut effects = super::activation::ManagementEffects::default();
+    manager
+        .save_secret_with_effects(&identity.plugin_id, "synthetic", None, &mut effects)
+        .unwrap();
+    assert!(effects.retired.iter().any(|(c, _)| c == &action.context));
+    assert!(service.settle_panel_action(&action.context, Ok(json!("must not publish")), true));
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            super::panel_action::PanelActionError::ExpiredPanelSession
+        ))
+    );
+    let (next, next_receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    assert!(
+        manager
+            .scheduler()
+            .complete(&next.context, Instant::now())
+            .unwrap()
+            .accepted
+    );
+    assert!(service.settle_panel_action(&next.context, Ok(json!("current")), true));
+    assert_eq!(
+        next_receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Ok(json!("current")))
+    );
+}
+
+#[test]
+fn panel_action_timeout_and_transport_errors_keep_their_fixed_error_names() {
+    for error in [
+        super::panel_action::PanelActionError::PanelRequestTimeoutError,
+        super::panel_action::PanelActionError::PanelRequestUnavailableError,
+    ] {
+        let (_root, service, manager, controller, identity) =
+            panel_action_fixture("panel-action-terminal-error");
+        let (action, receiver) = controller
+            .admit_panel_action(
+                &service,
+                &identity.content_label,
+                identity.session_epoch,
+                panel_action_input(),
+            )
+            .unwrap();
+        manager.retire_panel_action(&action.context);
+        assert!(service.settle_panel_action(&action.context, Err(error), true));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(error))
+        );
+        assert!(
+            !manager
+                .scheduler()
+                .complete(&action.context, Instant::now())
+                .unwrap()
+                .accepted
+        );
+    }
+}
+
+#[test]
+fn panel_action_all_session_removal_entries_retire_the_exact_registration() {
+    for removal in ["session", "plugin", "current", "hidden", "replacement"] {
+        let (_root, service, manager, controller, identity) =
+            panel_action_fixture(&format!("panel-action-removal-{removal}"));
+        let (action, receiver) = controller
+            .admit_panel_action(
+                &service,
+                &identity.content_label,
+                identity.session_epoch,
+                panel_action_input(),
+            )
+            .unwrap();
+        match removal {
+            "session" => {
+                controller.teardown_session(Some(identity.session_epoch));
+            }
+            "plugin" => {
+                controller.teardown_plugin(&identity.plugin_id);
+            }
+            "current" => {
+                controller.teardown_current(identity.session_epoch, "initial", "initial-command");
+            }
+            "hidden" => controller.host_hidden(),
+            _ => {
+                controller.open_session(crate::plugin_panel::PanelOwner {
+                    plugin_id: identity.plugin_id,
+                    plugin_generation: identity.generation,
+                    activation_id: identity.activation_id,
+                    admission_epoch: identity.admission_epoch,
+                    command_label: "demo".into(),
+                    request_id: "replacement".into(),
+                    submission_token: "replacement".into(),
+                    argument: String::new(),
+                    host_keys: vec![],
+                    host_key_focus: super::PanelHostKeyFocus::Content,
+                });
+            }
+        }
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(
+                super::panel_action::PanelActionError::ExpiredPanelSession
+            )),
+            "{removal}"
+        );
+        assert_eq!(
+            manager.scheduler().context_status(&action.context),
+            super::PluginContextStatus::Expired
+        );
+        assert!(
+            !manager
+                .scheduler()
+                .complete(&action.context, Instant::now())
+                .unwrap()
+                .accepted
+        );
+    }
+}
+
+#[test]
+fn panel_action_poisoned_controller_hide_still_retires_registered_authority() {
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture("panel-action-poisoned-controller");
+    let (action, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    controller.poison_core_for_test();
+    controller.host_hidden();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            super::panel_action::PanelActionError::ExpiredPanelSession
+        ))
+    );
+    assert_eq!(
+        manager.scheduler().context_status(&action.context),
+        super::PluginContextStatus::Expired
+    );
+    assert_eq!(
+        controller
+            .admit_panel_action(
+                &service,
+                &identity.content_label,
+                identity.session_epoch,
+                panel_action_input()
+            )
+            .err(),
+        Some(super::panel_action::PanelActionError::PanelRequestUnavailableError)
+    );
+    assert!(
+        !manager
+            .scheduler()
+            .complete(&action.context, Instant::now())
+            .unwrap()
+            .accepted
     );
 }

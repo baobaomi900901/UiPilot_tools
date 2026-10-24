@@ -2230,6 +2230,54 @@ pub(crate) fn plugin_panel_focus_host_input_ack(
 }
 
 #[tauri::command]
+pub(crate) async fn plugin_panel_request(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    settings: State<'_, SettingsStore>,
+    session_epoch: String,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, crate::public_plugins::panel_action::PanelActionError> {
+    use crate::public_plugins::panel_action::{PanelActionError as E, PanelActionRequest};
+    if plugin_panel::plugin_id_from_panel_content_label(webview.label()).is_none() {
+        return Err(E::ExpiredPanelSession);
+    }
+    let epoch = crate::public_plugins::panel_action::parse_epoch(&session_epoch)?;
+    let request = PanelActionRequest::from_value(request)?;
+    let (dispatch, receiver) =
+        controller
+            .inner()
+            .admit_panel_action(service.inner(), webview.label(), epoch, request)?;
+    if service
+        .dispatch(
+            &app,
+            &dispatch,
+            invocation_theme(&app, settings.snapshot().theme),
+            invoked_at_rfc3339(),
+        )
+        .is_err()
+    {
+        // Delivery may have occurred. Revoke authority but retain the physical slot and watchdog.
+        if let Ok(manager) = service.manager() {
+            manager.retire_panel_action(&dispatch.context);
+        }
+        service.settle_panel_action(
+            &dispatch.context,
+            Err(E::PanelRequestUnavailableError),
+            true,
+        );
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        receiver
+            .recv()
+            .unwrap_or(Err(E::PanelRequestUnavailableError))
+    })
+    .await
+    .map_err(|_| E::PanelRequestUnavailableError)?
+}
+
+#[tauri::command]
 pub(crate) fn plugin_panel_storage_get(
     webview: tauri::Webview,
     controller: State<'_, Arc<PluginPanelController>>,
@@ -2802,7 +2850,12 @@ fn rollback_panel_submission(
         }
         next = public.abort_submission_request(
             &request.context,
-            &request.candidate.owner.submission_token,
+            &request
+                .candidate
+                .owner
+                .command()
+                .expect("promoted waiter is a command")
+                .submission_token,
             Instant::now(),
         );
     }
@@ -5732,7 +5785,14 @@ mod tests {
                 let completion = manager.scheduler().complete(&running.context, now).unwrap();
                 assert!(!completion.accepted);
                 assert_eq!(
-                    completion.next.unwrap().candidate.owner.submission_token,
+                    completion
+                        .next
+                        .unwrap()
+                        .candidate
+                        .owner
+                        .command()
+                        .unwrap()
+                        .submission_token,
                     next.token
                 );
             });

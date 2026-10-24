@@ -153,6 +153,8 @@ fn present_panel_host_key_focus_schema(generator: &mut SchemaGenerator) -> Schem
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicPanelV1 {
+    #[serde(default)]
+    pub(crate) runtime_actions: bool,
     pub(crate) entry: String,
     #[serde(default)]
     #[schemars(schema_with = "panel_host_keys_schema")]
@@ -714,6 +716,11 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.panel.as_ref().is_some_and(|p| p.runtime_actions)
+        && (minimum_host < [0, 6, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.is_multi_command() && minimum_host < MULTI_COMMAND_MIN_HOST {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -951,6 +958,32 @@ mod schema_tests {
             &serde_json::to_vec(value).unwrap(),
             &PublicPluginHost::current(PublicPlatform::Windows),
         )
+    }
+
+    #[test]
+    fn panel_action_opt_in_is_strict_and_requires_windows_host_0_6() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.6.0");
+        value["supportedPlatforms"] = serde_json::json!(["windows"]);
+        value["command"]["activationMode"] = serde_json::json!("submit");
+        value["command"]["outputMode"] = serde_json::json!("panel");
+        value["panel"] = serde_json::json!({"entry":"dist/panel.html"});
+        value["permissions"] = serde_json::json!(["ui.panel"]);
+        assert!(parse(&value).is_ok());
+        for opt in [serde_json::json!(false), serde_json::json!(true)] {
+            value["panel"]["runtimeActions"] = opt;
+            assert!(parse(&value).is_ok());
+        }
+        for opt in [Value::Null, serde_json::json!(1), serde_json::json!("true")] {
+            value["panel"]["runtimeActions"] = opt;
+            assert!(parse(&value).is_err());
+        }
+        value["panel"]["runtimeActions"] = serde_json::json!(true);
+        value["minimumHostVersion"] = serde_json::json!("0.5.0");
+        assert!(parse(&value).is_err());
+        value["minimumHostVersion"] = serde_json::json!("0.6.0");
+        value["supportedPlatforms"] = serde_json::json!(["windows", "macos"]);
+        assert!(parse(&value).is_err());
     }
 
     #[test]

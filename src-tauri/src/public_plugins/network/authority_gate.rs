@@ -665,11 +665,13 @@ mod tests {
                     admission_epoch,
                     activation_mode: PublicActivationMode::Live,
                     input: String::new(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 1,
-                        control_value: String::new(),
-                        submission_token: format!("submission-{generation}"),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 1,
+                            control_value: String::new(),
+                            submission_token: format!("submission-{generation}"),
+                        },
+                    ),
                 },
                 Instant::now(),
             )

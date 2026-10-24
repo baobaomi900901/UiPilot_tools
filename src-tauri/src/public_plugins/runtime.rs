@@ -24,7 +24,10 @@ pub(crate) const PUBLIC_RUNTIME_LABEL_PREFIX: &str = "plugin-runtime-";
 pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
 (() => {
   'use strict';
+  __PANEL_JSON__
   let handler = null;
+  let panelHandler = null;
+  const panelActionsEnabled = __PANEL_ACTIONS__;
   let busy = false;
   const networkEnabled = __NETWORK_HTTPS__;
   const uncurryThis = (method) => Function.prototype.call.bind(method);
@@ -264,7 +267,13 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
       const api = deepFreeze(apiShape);
       let completion;
       try {
-        const response = await handler(deepFreeze(dispatch.invocation), api);
+        const response = await (dispatch.kind === 'panelAction' ? panelHandler : handler)(deepFreeze(dispatch.invocation), api);
+        if (dispatch.kind === 'panelAction') {
+          try {
+            const snapshot = panelJson.snapshot(response, ['requestId', 'data']);
+            completion = { context: requestContext, response: snapshot };
+          } catch (_) { completion = { context: requestContext, response: null }; }
+        } else
         completion = { context: requestContext, response };
       } catch (_) {
         completion = { context: requestContext, failed: true };
@@ -283,17 +292,32 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     const entry = document.documentElement.dataset.runtimeEntry;
     const module = entry ? await import(entry) : null;
     if (!module || typeof module.onCommand !== 'function') throw new TypeError('onCommand export required');
+    if (panelActionsEnabled && typeof module.onPanelAction !== 'function') throw new TypeError('onPanelAction export required');
+    panelHandler = module.onPanelAction;
     handler = module.onCommand;
     document.title = 'uipilot-public-plugin-ready';
   }).catch(() => { document.title = 'uipilot-public-plugin-failed'; });
 })();
 "#;
 
+#[cfg(test)]
 pub(crate) fn public_runtime_bootstrap(network_https: bool) -> String {
-    PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE.replace(
-        "__NETWORK_HTTPS__",
-        if network_https { "true" } else { "false" },
-    )
+    public_runtime_bootstrap_with_panel(network_https, false)
+}
+pub(crate) fn public_runtime_bootstrap_with_panel(
+    network_https: bool,
+    panel_actions: bool,
+) -> String {
+    PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE
+        .replace("__PANEL_JSON__", super::panel_action::JSON_BOOTSTRAP)
+        .replace(
+            "__PANEL_ACTIONS__",
+            if panel_actions { "true" } else { "false" },
+        )
+        .replace(
+            "__NETWORK_HTTPS__",
+            if network_https { "true" } else { "false" },
+        )
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -875,7 +899,8 @@ pub(crate) enum PluginInvocationTheme {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PluginCommandDispatch {
     pub(crate) context: PluginRequestContext,
-    pub(crate) invocation: PluginInvocation,
+    pub(crate) kind: String,
+    pub(crate) invocation: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1085,11 +1110,13 @@ mod tests {
                     admission_epoch: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "input".into(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 1,
-                        control_value: "/runtime input".into(),
-                        submission_token: "submission-notification".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 1,
+                            control_value: "/runtime input".into(),
+                            submission_token: "submission-notification".into(),
+                        },
+                    ),
                 },
                 Instant::now(),
             )
@@ -1210,11 +1237,13 @@ mod tests {
                     admission_epoch: 1,
                     activation_mode: PublicActivationMode::Live,
                     input: "input".into(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 1,
-                        control_value: "/runtime input".into(),
-                        submission_token: "submission-1".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 1,
+                            control_value: "/runtime input".into(),
+                            submission_token: "submission-1".into(),
+                        },
+                    ),
                 },
                 Instant::now(),
             )
@@ -1245,11 +1274,13 @@ mod tests {
                     admission_epoch: 1,
                     activation_mode: PublicActivationMode::Live,
                     input: "new".into(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 2,
-                        control_value: "/runtime new".into(),
-                        submission_token: "submission-2".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 2,
+                            control_value: "/runtime new".into(),
+                            submission_token: "submission-2".into(),
+                        },
+                    ),
                 },
                 Instant::now(),
             )
@@ -1569,11 +1600,13 @@ mod tests {
                     admission_epoch: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "new".into(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 2,
-                        control_value: "/runtime new".into(),
-                        submission_token: "submission-new".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 2,
+                            control_value: "/runtime new".into(),
+                            submission_token: "submission-new".into(),
+                        },
+                    ),
                 },
                 Instant::now(),
             )
@@ -1667,11 +1700,13 @@ mod tests {
                     admission_epoch: 1,
                     activation_mode: PublicActivationMode::Submit,
                     input: "new".into(),
-                    owner: PluginSubmissionOwner {
-                        ui_intent_epoch: 2,
-                        control_value: "/runtime new".into(),
-                        submission_token: "submission-new".into(),
-                    },
+                    owner: crate::public_plugins::PluginRequestOwner::Command(
+                        PluginSubmissionOwner {
+                            ui_intent_epoch: 2,
+                            control_value: "/runtime new".into(),
+                            submission_token: "submission-new".into(),
+                        },
+                    ),
                 },
                 Instant::now(),
             )

@@ -728,7 +728,7 @@ mod tests {
         for required in [
             "WebviewUrl::CustomProtocol(inert_url)",
             "prepare_windows_webview(",
-            "public_runtime_bootstrap(candidate.network_https_declared)",
+            "runtime::public_runtime_bootstrap_with_panel(candidate.network_https_declared, candidate.panel_actions)",
         ] {
             assert!(production.contains(required), "missing {required}");
         }
