@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令实施计划
 
-状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Tasks 2–8 待执行，M2-A 尚未完成。
+状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Tasks 3–8 待执行，M2-A 尚未完成。
 
 > **For agentic workers:** 使用 `subagent-driven-development`；单写者顺序实施，每任务通过独立 Spec 与 Quality 双门禁后才可开始下一任务。
 
@@ -58,10 +58,10 @@
 
 **Dependencies:** Task 1；设计 §9–12、§16.8–13。读取最终 M4 的 state prepared/durable/revalidation 和 recovery 实际接口后修改，不重建事务系统。
 
-- [ ] 引入显式严格 schema-1/schema-2 DTO 与确定性命令 map，读取按 schema 分流；检测重复 JSON 命令 key，必填 nullable nameOverride 不可被 Option 缺省吞掉。存储 raw 始终保留实际权威字节，规范化 view 不触发写盘。
-- [ ] 同任务更新 EffectivePluginConfig 和所有直接构造/消费者，命令配置只由经验证 ID 查询；网络 grant/settings/revision/generation 仍包级。现有 legacy 外层入口只用已验证 default，不能选择集合首项。Task 3 才切换主结果公共协议，不在此任务新造公开 SDK config 类型。
-- [ ] 把 activation/升级 reconciliation、rename/favorite prepared state、冲突检查及 retainData 状态操作改为命令集合，所有写端写 schema 2。准确比较存储 override，favorite/override 真 no-op 不生成迁移事务。完整集合验证后才 prepared publish。
-- [ ] 保持 backup/语义修复 durable-first 以及 M4 grant 修复分类；Unknown、NotCommitted 和 failed revalidation 分别处理。将状态发布及任何 authority 重开留在既有统一 checked 通道，不能用内存规范化成功作 durable 证据。
+- [x] 引入显式严格 schema-1/schema-2 DTO 与确定性命令 map，读取按 schema 分流；检测重复 JSON 命令 key，必填 nullable nameOverride 不可被 Option 缺省吞掉。存储 raw 始终保留实际权威字节，规范化 view 不触发写盘。
+- [x] 同任务更新 EffectivePluginConfig 和所有直接构造/消费者，命令配置只由经验证 ID 查询；网络 grant/settings/revision/generation 仍包级。现有 legacy 外层入口只用已验证 default，不能选择集合首项。Task 3 才切换主结果公共协议，不在此任务新造公开 SDK config 类型。
+- [x] 把 activation/升级 reconciliation、rename/favorite prepared state、冲突检查及 retainData 状态操作改为命令集合，所有写端写 schema 2。准确比较存储 override，favorite/override 真 no-op 不生成迁移事务。完整集合验证后才 prepared publish。
+- [x] 保持 backup/语义修复 durable-first 以及 M4 grant 修复分类；Unknown、NotCommitted 和 failed revalidation 分别处理。将状态发布及任何 authority 重开留在既有统一 checked 通道，不能用内存规范化成功作 durable 证据。
 
 **Distinct test coverage:** 精确 schema-2 roundtrip/根默认值/空 credentials 省略，inventory schema 不变；缺 commands、0/17、非法 key/name、重复 JSON key、未知根/条目、缺/null favorite、缺 nameOverride、旧根三字段、未知 schema 全部拒绝或按既有分类恢复。有效 schema-1 primary 含/缺 favorite 首读后 inventory/route 可读，raw/revision 无变化、没有迁移专用写；与正常 startup 合法 activation 写入分开观测。第一次真实 favorite/rename commit 的 NotCommitted+旧字节复核成功不发布，重试只写一次 schema 2；Unknown/复核失败 fail-closed，不断言旧可用性。语义坏 grant、结构坏 primary、current 缺失及 backup 恢复分别测试撤权 durable 后发布，修复写失败无 authority。retainData 保留命令条目/覆盖、清空全部 favorite，按 M4 清授权。仅存活同 ID 继承；删除→重启→重加 fresh；legacy→无 default→回退旧包产生 fresh default，绝不按名/位置恢复。
 
