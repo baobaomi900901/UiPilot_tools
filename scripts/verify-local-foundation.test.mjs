@@ -32,7 +32,7 @@ test('discovery sorts all collections and preserves spaced paths as argv', t => 
     'reference package validation',
   ]);
   assert.deepEqual(stages[6].args.slice(1), found.tests);
-  assert.deepEqual(stages[7].args.slice(-2), found.contracts);
+  assert.deepEqual(stages[7].args.slice(-found.contracts.length), found.contracts);
   assert.equal(stages[3].args.at(-1), '--offline');
   assert.equal(stages[4].args.at(-1), '--check');
   assert.equal(stages[1].command, process.execPath);
@@ -181,4 +181,35 @@ test('a file in place of the discovery root fails closed', t => {
   rmSync(directory, { recursive: true });
   writeFileSync(directory, 'not a directory');
   assert.throws(() => discover(root), /ordinary directory/);
+});
+
+test('unreleased multi-package fixture adds tests and SDK contracts without release validation', t => {
+  const root = fixture(t);
+  const base = path.join(root, 'examples/public-plugins/multi plugin/tests');
+  const pkg = path.join(base, 'fixtures/multi-package');
+  mkdirSync(path.join(pkg, 'dist'), { recursive: true });
+  writeFileSync(path.join(pkg, 'plugin.json'), '{}');
+  writeFileSync(path.join(pkg, 'dist/runtime.js'), 'export async function onCommand() {}');
+  writeFileSync(path.join(base, 'runtime.test.js'), '');
+  writeFileSync(path.join(base, 'sdk-contract.ts'), '');
+  const found = discover(root);
+  assert.equal(found.tests.length, 3);
+  assert.equal(found.contracts.length, 3);
+  assert.equal(found.packages.length, 2);
+  assert.ok(found.tests.includes(path.join(base, 'runtime.test.js')));
+  assert.ok(found.contracts.includes(path.join(base, 'sdk-contract.ts')));
+  const stages = buildStages(root, found, { npmCli: 'C:/npm cli/npm-cli.js' });
+  assert.deepEqual(stages[7].args.slice(-found.contracts.length), found.contracts);
+  assert.deepEqual(stages[8].commands.map(item => item.args[2]), found.packages);
+  assert.ok(stages[8].commands.every(item => !item.args.includes(pkg)));
+});
+
+test('Task 7 repository inventory includes unreleased demo tests but ten release packages', () => {
+  const found = discover(repositoryRoot);
+  assert.equal(found.tests.length, 13);
+  assert.equal(found.contracts.length, 10);
+  assert.equal(found.packages.length, 10);
+  assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-multi')));
+  assert.ok(found.contracts.some(file => file.includes('com.uipilot.demo-multi')));
+  assert.ok(found.packages.every(file => !file.includes('com.uipilot.demo-multi')));
 });

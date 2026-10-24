@@ -15,7 +15,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{
     activation::{PublicPluginInstallSource, PublicPluginManager},
-    manifest::{PanelHostKeyDeclaration, PublicOutputMode, PublicPermission},
+    manifest::{PanelHostKeyDeclaration, PublicActivationMode, PublicOutputMode, PublicPermission},
     package, stage_public_package,
     webview_audio_guard::{INERT_DOCUMENT, INERT_PATH},
     PluginCommandCompletion, PluginRuntimeError, PublicPackageError, PublicPackageSource,
@@ -1758,6 +1758,131 @@ fn repository_demo_examples_stage_as_independently_removable_public_plugins() {
     ] {
         for command in ["/demo-win", "/demo-return"] {
             assert!(!production.contains(command));
+        }
+    }
+}
+
+#[test]
+fn repository_multi_demo_stages_real_directory_and_archive_only_on_explicit_0_5_host() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let source = workspace
+        .join("examples/public-plugins/com.uipilot.demo-multi/tests/fixtures/multi-package");
+    let new_host = PublicPluginHost {
+        version: [0, 5, 0],
+        ..host()
+    };
+    assert_eq!(host().version, [0, 4, 0]);
+    for archive in [false, true] {
+        let root = TestRoot::new(if archive {
+            "multi-demo-archive"
+        } else {
+            "multi-demo-directory"
+        });
+        let package_source = if archive {
+            let archive_path = root.0.join("multi.uipilot-plugin");
+            archive_directory(&source, &archive_path);
+            PublicPackageSource::Archive(archive_path)
+        } else {
+            PublicPackageSource::DevelopmentDirectory(source.clone())
+        };
+        assert_eq!(
+            stage_public_package(package_source.clone(), &root.staging(), &host()).unwrap_err(),
+            PublicPackageError::IncompatibleApi
+        );
+        let prepared = stage_public_package(package_source, &root.staging(), &new_host).unwrap();
+        assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-multi");
+        assert!(prepared.manifest.is_multi_command());
+        assert!(prepared.manifest.legacy_command().is_none());
+        let commands = prepared.manifest.normalized_commands().collect::<Vec<_>>();
+        assert_eq!(
+            commands.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["upper", "lower"]
+        );
+        assert_eq!(commands[0].1.activation_mode, PublicActivationMode::Live);
+        assert_eq!(commands[1].1.activation_mode, PublicActivationMode::Submit);
+        assert!(commands
+            .iter()
+            .all(|(_, command)| command.output_mode == PublicOutputMode::MainResult));
+        assert_eq!(
+            prepared.manifest.permissions,
+            vec![PublicPermission::ClipboardWrite]
+        );
+        assert_eq!(
+            prepared
+                .resources
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["dist/runtime.js", "plugin.json"]
+        );
+        let source_manifest: Value =
+            serde_json::from_slice(&fs::read(source.join("plugin.json")).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&prepared.manifest).unwrap(),
+            source_manifest
+        );
+        for file in ["plugin.json", "dist/runtime.js"] {
+            assert_eq!(
+                fs::read(prepared.package_root.join(file)).unwrap(),
+                fs::read(source.join(file)).unwrap()
+            );
+        }
+        assert_eq!(prepared.revalidate(), Ok(()));
+    }
+}
+
+#[test]
+fn repository_legacy_original_packages_stage_as_directory_and_archive_on_0_5_host() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let new_host = PublicPluginHost {
+        version: [0, 5, 0],
+        ..host()
+    };
+    for (id, mode) in [
+        ("com.uipilot.demo-return", PublicOutputMode::MainResult),
+        ("com.uipilot.demo-panel", PublicOutputMode::Panel),
+        ("com.uipilot.demo-win", PublicOutputMode::Window),
+        ("com.uipilot.pomodoro", PublicOutputMode::Window),
+    ] {
+        let source = workspace.join(format!("examples/public-plugins/{id}/package"));
+        for archive in [false, true] {
+            let root = TestRoot::new("legacy-demo-0-5");
+            let package_source = if archive {
+                let archive_path = root.0.join("legacy.uipilot-plugin");
+                archive_directory(&source, &archive_path);
+                PublicPackageSource::Archive(archive_path)
+            } else {
+                PublicPackageSource::DevelopmentDirectory(source.clone())
+            };
+            let prepared =
+                stage_public_package(package_source, &root.staging(), &new_host).unwrap();
+            assert_eq!(prepared.manifest.plugin_id, id);
+            assert!(!prepared.manifest.is_multi_command());
+            assert_eq!(
+                prepared.manifest.legacy_command().unwrap().output_mode,
+                mode
+            );
+            assert_eq!(
+                prepared
+                    .manifest
+                    .normalized_commands()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+                vec!["default"]
+            );
+            let mut files = Vec::new();
+            collect_files(&source, &source, &mut files);
+            assert_eq!(
+                prepared.resources.len(),
+                files
+                    .iter()
+                    .filter(|(path, _)| path != "assets/sounds/timer-alarm.wav")
+                    .count()
+            );
+            for (path, bytes) in files {
+                assert_eq!(fs::read(prepared.package_root.join(path)).unwrap(), bytes);
+            }
+            assert_eq!(prepared.revalidate(), Ok(()));
         }
     }
 }

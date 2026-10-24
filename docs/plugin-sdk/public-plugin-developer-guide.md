@@ -10,7 +10,8 @@
 
 仓库中的完整参考实现：
 
-- [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：主界面结果与复制。
+- [`com.uipilot.demo-return`](../../examples/public-plugins/com.uipilot.demo-return)：旧形态单命令主界面结果与复制。
+- [`com.uipilot.demo-multi`](../../examples/public-plugins/com.uipilot.demo-multi)：Host `0.5.0+` 的双 mainResult 命令、一个 Runtime 与共享设置/存储；Task 8 发布前仅保留测试 fixture。
 - [`com.uipilot.demo-win`](../../examples/public-plugins/com.uipilot.demo-win)：单例子窗口。
 - [`com.uipilot.demo-panel`](../../examples/public-plugins/com.uipilot.demo-panel)：启动器内嵌面板。
 - [`com.uipilot.demo-credentials`](../../examples/public-plugins/com.uipilot.demo-credentials)：Windows Host `0.4.0+` 的 bearer 凭据引用与离线假服务测试。
@@ -29,9 +30,10 @@
 | 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（使用基础 `hostKeys` 时 `minimumHostVersion` ≥ `0.3.1`；使用 `Tab` / `Shift+Tab` / `Enter` 或剪贴板历史时 ≥ `0.3.3`） | `demo-panel` |
 | 在面板中显示宿主管理的剪贴板历史摘要并粘贴一次 | `submit` | `panel` | `ui.panel`、`clipboard.history.read`、可选 `clipboard.history.paste`（仅 Windows，`minimumHostVersion` ≥ `0.3.3`） | 暂无产品 Demo |
 | 在 Runtime 中请求声明的 HTTPS 服务 | 任意现有模式 | 任意现有输出 | `network.https`（仅 Windows，`minimumHostVersion` ≥ `0.3.2`） | `demo-http` |
-| 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | 无独立 Demo |
+| 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | `demo-multi`（Host `0.5.0+`） |
+| 一个包提供多条独立搜索、改名和收藏的主结果命令 | 每项 `live` / `submit` | 每项 `mainResult` | 包级共享 | `demo-multi`（Host `0.5.0+`） |
 
-MVP 中每个插件只能注册一个启动键（Manifest 字段是 `command.defaultName`）。用户可以在 UiPilot 设置中修改该启动键，所以 Runtime 不应硬编码 `/命令名`。
+旧 `command` 形态注册一个启动键；Host `0.5.0+` 的 `commands` 形态注册 1–16 条 mainResult 命令。每项 `defaultName` 是初始启动键，用户可分别修改并收藏。身份是稳定的 `(pluginId, commandId)`，Runtime 按 ID 分派，不硬编码 `/命令名`，也不按数组位置识别命令。两种形态仍共用一个 Runtime、设置、存储、权限和包级启停。
 
 ## 2. 准备目录
 
@@ -87,7 +89,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 - `pluginId` 是永久身份，使用自己的反向域名，例如 `com.example.hello-return`。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
-- `command.defaultName` 不包含 `/`，只能有一个。
+- 旧 `command.defaultName` 不包含 `/`；新 `commands` 每项也使用相同名称规则。`command` / `commands` 必须二选一，显式 null 无效。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
 - 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read` 和 `clipboard.history.paste`。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
@@ -123,6 +125,23 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 ```
 
 `mainResult` 不能声明 `window` 或 `ui.window`。
+
+### 分支 A2：多条主界面结果命令（Host 0.5.0+）
+
+把单个 command 换成 commands，minimumHostVersion 至少为 0.5.0（单项数组也一样）：
+
+```json
+{
+  "commands": [
+    { "id": "upper", "defaultName": "demo-upper", "activationMode": "live", "outputMode": "mainResult", "inputRequired": true },
+    { "id": "lower", "defaultName": "demo-lower", "activationMode": "submit", "outputMode": "mainResult", "inputRequired": true }
+  ]
+}
+```
+
+这是字段片段；完整离线包见 [demo-multi](../../examples/public-plugins/com.uipilot.demo-multi/README.md)。数组限 1–16 项，每项必填唯一 id，匹配 `^[a-z][a-z0-9-]{0,31}$`；defaultName 也须包内唯一。合法 ID 包含 constructor，勿用继承属性进行分派。每项只支持 mainResult，不能声明 window/panel 及 ui.window、ui.panel、timer.control、clipboard.history.* 权限。任一项无效则整包拒绝，不能忽略或退回第一项。
+
+Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。Task 7 的 current Host 和 CLI Host target 仍为 0.4.0，会拒绝这个包；Task 8 才对齐到 0.5.0，测试通过不表示当前生产目标已开放。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
 
 ### 分支 B：子窗口型 Manifest
 
@@ -229,6 +248,18 @@ invocation.context.platform // 'windows' 或 'macos'
 invocation.context.theme    // 'dark' 或 'light'
 invocation.context.invokedAt // 带本地时区偏移的 RFC 3339 时间
 ```
+
+新 commands 包的每次 invocation 必有准确的 commandId；旧 command 包完全省略该 key，不发送 null 或内部 default。SDK 的 commandId?: string 同时兼容两种 wire。一个 onCommand 内按 ID 分派，例如：
+
+```js
+switch (invocation.commandId) {
+  case 'upper': return uppercaseResult(invocation)
+  case 'lower': return lowercaseResult(invocation)
+  default: throw new Error('Unsupported command ID')
+}
+```
+
+示例结果函数由插件实现；不可因缺失或未知 ID 执行第一条命令。响应仍只使用 requestId，不自行返回 commandId 改变归属。Host 保存候选 ID 和输入，切换同包命令后旧响应不会覆盖新结果。
 
 `invocation` 和 `api` 都由宿主冻结，并且只在当前请求生命周期内有效。不要保存它们供定时器或后续请求使用。
 
@@ -825,7 +856,11 @@ uipilot-plugin validate .\package --platform windows --json
 2. 再次选择同一个开发目录。
 3. 确认更新。
 
-更新会在 Runtime 通过 ready 校验后原子生效。更新失败时，当前已安装版本保持可用。
+更新会在完整候选与 Runtime ready 校验通过后原子发布。验证/名称冲突拒绝，或确定未提交且旧字节复核成功的持久化失败，保留旧配置；持久结果不确定或旧字节复核失败时遵循 fail-closed 恢复，不能承诺任何更新失败后旧版都可用。
+
+每条命令只有一个 nameOverride：覆盖会替换 effectiveName 并释放旧路由，不是同时保留多个别名。设置页逐命令改名，包级设置和启停仍只有一份。同 ID 升级保留覆盖/收藏，使用新 manifest 默认名；删除 ID 成功后状态移除，删除→重启→重加是 fresh。更换 ID 即删除再新增，不按同名或数组位置转移状态。旧 command 只由显式 default 继承；没有 default 的 commands 包不会自动继承旧值。
+
+新 Host 内可按普通校验、冲突、授权和生命周期规则回退包版本，只保留当前仍存活的 ID；先前删除的 default 在回退旧包时重新创建。Host 二进制降级不同：一旦正常事务或必要恢复写出 state schema 2，只懂 schema 1 的旧 Host 不保证能读取这个数据目录；不提供自动回写旧 schema 或利用 backup 降级的承诺。
 
 ## 12. 打包 `.uipilot-plugin`
 
@@ -911,11 +946,11 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 
 当前不支持：
 
-- 一个插件注册多个命令或多个窗口。
+- 多命令 panel/window、多个窗口、每命令快捷键或独立别名集合；Host `0.5.0+` 仅新增多 mainResult。
 - 插件代码长期后台运行、插件自建计时器或任意后台回调；单轮窗口计时必须交给宿主的 `timer.control`，延迟纯文本消息交给 `notifications.schedule()`。
 - 浏览器/WebView 网络、原始套接字、任意文件、原生二进制和 Shell；外部访问仅限 Runtime 请求期内的 Host 托管 HTTPS。
 - 输入模拟或控制鼠标键盘。
-- 多动作结果、自定义动作回调、HTML/Markdown 结果。
+- 多动作结果（actions 数组）、onAction / 自定义动作回调、HTML/Markdown 结果。
 - 插件间通信、远程资源、依赖安装、市场发布和自动更新。
 
 遇到未覆盖的需求时，不要通过 WebView 或 Tauri 私有对象绕过限制；应等待宿主公开相应版本化 API。
@@ -929,7 +964,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和固定错误名（包括 `CredentialUnavailableError`）。
 - [ ] 使用剪贴板历史时，仅面向 Windows Host `0.3.3+`，同时声明 `ui.panel` 和 `clipboard.history.read`，需要粘贴时再声明 `clipboard.history.paste`，并处理六种固定 `Error.name`。
 - [ ] 网络插件未记录凭据或完整请求；生产 token 不打包，使用 bearer 引用时要求 Windows `0.4.0+`、完整绑定授权，并理解服务端回显、取消不能撤回远端请求、保存失败不回滚且后续核验可恢复网络的边界。
-- [ ] Runtime 始终原样返回 `requestId`。
+- [ ] Runtime 始终原样返回 `requestId`；commands 包显式按 commandId 分派并拒绝未知/缺失 ID，重排或改启动名不改变身份。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。
 - [ ] `timer.control` 包只包含唯一的 `assets/sounds/timer-alarm.wav`，且 WAV 满足固定 PCM、大小与时长限制。

@@ -4,6 +4,11 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 export interface PluginInvocation {
   apiVersion: 1
   requestId: string
+  /** Host 0.5.0+: commands packages always receive the selected ID.
+   * Legacy command packages omit this key entirely (not null or default).
+   * Dispatch within one onCommand by ID, never by startup name or array order.
+   */
+  commandId?: string
   input: string
   context: {
     platform: 'windows' | 'macos'

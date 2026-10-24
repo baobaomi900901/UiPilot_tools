@@ -2,7 +2,7 @@
 
 New to public plugin development? Start with the [third-party plugin developer tutorial](./public-plugin-developer-guide.md), then use this document as the complete contract reference.
 
-Public plugins are static packages loaded by UiPilot. A plugin owns one slash command, one hidden Runtime, and optionally one singleton content window. Removing or disabling the package removes its command; the host does not provide command-specific fallbacks.
+Public plugins are static packages loaded by UiPilot. A plugin owns one hidden Runtime and either one legacy slash command (optionally with a singleton content window or launcher panel), or Host 0.5.0+ main-result commands sharing the package. Removing or disabling the package removes all its commands; the host does not provide command-specific fallbacks.
 
 ## Package Layout
 
@@ -35,7 +35,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `pluginId` is stable, lowercase, and globally identifies storage, permissions, generations, and windows.
 - `version` and `minimumHostVersion` are canonical `major.minor.patch` numbers.
 - `supportedPlatforms` contains `windows` and/or `macos` without duplicates.
-- `command.defaultName` is the initial slash command name. Users may rename it, but reserved and conflicting names fail closed.
+- For legacy packages, `command.defaultName` is the initial slash command name. Users may rename it, but reserved and conflicting names fail closed.
 - `command.summary` is an optional one-line discovery hint. It is limited to 512 Unicode scalar values; when omitted, the launcher uses `name`.
 - `command.inputPlaceholder` is the command-input usage hint. It is distinct from the management-page `description` and discovery `summary`.
 - `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
@@ -81,11 +81,23 @@ The Host canonicalizes credentials by ID and grants complete `(id, settingKey, h
 
 The installation prepare summary includes sorted `httpsHosts`, `addedHttpsHosts`, full `credentials` (always an array), `addedCredentialIds`, and `requiresNetworkConsent`. Its token binds the displayed candidate and previous configuration; commit accepts only that token and permission grants, not caller-supplied credential tuples. Inventory also exposes full credential metadata. Re-enabling credential network access requires the current displayed `expectedInventoryRevision`; stale/missing revisions fail and require a reload and fresh consent. Revocation is immediate and clears both host and credential grants.
 
-Installation and reload use staging. Static validation and Runtime readiness must succeed before the generation becomes active. A failed upgrade leaves the previous generation usable.
+### Multiple Main-Result Commands (Host 0.5.0+)
+
+Exactly one of legacy `command` or new `commands` must be present; explicit null is invalid. Legacy `command` has no `id` field. A `commands` array contains 1–16 entries, including for a single-command array, and requires `minimumHostVersion >= 0.5.0`. Every entry requires a unique, case-sensitive ID matching `^[a-z][a-z0-9-]{0,31}$` and a unique defaultName using the ordinary startup-name rules. IDs are never trimmed or generated from names or positions. `constructor` is a valid ID; use explicit comparisons or a Map rather than inherited object properties.
+
+Each entry otherwise uses the existing command fields, with `live` or `submit` activation and only `mainResult` output. New-shape packages forbid `window`, `panel`, `ui.window`, `ui.panel`, `timer.control`, and `clipboard.history.*`. Invalid entries reject the entire package; the Host never registers a partial array or chooses the first item as a legacy fallback.
+
+Stable identity is `(pluginId, commandId)`. Legacy `command` internally uses `default`; a new package may explicitly retain that ID or omit it entirely. Version, startup name and array order do not define identity. One Runtime, onCommand, settings, storage, permissions, network grants, enable switch and package lifecycle serve the whole array. Each main-result command can be searched, renamed and favorited independently; result rows retain the existing optional copyText default action.
+
+Manifest schemaVersion and Runtime apiVersion remain 1. Internal state schema is 2; inventory schema and CLI report schema remain 1. These are independent of the plugin's own version, the Host release version, and the CLI npm package version (currently 0.1.0). Through Task 7, Host current and the CLI's production Host target remain 0.4.0 and reject commands packages; explicit 0.5.0 test Hosts verify the new capability. Release alignment occurs in Task 8. Old example minimums and the credential capability's 0.4.0 minimum remain unchanged. The [offline multi demo](../../examples/public-plugins/com.uipilot.demo-multi/README.md) is temporarily staged under tests/fixtures/multi-package until that release step.
+
+Installation and reload use staging. Static validation and Runtime readiness must succeed before the generation becomes active. Validation/conflict rejection, or a definitely uncommitted persistence failure with verified previous bytes, preserves the previous usable configuration. An uncertain persistence outcome or failed previous-byte verification follows fail-closed recovery; failed updates do not universally guarantee availability or rollback.
 
 ## Runtime Contract
 
 The Runtime entry is an ES module exporting `onCommand` with the `PluginHandler` type from [uipilot-plugin-api-v1.d.ts](./uipilot-plugin-api-v1.d.ts). Each invocation and API object is new, deeply frozen, and bound to an immutable plugin ID, generation, and request ID. On Windows, a plugin that declares and receives `notifications.publish` may submit one notification action during that request: immediate `api.notifications.publish({ content })` or delayed `api.notifications.schedule({ content, delayMs })`. A Manifest declaring `network.https` receives the optional frozen `api.network` facade; all authority is still revalidated by the Host for every call.
+
+For a new `commands` package, every invocation includes the exact selected `commandId: string`. A legacy `command` invocation omits this key completely, including when its internal identity is default: it is never sent as null or a synthesized default. The shared SDK declares `commandId?: string` to describe both wire shapes. Dispatch inside one onCommand using this ID, reject missing/unknown IDs for a new package, and never infer identity from startup names, array order or response fields. Responses still return only requestId plus the existing output; they cannot retarget a request by supplying commandId. The Host binds pending input and ID to requestId and discards stale responses when switching sibling commands.
 
 `invocation.input` has command text and boundary whitespace removed while preserving internal whitespace. `context.invokedAt` is RFC 3339 with a local UTC offset. The API permits only plugin-scoped JSON storage, reads of declared non-secret settings, the request-bound Windows message operation when granted, and bounded Host-managed HTTPS when declared and authorized. Runtime code cannot access Tauri, Shell, files, native input, another plugin, direct secret plaintext getters, raw sockets, or browser/WebView networking.
 
@@ -222,7 +234,7 @@ The complete serialized response budget is 64 KiB. Unknown fields, duplicate key
 
 ## State, Timing, And Faults
 
-- Private JSON storage is shared by Runtime and content-window facades, limited to 5 MiB per plugin, and fails atomically at the limit.
+- Private JSON storage is shared by all commands in a package and by Runtime and content-window facades, limited to 5 MiB per plugin, and fails atomically at the limit.
 - `live` dispatches use a 150 ms frontend debounce and a 5 second post-dispatch timeout.
 - `submit` dispatches only after Enter and use a 30 second post-dispatch timeout.
 - Each plugin generation has at most one running request and one latest waiting request.
@@ -230,6 +242,16 @@ The complete serialized response budget is 64 KiB. Unknown fields, duplicate key
 - Three consecutive runtime faults within five minutes persistently disable the plugin; a successful request or manual enable resets the relevant fault state.
 
 Settings support `text`, `secret`, `number`, `boolean`, and `select`. Keys match `^[a-z][a-z0-9.-]{0,63}$` and remain stable across upgrades. Secrets have no default. Runtime can ask only whether one is configured; Windows Host `0.4.0+` may consume an explicitly declared, authorized bearer reference without exposing a plaintext getter. Host settings provide per-key password save and explicit clear actions; blank unedited inputs do not delete secrets. Saving/clearing can cancel current plugin requests; a failure requires refreshed status and carries the partial-commit/recovery rules above.
+
+### Names, Upgrades And Recovery
+
+Each command has at most one nameOverride. It replaces effectiveName and releases the previous route; it does not create an additional alias. Renaming one command leaves sibling names unchanged and retains its ID/favorite. An actual nameOverride state change invalidates package requests and result handles, even if effectiveName stays the same; setting exactly the already-saved override (distinguishing null from a string) is a no-op. A favorite change does not restart Runtime or cancel valid work.
+
+A successful upgrade preserves overrides/favorites for retained IDs, adopts new manifest defaults, creates fresh state for added IDs, and removes deleted IDs atomically. Deleting an ID, restarting, and re-adding it creates fresh state. Changing an ID is deletion plus addition even when its name is unchanged. Legacy state is inherited only through an explicit default ID; no name or first-item migration occurs. A package rollback on the new Host follows normal validation, conflict, authorization and lifecycle checks; it preserves only IDs still present, so a previously deleted default is fresh on return to a legacy package.
+
+Host binary downgrade is separate and unsupported once a normal transaction or required recovery has written state schema 2: an older binary that only understands schema 1 is not guaranteed to read that data directory. There is no automatic schema-1 writeback or backup-based downgrade feature. New Hosts accept valid old packages; old Hosts do not accept commands packages.
+
+Only the old set_plugin_favorite / set_plugin_effective_name IPC callers may omit commandId to target an existing default. Explicit null, empty, invalid or unknown IDs fail, and omission fails if default is absent. This compatibility does not apply to new activation payloads or new-package Runtime invocations.
 
 ## Permissions
 
@@ -248,12 +270,13 @@ Other parsed permission names are reserved and installation fails until the host
 
 ## Unsupported In v1
 
-Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multiple commands, multiple windows, streaming, pagination, large responses, browser/WebView networking, raw sockets, arbitrary files, raw clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. External access is limited to request-scoped Host-managed HTTPS and the Host-managed clipboard history summary bridge described above. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
+Arbitrary background execution, plugin-owned timers, repeating or persistent scheduling, multi-command panel/window output, multiple windows, per-command hotkeys, independent alias collections, actions arrays/onAction, streaming, pagination, large responses, browser/WebView networking, raw sockets, arbitrary files, raw clipboard read, native binaries, Shell, input synthesis, plugin-to-plugin communication, remote media, dependencies, signing, marketplace delivery, and automatic updates are outside this MVP. External access is limited to request-scoped Host-managed HTTPS and the Host-managed clipboard history summary bridge described above. Delayed work is limited to the host-owned, process-local `notifications.schedule()` message and the single-generation window timer described above.
 
 The fixed-output reference packages are:
 
 - `examples/public-plugins/com.uipilot.demo-win`: Windows-only `submit + window` with `ui.window` and a 10-second host-owned delayed message.
-- `examples/public-plugins/com.uipilot.demo-return`: `submit + mainResult` with `clipboard.write`.
+- `examples/public-plugins/com.uipilot.demo-return`: legacy `submit + mainResult` with `clipboard.write`.
+- `examples/public-plugins/com.uipilot.demo-multi`: Host `0.5.0+` live uppercase and submit lowercase commands, one offline Runtime and shared data; unreleased fixture until Task 8.
 - `examples/public-plugins/com.uipilot.demo-panel`: Windows-only `submit + panel` with `ui.panel`, Host key routing, `focusHostInput()`, and `requestHide()`.
 - `examples/public-plugins/com.uipilot.demo-credentials`: Windows-only Host `0.4.0+` bearer reference with synthetic offline provider tests, presence-only status, and manual Host acceptance steps.
 - `examples/public-plugins/com.uipilot.demo-http`: Windows-only `submit + mainResult` with Host-managed `network.https` requests to `httpbin.org`.
