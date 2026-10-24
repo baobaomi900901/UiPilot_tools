@@ -1,6 +1,6 @@
 # Panel Runtime actions and offline templates — approved design
 
-Status: independently reviewed Spec PASS on 2026-10-24; incorporated by controller under existing user authorization for autonomous development. Implementation and manual acceptance pending.
+Status: Host capability and offline template delivery implemented at source125e9d7, targeted checks passed, independent final Spec PASS / Quality Approved with zero remaining findings. Ready for user-operated acceptance; every new native/manual case is still pending. This is not completion of the full foundation.
 Baseline: `8176c42f434ee18556b6c6c1acb3d6d1b42915bc`; no `.codegraph/` directory.
 Delivery: Host 0.6.0 plus one runnable offline template plugin.
 

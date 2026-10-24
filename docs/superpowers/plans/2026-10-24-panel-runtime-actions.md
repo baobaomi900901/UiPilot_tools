@@ -1,5 +1,7 @@
 # Panel Runtime Actions Implementation Plan
 
+Implementation status: both tasks have passed focused checks and independent review at source125e9d7. The 0.6.0 executable and templates1.0.0 archive are ready under .superpowers/deliveries/uipilot-0.6.0-acceptance/. User native acceptance remains PENDING; checked implementation items do not mean manual PASS.
+
 > For agentic workers: use subagent-driven-development with one source writer and a combined specification/quality review per cohesive task.
 
 **Goal:** Deliver a Windows Host 0.6.0 and an offline template editor whose buttons call its existing Runtime for validation, preview and durable save.
@@ -33,12 +35,12 @@ Commands run from the worktree. Set process-local CARGO_TARGET_DIR=D:/code/UiPil
 
 **Dependencies:** Approved design sections Public contract, Actual seams and minimal ownership model, Cancellation and authority proof; existing M4 authority and M2-A identity semantics. Baseline 8176c42.
 
-- [ ] Implement opt-in validation/schema/CLI parity and missing-handler Runtime readiness rejection. Export the exact SDK handler/invocation/response types and document capability detection.
-- [ ] Implement tagged Command/PanelAction dispatch and owner without fabricated launcher ownership; immutable bounded JSON bridge and private caller-restricted async command.
-- [ ] Admit and register under the live controller lock; connect exact retirement to every session-removal/replacement path and actual navigation/destruction hooks.
-- [ ] Preserve physical Runtime ownership on logical retirement; settle exactly once, validate completion owner and response, arm watchdog before emit and match teardown generation.
-- [ ] Integrate lifecycle/permission/credential changes and existing API guards. Synchronize release version once; keep legacy behavior and historical minima.
-- [ ] Commit implementation and write .superpowers/sdd/local-foundation/panel-runtime-task-1-report.md with actual interfaces for Task 2.
+- [x] Implement opt-in validation/schema/CLI parity and missing-handler Runtime readiness rejection. Export the exact SDK handler/invocation/response types and document capability detection.
+- [x] Implement tagged Command/PanelAction dispatch and owner without fabricated launcher ownership; immutable bounded JSON bridge and private caller-restricted async command.
+- [x] Admit and register under the live controller lock; connect exact retirement to every session-removal/replacement path and actual navigation/destruction hooks.
+- [x] Preserve physical Runtime ownership on logical retirement; settle exactly once, validate completion owner and response, arm watchdog before emit and match teardown generation.
+- [x] Integrate lifecycle/permission/credential changes and existing API guards. Synchronize release version once; keep legacy behavior and historical minima.
+- [x] Commit implementation and write .superpowers/sdd/local-foundation/panel-runtime-task-1-report.md with actual interfaces for Task 2.
 
 **Distinct test coverage:** Opt-in absent/false/null/true and minimum version/handler readiness; invalid caller, epoch, activation, accessor/non-JSON/size/depth/count and mismatched reply ID must fail closed. Start a command, attempt panel admission, and verify Busy does not replace running/waiting state. Admit panel request, retire it, attempt replacement: old context loses API authority while physical slot remains until completion/deadline. Use deterministic barriers to serialize close against admission/late storage call; after invalidation no new effect is admitted. Host submit retires panel ownership but does not overlap Runtime handlers. Duplicate/late completion settles once. Complete physically, change credentials before controller settlement, then reject old success and allow a subsequent fresh request without a leaked ticket. Replace generation before old timeout; replacement panel survives. Relevant existing M4 credential/admission coverage remains passing. Execute bridge behavior tests; source-string assertions alone cannot prove these races.
 
@@ -50,12 +52,12 @@ Commands run from the worktree. Set process-local CARGO_TARGET_DIR=D:/code/UiPil
 
 **Dependencies:** Task 1 reviewed interfaces and approved design Runnable template editor, Two cohesive tasks and verification; docs/ui-guidelines.md and public plugin developer guide. Existing map .superpowers/sdd/local-foundation/template-panel-integration-map.md is UI reference only: use onPanelAction, never its obsolete placeholder onCommand business routing.
 
-- [ ] Implement exact load/preview/save payloads, literal grammar, missing-versus-empty samples, whole-catalog validation/capacity/revision-conflict handling and single storage write.
-- [ ] Implement editor with explicit new draft, variable discovery, busy/error/unsaved states, draft-revision ownership, explicit reload after ambiguous save, theme/focus/keyboard behavior and selectable output.
-- [ ] Add visible labels “选择插件包” and “选择开发目录” alongside existing icons, preserve compact 720px layout and handlers.
-- [ ] Package plugin with fresh CLI and build a new acceptance Host, preserving identifier com.uipilot.launcher.acceptance and old 0.5.0 delivery. No native launch/install. Copy required existing Everything/sound resources; do not run service or installer.
-- [ ] Provide README.zh-CN.md with exact executable/archive paths and numbered preconditions/steps/expected/feedback. Record artifact versions, SHA256, source commit and build evidence. Core old-flow regression is short and targeted.
-- [ ] Commit plugin/labels/docs; report manual tests as pending until user responds.
+- [x] Implement exact load/preview/save payloads, literal grammar, missing-versus-empty samples, whole-catalog validation/capacity/revision-conflict handling and single storage write.
+- [x] Implement editor with explicit new draft, variable discovery, busy/error/unsaved states, draft-revision ownership, explicit reload after ambiguous save, theme/focus/keyboard behavior and selectable output.
+- [x] Add visible labels “选择插件包” and “选择开发目录” alongside existing icons, preserve compact 720px layout and handlers.
+- [x] Package plugin with fresh CLI and build a new acceptance Host, preserving identifier com.uipilot.launcher.acceptance and old 0.5.0 delivery. No native launch/install. Copy required existing Everything/sound resources; do not run service or installer.
+- [x] Provide README.zh-CN.md with exact executable/archive paths and numbered preconditions/steps/expected/feedback. Record artifact versions, SHA256, source commit and build evidence. Core old-flow regression is short and targeted.
+- [x] Commit plugin/labels/docs; report manual tests as pending until user responds.
 
 **Distinct test coverage:** Parser literal substitution/malformed syntax/missing versus deliberate empty values/duplicate names and nonrecursive replacement; conflict never overwrites; failed storage preserves prior catalog; invalid saved data is not reset; aggregate capacity rejection preserves draft/catalog. Human tests own primary UI interaction, keyboard/themes, rapid edit/close and restart persistence. Do not add exhaustive mocked UI matrices.
 
