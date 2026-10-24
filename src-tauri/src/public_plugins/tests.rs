@@ -2626,10 +2626,137 @@ fn panel_action_host_submit_cancels_once_and_late_completion_cannot_publish() {
         .unwrap();
     assert!(!completed.accepted);
     assert_eq!(
-        completed.next.unwrap().candidate.owner.token(),
+        completed.next.as_ref().unwrap().candidate.owner.token(),
         Some(command.token.as_str())
     );
     assert!(receiver.try_recv().is_err());
+    // A late physical completion must not retain a ticket after Host settled the sender.
+    assert!(!service.settle_panel_action(&action.context, Ok(json!("late")), true));
+    assert_eq!(
+        manager.claim_panel_completion(&identity, &action.context),
+        Err(super::panel_action::PanelActionError::ExpiredPanelSession)
+    );
+    manager
+        .scheduler()
+        .complete(&completed.next.unwrap().context, Instant::now())
+        .unwrap();
+    let (fresh, fresh_receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    assert!(
+        manager
+            .scheduler()
+            .complete(&fresh.context, Instant::now())
+            .unwrap()
+            .accepted
+    );
+    // Old-context cleanup must not steal the new response's ticket.
+    assert!(!service.settle_panel_action(&action.context, Ok(json!("old")), true));
+    assert!(service.settle_panel_action(&fresh.context, Ok(json!("fresh")), true));
+    assert_eq!(
+        fresh_receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Ok(json!("fresh")))
+    );
+}
+
+#[test]
+fn panel_action_host_submit_cancels_when_completion_takes_sender_before_host_scan() {
+    use super::panel_action::PanelActionError as E;
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture("panel-action-host-submit-race");
+    let (action, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    let prepared = service
+        .prepare_command(
+            manager.route("/demo next").unwrap().unwrap(),
+            1,
+            "/demo next".into(),
+        )
+        .unwrap();
+    let token = prepared.token.clone();
+    let (enqueued, wait_enqueued) = std::sync::mpsc::channel();
+    let (taken, wait_taken) = std::sync::mpsc::channel();
+    let completion_service = service.clone();
+    let completion_manager = manager.clone();
+    let context = action.context.clone();
+    let completion = std::thread::spawn(move || {
+        wait_enqueued.recv_timeout(Duration::from_secs(5)).unwrap();
+        let outcome = completion_manager
+            .scheduler()
+            .complete(&context, Instant::now())
+            .unwrap();
+        assert!(!outcome.accepted);
+        assert_eq!(
+            outcome.next.unwrap().candidate.owner.token(),
+            Some(token.as_str())
+        );
+        // Same Expired result selected by complete_submission for an unaccepted completion.
+        assert!(completion_service.settle_panel_action_with(
+            &context,
+            Err(E::ExpiredPanelSession),
+            true,
+            || taken.send(()).unwrap(),
+        ));
+    });
+    let command = controller
+        .admit_current_dispatch(identity.session_epoch, "initial", "initial-command", || {
+            service.admit_prepared_command_with(prepared, Instant::now(), || {
+                assert_eq!(
+                    manager.scheduler().context_status(&action.context),
+                    super::PluginContextStatus::Expired
+                );
+                assert!(manager
+                    .expire_network_timeouts(action.deadline - Duration::from_millis(1))
+                    .unwrap()
+                    .is_empty());
+                enqueued.send(()).unwrap();
+                wait_taken.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(!service
+                    .panel_actions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&action.context));
+                // Completion has taken the sender but cannot enter this controller yet.
+                assert_eq!(
+                    receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                );
+            })
+        })
+        .unwrap();
+    assert!(
+        command.dispatch.is_none(),
+        "Host must wait for physical completion"
+    );
+    completion.join().unwrap();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(E::PanelRequestCancelledError))
+    );
+    assert_eq!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Disconnected)
+    );
+    assert!(!service.settle_panel_action(&action.context, Ok(json!("late")), true));
+    assert!(manager
+        .scheduler()
+        .complete(&action.context, Instant::now())
+        .is_err());
+    assert_eq!(
+        manager.claim_panel_completion(&identity, &action.context),
+        Err(E::ExpiredPanelSession)
+    );
 }
 
 #[test]

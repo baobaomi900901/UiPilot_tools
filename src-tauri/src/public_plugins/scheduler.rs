@@ -168,6 +168,8 @@ pub(crate) enum PluginContextAccessError {
 struct RunningRequest {
     request: ScheduledPluginRequest,
     current: bool,
+    // Preserve logical retirement across physical completion and controller settlement.
+    panel_retirement: Option<super::panel_action::PanelActionError>,
     notification_published: bool,
 }
 
@@ -345,7 +347,11 @@ impl PluginRequestScheduler {
         }
         match &reserved.candidate.owner {
             PluginRequestOwner::Command(_) => {
-                if let Some((_, reason)) = queue.panel_completion.as_mut() {
+                if let Some((_, reason)) = queue
+                    .panel_completion
+                    .as_mut()
+                    .filter(|(_, reason)| reason.is_none())
+                {
                     *reason =
                         Some(super::panel_action::PanelActionError::PanelRequestCancelledError);
                 }
@@ -385,6 +391,15 @@ impl PluginRequestScheduler {
             });
         }
         if let Some(running) = queue.running.as_mut() {
+            if running.current
+                && matches!(
+                    running.request.candidate.owner,
+                    PluginRequestOwner::PanelAction { .. }
+                )
+            {
+                running.panel_retirement =
+                    Some(super::panel_action::PanelActionError::PanelRequestCancelledError);
+            }
             running.current = false;
             let expired = running.request.context.clone();
             let replaced_submission_token =
@@ -433,13 +448,11 @@ impl PluginRequestScheduler {
             });
         }
         let accepted = running.current;
-        if accepted
-            && matches!(
-                running.request.candidate.owner,
-                PluginRequestOwner::PanelAction { .. }
-            )
-        {
-            queue.panel_completion = Some((context.clone(), None));
+        if matches!(
+            running.request.candidate.owner,
+            PluginRequestOwner::PanelAction { .. }
+        ) {
+            queue.panel_completion = Some((context.clone(), running.panel_retirement));
         }
         let next = if queue.rebuilding {
             None
@@ -532,6 +545,8 @@ impl PluginRequestScheduler {
                 .filter(|r| r.request.context == *context)
             {
                 running.current = false;
+                running.panel_retirement =
+                    Some(super::panel_action::PanelActionError::ExpiredPanelSession);
             }
         }
         Ok(())
@@ -702,6 +717,8 @@ impl PluginRequestScheduler {
         }
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
+            running.panel_retirement =
+                Some(super::panel_action::PanelActionError::ExpiredPanelSession);
             retired.push((
                 running.request.context.clone(),
                 running.request.candidate.owner.token().map(str::to_owned),
@@ -804,6 +821,7 @@ fn dispatch(
     queue.running = Some(RunningRequest {
         request: request.clone(),
         current: true,
+        panel_retirement: None,
         notification_published: false,
     });
     Ok(request)
@@ -847,6 +865,78 @@ mod tests {
         let mut candidate = candidate(input, generation, mode);
         candidate.command_id = command_id.into();
         candidate
+    }
+
+    #[test]
+    fn panel_action_retirement_reason_survives_completion_and_lifecycle_still_expires() {
+        use super::super::panel_action::{PanelActionError as E, PanelActionRequest};
+        for lifecycle in 0..3 {
+            let scheduler = PluginRequestScheduler::default();
+            let now = Instant::now();
+            let mut panel = candidate("", 1, PublicActivationMode::Submit);
+            panel.owner = PluginRequestOwner::PanelAction {
+                content_label: "panel".into(),
+                session_epoch: 1,
+                request: PanelActionRequest {
+                    action: "save".into(),
+                    payload: serde_json::Value::Null,
+                },
+            };
+            let PluginScheduleOutcome::Dispatched(action) = scheduler.enqueue(panel, now).unwrap()
+            else {
+                panic!()
+            };
+            assert!(matches!(
+                scheduler
+                    .enqueue(candidate("next", 1, PublicActivationMode::Submit), now)
+                    .unwrap(),
+                PluginScheduleOutcome::Waiting { .. }
+            ));
+            if lifecycle == 1 {
+                scheduler.retire_context(&action.context).unwrap();
+            } else if lifecycle == 2 {
+                scheduler
+                    .retire_plugin_requests(&action.context.plugin_id)
+                    .unwrap();
+            }
+            let before = scheduler.lock().unwrap().by_plugin[&action.context.plugin_id]
+                .running
+                .as_ref()
+                .unwrap()
+                .request
+                .clone();
+            assert_eq!(
+                before, action,
+                "retirement keeps the physical request and deadline"
+            );
+            assert_eq!(
+                scheduler.context_status(&action.context),
+                PluginContextStatus::Expired
+            );
+            let outcome = scheduler.complete(&action.context, now).unwrap();
+            assert!(!outcome.accepted);
+            // Further Host commands cannot turn lifecycle expiry back into cancellation.
+            scheduler
+                .enqueue(candidate("latest", 1, PublicActivationMode::Submit), now)
+                .unwrap();
+            assert_eq!(
+                scheduler.claim_panel_completion(&action.context),
+                Err(if lifecycle == 0 {
+                    E::PanelRequestCancelledError
+                } else {
+                    E::ExpiredPanelSession
+                })
+            );
+            assert_eq!(
+                scheduler.claim_panel_completion(&action.context),
+                Err(E::ExpiredPanelSession)
+            );
+            assert!(
+                scheduler.lock().unwrap().by_plugin[&action.context.plugin_id]
+                    .panel_completion
+                    .is_none()
+            );
+        }
     }
 
     #[test]

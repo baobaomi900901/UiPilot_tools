@@ -728,10 +728,15 @@ mod tests {
         for required in [
             "WebviewUrl::CustomProtocol(inert_url)",
             "prepare_windows_webview(",
-            "runtime::public_runtime_bootstrap_with_panel(candidate.network_https_declared, candidate.panel_actions)",
         ] {
             assert!(production.contains(required), "missing {required}");
         }
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("runtime::public_runtime_bootstrap_with_panel(candidate.network_https_declared,candidate.panel_actions,)")
+                || compact.contains("runtime::public_runtime_bootstrap_with_panel(candidate.network_https_declared,candidate.panel_actions)"),
+            "missing opt-in-aware runtime bootstrap call"
+        );
         assert!(!production.contains(".initialization_script(public_runtime_bootstrap"));
     }
 }

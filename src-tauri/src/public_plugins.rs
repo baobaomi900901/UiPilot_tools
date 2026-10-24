@@ -475,6 +475,15 @@ impl PublicPluginService {
         prepared: PreparedPublicSubmission,
         now: Instant,
     ) -> Result<PublicSubmission, PublicPluginManagementError> {
+        self.admit_prepared_command_with(prepared, now, || {})
+    }
+
+    fn admit_prepared_command_with(
+        &self,
+        prepared: PreparedPublicSubmission,
+        now: Instant,
+        after_enqueue: impl FnOnce(),
+    ) -> Result<PublicSubmission, PublicPluginManagementError> {
         let PreparedPublicSubmission {
             token,
             receiver,
@@ -515,6 +524,8 @@ impl PublicPluginService {
                 return Err(PublicPluginManagementError::Unavailable);
             }
         };
+        after_enqueue();
+
         let contexts = self
             .panel_actions
             .lock()
@@ -800,14 +811,32 @@ impl PublicPluginService {
         result: Result<serde_json::Value, panel_action::PanelActionError>,
         recheck: bool,
     ) -> bool {
+        self.settle_panel_action_with(context, result, recheck, || {})
+    }
+
+    fn settle_panel_action_with(
+        &self,
+        context: &PluginRequestContext,
+        result: Result<serde_json::Value, panel_action::PanelActionError>,
+        recheck: bool,
+        after_take: impl FnOnce(),
+    ) -> bool {
         let pending = self
             .panel_actions
             .lock()
             .ok()
             .and_then(|mut map| map.remove(context));
         let Some(pending) = pending else {
+            // Only the completion path may clean up a ticket after another path settled it.
+            // Host/lifecycle scans must leave an in-flight completion's ticket for its claim.
+            if recheck {
+                if let Ok(manager) = self.manager() {
+                    manager.discard_panel_completion(context);
+                }
+            }
             return false;
         };
+        after_take();
         let terminal_without_completion = matches!(
             result,
             Err(panel_action::PanelActionError::PanelRequestTimeoutError
