@@ -1299,6 +1299,7 @@ pub(crate) async fn commit_public_plugin_install(
     app: AppHandle,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
@@ -1311,19 +1312,23 @@ pub(crate) async fn commit_public_plugin_install(
     let manager = service.manager()?;
     manager.replace_external_reserved_names(quicklinks.commands())?;
     let mut created_runtime = None;
-    let result = manager.commit_with_readiness(
-        window.label(),
-        &input.token,
-        input.permission_grants,
-        Instant::now(),
-        |candidate| match service.create_runtime(&app, candidate) {
-            Ok(_) => {
-                created_runtime = Some(candidate.label.clone());
-                true
-            }
-            Err(_) => false,
-        },
-    );
+    let outcome = service.manage_with_effects(|manager, effects| {
+        manager.commit_with_readiness_with_effects(
+            window.label(),
+            &input.token,
+            input.permission_grants,
+            Instant::now(),
+            |candidate| match service.create_runtime(&app, candidate) {
+                Ok(_) => {
+                    created_runtime = Some(candidate.label.clone());
+                    true
+                }
+                Err(_) => false,
+            },
+            effects,
+        )
+    });
+    let result = finish_public_plugin_management(outcome, registries.main(), || {});
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.previous_runtime_label.as_deref());
@@ -1355,6 +1360,7 @@ pub(crate) async fn set_plugin_enabled(
     window: WebviewWindow,
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
     plugin_id: String,
@@ -1366,17 +1372,21 @@ pub(crate) async fn set_plugin_enabled(
         .suppress_transient_focus_loss()
         .map_err(|_| PublicPluginManagementError::Unavailable)?;
     let mut created_runtime = None;
-    let result = service
-        .manager()?
-        .set_enabled_with_readiness(&plugin_id, enabled, |candidate| {
-            match service.create_runtime(&app, candidate) {
+    let outcome = service.manage_with_effects(|manager, effects| {
+        manager.set_enabled_with_readiness_with_effects(
+            &plugin_id,
+            enabled,
+            |candidate| match service.create_runtime(&app, candidate) {
                 Ok(_) => {
                     created_runtime = Some(candidate.label.clone());
                     true
                 }
                 Err(_) => false,
-            }
-        });
+            },
+            effects,
+        )
+    });
+    let result = finish_public_plugin_management(outcome, registries.main(), || {});
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.closed_runtime_label.as_deref());
@@ -1403,26 +1413,38 @@ pub(crate) async fn set_plugin_enabled(
 pub(crate) fn set_public_plugin_network_access(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     plugin_id: String,
     granted: bool,
     expected_inventory_revision: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
-    Ok(service.set_network_access(&plugin_id, granted, expected_inventory_revision.as_deref())?)
+    finish_public_plugin_management(
+        service.set_network_access_outcome(
+            &plugin_id,
+            granted,
+            expected_inventory_revision.as_deref(),
+        ),
+        registries.main(),
+        || {},
+    )
 }
 
 #[tauri::command]
 pub(crate) fn set_plugin_favorite(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     plugin_id: String,
     command_id: String,
     favorite: bool,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    service
-        .manager()?
-        .set_command_favorite(&plugin_id, &command_id, favorite)?;
+    finish_public_plugin_management(
+        service.set_command_favorite(&plugin_id, &command_id, favorite),
+        registries.main(),
+        || {},
+    )?;
     Ok(())
 }
 
@@ -1431,6 +1453,7 @@ pub(crate) fn set_plugin_effective_name(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
@@ -1440,9 +1463,13 @@ pub(crate) fn set_plugin_effective_name(
     require_main_window(&window)?;
     let manager = service.manager()?;
     manager.replace_external_reserved_names(quicklinks.commands())?;
-    let mutation = manager.rename_command(&plugin_id, &command_id, name_override.as_deref())?;
-    plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
-    Ok(mutation)
+    finish_public_plugin_management(
+        service.rename_command(&plugin_id, &command_id, name_override.as_deref()),
+        registries.main(),
+        || {
+            plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
+        },
+    )
 }
 
 #[tauri::command]
@@ -1450,26 +1477,38 @@ pub(crate) fn save_plugin_settings(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     input: SavePublicPluginSettingsInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
     let plugin_id = input.plugin_id.clone();
-    save_plugin_settings_with(service.inner().as_ref(), input, || {
+    save_plugin_settings_with(service.inner().as_ref(), input, registries.main(), || {
         plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
     })
+}
+
+fn finish_public_plugin_management<T>(
+    outcome: crate::public_plugins::ManagementOutcome<T>,
+    registry: &ResultRegistry,
+    cleanup: impl FnOnce(),
+) -> Result<T, CommandError> {
+    if outcome.changed {
+        // Overflow also clears the domain and permanently fails it closed.
+        let _ = registry.invalidate_domain(QueryDomain::Plugin);
+        cleanup();
+    }
+    Ok(outcome.result?)
 }
 
 fn save_plugin_settings_with(
     service: &PublicPluginService,
     input: SavePublicPluginSettingsInput,
+    registry: &ResultRegistry,
     teardown: impl FnOnce(),
 ) -> Result<PublicPluginMutation, CommandError> {
     let outcome = service.save_settings(&input.plugin_id, &input.settings, &input.secrets);
-    if outcome.changed {
-        teardown();
-    }
-    Ok(outcome.result?)
+    finish_public_plugin_management(outcome, registry, teardown)
 }
 
 #[tauri::command]
@@ -1477,6 +1516,7 @@ pub(crate) fn uninstall_plugin(
     window: WebviewWindow,
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
+    registries: State<'_, ResultRegistries>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
     plugin_id: String,
@@ -1484,7 +1524,11 @@ pub(crate) fn uninstall_plugin(
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
     let manager = service.manager()?;
-    let Some(mut transaction) = manager.begin_uninstall(&plugin_id, retain_data)? else {
+    let outcome = service.manage_with_effects(|manager, effects| {
+        manager.begin_uninstall_with_effects(&plugin_id, retain_data, effects)
+    });
+    let Some(mut transaction) = finish_public_plugin_management(outcome, registries.main(), || {})?
+    else {
         return Ok(());
     };
     reset_plugin_panel(&app, panel_controller.inner().as_ref(), &plugin_id);
@@ -5595,6 +5639,7 @@ mod tests {
                         settings,
                         secrets,
                     },
+                    &ready_registry("settings"),
                     || {
                         teardown.set(teardown.get() + 1);
                         // Settlement is complete before the command tears down its window.
@@ -5713,7 +5758,7 @@ mod tests {
         let command = &tail[..end];
         let first = command[command.find('{').unwrap() + 1..].trim_start();
         assert!(first.starts_with("require_main_window(&window)?;"));
-        assert!(command.contains("service.set_network_access("));
+        assert!(command.contains("service.set_network_access_outcome("));
         assert!(command.contains("expected_inventory_revision.as_deref()"));
         assert!(!command.contains("https_hosts"));
         assert!(!command.contains("httpsHosts"));
@@ -7296,7 +7341,7 @@ mod tests {
             .find("suppress_transient_focus_loss()")
             .expect("commit must suppress transient focus loss");
         let runtime = body
-            .find("commit_with_readiness(")
+            .find("commit_with_readiness_with_effects(")
             .expect("commit readiness call is missing");
         assert!(suppression < runtime);
         let restore = body
@@ -7317,7 +7362,7 @@ mod tests {
             .find("suppress_transient_focus_loss()")
             .expect("enable must suppress transient focus loss");
         let runtime = body
-            .find("set_enabled_with_readiness(")
+            .find("set_enabled_with_readiness_with_effects(")
             .expect("enable readiness call is missing");
         assert!(suppression < runtime);
     }
@@ -10149,6 +10194,95 @@ mod tests",
         use super::super::{execute_result_with_clipboard, ClipboardExecution};
         use super::*;
         use crate::plugins::PluginCopyError;
+
+        #[test]
+        fn management_effects_invalidate_real_copy_handles_and_inflight_query_before_return() {
+            for case in ["rename", "noop", "favorite", "partial-error"] {
+                crate::public_plugins::with_settings_service_for_test(|service, manager| {
+                    let registry = ready_registry("management");
+                    let token = registry
+                        .begin_query(QueryDomain::Plugin, "management", 1)
+                        .unwrap();
+                    let route = manager.route("/demo first").unwrap().unwrap();
+                    let action = ResultAction::CopyText {
+                        plugin_id: route.plugin_id.clone(),
+                        command_id: Some("default".into()),
+                        generation: route.generation,
+                        text: "private".into(),
+                    };
+                    let (request_id, result_id) = registry
+                        .publish_if_latest(
+                            token,
+                            vec![((), action.clone())],
+                            || true,
+                            |request, items| (request, items[0].0.clone()),
+                        )
+                        .unwrap();
+                    let a = service
+                        .schedule_command(route, 1, "/demo first".into(), std::time::Instant::now())
+                        .unwrap();
+                    let outcome = match case {
+                        "rename" => {
+                            service.rename_command("com.uipilot.demo", "default", Some("renamed"))
+                        }
+                        "noop" => service.rename_command("com.uipilot.demo", "default", None),
+                        "favorite" => {
+                            service.set_command_favorite("com.uipilot.demo", "default", true)
+                        }
+                        "partial-error" => service.save_settings(
+                            "com.uipilot.demo",
+                            &BTreeMap::new(),
+                            &BTreeMap::from([
+                                ("first".into(), Some("synthetic".into())),
+                                ("second".into(), Some("x".repeat(65537))),
+                            ]),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    let changed = matches!(case, "rename" | "partial-error");
+                    let cleanup = Cell::new(false);
+                    let result =
+                        super::super::finish_public_plugin_management(outcome, &registry, || {
+                            assert_eq!(a.receiver.try_recv(), Ok(None));
+                            assert!(
+                                registry.resolve(&request_id, &result_id).is_err(),
+                                "cleanup must follow result invalidation"
+                            );
+                            cleanup.set(true);
+                        });
+                    assert_eq!(result.is_err(), case == "partial-error");
+                    assert_eq!(cleanup.get(), changed);
+                    let copies = Cell::new(0);
+                    let copied = tauri::async_runtime::block_on(execute_result_with_clipboard(
+                        (&request_id, &result_id),
+                        ClipboardExecution {
+                            resolve: |request: &str, result: &str| {
+                                registry.resolve(request, result)
+                            },
+                            execute: |_: &ResultAction| unreachable!(),
+                            execute_file: no_file_execution,
+                            open_web_search: no_web_search,
+                            open_quicklink: no_quicklink,
+                            copy_builtin: |_: &str| unreachable!(),
+                            copy_plugin: |_: &str, _: Option<&str>, _: u64, _: &str| {
+                                copies.set(copies.get() + 1);
+                                Ok(())
+                            },
+                            clear_and_hide: || Ok(()),
+                            increment: |_: &str| unreachable!(),
+                        },
+                    ));
+                    assert_eq!(copied.is_err(), changed);
+                    assert_eq!(copies.get(), usize::from(!changed));
+                    assert_eq!(
+                        registry
+                            .publish_if_latest(token, vec![((), action)], || true, |_, _| ())
+                            .is_none(),
+                        changed
+                    );
+                });
+            }
+        }
 
         #[test]
         fn denied_public_command_never_falls_back_to_legacy_copy_authority() {

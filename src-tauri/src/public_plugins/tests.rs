@@ -353,6 +353,182 @@ fn multi_service(
 }
 
 #[test]
+fn favorite_and_exact_override_noops_preserve_business_work_and_stored_choices() {
+    for clear in [false, true] {
+        let root = TestRoot::new("rename-stored-choice");
+        let (service, manager) = multi_service(&root, false);
+        if clear {
+            service
+                .rename_command("com.uipilot.demo", "upper", Some("upper"))
+                .result
+                .unwrap();
+        }
+        let current = root
+            .0
+            .join("app-data/public-plugins/state/com.uipilot.demo/state.json");
+        let now = Instant::now();
+        let a = service
+            .schedule_command(
+                manager.route("/upper A").unwrap().unwrap(),
+                1,
+                "/upper A".into(),
+                now,
+            )
+            .unwrap();
+        let running = a.dispatch.as_ref().unwrap();
+        let favorite = service.set_command_favorite("com.uipilot.demo", "constructor", true);
+        assert!(favorite.result.is_ok());
+        assert!(!favorite.changed);
+        assert_eq!(
+            manager.scheduler().context_status(&running.context),
+            super::PluginContextStatus::Current
+        );
+        let before = fs::read(&current).unwrap();
+        let same = if clear { Some("upper") } else { None };
+        let noop = service.rename_command("com.uipilot.demo", "upper", same);
+        assert!(noop.result.is_ok());
+        assert!(!noop.changed);
+        assert_eq!(fs::read(&current).unwrap(), before);
+        assert_eq!(
+            manager.scheduler().context_status(&running.context),
+            super::PluginContextStatus::Current
+        );
+        assert!(matches!(
+            a.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let waiting = service
+            .schedule_command(
+                manager.route("/lower old").unwrap().unwrap(),
+                2,
+                "/lower old".into(),
+                now,
+            )
+            .unwrap();
+        let untouched = service
+            .prepare_command(
+                manager.route("/lower later").unwrap().unwrap(),
+                3,
+                "/lower later".into(),
+            )
+            .unwrap();
+        let target = if clear { None } else { Some("upper") };
+        let changed = service.rename_command("com.uipilot.demo", "upper", target);
+        assert!(changed.result.is_ok());
+        assert!(changed.changed);
+        assert_eq!(a.receiver.try_recv(), Ok(None));
+        assert_eq!(waiting.receiver.try_recv(), Ok(None));
+        assert!(service
+            .lock_submissions()
+            .unwrap()
+            .by_token
+            .contains_key(&untouched.token));
+        let wire: Value = serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+        assert_eq!(wire["commands"]["upper"]["nameOverride"], json!(target));
+        let before = fs::read(&current).unwrap();
+        let noop = service.rename_command("com.uipilot.demo", "upper", target);
+        assert!(noop.result.is_ok());
+        assert!(!noop.changed);
+        assert_eq!(fs::read(current).unwrap(), before);
+    }
+}
+
+#[test]
+fn rename_retains_running_until_completion_or_timeout_and_preserves_saved_sibling() {
+    for renamed_id in ["upper", "constructor"] {
+        for timeout in [false, true] {
+            let root = TestRoot::new("rename-running");
+            let (service, manager) = multi_service(&root, false);
+            let now = Instant::now();
+            let a = service
+                .schedule_command(
+                    manager.route("/upper A").unwrap().unwrap(),
+                    1,
+                    "/upper A".into(),
+                    now,
+                )
+                .unwrap();
+            let running = a.dispatch.as_ref().unwrap().clone();
+            let old_waiting = service
+                .schedule_command(
+                    manager.route("/lower old").unwrap().unwrap(),
+                    2,
+                    "/lower old".into(),
+                    now,
+                )
+                .unwrap();
+            service
+                .rename_command("com.uipilot.demo", renamed_id, Some("renamed"))
+                .result
+                .unwrap();
+            let query = if renamed_id == "constructor" {
+                "/renamed B  saved"
+            } else {
+                "/lower B  saved"
+            };
+            let b = service
+                .schedule_command(manager.route(query).unwrap().unwrap(), 3, query.into(), now)
+                .unwrap();
+            assert!(
+                b.dispatch.is_none(),
+                "rename must retain the occupied Runtime slot"
+            );
+            assert_eq!(a.receiver.try_recv(), Ok(None));
+            assert_eq!(old_waiting.receiver.try_recv(), Ok(None));
+            let next = if timeout {
+                let replacements = manager
+                    .scheduler()
+                    .expire_timeouts(running.deadline)
+                    .unwrap();
+                assert_eq!(replacements.len(), 1);
+                let replacement = &replacements[0];
+                assert!(!replacement.counts_as_fault);
+                let candidate = manager
+                    .replace_runtime_generation(
+                        &replacement.plugin_id,
+                        replacement.previous_generation,
+                        replacement.new_generation,
+                    )
+                    .unwrap();
+                manager
+                    .finish_runtime_replacement(
+                        &candidate.plugin_id,
+                        candidate.generation,
+                        candidate.activation_id,
+                        candidate.admission_epoch,
+                        running.deadline,
+                    )
+                    .unwrap()
+                    .unwrap()
+            } else {
+                let completion = PluginCommandCompletion {
+                    context: running.context.clone(),
+                    failed: false,
+                    response: Some(
+                        json!({"requestId":running.context.request_id,"results":[{"id":"same","title":"stale"}]}),
+                    ),
+                };
+                let outcome = manager.scheduler().complete(&running.context, now).unwrap();
+                assert!(!outcome.accepted);
+                service
+                    .complete_submission_with(&completion, outcome, now, || {
+                        panic!("retired completion must not fault")
+                    })
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(next.candidate.command_id, "constructor");
+            assert_eq!(next.candidate.input, "B  saved");
+            assert_eq!(next.candidate.owner.submission_token, b.token);
+            assert_eq!(
+                manager.invocation_command_id(&next).unwrap().as_deref(),
+                Some("constructor")
+            );
+        }
+    }
+}
+
+#[test]
 fn multi_command_service_binds_late_completion_to_saved_route_and_input() {
     let root = TestRoot::new("multi-command-service");
     let (service, manager) = multi_service(&root, false);

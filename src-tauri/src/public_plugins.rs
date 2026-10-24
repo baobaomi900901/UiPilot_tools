@@ -136,8 +136,10 @@ struct RuntimeRecoveryState {
     by_plugin: HashMap<String, RuntimeRecoveryAttempt>,
 }
 
-pub(crate) struct SettingsSaveOutcome {
-    pub(crate) result: Result<PublicPluginMutation, PublicPluginManagementError>,
+pub(crate) struct ManagementOutcome<T = PublicPluginMutation> {
+    pub(crate) result: Result<T, PublicPluginManagementError>,
+    // Request/result invalidation occurred, even if result is Err. A successful
+    // favorite write changes stored UI metadata without setting this flag.
     pub(crate) changed: bool,
 }
 
@@ -211,12 +213,52 @@ impl PublicPluginService {
             .ok_or(PublicPluginManagementError::Unavailable)
     }
 
+    pub(crate) fn manage_with_effects<T>(
+        &self,
+        operation: impl FnOnce(
+            &PublicPluginManager,
+            &mut activation::ManagementEffects,
+        ) -> Result<T, PublicPluginManagementError>,
+    ) -> ManagementOutcome<T> {
+        let mut effects = activation::ManagementEffects::default();
+        let result = self
+            .manager()
+            .and_then(|manager| operation(manager, &mut effects));
+        self.settle_management_effects(&effects);
+        ManagementOutcome {
+            result,
+            changed: effects.changed,
+        }
+    }
+
+    pub(crate) fn rename_command(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
+        name_override: Option<&str>,
+    ) -> ManagementOutcome {
+        self.manage_with_effects(|manager, effects| {
+            manager.rename_command_with_effects(plugin_id, command_id, name_override, effects)
+        })
+    }
+
+    pub(crate) fn set_command_favorite(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
+        favorite: bool,
+    ) -> ManagementOutcome {
+        self.manage_with_effects(|manager, effects| {
+            manager.set_command_favorite_with_effects(plugin_id, command_id, favorite, effects)
+        })
+    }
+
     pub(crate) fn save_settings(
         &self,
         plugin_id: &str,
         settings: &BTreeMap<String, serde_json::Value>,
         secrets: &BTreeMap<String, Option<String>>,
-    ) -> SettingsSaveOutcome {
+    ) -> ManagementOutcome {
         let mut effects = activation::ManagementEffects::default();
         let result = (|| {
             let manager = self.manager()?;
@@ -230,18 +272,29 @@ impl PublicPluginService {
             manager.save_settings_with_effects(plugin_id, settings, &mut effects)
         })();
         self.settle_management_effects(&effects);
-        SettingsSaveOutcome {
+        ManagementOutcome {
             result,
             changed: effects.changed,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_network_access(
         &self,
         plugin_id: &str,
         granted: bool,
         expected_inventory_revision: Option<&str>,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        self.set_network_access_outcome(plugin_id, granted, expected_inventory_revision)
+            .result
+    }
+
+    pub(crate) fn set_network_access_outcome(
+        &self,
+        plugin_id: &str,
+        granted: bool,
+        expected_inventory_revision: Option<&str>,
+    ) -> ManagementOutcome {
         let mut effects = activation::ManagementEffects::default();
         let result = self.manager().and_then(|manager| {
             manager.set_network_access_with_effects(
@@ -252,7 +305,10 @@ impl PublicPluginService {
             )
         });
         self.settle_management_effects(&effects);
-        result
+        ManagementOutcome {
+            result,
+            changed: effects.changed,
+        }
     }
 
     fn settle_management_effects(&self, effects: &activation::ManagementEffects) {
