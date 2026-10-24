@@ -9452,7 +9452,7 @@ describe('independent command management', () => {
     await activateSettingsTab(mounted.host, '插件')
     const open = async () => { await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click()) }
     await open()
-    return { ...fake, ...mounted, core, open, update, async cleanup() { await mounted.unmount(); core.destroy() } }
+    return { ...fake, ...mounted, core, open, update, snapshot: () => structuredClone(inventory), async cleanup() { await mounted.unmount(); core.destroy() } }
   }
   const button = (host: HTMLElement, label: string) => host.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!
   const input = (host: HTMLElement, id: string) => host.querySelector<HTMLInputElement>(`input[aria-label="启动键 ${id}"]`)!
@@ -9509,6 +9509,258 @@ describe('independent command management', () => {
       await vi.waitFor(() => expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'upper' }))
       await act(async () => button(ui.host, '恢复默认启动键 upper').click())
       await vi.waitFor(() => expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null }))
+    } finally { await ui.cleanup() }
+  })
+  it.each(['rename', 'favorite'] as const)('keeps %s controls gated until the committed inventory arrives', async (kind) => {
+    const ui = await setup()
+    try {
+      const refresh = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(refresh.promise)
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      expect(input(ui.host, 'upper').readOnly).toBe(true)
+      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
+      expect(button(ui.host, '设为常用 upper').disabled).toBe(true)
+      await act(async () => { button(ui.host, '恢复默认启动键 upper').click(); button(ui.host, '设为常用 upper').click() })
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
+      const authoritative = ui.snapshot()
+      await act(async () => refresh.resolve(authoritative))
+      expect(input(ui.host, 'upper').readOnly).toBe(false)
+      if (kind === 'rename') {
+        expect(input(ui.host, 'upper').value).toBe('custom')
+        await act(async () => button(ui.host, '恢复默认启动键 upper').click())
+        expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null })
+        expect(input(ui.host, 'upper').value).toBe('upper')
+      } else {
+        await act(async () => button(ui.host, '取消常用 upper').click())
+        expect(ui.client.setPublicPluginFavorite).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', favorite: false })
+        expect(button(ui.host, '设为常用 upper')).not.toBeNull()
+      }
+    } finally { await ui.cleanup() }
+  })
+  it.each([
+    ['rename', false], ['favorite', false], ['rename', true], ['favorite', true],
+  ] as const)('tracks pending %s through a sibling revision and reconciles its actual outcome, failure=%s', async (kind, fails) => {
+    const ui = await setup()
+    try {
+      const pending = deferred<void>()
+      if (kind === 'rename') vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(async ({ commandId, nameOverride }) => {
+        await pending.promise
+        ui.update(commandId, { nameOverride, effectiveName: nameOverride! })
+      })
+      else vi.mocked(ui.client.setPublicPluginFavorite).mockImplementationOnce(async ({ commandId, favorite }) => {
+        await pending.promise
+        ui.update(commandId, { favorite })
+      })
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      await act(async () => button(ui.host, '设为常用 constructor').click())
+      await enter(input(ui.host, 'constructor'), 'sibling-draft')
+      expect(input(ui.host, 'upper').readOnly).toBe(true)
+      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
+      await act(async () => {
+        button(ui.host, '恢复默认启动键 upper').click()
+        button(ui.host, '设为常用 upper').click()
+        input(ui.host, 'upper').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+      })
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 2 : 1)
+      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
+      await act(async () => fails ? pending.reject(new Error('synthetic outcome')) : pending.resolve())
+      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads + 1)
+      expect(input(ui.host, 'upper').readOnly).toBe(false)
+      expect(input(ui.host, 'constructor').value).toBe('sibling-draft')
+      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+      expect(ui.host.querySelector('[data-command-id="upper"] [role="alert"]')).toBeNull()
+      expect(input(ui.host, 'upper').value).toBe(kind === 'rename' ? 'custom' : 'upper')
+      expect(button(ui.host, `${kind === 'favorite' && !fails ? '取消常用' : '设为常用'} upper`)).not.toBeNull()
+      expect(ui.snapshot().items[0]!.commands.find(({ commandId }) => commandId === 'upper')).toMatchObject({
+        nameOverride: kind === 'rename' && !fails ? 'custom' : null,
+        favorite: kind === 'favorite' && !fails,
+      })
+      expect(ui.host.querySelectorAll('.public-plugin-detail')).toHaveLength(1)
+    } finally { await ui.cleanup() }
+  })
+  it.each([['rename', 'older-success'], ['favorite', 'older-success'], ['rename', 'older-failure'], ['favorite', 'older-failure'], ['rename', 'newer-first'], ['favorite', 'newer-first']] as const)('does not release %s when its refresh is superseded by a pending newer refresh: %s', async (kind, order) => {
+    const ui = await setup()
+    try {
+      const older = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      const newer = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise)
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      await act(async () => button(ui.host, '设为常用 constructor').click())
+      const authoritative = ui.snapshot()
+      if (order !== 'newer-first') {
+        await act(async () => order === 'older-failure' ? older.reject(new Error('discarded refresh')) : older.resolve(authoritative))
+        expect(input(ui.host, 'upper').readOnly).toBe(true)
+        expect(input(ui.host, 'constructor').readOnly).toBe(true)
+      }
+      await act(async () => newer.resolve(authoritative))
+      expect(input(ui.host, 'upper').readOnly).toBe(false)
+      expect(input(ui.host, 'constructor').readOnly).toBe(false)
+      if (order === 'newer-first') await act(async () => older.resolve({ ...authoritative, revision: '10', items: [] }))
+      expect(button(ui.host, '取消常用 constructor')).not.toBeNull()
+      expect(kind === 'rename' ? input(ui.host, 'upper').value : button(ui.host, '取消常用 upper')?.getAttribute('aria-pressed')).toBe(kind === 'rename' ? 'custom' : 'true')
+    } finally { await ui.cleanup() }
+  })
+  it.each(['rename', 'favorite'] as const)('recovers a committed %s refresh failure without repeating the mutation or using stale equality', async (kind) => {
+    const ui = await setup()
+    try {
+      vi.mocked(ui.client.listPublicPlugins).mockRejectedValueOnce(new Error('refresh failed'))
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      expect(ui.host.querySelector('[data-command-id="upper"]')?.getAttribute('aria-busy')).toBe('false')
+      expect(ui.host.querySelector('[data-command-id="upper"] [role="alert"]')?.textContent).toContain('无法刷新')
+      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
+      expect(button(ui.host, '设为常用 upper').disabled).toBe(true)
+      await act(async () => button(ui.host, '刷新命令状态 upper').click())
+      expect(input(ui.host, 'upper').readOnly).toBe(false)
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
+      if (kind === 'rename') {
+        await act(async () => button(ui.host, '恢复默认启动键 upper').click())
+        expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null })
+      } else await act(async () => button(ui.host, '取消常用 upper').click())
+    } finally { await ui.cleanup() }
+  })
+  it.each([['rename', false], ['favorite', false], ['rename', true], ['favorite', true]] as const)('returns failed %s refresh focus to recovery without stealing a deliberate move=%s', async (kind, moved) => {
+    const ui = await setup()
+    try {
+      const refresh = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(refresh.promise)
+      if (kind === 'rename') await enter(input(ui.host, 'upper'), 'custom')
+      const origin = button(ui.host, kind === 'rename' ? '保存启动键 upper' : '设为常用 upper')
+      await act(async () => { origin.focus(); origin.click() })
+      // Browsers blur an action disabled by the in-flight state; reproduce that real focus loss.
+      await act(async () => origin.blur())
+      if (moved) await act(async () => input(ui.host, 'constructor').focus())
+      await act(async () => refresh.reject(new Error('refresh failed')))
+      const retry = button(ui.host, '刷新命令状态 upper')
+      expect(document.activeElement).toBe(moved ? input(ui.host, 'constructor') : retry)
+      if (!moved) {
+        await act(async () => retry.click())
+        expect(document.activeElement).toBe(input(ui.host, 'upper'))
+        expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
+        expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
+      }
+    } finally { await ui.cleanup() }
+  })
+  it('shares a latest refresh failure with older waiters and retries only the read', async () => {
+    const ui = await setup()
+    try {
+      const older = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      const newer = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise)
+      await enter(input(ui.host, 'upper'), 'custom')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      await act(async () => button(ui.host, '设为常用 constructor').click())
+      await act(async () => newer.reject(new Error('latest refresh failed')))
+      for (const id of ['upper', 'constructor']) {
+        expect(ui.host.querySelector(`[data-command-id="${id}"]`)?.getAttribute('aria-busy')).toBe('false')
+        expect(button(ui.host, `恢复默认启动键 ${id}`).disabled).toBe(true)
+        expect(button(ui.host, `刷新命令状态 ${id}`)).not.toBeNull()
+      }
+      await act(async () => button(ui.host, '刷新命令状态 upper').click())
+      // The accepted snapshot reconciles both rows, including the sibling's recovery state.
+      expect(input(ui.host, 'upper').readOnly).toBe(false)
+      expect(input(ui.host, 'constructor').readOnly).toBe(false)
+      expect(button(ui.host, '取消常用 constructor')).not.toBeNull()
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(1)
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(1)
+      await act(async () => older.reject(new Error('discarded old failure')))
+      expect(ui.host.querySelector('[role="alert"]')).toBeNull()
+    } finally { await ui.cleanup() }
+  })
+  it.each(['rename', 'favorite'] as const)('rejects an old %s refresh after close and reopen', async (kind) => {
+    const ui = await setup()
+    try {
+      const refresh = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
+      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(refresh.promise)
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      const authoritative = ui.snapshot()
+      await act(async () => button(ui.host, '返回插件列表').click())
+      await ui.open()
+      await enter(input(ui.host, 'constructor'), 'reopened-draft')
+      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
+      await act(async () => refresh.resolve(authoritative))
+      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
+      expect(input(ui.host, 'constructor').value).toBe('reopened-draft')
+      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+      expect(input(ui.host, 'upper').readOnly).toBe(false)
+    } finally { await ui.cleanup() }
+  })
+  it.each(['rename', 'favorite'] as const)('does not refresh a removed command when its pending %s settles', async (kind) => {
+    const ui = await setup()
+    try {
+      const pending = deferred<void>()
+      if (kind === 'rename') vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(async ({ commandId, nameOverride }) => {
+        await pending.promise
+        ui.update(commandId, { nameOverride, effectiveName: nameOverride! })
+      })
+      else vi.mocked(ui.client.setPublicPluginFavorite).mockImplementationOnce(async ({ commandId, favorite }) => {
+        await pending.promise
+        ui.update(commandId, { favorite })
+      })
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      const inventory = ui.snapshot()
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValueOnce({ ...inventory, revision: '99', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'constructor') })) })
+      await act(async () => button(ui.host, '设为常用 constructor').click())
+      expect(ui.host.querySelector('[data-command-id="upper"]')).toBeNull()
+      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
+      await act(async () => pending.resolve())
+      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
+      expect(ui.host.querySelector('[data-command-id="upper"]')).toBeNull()
+    } finally { await ui.cleanup() }
+  })
+  it.each(['rename', 'favorite'] as const)('does not refresh after detail unmount while %s is pending', async (kind) => {
+    const ui = await setup()
+    const pending = deferred<void>()
+    if (kind === 'rename') vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(async ({ commandId, nameOverride }) => {
+      await pending.promise
+      ui.update(commandId, { nameOverride, effectiveName: nameOverride! })
+    })
+    else vi.mocked(ui.client.setPublicPluginFavorite).mockImplementationOnce(async ({ commandId, favorite }) => {
+      await pending.promise
+      ui.update(commandId, { favorite })
+    })
+    try {
+      if (kind === 'rename') {
+        await enter(input(ui.host, 'upper'), 'custom')
+        await act(async () => button(ui.host, '保存启动键 upper').click())
+      } else await act(async () => button(ui.host, '设为常用 upper').click())
+    } finally { await ui.cleanup() }
+    const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
+    await act(async () => pending.resolve())
+    expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
+  })
+  it.each(['save', 'restore', 'error'] as const)('returns legitimate current-row %s focus after reconciliation', async (action) => {
+    const ui = await setup()
+    try {
+      await enter(input(ui.host, 'upper'), 'custom')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      if (action === 'error') vi.mocked(ui.client.setPublicPluginEffectiveName).mockRejectedValueOnce(new Error('conflict'))
+      if (action !== 'restore') await enter(input(ui.host, 'upper'), 'next')
+      const origin = button(ui.host, action === 'restore' ? '恢复默认启动键 upper' : '保存启动键 upper')
+      await act(async () => { origin.focus(); origin.click() })
+      expect(document.activeElement).toBe(origin)
+      expect(origin.disabled).toBe(false)
+      expect(input(ui.host, 'upper').value).toBe(action === 'restore' ? 'upper' : 'next')
+      expect(ui.host.querySelector('[role="alert"]') === null).toBe(action !== 'error')
     } finally { await ui.cleanup() }
   })
   it('bounds a sixteen-command package summary and exposes every identity in the single detail', async () => {

@@ -441,6 +441,14 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string; session: number } | null>(null)
   const detailSession = useRef(0)
   const detailReload = useRef(0)
+  const detailReloadPending = useRef<{
+    session: number
+    request: number
+    promise: Promise<void>
+    resolve: (next?: PromiseLike<void>) => void
+    reject: (reason: unknown) => void
+    beforePublish: Array<(revision: string) => void>
+  } | null>(null)
   const selectedPublicPlugin = publicPluginDetail?.plugin ?? null
   const [quicklinksStatus, setQuicklinksStatus] = useState<QuicklinksUiStatus | null>(null)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
@@ -486,8 +494,23 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     }
   }, [colorScheme])
 
+  useEffect(() => () => {
+    detailSession.current++
+    detailReload.current++
+    detailReloadPending.current?.beforePublish.splice(0)
+    detailReloadPending.current?.resolve()
+    detailReloadPending.current = null
+  }, [])
+
   useEffect(() => {
-    if (snapshot.view !== 'settings') { detailSession.current++; setPublicPluginDetail(null) }
+    if (snapshot.view !== 'settings') {
+      detailSession.current++
+      detailReload.current++
+      detailReloadPending.current?.beforePublish.splice(0)
+      detailReloadPending.current?.resolve()
+      detailReloadPending.current = null
+      setPublicPluginDetail(null)
+    }
   }, [snapshot.view])
 
   const selectedPublicPluginId = selectedPublicPlugin?.pluginId
@@ -1994,6 +2017,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const closePublicPluginDetail = () => {
     detailSession.current++
     detailReload.current++
+    detailReloadPending.current?.beforePublish.splice(0)
+    detailReloadPending.current?.resolve()
+    detailReloadPending.current = null
     restoreSettingsTabFocus.current = true
     setPublicPluginDetail(null)
   }
@@ -2163,17 +2189,40 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             key={`${selectedPublicPlugin.pluginId}:${publicPluginDetail!.session}`}
             plugin={selectedPublicPlugin}
             inventoryRevision={publicPluginDetail!.revision}
-            reload={async () => {
+            reload={async (beforePublish) => {
               const session = publicPluginDetail!.session
               if (detailSession.current !== session) return
-              const request = ++detailReload.current
-              const inventory = await core.client.listPublicPlugins()
-              if (detailSession.current !== session || detailReload.current !== request) return
-              setPublicPluginDetail((current) => {
-                if (current?.session !== session || current.plugin.pluginId !== selectedPublicPlugin.pluginId) return current
-                const plugin = inventory.items.find(({ pluginId }) => pluginId === current.plugin.pluginId)
-                return plugin ? { plugin, revision: inventory.revision, session } : null
-              })
+              const previous = detailReloadPending.current
+              let resolve!: (next?: PromiseLike<void>) => void
+              let reject!: (reason: unknown) => void
+              const promise = new Promise<void>((accepted, failed) => { resolve = accepted; reject = failed })
+              const entry = {
+                session, request: ++detailReload.current, promise, resolve, reject,
+                beforePublish: previous?.session === session ? previous.beforePublish.splice(0) : [],
+              }
+              if (beforePublish) entry.beforePublish.push(beforePublish)
+              detailReloadPending.current = entry
+              // Older waiters follow the newest request immediately, even if their read hangs.
+              if (previous?.session === session) previous.resolve(entry.promise)
+              void (async () => {
+                try {
+                  const inventory = await core.client.listPublicPlugins()
+                  if (detailSession.current !== session || detailReload.current !== entry.request) return
+                  // Notify waiting rows before React can publish the accepted revision.
+                  for (const accept of entry.beforePublish.splice(0)) accept(inventory.revision)
+                  setPublicPluginDetail((current) => {
+                    if (current?.session !== session || current.plugin.pluginId !== selectedPublicPlugin.pluginId) return current
+                    const plugin = inventory.items.find(({ pluginId }) => pluginId === current.plugin.pluginId)
+                    return plugin ? { plugin, revision: inventory.revision, session } : null
+                  })
+                  entry.resolve()
+                } catch (error) {
+                  if (detailSession.current !== session || detailReload.current !== entry.request) return
+                  entry.beforePublish.length = 0
+                  entry.reject(error)
+                }
+              })()
+              await entry.promise
             }}
           />
         </div>

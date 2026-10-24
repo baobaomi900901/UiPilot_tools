@@ -202,11 +202,13 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
   pluginId: string
   command: PublicPluginInventoryItem['commands'][number]
   revision: string
-  reload: () => Promise<void>
+  reload: (beforePublish?: (revision: string) => void) => Promise<void>
   single: boolean
 }) {
   const [draft, setDraft] = useState(command.effectiveName)
   const [busy, setBusy] = useState(false)
+  const [unreconciled, setUnreconciled] = useState(false)
+  const acceptedRevision = useRef<string | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const touched = useRef(false)
@@ -227,13 +229,16 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
     return () => { alive.current = false; sequence.current++; document.removeEventListener('focusin', onFocus) }
   }, [])
   useLayoutEffect(() => {
-    // Any new inventory revision retires continuations admitted against the old one.
-    if (pending.current) focusReturn.current = null
-    sequence.current++
-    pending.current = false
-    setBusy(false)
-    setError('')
-    setNotice('')
+    // Revision ownership governs UI publication, not the outstanding mutation gate.
+    // The reload owner marks this row's accepted refresh before publishing inventory.
+    if (acceptedRevision.current !== revision) {
+      if (pending.current) focusReturn.current = null
+      sequence.current++
+      setError('')
+      setNotice('')
+    }
+    acceptedRevision.current = null
+    setUnreconciled(false)
     const previous = previousCommand.current
     if (previous.effectiveName !== command.effectiveName || previous.nameOverride !== command.nameOverride) {
       setDraft(command.effectiveName)
@@ -242,17 +247,40 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
     previousCommand.current = command
   }, [revision, command.effectiveName, command.nameOverride])
   useLayoutEffect(() => {
+    // Release admission only after the accepted props/disabled state reach the DOM.
+    if (!busy) pending.current = false
+  })
+  useLayoutEffect(() => {
     const focus = focusReturn.current
     if (busy || !focus) return
     focusReturn.current = null
     if (focus.moved) return
     const active = document.activeElement
     if (active !== document.body && active !== focus.origin) return
-    const target = focus.origin.isConnected ? focus.origin : row.current?.querySelector<HTMLInputElement>('input')
+    const recovery = unreconciled ? row.current?.querySelector<HTMLButtonElement>('button[data-command-refresh]') : null
+    const target = focus.origin.isConnected && !focus.origin.matches(':disabled') ? focus.origin
+      : recovery ?? row.current?.querySelector<HTMLInputElement>('input')
     if (target?.isConnected && !target.matches(':disabled')) target.focus()
-  }, [busy])
+  }, [busy, unreconciled])
+  const reconcile = async (owns: () => boolean) => {
+    try {
+      await reload((nextRevision) => {
+        if (owns()) acceptedRevision.current = nextRevision
+      })
+      if (alive.current) setUnreconciled(false)
+    } catch {
+      if (alive.current) {
+        // The write may already be durable. Retry only the read, never the mutation.
+        setUnreconciled(true)
+        setError('无法刷新当前状态，请刷新命令状态后继续。')
+        setNotice('')
+      }
+    } finally {
+      if (alive.current) setBusy(false)
+    }
+  }
   const mutate = async (operation: () => Promise<void>, success: () => void, failure: string, origin?: HTMLElement) => {
-    if (pending.current) return
+    if (pending.current || unreconciled) return
     pending.current = true
     const token = ++sequence.current
     const ownerRevision = revision
@@ -261,22 +289,24 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
     setBusy(true); setError(''); setNotice('')
     try {
       await operation()
-      if (!owns()) return
-      success()
+      if (owns()) success()
     } catch {
-      if (!owns()) return
-      setError(failure)
-      return
-    } finally {
-      if (owns()) { pending.current = false; setBusy(false) }
+      if (owns()) setError(failure)
     }
-    if (!owns()) return
-    try { await reload() } catch {
-      if (owns()) setError('操作已完成，无法刷新当前状态，请返回列表刷新后核对。')
-    }
+    // A sibling revision can retire captured feedback, but cannot erase reconciliation.
+    if (alive.current) await reconcile(owns)
+  }
+  const retryRefresh = (origin: HTMLElement) => {
+    if (pending.current) return
+    pending.current = true
+    const token = ++sequence.current
+    const ownerRevision = revision
+    focusReturn.current = { origin, moved: false }
+    setBusy(true); setError('')
+    void reconcile(() => alive.current && sequence.current === token && currentRevision.current === ownerRevision)
   }
   const save = (nameOverride: string | null, origin?: HTMLElement) => {
-    if (pending.current) return
+    if (pending.current || unreconciled) return
     if (nameOverride === command.nameOverride) {
       setDraft(command.effectiveName); touched.current = false; setError('')
       return
@@ -292,7 +322,7 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
     <div className="public-command-row" data-command-id={command.commandId} aria-busy={busy} ref={row}>
       {!single ? <code className="public-command-id" title={command.commandId}>{command.commandId}</code> : null}
       <form className="public-detail-name-control" onSubmit={(event) => { event.preventDefault(); save(draft, document.activeElement instanceof HTMLElement ? document.activeElement : undefined) }}>
-        <Input aria-label={`启动键${suffix}`} placeholder="输入启动键" value={draft} readOnly={busy}
+        <Input aria-label={`启动键${suffix}`} placeholder="输入启动键" value={draft} readOnly={busy || unreconciled}
           onChange={(event) => { touched.current = true; setDraft(event.target.value) }}
           onBlur={(event) => {
             // Tab/click into a row action gives that action sole ownership (especially restore).
@@ -306,11 +336,11 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
               event.preventDefault(); event.stopPropagation(); setDraft(command.effectiveName); touched.current = false; setError('')
             }
           }} />
-        <Button htmlType="submit" aria-label={`保存启动键${suffix}`} disabled={busy}>保存</Button>
-        <Tooltip title="恢复默认"><Button aria-label={`恢复默认启动键${suffix}`} icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy}
+        <Button htmlType="submit" aria-label={`保存启动键${suffix}`} disabled={busy || unreconciled}>保存</Button>
+        <Tooltip title="恢复默认"><Button aria-label={`恢复默认启动键${suffix}`} icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy || unreconciled}
           onClick={(event) => save(null, event.currentTarget)} /></Tooltip>
         <Tooltip title={command.favorite ? '取消常用' : '设为常用'}><Button
-          aria-label={`${command.favorite ? '取消常用' : '设为常用'}${suffix}`} aria-pressed={command.favorite} disabled={busy}
+          aria-label={`${command.favorite ? '取消常用' : '设为常用'}${suffix}`} aria-pressed={command.favorite} disabled={busy || unreconciled}
           icon={<Star aria-hidden size={16} strokeWidth={1.8} fill={command.favorite ? 'currentColor' : 'none'} />}
           onClick={(event) => void mutate(
             () => client.setPublicPluginFavorite({ pluginId, commandId: command.commandId, favorite: !command.favorite }),
@@ -319,6 +349,8 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
       </form>
       <div className="public-command-feedback" aria-live="polite">
         {error ? <span role="alert" className="plugin-row-error">{error}</span> : busy ? '保存中…' : notice}
+        {unreconciled ? <Button size="small" data-command-refresh aria-label={`刷新命令状态${suffix}`} disabled={busy}
+          onClick={(event) => retryRefresh(event.currentTarget)}>刷新状态</Button> : null}
       </div>
     </div>
   )
@@ -328,7 +360,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
   client: LauncherClient
   plugin: PublicPluginInventoryItem
   inventoryRevision: string
-  reload: () => Promise<void>
+  reload: (beforePublish?: (revision: string) => void) => Promise<void>
 }) {
   const [busy, setBusy] = useState(false)
   const operationPending = useRef(false)

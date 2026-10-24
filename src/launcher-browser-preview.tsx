@@ -139,7 +139,8 @@ const commandPreviewPlugin: PublicPluginInventoryItem = {
 }
 if (commandPreview) previewPublicPlugins = { ...previewPublicPlugins, items: [commandPreviewPlugin] }
 let commandScenarioPending = true
-async function beforeCommandMutation() {
+async function beforeCommandMutation(commandId: string) {
+  if (previewParameters.get('commandScenario') === 'sibling-delay' && commandId === 'upper') await new Promise<void>((resolve) => window.setTimeout(resolve, 5000))
   if (previewParameters.get('commandScenario') === 'delay') await new Promise<void>((resolve) => window.setTimeout(resolve, 2500))
   if (commandScenarioPending && previewParameters.get('commandScenario') === 'error') {
     commandScenarioPending = false
@@ -341,7 +342,17 @@ const client: LauncherClient = {
   setPluginPanelBounds: async () => undefined,
   acknowledgePluginPanelFocusHostInput: async () => undefined,
   commitPluginWindowTransfer: async () => undefined,
-  listPublicPlugins: async () => previewPublicPlugins,
+  listPublicPlugins: async () => {
+    const inventory = structuredClone(previewPublicPlugins)
+    if (commandPreview && inventory.revision !== '1') {
+      if (previewParameters.get('commandScenario') === 'refresh-delay') await new Promise<void>((resolve) => window.setTimeout(resolve, 4000))
+      if (commandScenarioPending && previewParameters.get('commandScenario') === 'refresh-error') {
+        commandScenarioPending = false
+        throw new Error('Synthetic inventory refresh failure')
+      }
+    }
+    return inventory
+  },
   selectPublicPluginArchive: async () => null,
   selectPublicPluginDirectory: async () => 'synthetic-credential-preview',
   preparePublicPlugin: async () => ({
@@ -373,7 +384,7 @@ const client: LauncherClient = {
     }))
   },
   setPublicPluginFavorite: async ({ pluginId, commandId, favorite }) => {
-    await beforeCommandMutation()
+    await beforeCommandMutation(commandId)
     if (previewParameters.get('commandScenario') === 'remove') {
       updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId !== commandId) }))
       return
@@ -381,7 +392,7 @@ const client: LauncherClient = {
     updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, favorite } : command) })) },
   setBuiltinFeatureFavorite: async () => undefined,
   setPublicPluginEffectiveName: async ({ pluginId, commandId, nameOverride }) => {
-    await beforeCommandMutation()
+    await beforeCommandMutation(commandId)
     const name = nameOverride ?? previewPublicPlugins.items.find((plugin) => plugin.pluginId === pluginId)?.commands.find((command) => command.commandId === commandId)?.defaultName
     if (!name || !/^[a-z][a-z0-9-]{0,31}$/u.test(name) || name === 'conflict' || previewPublicPlugins.items.some((plugin) => plugin.commands.some((command) => (plugin.pluginId !== pluginId || command.commandId !== commandId) && command.effectiveName === name))) throw new Error('Synthetic command conflict')
     updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, nameOverride, effectiveName: nameOverride ?? command.defaultName } : command) })) },
