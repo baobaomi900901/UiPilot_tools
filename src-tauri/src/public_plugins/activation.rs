@@ -1701,8 +1701,18 @@ impl PublicPluginManager {
                 .bundles
                 .bundle(plugin_id)?
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            bundle
+                .runtime
+                .manifest
+                .command_by_id("default")
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let Some(prepared_state) =
+                self.state
+                    .prepare_rename(plugin_id, "default", name_override)?
+            else {
+                return Ok(mutation_from_config(&bundle.config));
+            };
             let reservation = self.bundles.reserve(plugin_id)?;
-            let prepared_state = self.state.prepare_rename(plugin_id, name_override)?;
             (bundle, reservation, prepared_state)
         };
         self.make_state_durable(&reservation, &prepared_state)?;
@@ -1737,11 +1747,18 @@ impl PublicPluginManager {
             if !bundle.config.installed {
                 return Err(PublicPluginManagementError::Unavailable);
             }
-            if bundle.config.favorite == favorite {
+            bundle
+                .runtime
+                .manifest
+                .command_by_id("default")
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let Some(prepared_state) = self
+                .state
+                .prepare_set_favorite(plugin_id, "default", favorite)?
+            else {
                 return Ok(mutation_from_config(&bundle.config));
-            }
+            };
             let reservation = self.bundles.reserve(plugin_id)?;
-            let prepared_state = self.state.prepare_set_favorite(plugin_id, favorite)?;
             (bundle, reservation, prepared_state)
         };
         self.make_state_durable(&reservation, &prepared_state)?;
@@ -2449,10 +2466,14 @@ impl PublicPluginManager {
                 plugin_id: config.plugin_id.clone(),
                 name: snapshot.manifest.name.clone(),
                 description: snapshot.manifest.description.clone(),
-                version: config.version,
+                version: config.version.clone(),
                 source: "localPackage",
                 default_name: command.default_name.clone(),
-                effective_name: config.effective_name,
+                effective_name: config
+                    .command("default")
+                    .ok_or(PublicPluginManagementError::Unavailable)?
+                    .effective_name
+                    .clone(),
                 enabled: config.enabled,
                 fault: config.fault,
                 generation: config.active_generation,
@@ -2492,7 +2513,12 @@ impl PublicPluginManager {
             .configs()?
             .into_iter()
             .filter(|config| config.installed)
-            .map(|config| config.effective_name)
+            .flat_map(|config| {
+                config
+                    .commands
+                    .into_values()
+                    .map(|command| command.effective_name)
+            })
             .collect())
     }
 
@@ -2520,6 +2546,9 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
+            let Some(command_config) = config.command("default") else {
+                continue;
+            };
             if self
                 .owner_cleanup
                 .is_blocked(&config.plugin_id)
@@ -2531,7 +2560,7 @@ impl PublicPluginManager {
                 || !config.enabled
                 || config.fault.is_some()
                 || config.active_generation != snapshot.generation
-                || config.effective_name != effective_name
+                || command_config.effective_name != effective_name
             {
                 continue;
             }
@@ -2548,7 +2577,7 @@ impl PublicPluginManager {
                 runtime_label: snapshot.label.clone(),
                 activation_mode: command.activation_mode,
                 output_mode: command.output_mode,
-                command_label: config.effective_name.clone(),
+                command_label: command_config.effective_name.clone(),
                 input: input.to_owned(),
                 input_required: command.input_required,
                 input_placeholder: command.input_placeholder.clone(),
@@ -2591,6 +2620,9 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
+            let Some(command_config) = config.command("default") else {
+                continue;
+            };
             if self
                 .owner_cleanup
                 .is_blocked(&config.plugin_id)
@@ -2624,7 +2656,7 @@ impl PublicPluginManager {
                 runtime_label: snapshot.label.clone(),
                 activation_mode: command.activation_mode,
                 output_mode: command.output_mode,
-                command_label: config.effective_name.clone(),
+                command_label: command_config.effective_name.clone(),
                 input: input.to_owned(),
                 input_required: command.input_required,
                 input_placeholder: command.input_placeholder.clone(),
@@ -2661,12 +2693,15 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
+            let Some(command_config) = config.command("default") else {
+                continue;
+            };
             if !config.installed
                 || !config.enabled
                 || config.fault.is_some()
                 || config.active_generation != snapshot.generation
                 || bundle.runtime_recovery_needed
-                || (!config.effective_name.starts_with(prefix)
+                || (!command_config.effective_name.starts_with(prefix)
                     && !snapshot
                         .manifest
                         .name
@@ -2681,11 +2716,11 @@ impl PublicPluginManager {
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             suggestions.push(PublicCommandSuggestion {
                 plugin_id: config.plugin_id.clone(),
-                effective_name: config.effective_name.clone(),
+                effective_name: command_config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
                 summary: command.summary.clone(),
                 icon_url: snapshot.icon_url(),
-                favorite: config.favorite,
+                favorite: command_config.favorite,
                 input_required: command.input_required,
                 output_mode: command.output_mode,
             });
@@ -2709,13 +2744,19 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
+            let Some(command_config) = config.command("default") else {
+                continue;
+            };
             if !config.installed
                 || !config.enabled
                 || config.fault.is_some()
                 || config.active_generation != snapshot.generation
                 || bundle.runtime_recovery_needed
-                || (!config.favorite
-                    && !config.effective_name.to_lowercase().contains(&folded_query))
+                || (!command_config.favorite
+                    && !command_config
+                        .effective_name
+                        .to_lowercase()
+                        .contains(&folded_query))
             {
                 continue;
             }
@@ -2725,11 +2766,11 @@ impl PublicPluginManager {
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             suggestions.push(PublicCommandSuggestion {
                 plugin_id: config.plugin_id.clone(),
-                effective_name: config.effective_name.clone(),
+                effective_name: command_config.effective_name.clone(),
                 display_name: snapshot.manifest.name.clone(),
                 summary: command.summary.clone(),
                 icon_url: snapshot.icon_url(),
-                favorite: config.favorite,
+                favorite: command_config.favorite,
                 input_required: command.input_required,
                 output_mode: command.output_mode,
             });
@@ -3267,7 +3308,15 @@ impl PublicPluginManager {
         let key = TimerKey::new(plugin_id, generation, activation_id)
             .ok_or(TimerError::TimerUnavailable)?;
         let alarm = bundle.alarm.clone().ok_or(TimerError::TimerUnavailable)?;
-        Ok((key, config.effective_name.clone(), alarm))
+        snapshot
+            .manifest
+            .legacy_command()
+            .filter(|command| command.output_mode == PublicOutputMode::Window)
+            .ok_or(TimerError::ExpiredWindowSessionError)?;
+        let command_config = config
+            .command("default")
+            .ok_or(TimerError::ExpiredWindowSessionError)?;
+        Ok((key, command_config.effective_name.clone(), alarm))
     }
 
     pub(crate) fn start_timers(
@@ -7095,7 +7144,7 @@ mod tests {
             .bundle("com.example.favorite")
             .unwrap()
             .unwrap();
-        assert!(!before.config.favorite);
+        assert!(!before.config.command("default").unwrap().favorite);
         let before_revision = before.config.inventory_revision;
         let before_activation = before.activation_id;
         let before_admission = before.admission_epoch;
@@ -7106,7 +7155,7 @@ mod tests {
             .bundle("com.example.favorite")
             .unwrap()
             .unwrap();
-        assert!(favorited.config.favorite);
+        assert!(favorited.config.command("default").unwrap().favorite);
         assert!(mutation.inventory_revision > before_revision);
         assert_eq!(
             favorited.config.inventory_revision,
@@ -9378,5 +9427,261 @@ mod tests {
             pending.await.unwrap(),
             Err(PluginNetworkErrorCode::ExpiredRequest)
         );
+    }
+
+    fn manager_with_schema_one_primary(
+        dir: &TestDir,
+        include_favorite: bool,
+    ) -> (PublicPluginManager, PathBuf, Vec<u8>) {
+        let mut manager = installed_credential_manager(dir);
+        let root = dir.path().join("public-plugins/state");
+        let current = root.join("com.example.network/state.json");
+        let mut wire: Value = serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+        let command = wire.as_object_mut().unwrap().remove("commands").unwrap()["default"].clone();
+        wire["schema"] = json!(1);
+        wire["defaultName"] = command["defaultName"].clone();
+        wire["nameOverride"] = command["nameOverride"].clone();
+        if include_favorite {
+            wire["favorite"] = json!(false);
+        }
+        let raw = format!("  {}\n", serde_json::to_string_pretty(&wire).unwrap()).into_bytes();
+        fs::write(&current, &raw).unwrap();
+        // Isolate pure state read from the normal startup activation transaction.
+        manager.state =
+            Arc::new(PluginStateStore::load(&root, ["find".into(), "math".into()]).unwrap());
+        (manager, current, raw)
+    }
+
+    #[test]
+    fn schema_one_inventory_route_noops_and_first_mutation_retry_use_authoritative_bytes() {
+        for include_favorite in [false, true] {
+            for rename in [false, true] {
+                let dir = TestDir::new("schema-one-manager-first-write");
+                let (manager, current, raw) =
+                    manager_with_schema_one_primary(&dir, include_favorite);
+                let before = manager
+                    .state
+                    .config("com.example.network")
+                    .unwrap()
+                    .unwrap();
+                let running = dispatch_network_scheduled(&manager);
+                assert_eq!(
+                    manager.inventory().unwrap().items[0].effective_name,
+                    "network"
+                );
+                assert_eq!(
+                    manager.route("/network sample").unwrap().unwrap().input,
+                    "sample"
+                );
+                manager.rename("com.example.network", None).unwrap();
+                manager.set_favorite("com.example.network", false).unwrap();
+                assert_eq!(
+                    manager.scheduler.context_status(&running.context),
+                    PluginContextStatus::Current
+                );
+                assert_eq!(fs::read(&current).unwrap(), raw);
+                assert_eq!(
+                    manager
+                        .state
+                        .config("com.example.network")
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+                let backup = current.with_file_name("state.json.backup");
+                if backup.exists() {
+                    fs::remove_file(&backup).unwrap();
+                }
+                fs::create_dir(&backup).unwrap();
+                let mutate = || {
+                    if rename {
+                        manager.rename("com.example.network", Some("renamed"))
+                    } else {
+                        manager.set_favorite("com.example.network", true)
+                    }
+                };
+                assert!(mutate().is_err());
+                assert!(!manager.bundles.is_terminal());
+                assert_eq!(
+                    manager.scheduler.context_status(&running.context),
+                    PluginContextStatus::Current
+                );
+                assert_eq!(
+                    manager
+                        .state
+                        .config("com.example.network")
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(fs::read(&current).unwrap(), raw);
+                assert_eq!(
+                    manager.inventory().unwrap().revision,
+                    before.inventory_revision.to_string()
+                );
+                fs::remove_dir(&backup).unwrap();
+                let committed = mutate().unwrap();
+                assert_eq!(committed.inventory_revision, before.inventory_revision + 1);
+                assert_eq!(fs::read(&backup).unwrap(), raw);
+                let wire: Value = serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+                assert_eq!(wire["schema"], 2);
+                if !rename {
+                    assert_eq!(
+                        manager.scheduler.context_status(&running.context),
+                        PluginContextStatus::Current
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema_one_first_rename_and_favorite_unknown_or_failed_revalidation_fail_closed() {
+        for rename in [false, true] {
+            for unknown in [false, true] {
+                let dir = TestDir::new("schema-one-manager-uncertain");
+                let (manager, current, _) = manager_with_schema_one_primary(&dir, true);
+                let before = manager
+                    .state
+                    .config("com.example.network")
+                    .unwrap()
+                    .unwrap();
+                let running = dispatch_network_scheduled(&manager);
+                let admitted = manager
+                    .network_authority
+                    .admit(
+                        "com.example.network",
+                        running.context.plugin_generation,
+                        &running.context,
+                        &manager.scheduler,
+                        network_request(),
+                    )
+                    .unwrap();
+                if unknown {
+                    fs::remove_file(&current).unwrap();
+                    fs::create_dir(&current).unwrap();
+                } else {
+                    let backup = current.with_file_name("state.json.backup");
+                    if backup.exists() {
+                        fs::remove_file(&backup).unwrap();
+                    }
+                    fs::create_dir(&backup).unwrap();
+                    fs::write(&current, b"different authoritative bytes").unwrap();
+                }
+                let result = if rename {
+                    manager.rename("com.example.network", Some("renamed"))
+                } else {
+                    manager.set_favorite("com.example.network", true)
+                };
+                assert!(result.is_err());
+                assert!(manager.bundles.is_terminal());
+                assert_eq!(
+                    manager
+                        .state
+                        .config("com.example.network")
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+                // Request retirement/service effects belong to Task 4. Task 2 verifies
+                // actual authority closure and the absence of candidate publication.
+                assert!(admitted.is_cancelled_for_test());
+                assert!(manager
+                    .network_authority
+                    .admit(
+                        "com.example.network",
+                        running.context.plugin_generation,
+                        &running.context,
+                        &manager.scheduler,
+                        network_request()
+                    )
+                    .is_err());
+                assert!(manager
+                    .bundles
+                    .confirmed_bundle("com.example.network")
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn valid_schema_one_startup_reads_inventory_and_route_without_a_migration_transaction() {
+        for include_favorite in [false, true] {
+            let dir = TestDir::new("schema-one-startup");
+            let (manager, current, raw) = manager_with_schema_one_primary(&dir, include_favorite);
+            let before = manager
+                .state
+                .config("com.example.network")
+                .unwrap()
+                .unwrap();
+            drop(manager);
+            let reloaded = credential_manager(&dir);
+            assert_eq!(
+                reloaded
+                    .state
+                    .config("com.example.network")
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                reloaded.inventory().unwrap().items[0].effective_name,
+                "network"
+            );
+            assert!(reloaded.route("/network").unwrap().is_some());
+            assert_eq!(fs::read(current).unwrap(), raw);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_semantic_repair_write_failure_publishes_no_network_authority() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for schema_one in [false, true] {
+            let dir = TestDir::new("startup-repair-write-failure");
+            let (manager, current, _) = manager_with_schema_one_primary(&dir, true);
+            let running = dispatch_network_scheduled(&manager);
+            let mut wire: Value = serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+            if !schema_one {
+                let command = json!({"defaultName":wire["defaultName"],"nameOverride":wire["nameOverride"],"favorite":wire["favorite"]});
+                for field in ["defaultName", "nameOverride", "favorite"] {
+                    wire.as_object_mut().unwrap().remove(field);
+                }
+                wire["schema"] = json!(2);
+                wire["commands"] = json!({"default":command});
+            }
+            wire["networkHttpsHostsGrant"] = json!(["invalid host"]);
+            let source = serde_json::to_vec(&wire).unwrap();
+            fs::write(&current, &source).unwrap();
+            drop(manager);
+            // Allow reading, but prevent the repair from replacing the authoritative file.
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&current)
+                .unwrap();
+            let (gate, _) = PluginNetworkAuthorityGate::blocking_for_test();
+            let result = PublicPluginManager::load_with_timer_and_network_dependencies(
+                dir.path(),
+                PublicPluginHost::current(PublicPlatform::Windows),
+                [],
+                Arc::new(MessageCenterService::load(dir.path())),
+                Arc::new(TestClock::default()),
+                Arc::new(TestPublisher::successful()),
+                Arc::clone(&gate),
+            );
+            assert!(result.is_err());
+            assert!(gate
+                .admit(
+                    "com.example.network",
+                    running.context.plugin_generation,
+                    &running.context,
+                    &PluginRequestScheduler::default(),
+                    network_request()
+                )
+                .is_err());
+            assert_eq!(fs::read(&current).unwrap(), source);
+            drop(held);
+        }
     }
 }

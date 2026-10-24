@@ -386,6 +386,8 @@ fn effective_names_are_global_and_failed_rename_is_atomic() {
             .config("com.example.beta")
             .unwrap()
             .unwrap()
+            .command("default")
+            .unwrap()
             .effective_name,
         "beta"
     );
@@ -419,6 +421,8 @@ fn dynamic_reserved_names_block_public_plugin_activation_and_rename() {
     assert_eq!(
         store
             .rename("com.example.alpha", Some("jd"))
+            .unwrap()
+            .command("default")
             .unwrap()
             .effective_name,
         "jd"
@@ -533,7 +537,10 @@ fn uninstall_retention_and_corrupt_owner_isolation_are_durable() {
     store.uninstall(&retained.plugin_id, true).unwrap();
     let kept = store.config(&retained.plugin_id).unwrap().unwrap();
     assert!(!kept.installed);
-    assert_eq!(kept.effective_name, "custom-name");
+    assert_eq!(
+        kept.command("default").unwrap().effective_name,
+        "custom-name"
+    );
     assert_eq!(kept.settings["limit"], json!(8));
     assert_eq!(install(&store, &retained).settings["limit"], json!(8));
     store.uninstall(&retained.plugin_id, false).unwrap();
@@ -553,6 +560,8 @@ fn uninstall_retention_and_corrupt_owner_isolation_are_durable() {
         reloaded
             .config(&healthy.plugin_id)
             .unwrap()
+            .unwrap()
+            .command("default")
             .unwrap()
             .effective_name,
         "healthy"
@@ -616,25 +625,28 @@ fn favorite_state_defaults_persists_and_survives_non_uninstall_mutations() {
     let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
     let mut plugin = manifest("com.example.favorite", "favorite", definitions());
     let installed = install(&store, &plugin);
-    assert!(!installed.favorite);
+    assert!(!installed.command("default").unwrap().favorite);
 
-    let prepared = store.prepare_set_favorite(&plugin.plugin_id, true).unwrap();
+    let prepared = store
+        .prepare_set_favorite(&plugin.plugin_id, "default", true)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store.persist_prepared(&prepared),
         DurableStateOutcome::Committed
     );
     let favorited = store.publish_prepared(prepared).unwrap();
-    assert!(favorited.favorite);
+    assert!(favorited.command("default").unwrap().favorite);
 
     let renamed = store
         .rename(&plugin.plugin_id, Some("favorite-renamed"))
         .unwrap();
-    assert!(renamed.favorite);
+    assert!(renamed.command("default").unwrap().favorite);
     let disabled = store.set_enabled(&plugin.plugin_id, false).unwrap();
-    assert!(disabled.favorite);
+    assert!(disabled.command("default").unwrap().favorite);
     plugin.version = "1.1.0".into();
     let upgraded = install(&store, &plugin);
-    assert!(upgraded.favorite);
+    assert!(upgraded.command("default").unwrap().favorite);
     drop(store);
 
     let reloaded = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
@@ -642,6 +654,8 @@ fn favorite_state_defaults_persists_and_survives_non_uninstall_mutations() {
         reloaded
             .config(&plugin.plugin_id)
             .unwrap()
+            .unwrap()
+            .command("default")
             .unwrap()
             .favorite
     );
@@ -656,8 +670,13 @@ fn favorite_state_defaults_persists_and_survives_non_uninstall_mutations() {
     );
     let removed = reloaded.publish_prepared(prepared).unwrap();
     assert!(!removed.installed);
-    assert!(!removed.favorite);
-    assert!(!install(&reloaded, &plugin).favorite);
+    assert!(!removed.command("default").unwrap().favorite);
+    assert!(
+        !install(&reloaded, &plugin)
+            .command("default")
+            .unwrap()
+            .favorite
+    );
 }
 
 #[test]
@@ -670,7 +689,15 @@ fn legacy_state_without_favorite_loads_false_and_next_write_is_canonical() {
 
     let state_path = dir.path().join(&plugin.plugin_id).join("state.json");
     let mut document = serde_json::from_slice::<Value>(&fs::read(&state_path).unwrap()).unwrap();
-    document.as_object_mut().unwrap().remove("favorite");
+    let command = document
+        .as_object_mut()
+        .unwrap()
+        .remove("commands")
+        .unwrap()["default"]
+        .clone();
+    document["schema"] = json!(1);
+    document["defaultName"] = command["defaultName"].clone();
+    document["nameOverride"] = command["nameOverride"].clone();
     fs::write(&state_path, serde_json::to_vec(&document).unwrap()).unwrap();
 
     let reloaded = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
@@ -679,13 +706,15 @@ fn legacy_state_without_favorite_loads_false_and_next_write_is_canonical() {
             .config(&plugin.plugin_id)
             .unwrap()
             .unwrap()
+            .command("default")
+            .unwrap()
             .favorite
     );
     reloaded
         .rename(&plugin.plugin_id, Some("legacy-favorite-renamed"))
         .unwrap();
     let canonical = serde_json::from_slice::<Value>(&fs::read(state_path).unwrap()).unwrap();
-    assert_eq!(canonical["favorite"], false);
+    assert_eq!(canonical["commands"]["default"]["favorite"], false);
 }
 
 #[test]
@@ -928,4 +957,565 @@ fn recovery_persistence_failure_publishes_no_config_and_preserves_source() {
     assert!(matches!(outcome, Err(PluginStateError::Storage)));
     assert_eq!(fs::read(paths.backup()).unwrap(), source);
     assert!(!paths.current().exists());
+}
+
+#[test]
+fn schema_two_roundtrip_has_command_map_and_canonical_roots() {
+    let dir = TestDir::new("schema-two-red");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let plugin = manifest("com.example.schema", "schema", json!([]));
+    install(&store, &plugin);
+    let path = dir.path().join(&plugin.plugin_id).join("state.json");
+    let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(value["schema"], 2);
+    assert_eq!(
+        value["commands"]["default"],
+        json!({
+            "defaultName":"schema", "nameOverride":null, "favorite":false
+        })
+    );
+    assert!(value.get("defaultName").is_none());
+    assert!(value.get("networkCredentialsGrant").is_none());
+    assert!(parse_document(&serde_json::to_vec(&value).unwrap(), &plugin.plugin_id).is_some());
+}
+
+#[test]
+fn schema_two_strict_structure_and_defaults() {
+    let valid = json!({"schema":2,"pluginId":"com.example.schema","version":"1.0.0",
+        "commands":{"constructor":{"defaultName":"schema","nameOverride":null,"favorite":false}},
+        "installed":true,"enabled":true,"permissionGrants":[],"inventoryRevision":7,"settings":{}});
+    let parse =
+        |value: &Value| parse_document(&serde_json::to_vec(value).unwrap(), "com.example.schema");
+    let defaults = parse(&valid).unwrap();
+    assert_eq!(defaults.fault, None);
+    assert_eq!(defaults.active_generation, 0);
+    assert_eq!(defaults.package_digest, None);
+    assert!(defaults.network_https_hosts_grant.is_empty());
+    assert!(defaults.network_credentials_grant.is_empty());
+    let canonical = serde_json::to_value(&defaults).unwrap();
+    assert_eq!(canonical["fault"], Value::Null);
+    assert_eq!(canonical["activeGeneration"], 0);
+    assert_eq!(canonical["packageDigest"], Value::Null);
+    assert_eq!(canonical["networkHttpsHostsGrant"], json!([]));
+    assert!(canonical.get("networkCredentialsGrant").is_none());
+    for field in [
+        "commands",
+        "pluginId",
+        "version",
+        "installed",
+        "enabled",
+        "permissionGrants",
+        "inventoryRevision",
+        "settings",
+    ] {
+        let mut bad = valid.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        assert!(parse(&bad).is_none(), "missing root {field}");
+    }
+    for field in ["defaultName", "nameOverride", "favorite"] {
+        let mut bad = valid.clone();
+        bad["commands"]["constructor"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(parse(&bad).is_none(), "missing entry {field}");
+        let mut bad = valid.clone();
+        bad[field] = json!(null);
+        assert!(parse(&bad).is_none(), "old root {field}");
+    }
+    for (field, value) in [
+        ("favorite", json!(null)),
+        ("defaultName", json!("bad name")),
+        ("nameOverride", json!("bad name")),
+        ("unknown", json!(0)),
+    ] {
+        let mut bad = valid.clone();
+        bad["commands"]["constructor"][field] = value;
+        assert!(parse(&bad).is_none(), "invalid entry {field}");
+    }
+    for (field, value) in [
+        ("unknown", json!(0)),
+        ("schema", json!(3)),
+        ("commands", json!({})),
+        (
+            "commands",
+            json!({"bad id":{"defaultName":"valid","nameOverride":null,"favorite":false}}),
+        ),
+        ("networkHttpsHostsGrant", json!(null)),
+        ("networkCredentialsGrant", json!(null)),
+    ] {
+        let mut bad = valid.clone();
+        bad[field] = value;
+        assert!(parse(&bad).is_none(), "invalid root {field}");
+    }
+    let mut many = valid.clone();
+    many["commands"] = Value::Object(
+        (0..16)
+            .map(|i| {
+                (
+                    format!("id{i}"),
+                    json!({"defaultName":format!("name{i}"),"nameOverride":null,"favorite":false}),
+                )
+            })
+            .collect(),
+    );
+    assert!(parse(&many).is_some());
+    many["commands"]["extra"] = json!({"defaultName":"extra","nameOverride":null,"favorite":false});
+    assert!(parse(&many).is_none());
+    let text = serde_json::to_string(&valid).unwrap();
+    let duplicate=text.replace("\"commands\":{", "\"commands\":{\"constructor\":{\"defaultName\":\"other\",\"nameOverride\":null,\"favorite\":false},");
+    assert!(parse_document(duplicate.as_bytes(), "com.example.schema").is_none());
+}
+
+#[test]
+fn repeated_stored_override_is_a_true_noop_but_explicit_default_is_a_change() {
+    let dir = TestDir::new("override-noop");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let plugin = manifest("com.example.noop", "noop", json!([]));
+    let before = install(&store, &plugin);
+    assert_eq!(store.rename(&plugin.plugin_id, None).unwrap(), before);
+    let explicit = store.rename(&plugin.plugin_id, Some("noop")).unwrap();
+    assert!(explicit.inventory_revision > before.inventory_revision);
+    assert_eq!(
+        store.rename(&plugin.plugin_id, Some("noop")).unwrap(),
+        explicit
+    );
+    let reset = store.rename(&plugin.plugin_id, None).unwrap();
+    assert!(reset.inventory_revision > explicit.inventory_revision);
+}
+
+#[test]
+fn state_activation_accepts_the_complete_validated_command_collection() {
+    let dir = TestDir::new("collection-activation");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let mut wire = serde_json::to_value(manifest("com.example.multi", "first", json!([]))).unwrap();
+    let mut command = wire.as_object_mut().unwrap().remove("command").unwrap();
+    command["id"] = json!("constructor");
+    let mut second = command.clone();
+    second["id"] = json!("second");
+    second["defaultName"] = json!("second");
+    wire["commands"] = json!([command, second]);
+    wire["minimumHostVersion"] = json!("0.5.0");
+    let plugin: PublicManifestV1 = serde_json::from_value(wire).unwrap();
+    assert!(store.install_or_upgrade(&plugin, BTreeSet::new()).is_ok());
+    let value: Value = serde_json::from_slice(
+        &fs::read(dir.path().join(&plugin.plugin_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["commands"].as_object().unwrap().len(), 2);
+}
+
+fn legacy_bytes(mut value: Value, favorite: Option<bool>) -> Vec<u8> {
+    let command = value.as_object_mut().unwrap().remove("commands").unwrap()["default"].clone();
+    value["schema"] = json!(1);
+    value["defaultName"] = command["defaultName"].clone();
+    value["nameOverride"] = command["nameOverride"].clone();
+    if let Some(favorite) = favorite {
+        value["favorite"] = json!(favorite);
+    }
+    // Whitespace proves we keep authoritative bytes rather than reserializing the view.
+    format!("  {}\n", serde_json::to_string_pretty(&value).unwrap()).into_bytes()
+}
+
+#[test]
+fn schema_one_first_read_noops_and_first_real_mutation_failure_retry_preserve_exact_bytes() {
+    for favorite in [None, Some(true)] {
+        for rename in [false, true] {
+            let dir = TestDir::new("schema-one-first-mutation");
+            let plugin = manifest("com.example.legacy", "legacy", json!([]));
+            let store = PluginStateStore::load(dir.path(), []).unwrap();
+            let before = install(&store, &plugin);
+            let owner = dir.path().join(&plugin.plugin_id);
+            let paths = AtomicPaths::new(&owner, "state.json");
+            let original = legacy_bytes(
+                serde_json::from_slice(&fs::read(paths.current()).unwrap()).unwrap(),
+                favorite,
+            );
+            fs::write(paths.current(), &original).unwrap();
+            let loaded = load_owner_with_recovery(&owner, &plugin.plugin_id, |_, _| {
+                panic!("pure normalization must not persist")
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(loaded.raw, original);
+            assert_eq!(
+                loaded.document.inventory_revision,
+                before.inventory_revision
+            );
+            assert_eq!(loaded.document.active_generation, before.active_generation);
+            assert_eq!(
+                loaded.document.commands["default"].favorite,
+                favorite.unwrap_or(false)
+            );
+            let store = PluginStateStore::load(dir.path(), []).unwrap();
+            let visible = store.config(&plugin.plugin_id).unwrap().unwrap();
+            assert!(store
+                .prepare_rename(&plugin.plugin_id, "default", None)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .prepare_set_favorite(&plugin.plugin_id, "default", favorite.unwrap_or(false))
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store.inventory_revision().unwrap(),
+                before.inventory_revision
+            );
+            assert_eq!(fs::read(paths.current()).unwrap(), original);
+            let prepare = || {
+                if rename {
+                    store.prepare_rename(&plugin.plugin_id, "default", Some("renamed"))
+                } else {
+                    store.prepare_set_favorite(
+                        &plugin.plugin_id,
+                        "default",
+                        !favorite.unwrap_or(false),
+                    )
+                }
+            };
+            let failed = prepare().unwrap().unwrap();
+            fs::create_dir(paths.backup()).unwrap();
+            assert_eq!(
+                store.persist_prepared(&failed),
+                DurableStateOutcome::NotCommitted
+            );
+            assert!(store.revalidate_previous(&failed));
+            assert_eq!(store.config(&plugin.plugin_id).unwrap().unwrap(), visible);
+            assert_eq!(fs::read(paths.current()).unwrap(), original);
+            fs::remove_dir(paths.backup()).unwrap();
+            let retry = prepare().unwrap().unwrap();
+            assert_eq!(
+                retry.candidate.document.inventory_revision,
+                visible.inventory_revision + 1
+            );
+            assert_eq!(
+                store.persist_prepared(&retry),
+                DurableStateOutcome::Committed
+            );
+            let committed = store.publish_prepared(retry).unwrap();
+            assert_eq!(committed.inventory_revision, visible.inventory_revision + 1);
+            assert_eq!(fs::read(paths.backup()).unwrap(), original);
+            let durable: Value =
+                serde_json::from_slice(&fs::read(paths.current()).unwrap()).unwrap();
+            assert_eq!(durable["schema"], 2);
+            assert_eq!(
+                store.lock().unwrap().by_plugin[&plugin.plugin_id].raw,
+                fs::read(paths.current()).unwrap()
+            );
+            let inventory: Value =
+                serde_json::from_slice(&fs::read(dir.path().join("inventory.json")).unwrap())
+                    .unwrap();
+            assert_eq!(inventory["schema"], 1);
+        }
+    }
+}
+
+fn multi_manifest(entries: &[(&str, &str)]) -> PublicManifestV1 {
+    let mut value =
+        serde_json::to_value(manifest("com.example.multi", "unused", json!([]))).unwrap();
+    value.as_object_mut().unwrap().remove("command");
+    value["minimumHostVersion"] = json!("0.5.0");
+    value["commands"]=Value::Array(entries.iter().map(|(id,name)| json!({"id":id,"defaultName":name,"activationMode":"live","outputMode":"mainResult","inputRequired":false})).collect());
+    let mut host = super::super::PublicPluginHost::current(super::super::PublicPlatform::Windows);
+    host.version = [0, 5, 0];
+    super::super::manifest::parse_manifest(&serde_json::to_vec(&value).unwrap(), &host).unwrap()
+}
+
+fn publish_change(
+    store: &PluginStateStore,
+    prepared: Option<PreparedStateCommit>,
+) -> EffectivePluginConfig {
+    let prepared = prepared.unwrap();
+    assert_eq!(
+        store.persist_prepared(&prepared),
+        DurableStateOutcome::Committed
+    );
+    store.publish_prepared(prepared).unwrap()
+}
+
+#[test]
+fn command_reconciliation_is_by_surviving_id_with_atomic_conflicts_and_fresh_readds() {
+    let dir = TestDir::new("command-reconciliation");
+    let store = PluginStateStore::load(dir.path(), ["reserved".into()]).unwrap();
+    let first = multi_manifest(&[("constructor", "old"), ("b", "bee")]);
+    install(&store, &first);
+    publish_change(
+        &store,
+        store
+            .prepare_rename(&first.plugin_id, "constructor", Some("custom"))
+            .unwrap(),
+    );
+    publish_change(
+        &store,
+        store
+            .prepare_set_favorite(&first.plugin_id, "constructor", true)
+            .unwrap(),
+    );
+    publish_change(
+        &store,
+        store
+            .prepare_set_favorite(&first.plugin_id, "b", true)
+            .unwrap(),
+    );
+    let before = store.config(&first.plugin_id).unwrap().unwrap();
+    for id in ["", "bad id", "missing"] {
+        assert!(store
+            .prepare_rename(&first.plugin_id, id, Some("new"))
+            .is_err());
+        assert!(store
+            .prepare_set_favorite(&first.plugin_id, id, true)
+            .is_err());
+        assert!(before.command(id).is_none());
+    }
+    for name in ["bee", "reserved"] {
+        assert!(matches!(
+            store.prepare_rename(&first.plugin_id, "constructor", Some(name)),
+            Err(PluginStateError::NameConflict { .. })
+        ));
+    }
+    let conflicting = multi_manifest(&[("constructor", "new"), ("b", "custom")]);
+    assert!(matches!(
+        store.install_or_upgrade(&conflicting, BTreeSet::new()),
+        Err(PluginStateError::NameConflict { .. })
+    ));
+    assert_eq!(store.config(&first.plugin_id).unwrap().unwrap(), before);
+    let updated = install(
+        &store,
+        &multi_manifest(&[("b", "beetwo"), ("constructor", "custom"), ("c", "cee")]),
+    );
+    assert_eq!(
+        updated
+            .command("constructor")
+            .unwrap()
+            .name_override
+            .as_deref(),
+        Some("custom")
+    );
+    assert!(updated.command("constructor").unwrap().favorite);
+    assert!(updated.command("b").unwrap().favorite);
+    assert!(!updated.command("c").unwrap().favorite);
+    assert_eq!(updated.command("c").unwrap().name_override, None);
+    let reset = publish_change(
+        &store,
+        store
+            .prepare_rename(&first.plugin_id, "constructor", None)
+            .unwrap(),
+    );
+    assert_eq!(
+        reset.command("constructor").unwrap().effective_name,
+        "custom"
+    );
+    assert_eq!(reset.command("constructor").unwrap().name_override, None);
+    drop(store);
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let updated = install(
+        &store,
+        &multi_manifest(&[("constructor", "next"), ("b", "bee")]),
+    );
+    assert_eq!(
+        updated.command("constructor").unwrap().effective_name,
+        "next"
+    );
+    install(&store, &multi_manifest(&[("b", "bee")]));
+    drop(store);
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let readded = install(
+        &store,
+        &multi_manifest(&[("constructor", "fresh"), ("b", "bee")]),
+    );
+    assert_eq!(readded.command("constructor").unwrap().name_override, None);
+    assert!(!readded.command("constructor").unwrap().favorite);
+    assert!(readded.command("b").unwrap().favorite);
+    publish_change(
+        &store,
+        store
+            .prepare_rename(&first.plugin_id, "b", Some("kept"))
+            .unwrap(),
+    );
+    let retained = publish_change(
+        &store,
+        store.prepare_uninstall(&first.plugin_id, true).unwrap(),
+    );
+    assert_eq!(retained.commands.len(), 2);
+    assert!(retained.commands.values().all(|command| !command.favorite));
+    assert_eq!(
+        retained.command("b").unwrap().name_override.as_deref(),
+        Some("kept")
+    );
+    let reinstalled = install(&store, &multi_manifest(&[("b", "bee")]));
+    assert_eq!(reinstalled.command("b").unwrap().effective_name, "kept");
+    assert!(!reinstalled.command("b").unwrap().favorite);
+}
+
+#[test]
+fn legacy_upgrade_and_package_rollback_only_inherit_a_surviving_default() {
+    let dir = TestDir::new("legacy-command-rollback");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let legacy = manifest("com.example.multi", "legacy", json!([]));
+    install(&store, &legacy);
+    store.rename(&legacy.plugin_id, Some("custom")).unwrap();
+    publish_change(
+        &store,
+        store
+            .prepare_set_favorite(&legacy.plugin_id, "default", true)
+            .unwrap(),
+    );
+    let upgraded = install(
+        &store,
+        &multi_manifest(&[("other", "other"), ("default", "newdefault")]),
+    );
+    assert_eq!(
+        upgraded.command("default").unwrap().effective_name,
+        "custom"
+    );
+    assert!(upgraded.command("default").unwrap().favorite);
+    assert!(!upgraded.command("other").unwrap().favorite);
+    let rollback = install(&store, &legacy);
+    assert_eq!(
+        rollback.command("default").unwrap().effective_name,
+        "custom"
+    );
+    install(&store, &multi_manifest(&[("other", "custom")]));
+    drop(store);
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let rollback = install(&store, &legacy);
+    assert_eq!(rollback.commands.len(), 1);
+    assert_eq!(
+        rollback.command("default").unwrap().effective_name,
+        "legacy"
+    );
+    assert_eq!(rollback.command("default").unwrap().name_override, None);
+    assert!(!rollback.command("default").unwrap().favorite);
+}
+
+#[test]
+fn both_schemas_repair_security_durably_and_repair_failure_never_returns_config() {
+    for schema in [1, 2] {
+        for kind in ["semantic", "structural", "missing"] {
+            for fail in [false, true] {
+                let dir = TestDir::new("both-schema-recovery");
+                let plugin = network_manifest("1.0.0", &["api.example.com"]);
+                let store = PluginStateStore::load(dir.path(), []).unwrap();
+                store
+                    .install_or_upgrade(&plugin, network_permission_grants())
+                    .unwrap();
+                let owner = dir.path().join(&plugin.plugin_id);
+                let paths = AtomicPaths::new(&owner, "state.json");
+                let mut source = fs::read(paths.current()).unwrap();
+                if schema == 1 {
+                    source = legacy_bytes(serde_json::from_slice(&source).unwrap(), Some(true));
+                }
+                fs::write(paths.backup(), &source).unwrap();
+                let mut current: Value = serde_json::from_slice(&source).unwrap();
+                if kind == "missing" {
+                    fs::remove_file(paths.current()).unwrap();
+                } else {
+                    current["settings"] = json!({"latest":"preserved"});
+                    current["networkHttpsHostsGrant"] = if kind == "semantic" {
+                        json!(["invalid host"])
+                    } else {
+                        json!(null)
+                    };
+                    fs::write(paths.current(), serde_json::to_vec(&current).unwrap()).unwrap();
+                }
+                let writes = std::cell::Cell::new(0);
+                let recovered =
+                    load_owner_with_recovery(&owner, &plugin.plugin_id, |paths, raw| {
+                        writes.set(writes.get() + 1);
+                        let candidate = parse_document(raw, &plugin.plugin_id).unwrap();
+                        assert!(candidate.network_https_hosts_grant.is_empty());
+                        assert!(candidate.network_credentials_grant.is_empty());
+                        assert!(!candidate
+                            .permission_grants
+                            .contains(&PublicPermission::NetworkHttps));
+                        if fail {
+                            Err(AtomicFileError::CandidateWrite)
+                        } else {
+                            commit_with_backup(paths, None, raw)
+                        }
+                    });
+                assert_eq!(writes.get(), 1);
+                assert_eq!(fs::read(paths.backup()).unwrap(), source);
+                if fail {
+                    assert!(matches!(recovered, Err(PluginStateError::Storage)));
+                } else {
+                    let recovered = recovered.unwrap().unwrap();
+                    assert_eq!(recovered.raw, fs::read(paths.current()).unwrap());
+                    assert_eq!(recovered.document.schema, 2);
+                    assert_eq!(
+                        recovered.document.settings.contains_key("latest"),
+                        kind == "semantic"
+                    );
+                    assert!(
+                        load_owner_with_recovery(&owner, &plugin.plugin_id, |_, _| panic!(
+                            "already repaired"
+                        ))
+                        .unwrap()
+                        .is_some()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_same_name_override_survives_restart_and_later_default_change() {
+    let dir = TestDir::new("explicit-default-override");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let plugin = manifest("com.example.explicit", "old", json!([]));
+    install(&store, &plugin);
+    let explicit = store.rename(&plugin.plugin_id, Some("old")).unwrap();
+    assert_eq!(
+        explicit
+            .command("default")
+            .unwrap()
+            .name_override
+            .as_deref(),
+        Some("old")
+    );
+    assert_eq!(
+        store.rename(&plugin.plugin_id, Some("old")).unwrap(),
+        explicit
+    );
+    drop(store);
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let updated = install(&store, &manifest(&plugin.plugin_id, "new", json!([])));
+    assert_eq!(updated.command("default").unwrap().default_name, "new");
+    assert_eq!(updated.command("default").unwrap().effective_name, "old");
+    assert_eq!(
+        updated.command("default").unwrap().name_override.as_deref(),
+        Some("old")
+    );
+}
+
+#[test]
+fn valid_schema_one_credential_order_normalization_keeps_raw_and_does_not_repair() {
+    let dir = TestDir::new("schema-one-credential-order");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let plugin = network_manifest("1.0.0", &["api.example.com"]);
+    store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    let owner = dir.path().join(&plugin.plugin_id);
+    let path = owner.join("state.json");
+    let mut wire: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    wire["networkCredentialsGrant"] = json!([
+        {"id":"z","settingKey":"token-z","host":"api.example.com","type":"bearer"},
+        {"id":"a","settingKey":"token-a","host":"api.example.com","type":"bearer"}
+    ]);
+    let raw = legacy_bytes(wire, Some(true));
+    fs::write(&path, &raw).unwrap();
+    let loaded = load_owner_with_recovery(&owner, &plugin.plugin_id, |_, _| {
+        panic!("valid ordering must not trigger repair")
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(loaded.raw, raw);
+    assert_eq!(loaded.document.network_credentials_grant[0].id, "a");
+    assert!(loaded
+        .document
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert_eq!(fs::read(path).unwrap(), raw);
 }

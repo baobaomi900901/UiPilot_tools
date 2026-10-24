@@ -32,11 +32,9 @@ pub(crate) enum PublicPluginFault {
 pub(crate) struct EffectivePluginConfig {
     pub(crate) plugin_id: String,
     pub(crate) version: String,
-    pub(crate) effective_name: String,
-    pub(crate) name_override: Option<String>,
+    pub(crate) commands: BTreeMap<String, EffectiveCommandConfig>,
     pub(crate) installed: bool,
     pub(crate) enabled: bool,
-    pub(crate) favorite: bool,
     pub(crate) fault: Option<PublicPluginFault>,
     pub(crate) permission_grants: BTreeSet<PublicPermission>,
     pub(crate) network_https_hosts_grant: BTreeSet<String>,
@@ -48,6 +46,32 @@ pub(crate) struct EffectivePluginConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectiveCommandConfig {
+    pub(crate) default_name: String,
+    pub(crate) effective_name: String,
+    pub(crate) name_override: Option<String>,
+    pub(crate) favorite: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandState {
+    default_name: String,
+    #[serde(deserialize_with = "codec::required_override")]
+    name_override: Option<String>,
+    favorite: bool,
+}
+
+impl CommandState {
+    fn effective_name(&self) -> &str {
+        self.name_override.as_deref().unwrap_or(&self.default_name)
+    }
+}
+
+#[path = "state_codec.rs"]
+mod codec;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginNetworkGrantSnapshot {
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
@@ -56,6 +80,12 @@ pub(crate) struct PluginNetworkGrantSnapshot {
 }
 
 impl EffectivePluginConfig {
+    pub(crate) fn command(&self, command_id: &str) -> Option<&EffectiveCommandConfig> {
+        valid_command_name(command_id)
+            .then(|| self.commands.get(command_id))
+            .flatten()
+    }
+
     pub(crate) fn network_grant_snapshot(
         &self,
         manifest: &PublicManifestV1,
@@ -120,12 +150,10 @@ struct PluginStateDocument {
     schema: u32,
     plugin_id: String,
     version: String,
-    default_name: String,
-    name_override: Option<String>,
+    #[serde(deserialize_with = "codec::command_map")]
+    commands: BTreeMap<String, CommandState>,
     installed: bool,
     enabled: bool,
-    #[serde(default)]
-    favorite: bool,
     fault: Option<PublicPluginFault>,
     permission_grants: BTreeSet<PublicPermission>,
     #[serde(default)]
@@ -141,19 +169,27 @@ struct PluginStateDocument {
 }
 
 impl PluginStateDocument {
-    fn effective_name(&self) -> &str {
-        self.name_override.as_deref().unwrap_or(&self.default_name)
-    }
-
     fn view(&self) -> EffectivePluginConfig {
         EffectivePluginConfig {
             plugin_id: self.plugin_id.clone(),
             version: self.version.clone(),
-            effective_name: self.effective_name().into(),
-            name_override: self.name_override.clone(),
+            commands: self
+                .commands
+                .iter()
+                .map(|(id, command)| {
+                    (
+                        id.clone(),
+                        EffectiveCommandConfig {
+                            default_name: command.default_name.clone(),
+                            effective_name: command.effective_name().into(),
+                            name_override: command.name_override.clone(),
+                            favorite: command.favorite,
+                        },
+                    )
+                })
+                .collect(),
             installed: self.installed,
             enabled: self.enabled,
-            favorite: self.favorite,
             fault: self.fault,
             permission_grants: self.permission_grants.clone(),
             network_https_hosts_grant: self.network_https_hosts_grant.clone(),
@@ -320,9 +356,6 @@ impl PluginStateStore {
         {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let command = manifest
-            .legacy_command()
-            .ok_or(PluginStateError::InvalidPlugin)?;
         let mut declared = manifest
             .permissions
             .iter()
@@ -348,32 +381,39 @@ impl PluginStateStore {
         if previous.is_some_and(|stored| generation <= stored.document.active_generation) {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let override_name = previous.and_then(|stored| stored.document.name_override.clone());
-        let effective_name = override_name.as_deref().unwrap_or(&command.default_name);
-        self.ensure_name_available(&state, &manifest.plugin_id, effective_name)?;
+        let commands = manifest
+            .normalized_commands()
+            .map(|(id, command)| {
+                let retained = previous.and_then(|stored| stored.document.commands.get(id));
+                (
+                    id.to_owned(),
+                    CommandState {
+                        default_name: command.default_name.clone(),
+                        name_override: retained.and_then(|entry| entry.name_override.clone()),
+                        favorite: previous.is_some_and(|stored| stored.document.installed)
+                            && retained.is_some_and(|entry| entry.favorite),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.ensure_commands_available(&state, &manifest.plugin_id, &commands)?;
         let revision = next_revision(state.revision)?;
         let settings = reconcile_settings(
             previous.map(|stored| &stored.document.settings),
             &manifest.settings,
         );
-        let (enabled, fault, favorite) = previous
+        let (enabled, fault) = previous
             .filter(|stored| stored.document.installed)
-            .map_or((true, None, false), |stored| {
-                (
-                    stored.document.enabled,
-                    stored.document.fault,
-                    stored.document.favorite,
-                )
+            .map_or((true, None), |stored| {
+                (stored.document.enabled, stored.document.fault)
             });
         let document = PluginStateDocument {
-            schema: 1,
+            schema: 2,
             plugin_id: manifest.plugin_id.clone(),
             version: manifest.version.clone(),
-            default_name: command.default_name.clone(),
-            name_override: override_name,
+            commands,
             installed: true,
             enabled,
-            favorite,
             fault,
             permission_grants,
             network_https_hosts_grant,
@@ -403,37 +443,26 @@ impl PluginStateStore {
         plugin_id: &str,
         name_override: Option<&str>,
     ) -> Result<EffectivePluginConfig, PluginStateError> {
-        if name_override.is_some_and(|name| !valid_command_name(name)) {
-            return Err(PluginStateError::InvalidPlugin);
+        let Some(prepared) = self.prepare_rename(plugin_id, "default", name_override)? else {
+            return self
+                .config(plugin_id)?
+                .ok_or(PluginStateError::InvalidPlugin);
+        };
+        if self.persist_prepared(&prepared) != DurableStateOutcome::Committed {
+            return Err(PluginStateError::Storage);
         }
-        let mut state = self.lock()?;
-        let previous = state
-            .by_plugin
-            .get(plugin_id)
-            .ok_or(PluginStateError::InvalidPlugin)?;
-        if !previous.document.installed {
-            return Err(PluginStateError::InvalidPlugin);
-        }
-        let target = name_override.unwrap_or(&previous.document.default_name);
-        self.ensure_name_available(&state, plugin_id, target)?;
-        let revision = next_revision(state.revision)?;
-        let mut document = previous.document.clone();
-        document.name_override = name_override.map(str::to_owned);
-        document.inventory_revision = revision;
-        self.persist_revision(revision)?;
-        let stored = self.persist(&document, Some(previous))?;
-        let view = document.view();
-        state.revision = revision;
-        state.by_plugin.insert(plugin_id.into(), stored);
-        Ok(view)
+        self.publish_prepared(prepared)
     }
 
     pub(crate) fn prepare_rename(
         &self,
         plugin_id: &str,
+        command_id: &str,
         name_override: Option<&str>,
-    ) -> Result<PreparedStateCommit, PluginStateError> {
-        if name_override.is_some_and(|name| !valid_command_name(name)) {
+    ) -> Result<Option<PreparedStateCommit>, PluginStateError> {
+        if !valid_command_name(command_id)
+            || name_override.is_some_and(|name| !valid_command_name(name))
+        {
             return Err(PluginStateError::InvalidPlugin);
         }
         let state = self.lock()?;
@@ -444,12 +473,24 @@ impl PluginStateStore {
         if !previous.document.installed {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let target = name_override.unwrap_or(&previous.document.default_name);
-        self.ensure_name_available(&state, plugin_id, target)?;
+        let command = previous
+            .document
+            .commands
+            .get(command_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if command.name_override.as_deref() == name_override {
+            return Ok(None);
+        }
         let mut document = previous.document.clone();
-        document.name_override = name_override.map(str::to_owned);
+        document
+            .commands
+            .get_mut(command_id)
+            .ok_or(PluginStateError::InvalidPlugin)?
+            .name_override = name_override.map(str::to_owned);
+        self.ensure_commands_available(&state, plugin_id, &document.commands)?;
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, false)
+            .map(Some)
     }
 
     #[cfg(test)]
@@ -590,8 +631,12 @@ impl PluginStateStore {
     pub(crate) fn prepare_set_favorite(
         &self,
         plugin_id: &str,
+        command_id: &str,
         favorite: bool,
-    ) -> Result<PreparedStateCommit, PluginStateError> {
+    ) -> Result<Option<PreparedStateCommit>, PluginStateError> {
+        if !valid_command_name(command_id) {
+            return Err(PluginStateError::InvalidPlugin);
+        }
         let state = self.lock()?;
         let previous = state
             .by_plugin
@@ -600,10 +645,23 @@ impl PluginStateStore {
         if !previous.document.installed {
             return Err(PluginStateError::InvalidPlugin);
         }
+        let command = previous
+            .document
+            .commands
+            .get(command_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if command.favorite == favorite {
+            return Ok(None);
+        }
         let mut document = previous.document.clone();
-        document.favorite = favorite;
+        document
+            .commands
+            .get_mut(command_id)
+            .ok_or(PluginStateError::InvalidPlugin)?
+            .favorite = favorite;
         document.inventory_revision = next_revision(state.revision)?;
         self.prepare_document(&state, plugin_id, document, false)
+            .map(Some)
     }
 
     #[cfg(test)]
@@ -789,7 +847,9 @@ impl PluginStateStore {
             let mut document = previous.document.clone();
             document.installed = false;
             document.enabled = false;
-            document.favorite = false;
+            for command in document.commands.values_mut() {
+                command.favorite = false;
+            }
             document.fault = None;
             document
                 .permission_grants
@@ -824,7 +884,9 @@ impl PluginStateStore {
         let mut document = previous.document.clone();
         document.installed = false;
         document.enabled = false;
-        document.favorite = false;
+        for command in document.commands.values_mut() {
+            command.favorite = false;
+        }
         document.fault = None;
         document
             .permission_grants
@@ -877,8 +939,39 @@ impl PluginStateStore {
         let state = self.lock()?;
         for (plugin_id, stored) in &state.by_plugin {
             if stored.document.installed {
-                self.ensure_name_available(&state, plugin_id, stored.document.effective_name())?;
+                self.ensure_commands_available(&state, plugin_id, &stored.document.commands)?;
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_commands_available(
+        &self,
+        state: &StateData,
+        plugin_id: &str,
+        commands: &BTreeMap<String, CommandState>,
+    ) -> Result<(), PluginStateError> {
+        if commands.is_empty()
+            || commands.len() > 16
+            || commands.iter().any(|(id, command)| {
+                !valid_command_name(id)
+                    || !valid_command_name(&command.default_name)
+                    || command
+                        .name_override
+                        .as_deref()
+                        .is_some_and(|name| !valid_command_name(name))
+            })
+        {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut names = BTreeSet::new();
+        for command in commands.values() {
+            if !names.insert(command.effective_name().to_ascii_lowercase()) {
+                return Err(PluginStateError::NameConflict {
+                    owner: Some(plugin_id.into()),
+                });
+            }
+            self.ensure_name_available(state, plugin_id, command.effective_name())?;
         }
         Ok(())
     }
@@ -903,8 +996,11 @@ impl PluginStateStore {
             let document = &stored.document;
             (document.installed
                 && document.plugin_id != plugin_id
-                && document.effective_name().to_ascii_lowercase() == folded)
-                .then(|| document.plugin_id.clone())
+                && document
+                    .commands
+                    .values()
+                    .any(|command| command.effective_name().to_ascii_lowercase() == folded))
+            .then(|| document.plugin_id.clone())
         }) {
             return Err(PluginStateError::NameConflict { owner: Some(owner) });
         }
@@ -1098,8 +1194,7 @@ fn load_owner_with_recovery(
         if let Some(mut document) = parse_document(&bytes, plugin_id) {
             // Backup data never carries authority across recovery. Semantic repair must
             // also become durable before the normalized configuration can be published.
-            let original = serde_json::from_slice::<PluginStateDocument>(&bytes)
-                .map_err(|_| PluginStateError::Storage)?;
+            let original = codec::decode_document(&bytes).ok_or(PluginStateError::Storage)?;
             if index != 0 {
                 document
                     .permission_grants
@@ -1149,7 +1244,7 @@ fn valid_credential_grants(
 }
 
 fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> {
-    let mut document = serde_json::from_slice::<PluginStateDocument>(bytes).ok()?;
+    let mut document = codec::decode_document(bytes)?;
     let network_grant_valid = !document.network_https_hosts_grant.is_empty()
         && document.network_https_hosts_grant.len() <= 8
         && document
@@ -1174,15 +1269,20 @@ fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> 
     document
         .network_credentials_grant
         .sort_by(|a, b| a.id.cmp(&b.id));
-    (document.schema == 1
+    (document.schema == 2
         && document.plugin_id == plugin_id
         && valid_plugin_id(&document.plugin_id)
         && parse_canonical_version(&document.version).is_some()
-        && valid_command_name(&document.default_name)
-        && document
-            .name_override
-            .as_deref()
-            .is_none_or(valid_command_name)
+        && !document.commands.is_empty()
+        && document.commands.len() <= 16
+        && document.commands.iter().all(|(id, command)| {
+            valid_command_name(id)
+                && valid_command_name(&command.default_name)
+                && command
+                    .name_override
+                    .as_deref()
+                    .is_none_or(valid_command_name)
+        })
         && (document.package_digest.is_none()
             || (document.active_generation != 0
                 && document.package_digest.as_deref().is_some_and(|digest| {
