@@ -706,8 +706,8 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
       <div className="plugin-inventory-header">
         <h2 id="public-plugin-title">公开插件</h2>
         <div className="public-install-actions">
-          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)} /></Tooltip>
-          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)} /></Tooltip>
+          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)}>选择插件包</Button></Tooltip>
+          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)}>选择开发目录</Button></Tooltip>
           <Tooltip title="刷新">
             <Button
               aria-label="刷新"

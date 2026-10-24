@@ -7932,6 +7932,8 @@ describe('React view and accessibility', () => {
     await act(async () => fake.emit(shown('public-prepare-icon', 'settings')))
     await activateSettingsTab(mounted.host, '插件')
     const chooseDirectory = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!
+    expect(chooseDirectory.textContent).toContain('选择开发目录')
+    expect(mounted.host.querySelector<HTMLButtonElement>('button[aria-label="选择插件包"]')?.textContent).toContain('选择插件包')
     await act(async () => chooseDirectory.click())
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-prepare')).not.toBeNull())
     expect(mounted.host.querySelector<HTMLImageElement>('.public-prepare .plugin-icon-image')?.getAttribute('src'))

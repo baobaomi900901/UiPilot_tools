@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.templates",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.6.0",
+  "name": "文本模板",
+  "description": "离线编辑文本模板，发现变量、预览并保存样例。",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "templates",
+    "summary": "编辑、预览和保存文本模板",
+    "activationMode": "submit",
+    "outputMode": "panel",
+    "inputRequired": false,
+    "inputPlaceholder": "搜索模板名称，按 Enter 筛选"
+  },
+  "runtime": { "entry": "dist/runtime.js" },
+  "panel": {
+    "entry": "dist/panel.html",
+    "runtimeActions": true,
+    "hostKeys": ["Primary+N", "Tab", "Shift+Tab"]
+  },
+  "permissions": ["ui.panel"],
+  "settings": []
+}

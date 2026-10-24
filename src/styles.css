@@ -1393,6 +1393,15 @@ label,
   min-width: 0;
 }
 
+.public-install-actions {
+  flex: 0 0 auto;
+}
+
+.public-install-actions .ant-btn {
+  padding-inline: 8px;
+  font-size: 12px;
+}
+
 .public-install-actions,
 .public-prepare,
 .public-name-control,
@@ -1403,6 +1412,10 @@ label,
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+
+.public-install-actions {
+  gap: 6px;
 }
 
 .public-prepare,

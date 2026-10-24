@@ -1,0 +1,50 @@
+# 文本模板（离线 Panel Runtime 示例）
+
+插件 `com.uipilot.templates` **1.0.0**，要求 Windows UiPilot **0.6.0+**。默认启动键 `/templates`，只声明 `ui.panel`。使用 demo-panel 包结构和 Notes 的紧凑侧栏布局，无网络、远程资源或依赖安装。
+
+在设置 → 插件点击 **选择开发目录**，选择本例的 `package` 目录；或选择交付的 `.uipilot-plugin` 归档。授权后启用插件。开发目录不是父级示例目录。安装会复制资源，修改源码后需提高版本并重新安装更新。
+
+## 使用
+
+1. 输入 `/templates` 后按 Enter。初始不选中模板；点击 **新建模板**（或 Ctrl+N）。
+2. 填写名称与正文，例如 `你好，{{name}}！`，点击 **预览**。Runtime 发现变量并报告缺失样例。
+3. 填写 name 样例后再次预览，点击 **保存**。关闭重开后从左侧选择保存项；退出重启后也可读取。
+4. 在 Host 主输入框输入模板名称关键词并按 Enter 筛选。筛选保留当前草稿，Ctrl+F 返回主输入框。Tab/Shift+Tab 按视觉顺序移动；Ctrl+S 保存。
+
+预览是普通可选择的只读文本，可用系统复制快捷键。它不执行 HTML，也没有专用剪贴板接口。Escape、失焦和关闭仍由 Host 管理，未保存草稿不承诺跨关闭保留；切换模板或主动新建前可选择保留草稿或放弃。
+
+## 语法与数据
+
+仅支持 `{{name}}`，名称匹配 `[A-Za-z][A-Za-z0-9_]{0,31}`，可有外围空白。变量按首次出现排序，重复引用只生成一个输入框。`constructor`、`prototype` 是普通合法名称。没有表达式、循环、宏、递归替换或 HTML 渲染。
+
+未填写的输入没有样例条目，预览会报告缺值；主动填写后再清空会保留明确的空字符串。保存允许缺少样例，但不允许错误语法。已不被正文使用的合法样例会被丢弃。非法或重复样例拒绝。
+
+Runtime 的 `onCommand` 只读取目录并返回列表元数据；按钮通过可选 `panel.request` 调用 `onPanelAction`：
+
+- `load`: `{id}`。
+- `preview`: `{body, values:[{name,value}]}`。
+- `save`: `{id, expectedRevision, title, body, values}`；新建的 id/revision 均为 null，更新要求确切已存版本。
+
+面板不直接读写 storage。Runtime 使用 `templates.catalog-v1`，一个完整目录快照只调用一次 `storage.set`。每个模板有稳定 ID 和单调版本；冲突不会覆盖。保存中继续输入时，成功回复只合并同一草稿的 ID/版本，之后的新编辑仍未保存，不会再次新建同一个模板。
+
+最多 20 个模板，名称最多 80 个 Unicode 字符，正文最多 8 KiB UTF-8，最多 16 个不同变量，每个样例最多 256 个 Unicode 字符。预览最多 32 KiB UTF-8；目录紧凑 JSON 最多 512 KiB。完整回复另受 Host 64 KiB JSON 限制，超出返回业务错误，不截断文本。计数器耗尽拒绝，损坏目录显示错误，不重置数据。
+
+## 保存结果待确认时
+
+超时、取消、会话失效或存储错误可能发生在写入之后，**不能据此判断未保存**。不会自动重试，保存按钮保持阻止状态。请先复制需要保留的草稿文字，再明确检查：
+
+1. 已有模板：点击 **重新载入已保存**，确认放弃当前编辑后读取该 ID 的实际内容。检查后再修改、保存。
+2. 新草稿尚未获得 ID：点击 **重新载入已保存**，在 Host 主输入框**清空筛选并按 Enter**刷新列表。当前草稿保留。检查列表后主动选择已保存项并确认放弃草稿；如果确认没有保存，才主动点击 **新建模板** 并确认放弃旧草稿。普通主题/列表更新不会解除保存阻止状态；刷新列表本身也不会自动重试保存。
+3. 面板已关闭：重新进入 `/templates`，清空筛选后检查保存项。需要继续时选择实际保存的模板；不要直接重建相同内容。
+
+## 验证与人工验收
+
+```powershell
+node --test examples/public-plugins/com.uipilot.templates/tests/runtime.test.js
+node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.templates/tests/sdk-contract.ts
+npm run build
+npm run build --workspace @uipilot/plugin-cli
+node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.templates/package --platform windows
+```
+
+自动检查覆盖解析、字面替换、缺值/空值、重复样例、冲突、失败保存、损坏目录、容量与回复上限，不替代真实 Host 操作。人工仍需检查安装入口、首次预览/保存、重启持久化、错误恢复、快速编辑/关闭、键盘/双主题，以及旧 Notes/多命令插件。人工结果在交付说明中单独登记，未收到用户反馈前均为待测试。
