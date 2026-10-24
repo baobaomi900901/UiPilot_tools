@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令实施计划
 
-状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Task 3 已完成并通过独立规格/质量评审（`bd8707a`）；Task 4 已完成并通过独立规格/质量评审（实现 `2f8a5aa`，并发事务修正 `40e89de`）；Tasks 5–8 待执行，M2-A 尚未完成。
+状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Task 3 已完成并通过独立规格/质量评审（`bd8707a`）；Task 4 已完成并通过独立规格/质量评审（实现 `2f8a5aa`，并发事务修正 `40e89de`）；Task 5 已完成并通过独立规格/质量评审（实现 `20ee2cb`，异步状态修正 `80ece01`）；Tasks 6–8 待执行，M2-A 尚未完成。
 
 > **For agentic workers:** 使用 `subagent-driven-development`；单写者顺序实施，每任务通过独立 Spec 与 Quality 双门禁后才可开始下一任务。
 
@@ -103,10 +103,10 @@
 
 **Dependencies:** Task 4；设计 §5、§8、§16.4/6/16；UI 规范 §5–9。Task 3 的基础 ID/DTO 类型已存在，此任务完成管理参数边界和可操作表面。
 
-- [ ] `set_plugin_favorite`/`set_plugin_effective_name` 在真实 Tauri 参数提取层保留字段 presence，显式 null 不得被 Option 自动等同缺失；仅设计指定旧路径的字段缺失且 default 实存时规范化。新前端所有调用总发 commandId，保留 require_main_window 授权检查先于受保护状态操作。
-- [ ] 完成 ResultFavorite 构造、safeResultFavorite、favoriteMatchesResult、目标相等和异步 favorite owner 的 pair 身份；可收藏主命令入口，业务执行结果不能伪造入口收藏。不要让 sibling 相同名称/结果 ID 或 prototype 属性匹配成功。
-- [ ] 一份包详情列出命令行，每行独立编辑/恢复名称和收藏状态；loading/busy/error 属于当前命令及当前 revision。重载/关闭/更换详情时，旧异步完成不得覆盖新目标或把焦点移回旧 DOM。主题 token、键盘、可访问名称与实际焦点归属遵循既有 UI 规范。
-- [ ] 保持包级 enable/settings/network 一份；不添加命令 title、hotkey、第二别名或命令卸载控件。所有现有 preview/mock/IPC 参数断言同步，旧包收藏通过 default 保持。
+- [x] `set_plugin_favorite`/`set_plugin_effective_name` 在真实 Tauri 参数提取层保留字段 presence，显式 null 不得被 Option 自动等同缺失；仅设计指定旧路径的字段缺失且 default 实存时规范化。新前端所有调用总发 commandId，保留 require_main_window 授权检查先于受保护状态操作。
+- [x] 完成 ResultFavorite 构造、safeResultFavorite、favoriteMatchesResult、目标相等和异步 favorite owner 的 pair 身份；可收藏主命令入口，业务执行结果不能伪造入口收藏。不要让 sibling 相同名称/结果 ID 或 prototype 属性匹配成功。
+- [x] 一份包详情列出命令行，每行独立编辑/恢复名称和收藏状态；loading/busy/error 属于当前命令及当前 revision。重载/关闭/更换详情时，旧异步完成不得覆盖新目标或把焦点移回旧 DOM。主题 token、键盘、可访问名称与实际焦点归属遵循既有 UI 规范。
+- [x] 保持包级 enable/settings/network 一份；不添加命令 title、hotkey、第二别名或命令卸载控件。所有现有 preview/mock/IPC 参数断言同步，旧包收藏通过 default 保持。
 
 **Distinct test coverage:** 对两个管理 IPC 分别通过实际提取路径验证：缺字段且有 default 成功；缺字段无 default、显式 null、空、非法、未知 ID 拒绝且未改状态，绝不落第一项；非 main caller 先拒绝。favorite A 不改 B、跨重启保留、重复值 no-op、pending A 后切 B 仅更新 A owner；错误 sibling favorite payload 拒绝，constructor route/favorite/管理表正常。改 A/恢复默认的同包、他包、内置、quicklinks 冲突均无半提交并保留编辑值/可恢复焦点；旧名成功释放。双主题下 Enter/Tab/Escape、右键菜单、busy 禁用、错误提示、保存后恢复焦点、焦点触发元素消失时的合法 fallback 均有自动测试，并记录浏览器 Light/Dark 小窗口实检，不能仅看 activeElement mock。
 
