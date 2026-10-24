@@ -251,6 +251,19 @@ impl PluginManager {
         }
     }
 
+    /// Invalidate shared plugin results after public management has released its locks.
+    pub(crate) fn invalidate_plugin_results(&self, registry: &ResultRegistry) {
+        // Legacy durable publication owns admission across reserve -> commit/cancel.
+        // Even if an earlier owner panicked, acquire exclusion and fail the registry
+        // closed as usual; poisoning must not leave stale public results usable.
+        let _admission = self
+            .admission
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Overflow retains the registry's existing permanent fail-closed behavior.
+        let _ = registry.invalidate_domain(QueryDomain::Plugin);
+    }
+
     fn next_durable_id(&self) -> Result<String, PluginManagementError> {
         let sequence = self
             .next_quarantine
@@ -7515,6 +7528,169 @@ mod tests {
             let manager = Arc::new(PluginManager::new());
             manager.install_catalog_for_test(load(root));
             manager
+        }
+
+        fn public_management_waits_for_legacy_durable_reservation(commit: bool) {
+            use crate::result_registry::{QueryDomain, ResultAction};
+
+            let root = TestRoot::new();
+            root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+            let manager = manager(&root);
+            let registry = ResultRegistry::default();
+            registry.on_show("management-race".into());
+            let token = registry
+                .begin_query(QueryDomain::Plugin, "management-race", 1)
+                .unwrap();
+            let action = ResultAction::CopyText {
+                plugin_id: "com.uipilot.demo".into(),
+                command_id: Some("default".into()),
+                generation: 1,
+                text: "old public result".into(),
+            };
+            let (request_id, result_id) = registry
+                .publish_if_latest(
+                    token,
+                    vec![((), action.clone())],
+                    || true,
+                    |request, items| (request, items[0].0.clone()),
+                )
+                .unwrap();
+            let old = manager.route("/plugin").unwrap().identity();
+            let candidate = manager.state.get().unwrap().read().unwrap().active.entries[0].clone();
+            let (candidate, identity, attempt) =
+                manager.stage_candidate("plugin", candidate).unwrap();
+            manager.runtime_ready(&identity);
+            let (reserved_tx, reserved_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (legacy_done_tx, legacy_done_rx) = mpsc::channel();
+            let legacy_manager = Arc::clone(&manager);
+            let legacy_registry = registry.clone();
+            let legacy = std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    legacy_manager.promote_candidate(
+                        &legacy_registry,
+                        &candidate,
+                        &identity,
+                        &attempt,
+                        Some(&old),
+                        || {
+                            reserved_tx.send(()).unwrap();
+                            // A bounded wait also releases admission if a test assertion fails.
+                            if release_rx.recv_timeout(Duration::from_secs(5)).is_ok() && commit {
+                                Ok(())
+                            } else {
+                                Err(crate::plugins::PluginManagementError::Unavailable)
+                            }
+                        },
+                    )
+                }))
+                .map(|result| result.is_ok())
+                .map_err(|_| "legacy promotion panicked");
+                legacy_done_tx.send(result).unwrap();
+            });
+            reserved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let (changed_tx, changed_rx) = mpsc::channel();
+            let (public_done_tx, public_done_rx) = mpsc::channel();
+            let public_registry = registry.clone();
+            let public_manager = Arc::clone(&manager);
+            let old_handles = (request_id.clone(), result_id.clone());
+            let public = std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::public_plugins::with_settings_service_for_test(|service, _| {
+                        // These must finish while the legacy durable reservation is held.
+                        for outcome in [
+                            service.set_command_favorite("com.uipilot.demo", "default", true),
+                            service.rename_command("com.uipilot.demo", "default", None),
+                        ] {
+                            assert!(!outcome.changed);
+                            crate::commands::finish_public_plugin_management(
+                                outcome,
+                                &public_registry,
+                                &public_manager,
+                                || panic!("favorite/no-op must not clean up"),
+                            )
+                            .unwrap();
+                            assert!(public_registry
+                                .resolve(&old_handles.0, &old_handles.1)
+                                .is_ok());
+                        }
+                        let outcome =
+                            service.rename_command("com.uipilot.demo", "default", Some("renamed"));
+                        assert!(outcome.changed);
+                        assert!(outcome.result.is_ok());
+                        changed_tx.send(()).unwrap();
+                        crate::commands::finish_public_plugin_management(
+                            outcome,
+                            &public_registry,
+                            &public_manager,
+                            || {
+                                assert!(
+                                    public_manager.admission.try_write().is_ok(),
+                                    "cleanup must run after admission is released"
+                                );
+                                assert!(public_registry
+                                    .resolve(&old_handles.0, &old_handles.1)
+                                    .is_err());
+                            },
+                        )
+                        .unwrap();
+                    });
+                }))
+                .map_err(|_| "public management panicked");
+                let _ = public_done_tx.send(result);
+            });
+            // The signal follows real public mutation and precedes its finish helper.
+            let changed = changed_rx.recv_timeout(Duration::from_secs(5));
+            let early_public = public_done_rx.recv_timeout(Duration::from_millis(100));
+            // Always release before asserting, including on the broken implementation.
+            let _ = release_tx.send(());
+            let legacy_result = legacy_done_rx.recv_timeout(Duration::from_secs(5));
+            let public_result = match early_public {
+                Ok(result) => Ok(result),
+                Err(_) => public_done_rx.recv_timeout(Duration::from_secs(5)),
+            };
+            // Never join a worker without its bounded completion notification.
+            if legacy_result.is_ok() {
+                legacy.join().unwrap();
+            }
+            if public_result.is_ok() {
+                public.join().unwrap();
+            }
+            assert!(
+                changed.is_ok(),
+                "favorite/no-op blocked or public rename failed"
+            );
+            assert_eq!(
+                legacy_result,
+                Ok(Ok(commit)),
+                "reservation owner must finish safely"
+            );
+            assert_eq!(public_result, Ok(Ok(())), "public finish must not deadlock");
+            assert!(
+                matches!(early_public, Err(mpsc::RecvTimeoutError::Timeout)),
+                "changed management must wait for the legacy reservation"
+            );
+            assert!(registry.resolve(&request_id, &result_id).is_err());
+            assert!(registry
+                .publish_if_latest(token, vec![((), action.clone())], || true, |_, _| ())
+                .is_none());
+            let fresh = registry
+                .begin_query(QueryDomain::Plugin, "management-race", 2)
+                .expect("normal management overlap must not exhaust the Plugin domain");
+            assert!(registry
+                .publish_if_latest(fresh, vec![((), action)], || true, |_, _| ())
+                .is_some());
+        }
+
+        #[test]
+        fn public_management_waits_for_legacy_durable_commit() {
+            public_management_waits_for_legacy_durable_reservation(true);
+        }
+
+        #[test]
+        fn public_management_waits_for_legacy_durable_cancel() {
+            public_management_waits_for_legacy_durable_reservation(false);
         }
 
         #[test]

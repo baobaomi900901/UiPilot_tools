@@ -1300,6 +1300,7 @@ pub(crate) async fn commit_public_plugin_install(
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
@@ -1328,7 +1329,8 @@ pub(crate) async fn commit_public_plugin_install(
             effects,
         )
     });
-    let result = finish_public_plugin_management(outcome, registries.main(), || {});
+    let result =
+        finish_public_plugin_management(outcome, registries.main(), plugins.inner(), || {});
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.previous_runtime_label.as_deref());
@@ -1361,6 +1363,7 @@ pub(crate) async fn set_plugin_enabled(
     coordinator: State<'_, Arc<LifecycleCoordinator>>,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
     plugin_id: String,
@@ -1386,7 +1389,8 @@ pub(crate) async fn set_plugin_enabled(
             effects,
         )
     });
-    let result = finish_public_plugin_management(outcome, registries.main(), || {});
+    let result =
+        finish_public_plugin_management(outcome, registries.main(), plugins.inner(), || {});
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.closed_runtime_label.as_deref());
@@ -1414,6 +1418,7 @@ pub(crate) fn set_public_plugin_network_access(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     plugin_id: String,
     granted: bool,
     expected_inventory_revision: Option<String>,
@@ -1426,6 +1431,7 @@ pub(crate) fn set_public_plugin_network_access(
             expected_inventory_revision.as_deref(),
         ),
         registries.main(),
+        plugins.inner(),
         || {},
     )
 }
@@ -1435,6 +1441,7 @@ pub(crate) fn set_plugin_favorite(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     plugin_id: String,
     command_id: String,
     favorite: bool,
@@ -1443,6 +1450,7 @@ pub(crate) fn set_plugin_favorite(
     finish_public_plugin_management(
         service.set_command_favorite(&plugin_id, &command_id, favorite),
         registries.main(),
+        plugins.inner(),
         || {},
     )?;
     Ok(())
@@ -1454,6 +1462,7 @@ pub(crate) fn set_plugin_effective_name(
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
@@ -1466,6 +1475,7 @@ pub(crate) fn set_plugin_effective_name(
     finish_public_plugin_management(
         service.rename_command(&plugin_id, &command_id, name_override.as_deref()),
         registries.main(),
+        plugins.inner(),
         || {
             plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
         },
@@ -1478,24 +1488,34 @@ pub(crate) fn save_plugin_settings(
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     input: SavePublicPluginSettingsInput,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
     let plugin_id = input.plugin_id.clone();
-    save_plugin_settings_with(service.inner().as_ref(), input, registries.main(), || {
-        plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
-    })
+    save_plugin_settings_with(
+        service.inner().as_ref(),
+        input,
+        registries.main(),
+        plugins.inner(),
+        || {
+            plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
+        },
+    )
 }
 
-fn finish_public_plugin_management<T>(
+pub(crate) fn finish_public_plugin_management<T>(
     outcome: crate::public_plugins::ManagementOutcome<T>,
     registry: &ResultRegistry,
+    plugins: &PluginManager,
     cleanup: impl FnOnce(),
 ) -> Result<T, CommandError> {
     if outcome.changed {
-        // Overflow also clears the domain and permanently fails it closed.
-        let _ = registry.invalidate_domain(QueryDomain::Plugin);
+        // The owned outcome is settled: public mutation/authority/submission locks
+        // have been released before taking legacy admission. The method releases
+        // admission before cleanup, which may re-enter other host services.
+        plugins.invalidate_plugin_results(registry);
         cleanup();
     }
     Ok(outcome.result?)
@@ -1505,10 +1525,11 @@ fn save_plugin_settings_with(
     service: &PublicPluginService,
     input: SavePublicPluginSettingsInput,
     registry: &ResultRegistry,
+    plugins: &PluginManager,
     teardown: impl FnOnce(),
 ) -> Result<PublicPluginMutation, CommandError> {
     let outcome = service.save_settings(&input.plugin_id, &input.settings, &input.secrets);
-    finish_public_plugin_management(outcome, registry, teardown)
+    finish_public_plugin_management(outcome, registry, plugins, teardown)
 }
 
 #[tauri::command]
@@ -1517,6 +1538,7 @@ pub(crate) fn uninstall_plugin(
     app: AppHandle,
     service: State<'_, Arc<PublicPluginService>>,
     registries: State<'_, ResultRegistries>,
+    plugins: State<'_, Arc<PluginManager>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     panel_controller: State<'_, Arc<PluginPanelController>>,
     plugin_id: String,
@@ -1527,7 +1549,8 @@ pub(crate) fn uninstall_plugin(
     let outcome = service.manage_with_effects(|manager, effects| {
         manager.begin_uninstall_with_effects(&plugin_id, retain_data, effects)
     });
-    let Some(mut transaction) = finish_public_plugin_management(outcome, registries.main(), || {})?
+    let Some(mut transaction) =
+        finish_public_plugin_management(outcome, registries.main(), plugins.inner(), || {})?
     else {
         return Ok(());
     };
@@ -5640,6 +5663,7 @@ mod tests {
                         secrets,
                     },
                     &ready_registry("settings"),
+                    &crate::plugins::PluginManager::new(),
                     || {
                         teardown.set(teardown.get() + 1);
                         // Settlement is complete before the command tears down its window.
@@ -10241,15 +10265,19 @@ mod tests",
                     };
                     let changed = matches!(case, "rename" | "partial-error");
                     let cleanup = Cell::new(false);
-                    let result =
-                        super::super::finish_public_plugin_management(outcome, &registry, || {
+                    let result = super::super::finish_public_plugin_management(
+                        outcome,
+                        &registry,
+                        &crate::plugins::PluginManager::new(),
+                        || {
                             assert_eq!(a.receiver.try_recv(), Ok(None));
                             assert!(
                                 registry.resolve(&request_id, &result_id).is_err(),
                                 "cleanup must follow result invalidation"
                             );
                             cleanup.set(true);
-                        });
+                        },
+                    );
                     assert_eq!(result.is_err(), case == "partial-error");
                     assert_eq!(cleanup.get(), changed);
                     let copies = Cell::new(0);
