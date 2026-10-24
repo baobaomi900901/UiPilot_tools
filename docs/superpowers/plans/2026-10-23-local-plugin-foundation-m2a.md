@@ -132,10 +132,10 @@
 
 **Dependencies:** Task 6；设计 §1、§3–8、§12–14、§16.3/12/16。选最接近的 `com.uipilot.demo-return`，运行时/测试沿其 mock Host 模式，不改旧示例 manifest 最低版本。
 
-- [ ] SDK invocation 增加可选 commandId，并准确解释新 wire 必有/旧 wire 完全省略、一个 onCommand 内按 ID 分派；文档区分 Manifest/API/state/report 版本和 Host/CLI 包版本，明确 replacing nameOverride、ID 删除/重加、包回退与旧二进制读 schema 2 不受保证。
-- [ ] 双命令示例使用一个 runtime.js，live upper 与 submit lower 两入口，共享包级状态/设置，只有必要权限；拒绝未知 ID，不能 default 分支随便执行第一命令。测试可明确验证 constructor 变体，但不需要为此增加第三产品命令。
-- [ ] README 给出离线测试、pack、Host 0.5.0 安装和预期交互步骤，明确此示例在 Task 8 发布前不为 current 0.4.0 接受。本任务将完整示例包放在 `tests/fixtures/multi-package/`（目录名不是 `package`），Node/runtime 和 Rust staging 测试直接使用它；协调器仍发现测试/SDK，但不把这个尚未发布的 fixture 当正式参考 package。Task 8 将该目录原子移动为示例根 `package/` 并更新导入，不增加发现白名单或重复生产 runtime。
-- [ ] 为真实目录/归档 Host staging 添加显式 0.5.0 Host 测试，验证完整新包及旧示例原包；SDK 正反类型用例覆盖 optional 字段，runtime keys 的 legacy golden 不改。纯静态 staging 不启动实际插件服务。
+- [x] SDK invocation 增加可选 commandId，并准确解释新 wire 必有/旧 wire 完全省略、一个 onCommand 内按 ID 分派；文档区分 Manifest/API/state/report 版本和 Host/CLI 包版本，明确 replacing nameOverride、ID 删除/重加、包回退与旧二进制读 schema 2 不受保证。
+- [x] 双命令示例使用一个 runtime.js，live upper 与 submit lower 两入口，共享包级状态/设置，只有必要权限；拒绝未知 ID，不能 default 分支随便执行第一命令。测试可明确验证 constructor 变体，但不需要为此增加第三产品命令。
+- [x] README 给出离线测试、pack、Host 0.5.0 安装和预期交互步骤，明确此示例在 Task 8 发布前不为 current 0.4.0 接受。本任务将完整示例包放在 `tests/fixtures/multi-package/`（目录名不是 `package`），Node/runtime 和 Rust staging 测试直接使用它；协调器仍发现测试/SDK，但不把这个尚未发布的 fixture 当正式参考 package。Task 8 将该目录原子移动为示例根 `package/` 并更新导入，不增加发现白名单或重复生产 runtime。
+- [x] 为真实目录/归档 Host staging 添加显式 0.5.0 Host 测试，验证完整新包及旧示例原包；SDK 正反类型用例覆盖 optional 字段，runtime keys 的 legacy golden 不改。纯静态 staging 不启动实际插件服务。
 
 **Distinct test coverage:** 两 ID 输出正确及未知 ID 明确失败，旧 command invocation 缺 key、新形态必带 ID；shared runtime/settings/storage 由一个包管理；跨版本/reorder 的 identity 不按启动名分派；新示例正确要求 .5，0.4 current 拒绝，显式 .5 Host 真实 stage 成功，旧 return/panel/window/pomodoro 仍 stage。SDK contract 无新增 actions/onAction、hotkeys 或多命令 panel API。所有测试只用临时数据/假 Host，不读取真实凭据。
 
