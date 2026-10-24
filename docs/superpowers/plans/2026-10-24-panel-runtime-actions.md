@@ -1,6 +1,6 @@
 # Panel Runtime Actions Implementation Plan
 
-Implementation status: both tasks have passed focused checks and independent review at source125e9d7. The 0.6.0 executable and templates1.0.0 archive are ready under .superpowers/deliveries/uipilot-0.6.0-acceptance/. User native acceptance remains PENDING; checked implementation items do not mean manual PASS.
+Implementation status: both tasks have passed focused checks and independent review at source125e9d7. The 0.6.0 executable and templates1.0.0 archive are ready under .superpowers/deliveries/uipilot-0.6.0-acceptance/. User confirmed all eight requested manual cases passed on 2026-10-25. Implementation, independent review and this bounded delivery acceptance are complete; the larger foundation roadmap remains open.
 
 > For agentic workers: use subagent-driven-development with one source writer and a combined specification/quality review per cohesive task.
 
