@@ -53,11 +53,10 @@ pub(crate) struct EffectiveCommandConfig {
     pub(crate) favorite: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CommandState {
     default_name: String,
-    #[serde(deserialize_with = "codec::required_override")]
     name_override: Option<String>,
     favorite: bool,
 }

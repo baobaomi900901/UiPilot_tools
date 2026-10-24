@@ -1068,6 +1068,99 @@ fn schema_two_strict_structure_and_defaults() {
 }
 
 #[test]
+fn schema_two_command_entries_require_objects_in_raw_bytes() {
+    let parse = |entry: &str| {
+        let raw = format!(
+            r#"{{"schema":2,"pluginId":"com.example.schema","version":"1.0.0","commands":{{"default":{entry}}},"installed":true,"enabled":true,"permissionGrants":[],"inventoryRevision":7,"settings":{{}}}}"#
+        );
+        parse_document(raw.as_bytes(), "com.example.schema")
+    };
+    for entry in [
+        r#"{"defaultName":"schema","nameOverride":null,"favorite":false}"#,
+        r#"{"favorite":true,"nameOverride":"custom","defaultName":"schema"}"#,
+    ] {
+        assert!(parse(entry).is_some(), "valid object: {entry}");
+    }
+    for entry in [
+        r#"["schema",null,false]"#,
+        r#"["schema","custom",true]"#,
+        r#"[]"#,
+        r#"{"defaultName":"schema","favorite":false}"#,
+        r#"{"defaultName":"schema","nameOverride":null,"favorite":false,"extra":0}"#,
+        r#"{"defaultName":"schema","defaultName":"other","nameOverride":null,"favorite":false}"#,
+        r#"{"defaultName":"schema","nameOverride":null,"nameOverride":"custom","favorite":false}"#,
+        r#"{"defaultName":"schema","nameOverride":null,"favorite":false,"favorite":true}"#,
+    ] {
+        assert!(parse(entry).is_none(), "invalid command entry: {entry}");
+    }
+}
+
+#[test]
+fn schema_two_command_array_is_quarantined_and_recovers_revoked_backup() {
+    let dir = TestDir::new("command-array-recovery");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let plugin = network_manifest("1.0.0", &["api.example.com"]);
+    let original_config = store
+        .install_or_upgrade(&plugin, network_permission_grants())
+        .unwrap();
+    let owner = dir.path().join(&plugin.plugin_id);
+    let paths = AtomicPaths::new(&owner, "state.json");
+    let backup = fs::read(paths.current()).unwrap();
+    fs::write(paths.backup(), &backup).unwrap();
+    let mut current: Value = serde_json::from_slice(&backup).unwrap();
+    current["commands"]["default"] = json!(["primary", null, false]);
+    current["settings"] = json!({"latest":"not-in-backup"});
+    let corrupt = serde_json::to_vec(&current).unwrap();
+    fs::write(paths.current(), &corrupt).unwrap();
+
+    let restored = PluginStateStore::load(dir.path(), []).unwrap();
+    let config = restored.config(&plugin.plugin_id).unwrap().unwrap();
+    assert_eq!(config.commands, original_config.commands);
+    assert!(!config.settings.contains_key("latest"));
+    assert!(!config
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert!(config.network_https_hosts_grant.is_empty());
+    assert!(config.network_credentials_grant.is_empty());
+    assert_eq!(fs::read(paths.backup()).unwrap(), backup);
+    let quarantined: Vec<_> = fs::read_dir(&owner)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("state.json.invalid-")
+        })
+        .collect();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(fs::read(&quarantined[0]).unwrap(), corrupt);
+    let durable = fs::read(paths.current()).unwrap();
+    assert_eq!(
+        restored.lock().unwrap().by_plugin[&plugin.plugin_id].raw,
+        durable
+    );
+    let document = parse_document(&durable, &plugin.plugin_id).unwrap();
+    assert_eq!(
+        document.commands,
+        parse_document(&backup, &plugin.plugin_id).unwrap().commands
+    );
+    assert!(document.network_https_hosts_grant.is_empty());
+    assert!(document.network_credentials_grant.is_empty());
+    assert!(!document
+        .permission_grants
+        .contains(&PublicPermission::NetworkHttps));
+    assert_eq!(
+        PluginStateStore::load(dir.path(), [])
+            .unwrap()
+            .config(&plugin.plugin_id)
+            .unwrap()
+            .unwrap(),
+        config
+    );
+}
+
+#[test]
 fn repeated_stored_override_is_a_true_noop_but_explicit_default_is_a_change() {
     let dir = TestDir::new("override-noop");
     let store = PluginStateStore::load(dir.path(), []).unwrap();

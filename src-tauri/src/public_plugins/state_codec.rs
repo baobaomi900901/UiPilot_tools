@@ -71,6 +71,38 @@ pub(super) fn decode_document(bytes: &[u8]) -> Option<PluginStateDocument> {
     Some(document)
 }
 
+impl<'de> Deserialize<'de> for CommandState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Command;
+        impl<'de> Visitor<'de> for Command {
+            type Value = CommandState;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a command state object")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Fields {
+                    default_name: String,
+                    #[serde(deserialize_with = "required_override")]
+                    name_override: Option<String>,
+                    favorite: bool,
+                }
+                // Reuse strict field decoding on the original map, without accepting
+                // serde's positional struct representation or buffering through Value.
+                let fields =
+                    Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(CommandState {
+                    default_name: fields.default_name,
+                    name_override: fields.name_override,
+                    favorite: fields.favorite,
+                })
+            }
+        }
+        deserializer.deserialize_map(Command)
+    }
+}
+
 pub(super) fn required_override<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
