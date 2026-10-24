@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令实施计划
 
-状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Tasks 3–8 待执行，M2-A 尚未完成。
+状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Task 3 已完成并通过独立规格/质量评审（`bd8707a`）；Tasks 4–8 待执行，M2-A 尚未完成。
 
 > **For agentic workers:** 使用 `subagent-driven-development`；单写者顺序实施，每任务通过独立 Spec 与 Quality 双门禁后才可开始下一任务。
 
@@ -73,11 +73,11 @@
 
 **Dependencies:** Task 2；设计 §4–7、§8 的 activation/context 严格形状、§16.3–5/16。管理旧 IPC 缺失兼容和完整名称编辑体验由 Task 5 收口；此任务的新 activation/context 从第一天严格要求 commandId。
 
-- [ ] 以完整有效名称表原子注册并按命令 ID 定位；每条命令有独立 suggestion、summary 与包名/启动名显示，排序末尾 ID 稳定破同值。完成新 inventory commands 列表与所有前后端 parser/mock/preview/组件的同批类型切换，包级开关/设置不复制。
-- [ ] commandId 从 route、request candidate、pending submission、dispatch 到绑定 completion 全程保存；waiting/replacement/recovery 使用保存的 ID/input。invocation 仅新 wire 带 ID，legacy 严格省略 key。仍一个 Runtime、pluginId 队列和现有超时，不把 ID 当 generation/admission。
-- [ ] 主结果 activation 与 command context、snapshot 及其所有构造/消费者同任务更新；前端严格保留 validated ID，错误兄弟 ID 不匹配。收藏 DTO 新字段的构造/消费者必要类型传播同批完成，但 Task 5 拥有完整收藏菜单/管理入口验收。
-- [ ] 私有 CopyText action 加命令归属，执行时验证命令属于当前 activation 配置，继续以 opaque handle 和现有授权/窗口/结果域执行；所有复制动作构造与 match 分支一起改，不能留下默认 ID 或前端文本执行入口。
-- [ ] 旧 panel/window 仅显式 legacy/default 路径，原包 manifest 不改。新包完全不含 default、合法 constructor ID 均可经同一完整链运行。
+- [x] 以完整有效名称表原子注册并按命令 ID 定位；每条命令有独立 suggestion、summary 与包名/启动名显示，排序末尾 ID 稳定破同值。完成新 inventory commands 列表与所有前后端 parser/mock/preview/组件的同批类型切换，包级开关/设置不复制。
+- [x] commandId 从 route、request candidate、pending submission、dispatch 到绑定 completion 全程保存；waiting/replacement/recovery 使用保存的 ID/input。invocation 仅新 wire 带 ID，legacy 严格省略 key。仍一个 Runtime、pluginId 队列和现有超时，不把 ID 当 generation/admission。
+- [x] 主结果 activation 与 command context、snapshot 及其所有构造/消费者同任务更新；前端严格保留 validated ID，错误兄弟 ID 不匹配。收藏 DTO 新字段的构造/消费者必要类型传播同批完成，但 Task 5 拥有完整收藏菜单/管理入口验收。
+- [x] 私有 CopyText action 加命令归属，执行时验证命令属于当前 activation 配置，继续以 opaque handle 和现有授权/窗口/结果域执行；所有复制动作构造与 match 分支一起改，不能留下默认 ID 或前端文本执行入口。
+- [x] 旧 panel/window 仅显式 legacy/default 路径，原包 manifest 不改。新包完全不含 default、合法 constructor ID 均可经同一完整链运行。
 
 **Distinct test coverage:** 显式 0.5.0 Host 上 live A 与 submit B 一个 Runtime；A running→B waiting→query 改变→迟到 A completion，仅绑定 route 决定归属，B 保留原 ID/input；waiting 被替换和 timeout/rebuild 的两个事件序列分别验证。A/B 返回相同插件 result.id 不串结果；重排、改名后别人占旧名不接管旧句柄；错误 request/result/window/result-set、前端自报文本/commandId 均不能重解释动作。新 activation/context 缺失/null/空/非法/未知 ID 被拒；constructor 从 manifest 到 route/store/invocation/context/opaque action 正确。旧 invocation 精确键集仍相同；demo-return/demo-panel/demo-win/pomodoro 的旧路径可用。完整集合原子性另测：已安装旧双命令集合及其 override/favorite；安装或升级候选含一个合法变更及另一条与同包、其他插件、内置或 quicklinks 冲突的命令，或完整候选 prepared 后 commit 为 NotCommitted 且旧字节复核成功；整个候选拒绝，旧包/全部路由/状态字节与命令覆盖/收藏均保持，无半注册。成功升级一次性发布完整集合；Unknown/复核失败沿 Tasks 2/4 fail-closed 合同，不断言旧可用性。
 
