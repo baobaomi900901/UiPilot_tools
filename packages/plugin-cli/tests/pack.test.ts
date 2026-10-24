@@ -6,6 +6,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { packPackage } from '../src/pack.js'
 import { readArchiveSnapshot } from '../src/archive-reader.js'
 import { validateSnapshot } from '../src/validate.js'
+import { SnapshotBuilder } from '../src/package-policy.js'
+
+import { multiCommandManifest } from './multi-command-fixture.js'
 
 const roots: string[] = []
 const options = { hostPlatform: 'linux' as const }
@@ -151,4 +154,22 @@ describe('packPackage', () => {
     await expect(packPackage(request, { ...options, publication: { write: async () => { throw new Error('unknown') } } })).rejects.toThrow('unknown')
     expect(await readdir(request.root)).toEqual(['source'])
   })
+})
+
+
+it('embeds the same per-command directory diagnostics and metadata in a production-incompatible pack', async () => {
+  const request = await setup()
+  const manifest = multiCommandManifest()
+  manifest.commands[0].summary = ''
+  manifest.commands[1].inputRequired = true
+  await writeFile(join(request.source, 'plugin.json'), JSON.stringify(manifest))
+  const result = await packPackage(request, options)
+  const snapshot = new SnapshotBuilder('directory')
+  snapshot.addFile('plugin.json', Buffer.from(JSON.stringify(manifest)))
+  snapshot.addFile('dist/runtime.js', Buffer.from('export {}\n'))
+  const expected = validateSnapshot(snapshot.finish(), resolve(request.source), 'windows')
+  expect(result).toMatchObject({ created: false, error: { code: 'PACKAGE_INVALID' } })
+  expect(result.validation).toEqual(expected)
+  expect(result.validation?.issues.map(issue => issue.commandId)).toEqual(['upper', 'constructor', undefined])
+  expect(await readdir(request.root)).toEqual(['source'])
 })

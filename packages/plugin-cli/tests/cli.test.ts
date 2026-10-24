@@ -1,3 +1,10 @@
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { validatePackage } from '../src/source-validation.js'
+import { packPackage } from '../src/pack.js'
+import { createZip } from './zip-fixture.js'
+import { multiCommandManifest } from './multi-command-fixture.js'
 import { describe, expect, it } from 'vitest'
 
 import { parseCli, renderCliError, renderHumanReport, runCli } from '../src/cli.js'
@@ -163,3 +170,91 @@ describe('pack CLI', () => {
     expect((await runCli(['validate'], 'win32', async () => validReport)).stdout).toBe('CLI_USAGE: Provide exactly one source.\n')
   })
 })
+
+
+it('renders command context and pointer-only schema findings without requiring plugin metadata', async () => {
+  const issues = [
+    { code: 'MANIFEST_SEMANTIC_INVALID' as const, path: 'plugin.json', location: { kind: 'jsonPointer' as const, value: '/commands/1/inputPlaceholder' }, commandId: 'lower', message: 'Placeholder is required.' },
+    { code: 'MANIFEST_SCHEMA_INVALID' as const, path: 'plugin.json', location: { kind: 'jsonPointer' as const, value: '/commands/0/id' }, message: 'Manifest must have required property id.' },
+  ]
+  const { plugin: _, ...envelope } = validReport
+  const report = { ...envelope, valid: false, issues }
+  const lines = 'plugin.json: MANIFEST_SEMANTIC_INVALID [command lower at /commands/1/inputPlaceholder]: Placeholder is required.\n' +
+    'plugin.json: MANIFEST_SCHEMA_INVALID [/commands/0/id]: Manifest must have required property id.'
+  expect(renderHumanReport(report)).toBe('Invalid UiPilot public plugin (2 issues).\n' + lines)
+  const packed = { schemaVersion: 1 as const, created: false as const, output: { path: 'out' }, error: { code: 'PACKAGE_INVALID' as const, message: 'Cannot create package.' }, validation: report }
+  expect(await runCli(['pack', 'plugin', '--output', 'out'], 'win32', async () => report, async () => packed)).toEqual({
+    exitCode: 1, stdout: 'PACKAGE_INVALID: Cannot create package.\n' + lines + '\n',
+  })
+})
+
+
+it('locks actual legacy directory/archive JSON and human bytes and pack embedded reports to baseline goldens', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'uipilot-legacy-golden-'))
+  try {
+    for (const status of ['valid', 'invalid']) {
+      const manifest = await readFile(`tests/fixtures/legacy-reports/${status}-manifest.json`)
+      const directory = join(root, status)
+      await mkdir(join(directory, 'dist'), { recursive: true })
+      await writeFile(join(directory, 'plugin.json'), manifest)
+      await writeFile(join(directory, 'dist/runtime.js'), 'export {}')
+      const archive = join(root, `${status}.uipilot-plugin`)
+      await writeFile(archive, createZip([{ name: 'plugin.json', data: manifest }, { name: 'dist/runtime.js', data: Buffer.from('export {}') }]))
+      const validate = (request: { source: string; platform: 'windows' | 'macos' }) => validatePackage(request, { hostPlatform: 'linux' })
+      for (const [kind, source] of [['directory', directory], ['archive', archive]] as const) {
+        const report = await validate({ source, platform: 'windows' })
+        const canonical = { ...report, source: { kind, path: '<source>' } }
+        expect(JSON.stringify(canonical) + '\n').toBe(await readFile(`tests/fixtures/legacy-reports/${status}-${kind}.json`, 'utf8'))
+        const expectedText = await readFile(`tests/fixtures/legacy-reports/${status}-${kind}.txt`, 'utf8')
+        expect(await runCli(['validate', source], 'win32', validate)).toEqual({ exitCode: status === 'valid' ? 0 : 1, stdout: expectedText })
+        expect(await runCli(['validate', source, '--json'], 'win32', validate)).toEqual({ exitCode: status === 'valid' ? 0 : 1, stdout: JSON.stringify(report) + '\n' })
+      }
+      const packed = await packPackage({ source: directory, output: join(root, `${status}-packed.uipilot-plugin`), platform: 'windows' }, { hostPlatform: 'linux' })
+      expect(packed.validation).toEqual(await validate({ source: directory, platform: 'windows' }))
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+}, 30_000)
+
+
+
+it('keeps legacy pointer and byte-offset human formatting and pack failure envelope exact', async () => {
+  const report = { ...validReport, valid: false, issues: [
+    { code: 'MANIFEST_SCHEMA_INVALID' as const, path: 'plugin.json', location: { kind: 'jsonPointer' as const, value: '/command' }, message: 'Manifest must have required property inputRequired.' },
+    { code: 'MANIFEST_JSON_INVALID' as const, path: 'plugin.json', location: { kind: 'byteOffset' as const, value: '14' }, message: 'plugin.json is not strict JSON.' },
+  ] }
+  expect(renderHumanReport(report)).toBe('Invalid UiPilot public plugin (2 issues).\n' +
+    'plugin.json: MANIFEST_SCHEMA_INVALID: Manifest must have required property inputRequired.\n' +
+    'plugin.json: MANIFEST_JSON_INVALID: plugin.json is not strict JSON.')
+  const packed = { schemaVersion: 1 as const, created: false as const, output: { path: 'out' }, error: { code: 'PACKAGE_INVALID' as const, message: 'Package validation failed.' }, validation: report }
+  expect(await runCli(['pack', 'plugin', '--output', 'out'], 'win32', async () => report, async () => packed)).toEqual({
+    exitCode: 1, stdout: 'PACKAGE_INVALID: Package validation failed.\n',
+  })
+})
+
+it('shares command-local findings across real directory/archive validation and human pack output', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'uipilot-command-diagnostics-'))
+  try {
+    const value = multiCommandManifest()
+    value.commands[0].summary = ''
+    value.commands[1].inputRequired = true
+    const manifest = Buffer.from(JSON.stringify(value))
+    const directory = join(root, 'package')
+    await mkdir(join(directory, 'dist'), { recursive: true })
+    await writeFile(join(directory, 'plugin.json'), manifest)
+    await writeFile(join(directory, 'dist/runtime.js'), 'export {}')
+    const archive = join(root, 'package.uipilot-plugin')
+    await writeFile(archive, createZip([{ name: 'plugin.json', data: manifest }, { name: 'dist/runtime.js', data: Buffer.from('export {}') }]))
+    const validate = (request: { source: string; platform: 'windows' | 'macos' }) => validatePackage(request, { hostPlatform: 'linux' })
+    const first = await validate({ source: directory, platform: 'windows' })
+    const second = await validate({ source: archive, platform: 'windows' })
+    expect({ ...second, source: first.source }).toEqual(first)
+    const lines = [
+      'plugin.json: MANIFEST_SEMANTIC_INVALID [command upper at /commands/0/summary]: Command summary must be nonempty, at most 512 Unicode scalars, and contain no control characters.',
+      'plugin.json: MANIFEST_SEMANTIC_INVALID [command constructor at /commands/1/inputPlaceholder]: A command requiring input must have a nonempty placeholder.',
+      'plugin.json: API_INCOMPATIBLE [/minimumHostVersion]: Plugin API or minimum host version is incompatible.',
+    ].join('\n')
+    expect((await runCli(['validate', archive], 'win32', validate)).stdout).toBe('Invalid UiPilot public plugin (3 issues).\n' + lines + '\n')
+    const packed = await runCli(['pack', directory, '--output', join(root, 'out.uipilot-plugin')], 'win32', validate, request => packPackage(request, { hostPlatform: 'linux' }))
+    expect(packed).toEqual({ exitCode: 1, stdout: 'PACKAGE_INVALID: Package validation failed.\n' + lines + '\n' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+}, 30_000)

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.example.diagnostics",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.5.0",
+  "name": "Diagnostics",
+  "supportedPlatforms": [
+    "windows"
+  ],
+  "commands": [
+    {
+      "id": "upper",
+      "defaultName": "upper",
+      "activationMode": "submit",
+      "outputMode": "mainResult",
+      "inputRequired": false
+    },
+    {
+      "id": "constructor",
+      "defaultName": "lower",
+      "activationMode": "live",
+      "outputMode": "mainResult",
+      "inputRequired": false
+    }
+  ],
+  "runtime": {
+    "entry": "dist/runtime.js"
+  },
+  "permissions": [],
+  "settings": []
+}

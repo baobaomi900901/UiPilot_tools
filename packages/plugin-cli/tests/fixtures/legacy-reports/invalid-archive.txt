@@ -1,0 +1,2 @@
+Invalid UiPilot public plugin (1 issue).
+plugin.json: MANIFEST_SEMANTIC_INVALID: Manifest fields or output relationships are invalid.

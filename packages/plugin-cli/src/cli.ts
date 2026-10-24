@@ -2,6 +2,7 @@ import type {
   PackPackage,
   PluginCliErrorV1,
   PluginPlatform,
+  PluginValidationIssue,
   PluginValidationReportV1,
   ValidatePackage,
 } from './contracts.js'
@@ -95,6 +96,18 @@ export function renderCliError(
   return JSON.stringify({ schemaVersion: 1, error: { code, message } } satisfies PluginCliErrorV1)
 }
 
+function hasCommandContext(report: PluginValidationReportV1, issue: PluginValidationIssue): boolean {
+  return report.plugin?.commands !== undefined ||
+    (issue.location?.kind === 'jsonPointer' && /^\/commands(?:\/|$)/u.test(issue.location.value))
+}
+
+function renderHumanIssue(issue: PluginValidationIssue, commandContext: boolean): string {
+  const path = issue.path ? `${issue.path}: ` : ''
+  const pointer = commandContext && issue.location?.kind === 'jsonPointer' ? issue.location.value : undefined
+  const context = pointer !== undefined ? ` [${issue.commandId !== undefined ? `command ${issue.commandId} at ` : ''}${pointer}]` : ''
+  return `${path}${issue.code}${context}: ${issue.message}`
+}
+
 export function renderHumanReport(report: PluginValidationReportV1): string {
   if (report.valid) {
     const identity = report.plugin ? ` ${report.plugin.pluginId}@${report.plugin.version}` : ''
@@ -102,8 +115,7 @@ export function renderHumanReport(report: PluginValidationReportV1): string {
   }
   const lines = [`Invalid UiPilot public plugin (${report.issues.length} issue${report.issues.length === 1 ? '' : 's'}).`]
   for (const issue of report.issues) {
-    const path = issue.path ? `${issue.path}: ` : ''
-    lines.push(`${path}${issue.code}: ${issue.message}`)
+    lines.push(renderHumanIssue(issue, hasCommandContext(report, issue)))
   }
   if (report.truncated) lines.push('Additional issues were omitted.')
   return lines.join('\n')
@@ -128,7 +140,18 @@ export async function runCli(
       const report = await packPackage({ source: parsed.source, output: parsed.output, platform: parsed.platform })
       let text: string
       if (parsed.json) text = JSON.stringify(report)
-      else if (!report.created) text = report.error.code + ': ' + report.error.message
+      else if (!report.created) {
+        text = report.error.code + ': ' + report.error.message
+        if (report.validation) {
+          const validation = report.validation
+          for (const issue of validation.issues) if (hasCommandContext(validation, issue)) {
+            text += '\n' + renderHumanIssue(issue, true)
+          }
+          if (validation.truncated && validation.issues.some(issue => hasCommandContext(validation, issue))) {
+            text += '\nAdditional issues were omitted.'
+          }
+        }
+      }
       else {
         text = 'Created ' + report.output.path + '\nSHA-256: ' + report.output.sha256
         for (const warning of report.warnings ?? []) text += '\nWarning: ' + warning.code + ': ' + warning.message

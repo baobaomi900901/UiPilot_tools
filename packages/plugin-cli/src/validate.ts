@@ -135,6 +135,7 @@ export function validateSnapshot(
         path: 'plugin.json',
         location: issue.location,
         message: issue.message,
+        ...(issue.commandId !== undefined ? { commandId: issue.commandId } : {}),
       })
     })
     if (manifest) {

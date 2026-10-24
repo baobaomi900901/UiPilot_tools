@@ -6,6 +6,8 @@ import { SnapshotBuilder } from '../src/package-policy.js'
 import { validateSnapshot } from '../src/validate.js'
 import { createWav } from './wav-fixture.js'
 
+import { multiCommandManifest } from './multi-command-fixture.js'
+
 function timerSnapshot(includeAlarm = true) {
   const manifest = {
     schemaVersion: 1,
@@ -122,4 +124,42 @@ it('reports declared commands in order with fixed aggregate mode even on compati
       expect(report.issues.map((issue) => issue.code)).toContain('API_INCOMPATIBLE')
     } else expect(report.plugin).toBeUndefined()
   }
+})
+
+
+
+it('forwards command identities while leaving shared failures unowned and preserving phase order', () => {
+  const value = multiCommandManifest()
+  value.commands[0].inputRequired = true
+  value.commands[1].summary = ''
+  value.permissions = ['clipboard.read']
+  const builder = new SnapshotBuilder('directory')
+  builder.addFile('plugin.json', Buffer.from(JSON.stringify(value)))
+  const report = validateSnapshot(builder.finish(), 'multi', 'macos')
+  expect(report.plugin?.commands?.map(command => command.commandId)).toEqual(['upper', 'constructor'])
+  expect(report.issues.map(issue => issue.code)).toEqual([
+    'MANIFEST_SEMANTIC_INVALID', 'MANIFEST_SEMANTIC_INVALID', 'PLATFORM_INCOMPATIBLE', 'API_INCOMPATIBLE', 'PERMISSION_UNSUPPORTED', 'ENTRY_MISSING',
+  ])
+  expect(report.issues.slice(0, 2).map(issue => [issue.commandId, issue.location?.value])).toEqual([
+    ['upper', '/commands/0/inputPlaceholder'], ['constructor', '/commands/1/summary'],
+  ])
+  expect(report.issues.slice(2).every(issue => !Object.hasOwn(issue, 'commandId'))).toBe(true)
+})
+
+it('caps mixed command/resource findings at the same smallest 100 keys with stable phases', () => {
+  const value = multiCommandManifest()
+  value.commands[0].summary = ''
+  value.commands[1].inputRequired = true
+  const builder = new SnapshotBuilder('directory')
+  builder.addFile('plugin.json', Buffer.from(JSON.stringify(value)))
+  builder.addFile('icon.png', Buffer.from('bad'))
+  for (let index = 104; index >= 0; index -= 1) builder.addFile(`dist/${String(index).padStart(3, '0')}.css`, Buffer.from('@import "missing.css";'))
+  const report = validateSnapshot(builder.finish(), 'multi', 'windows')
+  expect(report.truncated).toBe(true)
+  expect(report.issues).toHaveLength(100)
+  expect(report.issues.slice(0, 5).map(issue => issue.code)).toEqual([
+    'MANIFEST_SEMANTIC_INVALID', 'MANIFEST_SEMANTIC_INVALID', 'API_INCOMPATIBLE', 'ENTRY_MISSING', 'ICON_INVALID',
+  ])
+  expect(report.issues[5]?.path).toBe('dist/000.css')
+  expect(report.issues.at(-1)?.path).toBe('dist/094.css')
 })

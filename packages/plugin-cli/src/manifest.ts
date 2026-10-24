@@ -272,62 +272,43 @@ function validCommand(command: PublicCommandV1): boolean {
     (command.inputPlaceholder == null || plainText(command.inputPlaceholder))
 }
 
-function semanticValid(manifest: PublicManifestV1): boolean {
+function sharedSemanticPointers(manifest: PublicManifestV1): string[] {
   const settings = manifest.settings ?? []
+  const rules: Array<readonly [boolean, string]> = [
+    [manifest.schemaVersion !== 1, '/schemaVersion'],
+    [!/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/u.test(manifest.pluginId), '/pluginId'],
+    [!canonicalVersion(manifest.version), '/version'],
+    [!nonemptyPlainText(manifest.name), '/name'],
+    [manifest.description != null && !plainText(manifest.description), '/description'],
+    [manifest.supportedPlatforms.length === 0 || duplicates(manifest.supportedPlatforms), '/supportedPlatforms'],
+    [!validEntry(manifest.runtime.entry, 'js'), '/runtime/entry'],
+    [manifest.window != null && !validEntry(manifest.window.entry, 'html'), '/window/entry'],
+    [manifest.panel != null && !validEntry(manifest.panel.entry, 'html'), '/panel/entry'],
+    [manifest.panel?.hostKeys != null && (manifest.panel.hostKeys.length > 8 || duplicates(manifest.panel.hostKeys)), '/panel/hostKeys'],
+    [manifest.network != null && (manifest.network.httpsHosts.length === 0 || manifest.network.httpsHosts.length > 8 ||
+      duplicates(manifest.network.httpsHosts) || manifest.network.httpsHosts.some(host => !validHttpsHost(host))), '/network/httpsHosts'],
+    [duplicates(manifest.permissions), '/permissions'],
+    [settings.some(setting => !validSetting(setting)) || duplicates(settings.map(setting => setting.key)), '/settings'],
+    [(manifest.network != null) !== manifest.permissions.includes('network.https'), '/network'],
+  ]
+  if (manifest.network?.credentials) {
+    const credentials = manifest.network.credentials
+    rules.push([credentials.length === 0 || credentials.length > 8 ||
+      duplicates(credentials.map(credential => credential.id)) || credentials.some(credential =>
+        !validSettingKey(credential.id) || !validSettingKey(credential.settingKey) || !validHttpsHost(credential.host) ||
+        !manifest.network!.httpsHosts.includes(credential.host) ||
+        !settings.some(setting => setting.key === credential.settingKey && setting.type === 'secret'),
+      ), '/network/credentials'])
+  }
+  return rules.filter(([invalid]) => invalid).map(([, pointer]) => pointer)
+}
+
+function semanticValid(manifest: PublicManifestV1): boolean {
   const permissions = manifest.permissions
   const hasClipboardHistoryRead = permissions.includes('clipboard.history.read')
   const hasClipboardHistoryPaste = permissions.includes('clipboard.history.paste')
-  if (
-    manifest.schemaVersion !== 1 ||
-    !/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/u.test(manifest.pluginId) ||
-    !canonicalVersion(manifest.version) ||
-    !nonemptyPlainText(manifest.name) ||
-    (manifest.description != null && !plainText(manifest.description)) ||
-    manifest.supportedPlatforms.length === 0 ||
-    duplicates(manifest.supportedPlatforms) ||
-    normalizedCommands(manifest).some(({ command }) => !validCommand(command)) ||
-    (manifest.commands !== undefined && (
-      manifest.commands.length < 1 || manifest.commands.length > MAX_PUBLIC_COMMANDS ||
-      manifest.commands.some((command) => !/^[a-z][a-z0-9-]{0,31}$/u.test(command.id) || command.outputMode !== 'mainResult') ||
-      duplicates(manifest.commands.map((command) => command.id)) ||
-      duplicates(manifest.commands.map((command) => command.defaultName)) ||
-      Object.hasOwn(manifest, 'window') || Object.hasOwn(manifest, 'panel') ||
-      permissions.some((permission) => ['ui.window', 'ui.panel', 'timer.control', 'clipboard.history.read', 'clipboard.history.paste'].includes(permission))
-    )) ||
-    !validEntry(manifest.runtime.entry, 'js') ||
-    (manifest.window != null && !validEntry(manifest.window.entry, 'html')) ||
-    (manifest.panel != null && !validEntry(manifest.panel.entry, 'html')) ||
-    (manifest.panel?.hostKeys != null &&
-      (manifest.panel.hostKeys.length > 8 || duplicates(manifest.panel.hostKeys))) ||
-    (manifest.network != null &&
-      (manifest.network.httpsHosts.length === 0 ||
-        manifest.network.httpsHosts.length > 8 ||
-        duplicates(manifest.network.httpsHosts) ||
-        manifest.network.httpsHosts.some((host) => !validHttpsHost(host)))) ||
-    duplicates(permissions) ||
-    settings.some((setting) => !validSetting(setting)) ||
-    duplicates(settings.map((setting) => setting.key))
-  ) {
-    return false
-  }
-  if (manifest.network?.credentials) {
-    const credentials = manifest.network.credentials
-    if (
-      credentials.length === 0 ||
-      credentials.length > 8 ||
-      duplicates(credentials.map((credential) => credential.id)) ||
-      credentials.some((credential) =>
-        !validSettingKey(credential.id) ||
-        !validSettingKey(credential.settingKey) ||
-        !validHttpsHost(credential.host) ||
-        !manifest.network!.httpsHosts.includes(credential.host) ||
-        !settings.some((setting) => setting.key === credential.settingKey && setting.type === 'secret'),
-      )
-    ) {
-      return false
-    }
-  }
-  if ((manifest.network != null) !== permissions.includes('network.https')) return false
+  if (sharedSemanticPointers(manifest).length > 0 ||
+    normalizedCommands(manifest).some(({ command }) => !validCommand(command))) return false
   const command = manifest.command
   if (command) {
     if (command.outputMode === 'window') {
@@ -387,11 +368,63 @@ function semanticValid(manifest: PublicManifestV1): boolean {
   return true
 }
 
-function schemaIssue(error: StandaloneValidationError): ManifestValidationIssue {
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+// Count the whole raw array first: no occurrence of a duplicate may claim identity,
+// even while schema errors prevent exposing declaration metadata.
+function diagnosticCommandIds(value: unknown): Array<string | undefined> {
+  if (!record(value) || !Array.isArray(value.commands)) return []
+  const ids = value.commands.map((command: unknown) => record(command) && typeof command.id === 'string' &&
+    /^[a-z][a-z0-9-]{0,31}$/u.test(command.id) ? command.id : undefined)
+  const counts = new Map<string, number>()
+  for (const id of ids) if (id !== undefined) counts.set(id, (counts.get(id) ?? 0) + 1)
+  return ids.map(id => id !== undefined && counts.get(id) === 1 ? id : undefined)
+}
+
+function namedCommandIssues(manifest: PublicManifestV1 & { commands: PublicNamedCommandV1[] }): ManifestValidationIssue[] {
+  const identities = diagnosticCommandIds(manifest)
+  const names = new Map<string, number>()
+  for (const command of manifest.commands) names.set(command.defaultName, (names.get(command.defaultName) ?? 0) + 1)
+  const issues: ManifestValidationIssue[] = []
+  manifest.commands.forEach((command, index) => {
+    const rules: Array<readonly [boolean, string, string]> = [
+      [identities[index] === undefined, 'id', 'Command ID must be valid and unique.'],
+      [!/^[a-z][a-z0-9-]{0,31}$/u.test(command.defaultName), 'defaultName', 'Command defaultName is invalid.'],
+      [(names.get(command.defaultName) ?? 0) > 1, 'defaultName', 'Command defaultName must be unique.'],
+      [command.summary != null && (command.summary.trim().length === 0 || [...command.summary].length > 512 ||
+        /\p{Cc}/u.test(command.summary)), 'summary', 'Command summary must be nonempty, at most 512 Unicode scalars, and contain no control characters.'],
+      [command.inputRequired && !command.inputPlaceholder?.trim(), 'inputPlaceholder', 'A command requiring input must have a nonempty placeholder.'],
+      [command.inputPlaceholder != null && !plainText(command.inputPlaceholder), 'inputPlaceholder', 'Command inputPlaceholder must be plain text.'],
+    ]
+    for (const [invalid, field, message] of rules) if (invalid) issues.push({
+      code: 'MANIFEST_SEMANTIC_INVALID', message,
+      location: { kind: 'jsonPointer', value: `/commands/${index}/${field}` },
+      ...(identities[index] !== undefined ? { commandId: identities[index] } : {}),
+    })
+  })
+  for (const pointer of sharedSemanticPointers(manifest)) issues.push({
+    code: 'MANIFEST_SEMANTIC_INVALID', message: 'Manifest fields or output relationships are invalid.',
+    location: { kind: 'jsonPointer', value: pointer },
+  })
+  return issues
+}
+
+function schemaIssue(error: StandaloneValidationError, identities: readonly (string | undefined)[]): ManifestValidationIssue {
+  let pointer = error.instancePath || ''
+  // Preserve legacy pointers/messages; only new-form item errors gain field precision.
+  const item = /^\/commands\/(0|[1-9][0-9]*)(?:\/|$)/u.exec(pointer)
+  if (item && (error.keyword === 'required' || error.keyword === 'additionalProperties')) {
+    const field = error.params[error.keyword === 'required' ? 'missingProperty' : 'additionalProperty']
+    if (typeof field === 'string') pointer += '/' + field.replaceAll('~', '~0').replaceAll('/', '~1')
+  }
+  const commandId = item ? identities[Number(item[1])] : undefined
   return {
     code: 'MANIFEST_SCHEMA_INVALID',
     message: error.message ? `Manifest ${error.message}.` : 'Manifest does not match Schema.',
-    location: { kind: 'jsonPointer', value: error.instancePath || '' },
+    location: { kind: 'jsonPointer', value: pointer },
+    ...(commandId !== undefined ? { commandId } : {}),
   }
 }
 
@@ -428,19 +461,24 @@ export function validateManifest(
     }
   }
   if (!validateSchema(value)) {
-    return { ok: false, issues: (validateSchema.errors ?? []).map(schemaIssue) }
+    const identities = diagnosticCommandIds(value)
+    return { ok: false, issues: (validateSchema.errors ?? []).map(error => schemaIssue(error, identities)) }
   }
 
   const manifest = value as PublicManifestV1
   const issues: ManifestValidationIssue[] = []
-  if (!semanticValid(manifest)) {
+  if (manifest.commands !== undefined) {
+    issues.push(...namedCommandIssues(manifest as PublicManifestV1 & { commands: PublicNamedCommandV1[] }))
+  } else if (!semanticValid(manifest)) {
     issues.push({
       code: 'MANIFEST_SEMANTIC_INVALID',
       message: 'Manifest fields or output relationships are invalid.',
     })
   }
   if (!manifest.supportedPlatforms.includes(platform)) {
-    issues.push({ code: 'PLATFORM_INCOMPATIBLE', message: `Plugin does not support ${platform}.` })
+    issues.push({ code: 'PLATFORM_INCOMPATIBLE', message: `Plugin does not support ${platform}.`,
+      ...(manifest.commands !== undefined ? { location: { kind: 'jsonPointer' as const, value: '/supportedPlatforms' } } : {}),
+    })
   }
   const minimumHost = canonicalVersion(manifest.minimumHostVersion)
   if (
@@ -459,10 +497,14 @@ export function validateManifest(
     (manifest.network?.credentials !== undefined && versionGreater([0, 4, 0], minimumHost)) ||
     (manifest.network != null && versionGreater([0, 3, 2], minimumHost))
   ) {
-    issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.' })
+    issues.push({ code: 'API_INCOMPATIBLE', message: 'Plugin API or minimum host version is incompatible.',
+      ...(manifest.commands !== undefined ? { location: { kind: 'jsonPointer' as const, value: manifest.apiVersion !== 1 ? '/apiVersion' : '/minimumHostVersion' } } : {}),
+    })
   }
   if (manifest.permissions.some((permission) => !permissionAvailable(permission, platform))) {
-    issues.push({ code: 'PERMISSION_UNSUPPORTED', message: `Plugin declares a permission unavailable on ${platform}.` })
+    issues.push({ code: 'PERMISSION_UNSUPPORTED', message: `Plugin declares a permission unavailable on ${platform}.`,
+      ...(manifest.commands !== undefined ? { location: { kind: 'jsonPointer' as const, value: '/permissions' } } : {}),
+    })
   }
   if (issues.length > 0) return { ok: false, manifest, issues }
   if (manifest.panel?.hostKeys) manifest.panel.hostKeys = canonicalPanelHostKeys(manifest.panel.hostKeys)

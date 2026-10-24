@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest'
 
 import { normalizedCommands, validateManifest } from '../src/manifest.js'
 
+import { multiCommandManifest } from './multi-command-fixture.js'
+
 function timerManifest(): Record<string, unknown> {
   return {
     schemaVersion: 1,
@@ -504,4 +506,84 @@ it('rejects duplicate JSON command fields before schema/normalization', async ()
       ok: false, issues: [{ code: 'MANIFEST_JSON_INVALID' }],
     })
   }
+})
+
+
+// Diagnostic identity is independent of display names and manifest position.
+
+describe('multi-command diagnostics', () => {
+  const check = (value: unknown) => validateManifest(Buffer.from(JSON.stringify(value)), 'windows', [0, 5, 0])
+  const semantic = (value: unknown) => check(value).issues.filter(issue => issue.code === 'MANIFEST_SEMANTIC_INVALID')
+
+  it('retains sibling and multiple same-item failures with exact pointers and stable identity', () => {
+    const value = multiCommandManifest()
+    value.commands[0].summary = ''
+    value.commands[0].inputRequired = true
+    value.commands[1].summary = 'bad\u0000'
+    const findings = semantic(value)
+    expect(findings.map(issue => [issue.commandId, issue.location?.value])).toEqual([
+      ['upper', '/commands/0/summary'], ['upper', '/commands/0/inputPlaceholder'],
+      ['constructor', '/commands/1/summary'],
+    ])
+    value.commands.reverse()
+    expect(semantic(value).map(issue => [issue.commandId, issue.location?.value])).toEqual([
+      ['constructor', '/commands/0/summary'], ['upper', '/commands/1/summary'], ['upper', '/commands/1/inputPlaceholder'],
+    ])
+  })
+
+  it('locates every duplicate ID including the first and never attributes its other failures', () => {
+    const value = multiCommandManifest()
+    value.commands[1].id = 'upper'
+    value.commands[0].summary = ''
+    value.commands[1].inputRequired = true
+    const findings = semantic(value)
+    expect(findings.filter(issue => issue.location?.value.endsWith('/id')).map(issue => issue.location?.value)).toEqual([
+      '/commands/0/id', '/commands/1/id',
+    ])
+    expect(findings).toHaveLength(4)
+    expect(findings.every(issue => !Object.hasOwn(issue, 'commandId'))).toBe(true)
+  })
+
+  it('attributes each duplicate name to its valid unique ID', () => {
+    const value = multiCommandManifest()
+    value.commands[1].defaultName = 'upper'
+    expect(semantic(value).map(issue => [issue.commandId, issue.location?.value])).toEqual([
+      ['upper', '/commands/0/defaultName'], ['constructor', '/commands/1/defaultName'],
+    ])
+  })
+
+  it.each([undefined, '', 'BAD', null, 3])('locates missing/invalid ID %s without inventing identity or metadata', id => {
+    const value = multiCommandManifest()
+    const raw = JSON.parse(JSON.stringify(value))
+    if (id === undefined) delete raw.commands[0].id
+    else raw.commands[0].id = id
+    const result = check(raw)
+    expect(result.manifest).toBeUndefined()
+    expect(result.issues).toContainEqual(expect.objectContaining({ location: { kind: 'jsonPointer', value: '/commands/0/id' } }))
+    expect(result.issues.filter(issue => issue.location?.value === '/commands/0/id').every(issue => !Object.hasOwn(issue, 'commandId'))).toBe(true)
+  })
+
+  it('uses raw unique valid IDs for other schema findings, but never duplicated IDs', () => {
+    const raw = JSON.parse(JSON.stringify(multiCommandManifest()))
+    delete raw.commands[1].inputRequired
+    expect(check(raw).issues).toContainEqual(expect.objectContaining({ commandId: 'constructor', location: { kind: 'jsonPointer', value: '/commands/1/inputRequired' } }))
+    raw.commands[0].id = 'constructor'
+    expect(check(raw).issues.every(issue => !Object.hasOwn(issue, 'commandId'))).toBe(true)
+  })
+
+  it('keeps package and compatibility findings unowned and locatable', () => {
+    const value = multiCommandManifest()
+    value.runtime.entry = '../runtime.js'
+    value.minimumHostVersion = '0.4.0'
+    const result = check(value)
+    expect(result.issues).toContainEqual(expect.objectContaining({ location: { kind: 'jsonPointer', value: '/runtime/entry' } }))
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'API_INCOMPATIBLE', location: { kind: 'jsonPointer', value: '/minimumHostVersion' } }))
+    expect(result.issues.every(issue => !Object.hasOwn(issue, 'commandId'))).toBe(true)
+  })
+
+  it('preserves strict JSON UTF-8 byte offsets', () => {
+    expect(validateManifest(Buffer.from('{"name":"\u4e2d",}'), 'windows')).toEqual({ ok: false, issues: [{
+      code: 'MANIFEST_JSON_INVALID', message: 'plugin.json is not strict JSON.', location: { kind: 'byteOffset', value: '14' },
+    }] })
+  })
 })

@@ -56,3 +56,25 @@ describe('IssueCollector', () => {
     expect(issues.finish().issues.map((issue) => issue.path)).toEqual(['a.js', 'z.js'])
   })
 })
+
+
+it('preserves diagnostic identity without changing frozen key equality or smallest-100 selection', () => {
+  const collector = new IssueCollector()
+  for (let index = 101; index >= 0; index -= 1) {
+    collector.add({
+      phaseRank: 40, ruleRank: index, code: 'MANIFEST_SEMANTIC_INVALID', path: 'plugin.json',
+      location: { kind: 'jsonPointer', value: `/commands/${index}/summary` }, commandId: `cmd-${index}`, message: `issue ${index}`,
+    })
+    if (index === 2) expect(collector.finish().truncated).toBe(false)
+    if (index === 1) expect(collector.finish().truncated).toBe(true)
+  }
+  collector.add({ phaseRank: 40, ruleRank: 0, code: 'MANIFEST_SEMANTIC_INVALID', path: 'plugin.json',
+    location: { kind: 'jsonPointer', value: '/commands/0/summary' }, commandId: 'different', message: 'ignored duplicate' })
+  collector.add({ phaseRank: 30, ruleRank: 0, code: 'MANIFEST_SCHEMA_INVALID', path: 'plugin.json', message: 'earlier' })
+  const report = collector.finish()
+  expect(report.truncated).toBe(true)
+  expect(report.issues).toHaveLength(100)
+  expect(report.issues[0]?.code).toBe('MANIFEST_SCHEMA_INVALID')
+  expect(report.issues[1]).toMatchObject({ commandId: 'cmd-0', message: 'issue 0' })
+  expect(report.issues.at(-1)?.commandId).toBe('cmd-98')
+})
