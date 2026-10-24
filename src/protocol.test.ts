@@ -61,8 +61,7 @@ describe('public plugin timer protocol', () => {
         description: null,
         version: '1.0.0',
         source: 'localPackage',
-        defaultName: 'timer',
-        effectiveName: 'timer',
+        commands: [{ commandId: 'default', defaultName: 'timer', effectiveName: 'timer', nameOverride: null, favorite: false }],
         enabled: true,
         fault: null,
         generation: 1,
@@ -84,8 +83,7 @@ describe('public plugin timer protocol', () => {
         description: null,
         version: '1.0.0',
         source: 'localPackage',
-        defaultName: 'panel',
-        effectiveName: 'panel',
+        commands: [{ commandId: 'default', defaultName: 'panel', effectiveName: 'panel', nameOverride: null, favorite: false }],
         enabled: true,
         fault: null,
         generation: 1,
@@ -105,8 +103,7 @@ describe('public plugin timer protocol', () => {
       description: null,
       version: '1.0.0',
       source: 'localPackage',
-      defaultName: 'network',
-      effectiveName: 'network',
+      commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false }],
       enabled: true,
       fault: null,
       generation: 1,
@@ -174,4 +171,20 @@ describe('public plugin timer protocol', () => {
       expect(parsePublicPluginPrepareSummary({ ...prepared, network })).toBeNull()
     }
   })
+})
+
+
+it('parses the full command inventory with constructor and rejects malformed command identities', () => {
+  const command = { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null, favorite: false }
+  const item = { pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage', commands: [command, { ...command, commandId: 'upper', defaultName: 'upper', effectiveName: 'custom', nameOverride: 'custom', favorite: true }], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
+  const inventory = (commands: unknown) => ({ revision: '1', items: [{ ...item, commands }] })
+  expect(parsePublicPluginInventory(inventory(item.commands))).toEqual(inventory(item.commands))
+  for (const commandId of [undefined, null, '', 'Upper', 'bad id']) {
+    const { commandId: _id, ...rest } = command
+    expect(parsePublicPluginInventory(inventory([{ ...rest, ...(commandId === undefined ? {} : { commandId }) }]))).toBeNull()
+  }
+  for (const commands of [[], [command, command], [{ ...command, extra: true }], [{ ...command, effectiveName: 'forged' }], Array(17).fill(command)]) {
+    expect(parsePublicPluginInventory(inventory(commands))).toBeNull()
+  }
+  expect(parsePublicPluginInventory(inventory([{ ...command, nameOverride: 'lower' }]))).toEqual(inventory([{ ...command, nameOverride: 'lower' }]))
 })

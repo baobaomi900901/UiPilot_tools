@@ -42,6 +42,7 @@ pub(crate) struct PluginSubmissionOwner {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginRequestCandidate {
+    pub(crate) command_id: String,
     pub(crate) plugin_id: String,
     pub(crate) plugin_generation: u64,
     pub(crate) activation_id: u64,
@@ -54,6 +55,7 @@ pub(crate) struct PluginRequestCandidate {
 impl PluginRequestCandidate {
     fn valid(&self) -> bool {
         valid_plugin_id(&self.plugin_id)
+            && super::manifest::valid_command_name(&self.command_id)
             && self.plugin_generation != 0
             && self.activation_id != 0
             && self.admission_epoch != 0
@@ -671,6 +673,7 @@ mod tests {
         mode: PublicActivationMode,
     ) -> PluginRequestCandidate {
         PluginRequestCandidate {
+            command_id: "default".into(),
             plugin_id: "com.example.scheduler".into(),
             plugin_generation: generation,
             activation_id: 17,
@@ -679,6 +682,41 @@ mod tests {
             input: value.into(),
             owner: owner(value),
         }
+    }
+
+    fn command_candidate(
+        command_id: &str,
+        input: &str,
+        generation: u64,
+        mode: PublicActivationMode,
+    ) -> PluginRequestCandidate {
+        let mut candidate = candidate(input, generation, mode);
+        candidate.command_id = command_id.into();
+        candidate
+    }
+
+    #[test]
+    fn command_candidates_reject_invalid_identity_before_reserving() {
+        for id in ["", "Upper", "with space", "constructor.invalid"] {
+            let scheduler = PluginRequestScheduler::default();
+            assert_eq!(
+                scheduler.reserve(command_candidate(
+                    id,
+                    "input",
+                    1,
+                    PublicActivationMode::Live
+                )),
+                Err(PluginScheduleError::InvalidCandidate)
+            );
+        }
+        assert!(PluginRequestScheduler::default()
+            .reserve(command_candidate(
+                "constructor",
+                "input",
+                1,
+                PublicActivationMode::Live
+            ))
+            .is_ok());
     }
 
     #[test]
@@ -898,7 +936,10 @@ mod tests {
         let scheduler = PluginRequestScheduler::default();
         let start = Instant::now();
         let a = match scheduler
-            .enqueue(candidate("A", 1, PublicActivationMode::Live), start)
+            .enqueue(
+                command_candidate("upper", "A", 1, PublicActivationMode::Live),
+                start,
+            )
             .unwrap()
         {
             PluginScheduleOutcome::Dispatched(request) => request,
@@ -913,7 +954,7 @@ mod tests {
         assert_eq!(
             scheduler
                 .enqueue(
-                    candidate("B", 1, PublicActivationMode::Submit),
+                    command_candidate("constructor", "B", 1, PublicActivationMode::Submit),
                     start + Duration::from_secs(1)
                 )
                 .unwrap(),
@@ -934,7 +975,7 @@ mod tests {
         assert!(matches!(
             scheduler
                 .enqueue(
-                    candidate("C", 1, PublicActivationMode::Submit),
+                    command_candidate("lower", "C", 1, PublicActivationMode::Submit),
                     start + Duration::from_secs(2)
                 )
                 .unwrap(),
@@ -950,6 +991,7 @@ mod tests {
         assert!(!completed.accepted);
         let c = completed.next.unwrap();
         assert_eq!(c.candidate.input, "C");
+        assert_eq!(c.candidate.command_id, "lower");
         assert_eq!(c.deadline.duration_since(c.dispatched_at), SUBMIT_TIMEOUT);
         assert_eq!(
             scheduler.context_status(&c.context),
@@ -962,7 +1004,10 @@ mod tests {
         let scheduler = PluginRequestScheduler::default();
         let start = Instant::now();
         let a = match scheduler
-            .enqueue(candidate("A", 7, PublicActivationMode::Live), start)
+            .enqueue(
+                command_candidate("upper", "A", 7, PublicActivationMode::Live),
+                start,
+            )
             .unwrap()
         {
             PluginScheduleOutcome::Dispatched(request) => request,
@@ -970,7 +1015,7 @@ mod tests {
         };
         scheduler
             .enqueue(
-                candidate("B", 7, PublicActivationMode::Live),
+                command_candidate("constructor", "B", 7, PublicActivationMode::Live),
                 start + Duration::from_secs(4),
             )
             .unwrap();
@@ -1008,6 +1053,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(b.candidate.input, "B");
+        assert_eq!(b.candidate.command_id, "constructor");
         assert_eq!(b.candidate.activation_id, 18);
         assert_eq!(b.candidate.admission_epoch, 24);
         assert_eq!(b.context.plugin_generation, 8);
@@ -1019,6 +1065,7 @@ mod tests {
         let scheduler = PluginRequestScheduler::default();
         let start = Instant::now();
         let candidate = |plugin_id: &str, value: &str, generation: u64| PluginRequestCandidate {
+            command_id: "default".into(),
             plugin_id: plugin_id.into(),
             plugin_generation: generation,
             activation_id: generation + 10,

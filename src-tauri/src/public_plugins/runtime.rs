@@ -841,6 +841,8 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PluginInvocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_id: Option<String>,
     pub(crate) api_version: u32,
     pub(crate) request_id: String,
     pub(crate) input: String,
@@ -1007,6 +1009,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invocation_legacy_keys_are_exact_and_new_wire_includes_selected_command() {
+        let mut invocation = PluginInvocation {
+            command_id: None,
+            api_version: 1,
+            request_id: "host-request".into(),
+            input: "A  B".into(),
+            context: PluginInvocationEnvironment {
+                platform: PluginInvocationPlatform::Windows,
+                theme: PluginInvocationTheme::Dark,
+                invoked_at: "2026-10-24T00:00:00Z".into(),
+            },
+        };
+        let legacy = serde_json::to_value(&invocation).unwrap();
+        assert_eq!(
+            legacy
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["apiVersion", "context", "input", "requestId"]
+        );
+        invocation.command_id = Some("constructor".into());
+        let new = serde_json::to_value(&invocation).unwrap();
+        assert_eq!(new["commandId"], "constructor");
+        assert_eq!(new["input"], "A  B");
+        assert_eq!(new.as_object().unwrap().len(), 5);
+    }
+
     fn runtime_fixture(
         dir: &TestDir,
         persisted_manifest: &PublicManifestV1,
@@ -1046,6 +1078,7 @@ mod tests {
         let scheduled = match scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: persisted_manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
@@ -1170,6 +1203,7 @@ mod tests {
         let scheduled = match scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
@@ -1204,6 +1238,7 @@ mod tests {
         scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
@@ -1527,6 +1562,7 @@ mod tests {
         scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,
@@ -1624,6 +1660,7 @@ mod tests {
         scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_generation: 1,
                     activation_id: 1,

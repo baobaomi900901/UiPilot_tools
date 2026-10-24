@@ -51,8 +51,7 @@ let previewPublicPlugins: PublicPluginInventory = {
       description: '项目笔记、代码片段和常用链接管理。',
       version: '0.1.0',
       source: 'localPackage',
-      defaultName: 'notes',
-      effectiveName: 'notes',
+      commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false }],
       enabled: true,
       fault: null,
       generation: 1,
@@ -72,8 +71,7 @@ let previewPublicPlugins: PublicPluginInventory = {
       description: '选中文本翻译、方向切换和复制结果。',
       version: '0.3.0',
       source: 'localPackage',
-      defaultName: 'translate',
-      effectiveName: 'translate',
+      commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false }],
       enabled: false,
       fault: null,
       generation: 2,
@@ -107,7 +105,7 @@ let previewPublicPlugins: PublicPluginInventory = {
 const credentialPreviewPlugin: PublicPluginInventoryItem = {
   pluginId: 'com.uipilot.credential-demo', name: 'Credential Demo',
   description: '合成凭据设置与网络授权预览，不连接真实服务。', version: '0.1.0', source: 'localPackage',
-  defaultName: 'credential-demo', effectiveName: 'credential-demo', enabled: true,
+  commands: [{ commandId: 'default', defaultName: 'credential-demo', effectiveName: 'credential-demo', nameOverride: null, favorite: false }], enabled: true,
   fault: null, generation: 1, iconUrl: null,
   network: { httpsHosts: ['api.example.com'], credentials: [
     { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' },
@@ -202,7 +200,7 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
           favorite: false,
         },
         favorite: {
-          target: { kind: 'publicPlugin', pluginId: panelPreviewPluginId },
+          target: { kind: 'publicPlugin', pluginId: panelPreviewPluginId, commandId: 'default' },
           favorite: false,
         },
         hasDefaultAction: false,
@@ -340,9 +338,9 @@ const client: LauncherClient = {
       permissions: plugin.permissions.map((permission) => permission.permission === 'network.https' ? { ...permission, granted } : permission),
     }))
   },
-  setPublicPluginFavorite: async () => undefined,
+  setPublicPluginFavorite: async ({ pluginId, commandId, favorite }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, favorite } : command) })) },
   setBuiltinFeatureFavorite: async () => undefined,
-  setPublicPluginEffectiveName: async ({ pluginId, nameOverride }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, effectiveName: nameOverride ?? plugin.defaultName })) },
+  setPublicPluginEffectiveName: async ({ pluginId, commandId, nameOverride }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, nameOverride, effectiveName: nameOverride ?? command.defaultName } : command) })) },
   savePublicPluginSettings: async ({ input }) => {
     await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
     updatePreviewPlugin(input.pluginId, (plugin) => ({ ...plugin, settings: plugin.settings.map((setting) =>

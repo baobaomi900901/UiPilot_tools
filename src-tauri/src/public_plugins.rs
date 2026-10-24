@@ -336,6 +336,7 @@ impl PublicPluginService {
             },
         );
         let request = self.manager()?.scheduler().reserve(PluginRequestCandidate {
+            command_id: route.command_id.clone(),
             plugin_id: route.plugin_id.clone(),
             plugin_generation: route.generation,
             activation_id: route.activation_id,
@@ -636,6 +637,7 @@ impl PublicPluginService {
                 PluginCommandDispatch {
                     context: request.context.clone(),
                     invocation: PluginInvocation {
+                        command_id: self.manager()?.invocation_command_id(request)?,
                         api_version: 1,
                         request_id: request.context.request_id.clone(),
                         input: request.candidate.input.clone(),
@@ -665,6 +667,37 @@ impl PublicPluginService {
         outcome: PluginCompletionOutcome,
         now: Instant,
     ) -> Result<Option<ScheduledPluginRequest>, PluginRuntimeError> {
+        self.complete_submission_with(completion, outcome, now, || {
+            Self::destroy_runtime(
+                app,
+                runtime_label(
+                    &completion.context.plugin_id,
+                    completion.context.plugin_generation,
+                )
+                .as_deref(),
+            );
+            if let Some(controller) =
+                app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
+            {
+                crate::plugin_window::teardown_current(
+                    app,
+                    controller.inner().as_ref(),
+                    &completion.context.plugin_id,
+                );
+            }
+        })
+    }
+
+    fn complete_submission_with<F>(
+        &self,
+        completion: &PluginCommandCompletion,
+        outcome: PluginCompletionOutcome,
+        now: Instant,
+        on_disabled: F,
+    ) -> Result<Option<ScheduledPluginRequest>, PluginRuntimeError>
+    where
+        F: FnOnce(),
+    {
         let mut runtime_success = None;
         let token = self
             .lock_submissions()
@@ -699,6 +732,7 @@ impl PublicPluginService {
                                         .map_err(|_| PluginRuntimeError::Unavailable)?
                                         .can_copy_text(
                                             &pending.route.plugin_id,
+                                            &pending.route.command_id,
                                             pending.route.generation,
                                         )
                                 {
@@ -742,23 +776,7 @@ impl PublicPluginService {
                 if let Some(next) = outcome.next.as_ref() {
                     self.settle_submission(&next.candidate.owner.submission_token, None);
                 }
-                Self::destroy_runtime(
-                    app,
-                    runtime_label(
-                        &completion.context.plugin_id,
-                        completion.context.plugin_generation,
-                    )
-                    .as_deref(),
-                );
-                if let Some(controller) =
-                    app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
-                {
-                    crate::plugin_window::teardown_current(
-                        app,
-                        controller.inner().as_ref(),
-                        &completion.context.plugin_id,
-                    );
-                }
+                on_disabled();
                 return Ok(None);
             }
         }

@@ -1634,6 +1634,7 @@ impl PluginManager {
                         return Err(PluginQueryError::InvalidResponse);
                     }
                     ResultAction::CopyText {
+                        command_id: None,
                         plugin_id: entry.id.clone(),
                         generation: entry.generation,
                         text,
@@ -7550,6 +7551,7 @@ mod tests {
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
+                            command_id: None,
                             plugin_id: "plugin".into(),
                             generation: 1,
                             text: "late".into(),
@@ -7634,6 +7636,7 @@ mod tests {
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
+                            command_id: None,
                             plugin_id: "plugin".into(),
                             generation: 1,
                             text: "2".into(),

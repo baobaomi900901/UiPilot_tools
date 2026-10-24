@@ -29,6 +29,8 @@ pub(crate) enum ResultAction {
         url: String,
     },
     CopyText {
+        // Public commands carry a saved ID; None belongs only to the internal legacy manager.
+        command_id: Option<String>,
         plugin_id: String,
         generation: u64,
         text: String,
@@ -1104,6 +1106,7 @@ mod tests {
                 vec![(
                     item("", "Plugin"),
                     ResultAction::CopyText {
+                        command_id: None,
                         plugin_id: "plugin".into(),
                         generation: 1,
                         text: "copy".into(),
@@ -1117,6 +1120,7 @@ mod tests {
         assert_eq!(
             registry.resolve(&response.0, &response.1[0].0),
             Ok(ResultAction::CopyText {
+                command_id: None,
                 plugin_id: "plugin".into(),
                 generation: 1,
                 text: "copy".into(),
@@ -1437,6 +1441,72 @@ mod tests {
         assert_eq!(response.items[1].result_id, "item-0000000000000003");
         assert_ne!(response.items[0].result_id, "forged-1");
         assert_ne!(response.items[0].result_id, response.items[1].result_id);
+    }
+
+    #[test]
+    fn public_copy_handles_keep_command_identity_and_same_result_ids_never_alias() {
+        let registries = ResultRegistries::default();
+        let registry = registries.main();
+        registries.find().on_show("other-window".into());
+        registry.on_show("invocation-1".into());
+        let copy = |command_id: &str, text: &str| ResultAction::CopyText {
+            plugin_id: "com.example.multi".into(),
+            command_id: Some(command_id.into()),
+            generation: 1,
+            text: text.into(),
+        };
+        let a = publish_app(
+            &registry,
+            registry
+                .begin_query(QueryDomain::Application, "invocation-1", 1)
+                .unwrap(),
+            vec![(
+                item("same-plugin-result", "Package /upper"),
+                copy("upper", "A private"),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .resolve(&a.request_id, &a.items[0].result_id)
+                .unwrap(),
+            copy("upper", "A private")
+        );
+        let b = publish_app(
+            &registry,
+            registry
+                .begin_query(QueryDomain::Application, "invocation-1", 2)
+                .unwrap(),
+            vec![(
+                item("same-plugin-result", "Package /lower"),
+                copy("constructor", "B private"),
+            )],
+        )
+        .unwrap();
+        assert_ne!(a.items[0].result_id, b.items[0].result_id);
+        assert!(registry
+            .resolve(&a.request_id, &a.items[0].result_id)
+            .is_err());
+        assert!(registry
+            .resolve(&a.request_id, &b.items[0].result_id)
+            .is_err());
+        assert!(registry
+            .resolve(&b.request_id, &a.items[0].result_id)
+            .is_err());
+        assert_eq!(
+            registry
+                .resolve(&b.request_id, &b.items[0].result_id)
+                .unwrap(),
+            copy("constructor", "B private")
+        );
+        assert!(registries
+            .find()
+            .resolve(&b.request_id, &b.items[0].result_id)
+            .is_err());
+        let wire = serde_json::to_string(&b).unwrap();
+        assert!(!wire.contains("private"));
+        assert!(!wire.contains("constructor"));
+        assert!(!wire.contains("same-plugin-result"));
     }
 
     #[test]

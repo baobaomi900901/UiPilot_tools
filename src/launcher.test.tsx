@@ -153,7 +153,7 @@ describe('plugin protocol', () => {
   it('strictly parses public inventory settings and rejects output mode or secret value leaks', () => {
     const item = {
       pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
-      source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
+      source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false }], enabled: true,
       fault: null, generation: 1,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
       network: null,
@@ -419,7 +419,7 @@ function panelItem(initialArgument: string, pluginId = 'com.uipilot.demo-panel')
       favorite: false,
     },
     favorite: {
-      target: { kind: 'publicPlugin' as const, pluginId },
+      target: { kind: 'publicPlugin' as const, pluginId, commandId: 'default' },
       favorite: false,
     },
     hasDefaultAction: false,
@@ -1637,6 +1637,7 @@ describe('shown and search ownership', () => {
       },
       {
         kind: 'mainResultActivation',
+        commandId: 'default',
         pluginId: 'com.uipilot.demo-return',
         commandLabel: 'demo-return',
         initialArgument: 'hello',
@@ -3287,6 +3288,7 @@ describe('shown and search ownership', () => {
               title: '/demo-return',
               activation: {
                 kind: 'mainResultActivation',
+                commandId: 'default',
                 pluginId: 'com.uipilot.demo-return',
                 commandLabel: 'demo-return',
                 initialArgument: '',
@@ -3486,7 +3488,7 @@ describe('shown and search ownership', () => {
           pluginId: 'com.uipilot.demo-win', favorite,
         },
         favorite: {
-          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win', commandId: 'default' },
           favorite,
         },
       }] : [],
@@ -3500,7 +3502,7 @@ describe('shown and search ownership', () => {
     core.openPluginContextMenu(0)
     core.setPluginFavorite(0, true)
     core.closePluginContextMenu()
-    expect(client.setPublicPluginFavorite).toHaveBeenCalledWith({
+    expect(client.setPublicPluginFavorite).toHaveBeenCalledWith({ commandId: 'default',
       pluginId: 'com.uipilot.demo-win', favorite: true,
     })
     expect(core.getSnapshot().favoriteMutationPending).toBe(true)
@@ -3559,7 +3561,7 @@ describe('shown and search ownership', () => {
           pluginId: 'com.uipilot.demo-win', favorite: true,
         },
         favorite: {
-          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win', commandId: 'default' },
           favorite: true,
         },
       }] : [],
@@ -3593,7 +3595,7 @@ describe('shown and search ownership', () => {
           pluginId: 'com.uipilot.demo-win', favorite: false,
         },
         favorite: {
-          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win', commandId: 'default' },
           favorite: false,
         },
       }] : [],
@@ -3627,7 +3629,7 @@ describe('shown and search ownership', () => {
               pluginId: 'com.uipilot.demo-a', favorite: false,
             },
             favorite: {
-              target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-a' },
+              target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-a', commandId: 'default' },
               favorite: false,
             },
           },
@@ -3638,7 +3640,7 @@ describe('shown and search ownership', () => {
               pluginId: 'com.uipilot.demo-b', favorite: false,
             },
             favorite: {
-              target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-b' },
+              target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-b', commandId: 'default' },
               favorite: false,
             },
           },
@@ -5586,7 +5588,7 @@ describe('React view and accessibility', () => {
             pluginId: 'com.uipilot.favorite-plugin', favorite: true,
           },
           favorite: {
-            target: { kind: 'publicPlugin', pluginId: 'com.uipilot.favorite-plugin' },
+            target: { kind: 'publicPlugin', pluginId: 'com.uipilot.favorite-plugin', commandId: 'default' },
             favorite: true,
           },
         },
@@ -5608,7 +5610,7 @@ describe('React view and accessibility', () => {
             pluginId: 'com.uipilot.favorite-plugin', favorite: true,
           },
           favorite: {
-            target: { kind: 'publicPlugin', pluginId: 'com.uipilot.favorite-plugin' },
+            target: { kind: 'publicPlugin', pluginId: 'com.uipilot.favorite-plugin', commandId: 'default' },
             favorite: true,
           },
         },
@@ -5774,7 +5776,7 @@ describe('React view and accessibility', () => {
           pluginId: 'com.uipilot.demo-win', favorite,
         },
         favorite: {
-          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win' },
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-win', commandId: 'default' },
           favorite,
         },
       }
@@ -5785,7 +5787,7 @@ describe('React view and accessibility', () => {
           pluginId: 'com.uipilot.demo-return', favorite: true,
         },
         favorite: {
-          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-return' },
+          target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-return', commandId: 'default' },
           favorite: true,
         },
       }
@@ -5818,7 +5820,7 @@ describe('React view and accessibility', () => {
     })
     expect(options[2]?.getAttribute('aria-selected')).toBe('true')
     await act(async () => menuItem!.click())
-    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledWith({
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledWith({ commandId: 'default',
       pluginId: 'com.uipilot.demo-win', favorite: true,
     })
     expect(fake.client.executeResult).not.toHaveBeenCalled()
@@ -6052,6 +6054,7 @@ describe('React view and accessibility', () => {
           items: [],
           commandHint: '请输入信息回车',
           mainResultCommand: {
+            commandId: 'default',
             pluginId: 'com.uipilot.demo-return',
             commandLabel: 'demo-return',
             argument,
@@ -6068,6 +6071,7 @@ describe('React view and accessibility', () => {
           hasDefaultAction: true,
         }],
         mainResultCommand: {
+          commandId: 'default',
           pluginId: 'com.uipilot.demo-return',
           commandLabel: 'demo-return',
           argument,
@@ -7668,7 +7672,7 @@ describe('React view and accessibility', () => {
       revision: '1',
       items: [{
         pluginId: 'com.example.demo', name: 'Demo', description: 'A compact plugin description that stays on one row.', version: '1.0.0',
-        source: 'localPackage', defaultName: 'demo', effectiveName: 'demo', enabled: true,
+        source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false }], enabled: true,
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
         network: { httpsHosts: ['api.example.com'], credentials: [] },
@@ -7685,6 +7689,12 @@ describe('React view and accessibility', () => {
           { definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true },
         ],
       }],
+    })
+    const inventory = await fake.client.listPublicPlugins()
+    vi.mocked(fake.client.setPublicPluginEffectiveName).mockImplementation(async ({ commandId, nameOverride }) => {
+      const command = inventory.items.flatMap((plugin) => plugin.commands).find((command) => command.commandId === commandId)!
+      command.nameOverride = nameOverride
+      command.effectiveName = nameOverride ?? command.defaultName
     })
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -7751,13 +7761,13 @@ describe('React view and accessibility', () => {
       nameInput.dispatchEvent(new Event('change', { bubbles: true }))
       nameInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
     })
-    await vi.waitFor(() => expect(fake.client.setPublicPluginEffectiveName).toHaveBeenCalledWith({
+    await vi.waitFor(() => expect(fake.client.setPublicPluginEffectiveName).toHaveBeenCalledWith({ commandId: 'default',
       pluginId: 'com.example.demo',
       nameOverride: 'demo-custom',
     }))
 
     await act(async () => detail.querySelector<HTMLButtonElement>('button[aria-label="恢复默认启动键"]')!.click())
-    await vi.waitFor(() => expect(fake.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({
+    await vi.waitFor(() => expect(fake.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ commandId: 'default',
       pluginId: 'com.example.demo',
       nameOverride: null,
     }))
@@ -7789,12 +7799,12 @@ describe('React view and accessibility', () => {
       items: [
         {
           pluginId: 'com.example.notes', name: 'Notes', description: null, version: '1.0.0',
-          source: 'localPackage', defaultName: 'notes', effectiveName: 'notes', enabled: true,
+          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false }], enabled: true,
           fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
         },
         {
           pluginId: 'com.example.translate', name: 'Translate', description: null, version: '1.0.0',
-          source: 'localPackage', defaultName: 'translate', effectiveName: 'translate', enabled: true,
+          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false }], enabled: true,
           fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
         },
       ],
@@ -7862,7 +7872,7 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const item = {
       pluginId: 'com.example.cleanup', name: 'Cleanup', description: null, version: '1.0.0',
-      source: 'localPackage' as const, defaultName: 'cleanup', effectiveName: 'cleanup', enabled: true,
+      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'cleanup', effectiveName: 'cleanup', nameOverride: null, favorite: false }], enabled: true,
       fault: null, generation: 1, iconUrl: null, permissions: [], settings: [],
       network: null,
     }
@@ -8060,7 +8070,7 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const networkItem = {
       pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
-      source: 'localPackage' as const, defaultName: 'network', effectiveName: 'network', enabled: true,
+      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false }], enabled: true,
       fault: null, generation: 1, iconUrl: null,
       network: { httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [] },
       permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
@@ -8249,7 +8259,7 @@ describe('real adapter and startup', () => {
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
-    await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', favorite: true })
+    await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', commandId: 'default', favorite: true })
     await main.client.setBuiltinFeatureFavorite({ feature: 'find', favorite: true })
     await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
@@ -8279,7 +8289,7 @@ describe('real adapter and startup', () => {
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
-      ['set_plugin_favorite', [{ pluginId: 'com.uipilot.demo-win', favorite: true }]],
+      ['set_plugin_favorite', [{ commandId: 'default', pluginId: 'com.uipilot.demo-win', favorite: true }]],
       ['set_builtin_feature_favorite', [{ input: { feature: 'find', favorite: true } }]],
       ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
@@ -9047,7 +9057,7 @@ describe('credential consent and settings', () => {
   const credential = { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' as const }
   const item = {
     pluginId: 'com.example.credentials', name: 'Credentials', description: null, version: '1.0.0',
-    source: 'localPackage' as const, defaultName: 'credentials', effectiveName: 'credentials', enabled: true,
+    source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'credentials', effectiveName: 'credentials', nameOverride: null, favorite: false }], enabled: true,
     fault: null, generation: 1, iconUrl: null,
     network: { httpsHosts: ['api.example.com'], credentials: [credential] },
     permissions: [{ permission: 'network.https' as const, supported: true, granted: false }],
@@ -9338,4 +9348,55 @@ describe('credential consent and settings', () => {
     } finally { await ui.cleanup() }
   })
 
+})
+
+
+it('requires a stable command ID for main-result activation and preserves constructor', () => {
+  const activation = { kind: 'mainResultActivation', pluginId: 'com.example.multi', commandLabel: 'upper', initialArgument: '', favorite: false }
+  for (const commandId of [undefined, null, '', 'Upper', 'with space']) {
+    expect(safeLauncherActivation({ ...activation, ...(commandId === undefined ? {} : { commandId }) })).toBeUndefined()
+  }
+  expect(safeLauncherActivation({ ...activation, commandId: 'constructor' })).toEqual({ ...activation, commandId: 'constructor' })
+})
+
+
+it('preserves constructor command identity and rejects sibling favorite and command contexts', async () => {
+  const { core, client, emit } = await startedCore()
+  let responseCommandId: unknown = "upper"
+  const activation = { kind: 'mainResultActivation' as const, pluginId: 'com.example.multi', commandId: 'constructor', commandLabel: 'lower', initialArgument: 'saved  input', favorite: false }
+  vi.mocked(client.searchApps).mockImplementation(async (request) => request.submit ? {
+    requestId: 'submit', items: [{ resultId: 'same', title: 'Sibling output', activation: executeActivation }],
+    mainResultCommand: { pluginId: activation.pluginId, ...(responseCommandId === undefined ? {} : { commandId: responseCommandId }), commandLabel: 'lower', argument: request.query.slice('/lower '.length) },
+  } as unknown as SearchResponse : request.query === 'multi' ? {
+    requestId: 'catalog', items: [
+      { resultId: 'sibling', title: 'Wrong sibling favorite', activation, favorite: { target: { kind: 'publicPlugin', pluginId: activation.pluginId, commandId: 'upper' }, favorite: false } },
+      { resultId: 'constructor', title: 'Package /lower', activation, favorite: { target: { kind: 'publicPlugin', pluginId: activation.pluginId, commandId: 'constructor' }, favorite: false } },
+    ],
+  } : { requestId: 'hint', items: [], commandHint: 'Text' })
+  emit(shown('multi-command-identity'))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'multi', inputType: 'insertText' })
+  await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+  expect(core.getSnapshot().results[0]?.title).toBe('Package /lower')
+  core.keyDown('Enter', false)
+  await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand?.commandId).toBe('constructor'))
+  expect(Object.isFrozen(core.getSnapshot().mainResultCommand)).toBe(true)
+  core.keyDown('Enter', false)
+  await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ submit: true })))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(core.getSnapshot().mainResultCommand?.commandId).toBe('constructor')
+  expect(core.getSnapshot().results).toHaveLength(0)
+  for (const invalid of [undefined, null, '', 'Upper', 'with space', 'unknown']) {
+    responseCommandId = invalid
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().mainResultCommand!.suffixControl, value: `rejected-${String(invalid)}`, inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(core.getSnapshot().mainResultCommand?.commandId).toBe('constructor')
+    expect(core.getSnapshot().results).toHaveLength(0)
+  }
+  responseCommandId = 'constructor'
+  core.text({ kind: 'ordinaryInput', control: core.getSnapshot().mainResultCommand!.suffixControl, value: 'retry  input', inputType: 'insertText' })
+  core.keyDown('Enter', false)
+  await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+  expect(core.getSnapshot().mainResultCommand).toMatchObject({ commandId: 'constructor', suffix: 'retry  input' })
 })

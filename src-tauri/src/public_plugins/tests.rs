@@ -18,8 +18,8 @@ use super::{
     manifest::{PanelHostKeyDeclaration, PublicOutputMode, PublicPermission},
     package, stage_public_package,
     webview_audio_guard::{INERT_DOCUMENT, INERT_PATH},
-    PluginRuntimeError, PublicPackageError, PublicPackageSource, PublicPlatform, PublicPluginHost,
-    PublicPluginResponse, PublicPluginService,
+    PluginCommandCompletion, PluginRuntimeError, PublicPackageError, PublicPackageSource,
+    PublicPlatform, PublicPluginHost, PublicPluginResponse, PublicPluginService,
 };
 use crate::message_center::MessageCenterService;
 use crate::plugins::{PluginCatalog, Version};
@@ -296,6 +296,215 @@ fn public_plugin_protocol_csp_allows_only_data_image_previews_and_denies_media()
     assert!(!super::PUBLIC_PLUGIN_CSP.contains("blob:"));
 }
 
+fn multi_service(
+    root: &TestRoot,
+    recovery: bool,
+) -> (Arc<PublicPluginService>, Arc<PublicPluginManager>) {
+    let source = root.package();
+    let mut value = manifest("mainResult");
+    value.as_object_mut().unwrap().remove("command");
+    value["minimumHostVersion"] = json!("0.5.0");
+    value["permissions"] = json!(["clipboard.write"]);
+    value["commands"] = json!([
+        {"id":"upper", "defaultName":"upper", "activationMode":"live", "outputMode":"mainResult", "inputRequired":false},
+        {"id":"constructor", "defaultName":"lower", "activationMode":"submit", "outputMode":"mainResult", "inputRequired":false}
+    ]);
+    write_package(&source, &value);
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            PublicPluginHost {
+                version: [0, 5, 0],
+                ..host()
+            },
+            ["find".into(), "math".into()],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let prepared = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness(
+            "main",
+            &prepared.token,
+            BTreeSet::from([PublicPermission::ClipboardWrite]),
+            now,
+            |_| true,
+        )
+        .unwrap();
+    if recovery {
+        let transaction = manager
+            .begin_uninstall("com.uipilot.demo", false)
+            .unwrap()
+            .unwrap();
+        manager.abort_uninstall_before_commit(transaction).unwrap();
+    }
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(Arc::clone(&manager)).is_ok());
+    (service, manager)
+}
+
+#[test]
+fn multi_command_service_binds_late_completion_to_saved_route_and_input() {
+    let root = TestRoot::new("multi-command-service");
+    let (service, manager) = multi_service(&root, false);
+    let now = Instant::now();
+    let a = service
+        .schedule_command(
+            manager.route("/upper A  original").unwrap().unwrap(),
+            1,
+            "/upper A  original".into(),
+            now,
+        )
+        .unwrap();
+    let dispatch_a = a.dispatch.as_ref().unwrap();
+    assert_eq!(dispatch_a.candidate.command_id, "upper");
+    assert_eq!(
+        manager
+            .invocation_command_id(dispatch_a)
+            .unwrap()
+            .as_deref(),
+        Some("upper")
+    );
+    let b = service
+        .schedule_command(
+            manager.route("/lower B  original").unwrap().unwrap(),
+            2,
+            "/lower B  original".into(),
+            now,
+        )
+        .unwrap();
+    assert!(b.dispatch.is_none());
+    // The current query can move independently; it must not rewrite the waiting submission.
+    let changed_query = manager.route("/upper entirely different").unwrap().unwrap();
+    assert_eq!(changed_query.input, "entirely different");
+    let completion = PluginCommandCompletion {
+        context: dispatch_a.context.clone(),
+        failed: false,
+        response: Some(
+            json!({"requestId":dispatch_a.context.request_id, "results":[{"id":"same", "title":"A stale"}]}),
+        ),
+    };
+    let outcome = manager
+        .scheduler()
+        .complete(&completion.context, now)
+        .unwrap();
+    assert!(!outcome.accepted);
+    let dispatch_b = service
+        .complete_submission_with(&completion, outcome, now, || panic!("must not fault"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(dispatch_b.candidate.command_id, "constructor");
+    assert_eq!(dispatch_b.candidate.input, "B  original");
+    assert_eq!(
+        manager
+            .invocation_command_id(&dispatch_b)
+            .unwrap()
+            .as_deref(),
+        Some("constructor")
+    );
+    assert_eq!(a.receiver.recv_timeout(Duration::from_secs(1)), Ok(None));
+    let pending = service.lock_submissions().unwrap();
+    let saved = pending.by_token.get(&b.token).unwrap();
+    assert_eq!(saved.route.command_id, "constructor");
+    assert_eq!(saved.route.input, "B  original");
+    drop(pending);
+    let completion = PluginCommandCompletion {
+        context: dispatch_b.context.clone(),
+        failed: false,
+        response: Some(
+            json!({"requestId":dispatch_b.context.request_id, "results":[{"id":"same", "title":"B current", "defaultAction":{"type":"copyText", "text":"B private"}}]}),
+        ),
+    };
+    let outcome = manager
+        .scheduler()
+        .complete(&completion.context, now)
+        .unwrap();
+    assert!(outcome.accepted);
+    assert!(service
+        .complete_submission_with(&completion, outcome, now, || panic!("must not fault"))
+        .unwrap()
+        .is_none());
+    let Some(Ok(PublicPluginResponse::MainResults(results))) =
+        b.receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("B must receive its own results")
+    };
+    assert_eq!(results[0].title, "B current");
+    assert_eq!(results[0].plugin_result_id, "same");
+    assert_eq!(results[0].copy_text.as_deref(), Some("B private"));
+    assert!(service.lock_submissions().unwrap().by_token.is_empty());
+    assert!(service
+        .lock_submissions()
+        .unwrap()
+        .token_by_request
+        .is_empty());
+}
+
+#[test]
+fn multi_command_recovery_preserves_latest_command_id_and_exact_input() {
+    let root = TestRoot::new("multi-command-recovery");
+    let (service, manager) = multi_service(&root, true);
+    let now = Instant::now();
+    let a = service
+        .schedule_command(
+            manager.route("/upper old  input").unwrap().unwrap(),
+            1,
+            "/upper old  input".into(),
+            now,
+        )
+        .unwrap();
+    let b = service
+        .schedule_command(
+            manager.route("/lower B  saved").unwrap().unwrap(),
+            2,
+            "/lower B  saved".into(),
+            now,
+        )
+        .unwrap();
+    let first = a.recovery.as_ref().unwrap();
+    let second = b.recovery.as_ref().unwrap();
+    let calls = AtomicU64::new(0);
+    assert!(service
+        .complete_runtime_recovery_with(first, now, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap()
+        .is_none());
+    let dispatch = service
+        .complete_runtime_recovery_with(second, now, |_| panic!("one shared Runtime"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(dispatch.candidate.command_id, "constructor");
+    assert_eq!(dispatch.candidate.input, "B  saved");
+    assert_eq!(
+        manager.invocation_command_id(&dispatch).unwrap().as_deref(),
+        Some("constructor")
+    );
+    assert_eq!(
+        service
+            .lock_submissions()
+            .unwrap()
+            .by_token
+            .get(&b.token)
+            .unwrap()
+            .route
+            .command_id,
+        "constructor"
+    );
+    assert_eq!(a.receiver.recv_timeout(Duration::from_secs(1)), Ok(None));
+}
+
 #[test]
 fn runtime_recovery_is_single_owner_and_latest_submission_wins() {
     let root = TestRoot::new("runtime-recovery-latest");
@@ -340,6 +549,7 @@ fn runtime_recovery_is_single_owner_and_latest_submission_wins() {
         .unwrap();
     assert_eq!(readiness_calls.load(Ordering::Relaxed), 1);
     assert_eq!(dispatch.candidate.input, "second");
+    assert_eq!(manager.invocation_command_id(&dispatch).unwrap(), None);
 
     service.settle_submission(
         &second.token,

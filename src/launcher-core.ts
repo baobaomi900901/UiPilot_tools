@@ -172,6 +172,7 @@ interface PrivateQuicklinksState {
 }
 
 interface PrivateMainResultCommandState {
+  commandId: string
   pluginId: string
   commandLabel: string
   suffix: TextControl
@@ -469,10 +470,10 @@ function safeResultFavorite(value: unknown): ResultFavorite | undefined {
     ? favorite.target as Record<string, unknown>
     : undefined
   if (target?.kind === 'publicPlugin') {
-    const record = exactPlainRecord(target, ['kind', 'pluginId'])
+    const record = exactPlainRecord(target, ['commandId', 'kind', 'pluginId'])
     return record && typeof record.pluginId === 'string' && record.pluginId.length <= 64 &&
-        PUBLIC_PLUGIN_ID.test(record.pluginId)
-      ? { target: { kind: 'publicPlugin', pluginId: record.pluginId }, favorite: favorite.favorite }
+        PUBLIC_PLUGIN_ID.test(record.pluginId) && typeof record.commandId === 'string' && LAUNCHER_COMMAND.test(record.commandId)
+      ? { target: { kind: 'publicPlugin', pluginId: record.pluginId, commandId: record.commandId }, favorite: favorite.favorite }
       : undefined
   }
   if (target?.kind === 'builtin') {
@@ -563,10 +564,11 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
   if (candidate?.kind === 'mainResultActivation') {
     const record = exactPlainRecord(
       value,
-      ['commandLabel', 'favorite', 'initialArgument', 'kind', 'pluginId'],
+      ['commandId', 'commandLabel', 'favorite', 'initialArgument', 'kind', 'pluginId'],
     )
     return record &&
         typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.commandId === 'string' && LAUNCHER_COMMAND.test(record.commandId) &&
         typeof record.commandLabel === 'string' && LAUNCHER_COMMAND.test(record.commandLabel) &&
         typeof record.initialArgument === 'string' && record.initialArgument.length <= 65_536 &&
         record.initialArgument.trim() === record.initialArgument &&
@@ -578,6 +580,7 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
       ? {
           kind: 'mainResultActivation',
           pluginId: record.pluginId,
+          commandId: record.commandId,
           commandLabel: record.commandLabel,
           initialArgument: record.initialArgument,
           favorite: record.favorite,
@@ -619,7 +622,7 @@ function pluginFavoriteActivation(activation: LauncherResultActivation) {
 function sameFavoriteTarget(left: ResultFavoriteTarget, right: ResultFavoriteTarget): boolean {
   if (left.kind !== right.kind) return false
   return left.kind === 'publicPlugin'
-    ? left.pluginId === (right as Extract<ResultFavoriteTarget, { kind: 'publicPlugin' }>).pluginId
+    ? left.pluginId === (right as Extract<ResultFavoriteTarget, { kind: 'publicPlugin' }>).pluginId && left.commandId === (right as Extract<ResultFavoriteTarget, { kind: 'publicPlugin' }>).commandId
     : left.feature === (right as Extract<ResultFavoriteTarget, { kind: 'builtin' }>).feature
 }
 
@@ -630,7 +633,7 @@ function favoriteMatchesResult(
 ): boolean {
   if (favorite.target.kind === 'publicPlugin') {
     const plugin = pluginFavoriteActivation(activation)
-    return plugin?.pluginId === favorite.target.pluginId && plugin.favorite === favorite.favorite
+    return plugin?.pluginId === favorite.target.pluginId && (plugin.kind === 'mainResultActivation' ? plugin.commandId : 'default') === favorite.target.commandId && plugin.favorite === favorite.favorite
   }
   if (favorite.target.feature === 'find') {
     return activation.kind === 'openFind' && iconKind === 'find'
@@ -647,12 +650,13 @@ function safeCommandHint(value: unknown): string | undefined {
 }
 
 function safeMainResultCommand(value: unknown): MainResultCommandContext | undefined {
-  const command = exactPlainRecord(value, ['argument', 'commandLabel', 'pluginId'])
+  const command = exactPlainRecord(value, ['argument', 'commandId', 'commandLabel', 'pluginId'])
   if (
     !command ||
     typeof command.pluginId !== 'string' ||
     command.pluginId.length > 64 ||
     !PUBLIC_PLUGIN_ID.test(command.pluginId) ||
+    typeof command.commandId !== 'string' || !LAUNCHER_COMMAND.test(command.commandId) ||
     typeof command.commandLabel !== 'string' ||
     !/^[a-z][a-z0-9-]{0,31}$/u.test(command.commandLabel) ||
     typeof command.argument !== 'string' ||
@@ -664,6 +668,7 @@ function safeMainResultCommand(value: unknown): MainResultCommandContext | undef
   ) return undefined
   return {
     pluginId: command.pluginId,
+    commandId: command.commandId,
     commandLabel: command.commandLabel,
     argument: command.argument,
   }
@@ -762,6 +767,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   const mainResultCommand = model.mainResultCommand
     ? Object.freeze({
         pluginId: model.mainResultCommand.pluginId,
+        commandId: model.mainResultCommand.commandId,
         commandLabel: model.mainResultCommand.commandLabel,
         suffixControl: model.mainResultCommand.suffix.key,
         suffix: model.mainResultCommand.suffix.draft,
@@ -2026,6 +2032,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const mainResultCommand = captured.submit
         ? safeMainResultCommand(response.mainResultCommand)
         : undefined
+      const activeCommand = model.mainResultCommand
+      if ((response.mainResultCommand !== undefined && !mainResultCommand) ||
+          (mainResultCommand && activeCommand &&
+            (mainResultCommand.pluginId !== activeCommand.pluginId || mainResultCommand.commandId !== activeCommand.commandId))) {
+        publish(true)
+        return
+      }
       if (mainResultCommand) activateMainResultCommand(mainResultCommand)
       model.requestId = response.requestId
       model.commandHint = safeCommandHint(response.commandHint)
@@ -2111,12 +2124,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function activateMainResultCommand(context: MainResultCommandContext): void {
     const current = model.mainResultCommand
-    if (current?.pluginId === context.pluginId && current.commandLabel === context.commandLabel) {
+    if (current?.pluginId === context.pluginId && current.commandId === context.commandId && current.commandLabel === context.commandLabel) {
       current.suffix.value = context.argument
       current.suffix.draft = context.argument
     } else {
       model.mainResultCommand = {
         pluginId: context.pluginId,
+        commandId: context.commandId,
         commandLabel: context.commandLabel,
         suffix: newTextControl(context.argument),
       }
@@ -3250,6 +3264,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     clearResults()
     activateMainResultCommand({
       pluginId: activation.pluginId,
+      commandId: activation.commandId,
       commandLabel: activation.commandLabel,
       argument: activation.initialArgument,
     })
@@ -3439,7 +3454,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     let pending: Promise<void>
     try {
       pending = owner.target.kind === 'publicPlugin'
-        ? client.setPublicPluginFavorite({ pluginId: owner.target.pluginId, favorite })
+        ? client.setPublicPluginFavorite({ pluginId: owner.target.pluginId, commandId: owner.target.commandId, favorite })
         : client.setBuiltinFeatureFavorite({ feature: owner.target.feature, favorite })
     } catch (error) {
       pending = Promise.reject(error)

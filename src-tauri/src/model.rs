@@ -21,6 +21,8 @@ pub(crate) enum ResultFavoriteTarget {
     PublicPlugin {
         #[serde(rename = "pluginId")]
         plugin_id: String,
+        #[serde(rename = "commandId")]
+        command_id: String,
     },
     Builtin {
         feature: BuiltinFeature,
@@ -35,11 +37,19 @@ pub(crate) struct ResultFavorite {
 }
 
 impl ResultFavorite {
-    pub(crate) fn public_plugin(plugin_id: String, favorite: bool) -> Option<Self> {
-        crate::public_plugins::valid_plugin_id(&plugin_id).then_some(Self {
-            target: ResultFavoriteTarget::PublicPlugin { plugin_id },
-            favorite,
-        })
+    pub(crate) fn public_plugin(
+        plugin_id: String,
+        command_id: String,
+        favorite: bool,
+    ) -> Option<Self> {
+        (crate::public_plugins::valid_plugin_id(&plugin_id) && valid_launcher_command(&command_id))
+            .then_some(Self {
+                target: ResultFavoriteTarget::PublicPlugin {
+                    plugin_id,
+                    command_id,
+                },
+                favorite,
+            })
     }
 
     pub(crate) fn builtin(feature: BuiltinFeature, favorite: bool) -> Self {
@@ -67,6 +77,8 @@ pub(crate) enum LauncherResultActivation {
         favorite: bool,
     },
     MainResultActivation {
+        #[serde(rename = "commandId")]
+        command_id: String,
         #[serde(rename = "pluginId")]
         plugin_id: String,
         #[serde(rename = "commandLabel")]
@@ -114,14 +126,17 @@ impl LauncherResultActivation {
 
     pub(crate) fn main_result_activation(
         plugin_id: String,
+        command_id: String,
         command_label: String,
         initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
         (crate::public_plugins::valid_plugin_id(&plugin_id)
+            && valid_launcher_command(&command_id)
             && valid_launcher_command(&command_label)
             && valid_panel_initial_argument(&initial_argument))
         .then_some(Self::MainResultActivation {
+            command_id,
             plugin_id,
             command_label,
             initial_argument,
@@ -185,6 +200,7 @@ pub(crate) fn valid_launcher_command(command: &str) -> bool {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MainResultCommandContext {
+    pub(crate) command_id: String,
     pub(crate) plugin_id: String,
     pub(crate) command_label: String,
     pub(crate) argument: String,

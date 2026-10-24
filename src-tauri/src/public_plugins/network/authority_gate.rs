@@ -658,6 +658,7 @@ mod tests {
         let outcome = scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: "com.example.network".into(),
                     plugin_generation: generation,
                     activation_id,

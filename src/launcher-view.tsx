@@ -519,7 +519,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     input.focus()
     const caret = input.value.length
     input.setSelectionRange(caret, caret)
-  }, [mainResultCommand?.commandLabel, mainResultCommand?.suffixControl])
+  }, [mainResultCommand?.commandId, mainResultCommand?.commandLabel, mainResultCommand?.suffixControl])
   const reportMainResultUnbound = useCallback((input: HTMLInputElement) => {
     if (mainResultInputRef.current === input) mainResultInputRef.current = null
   }, [])

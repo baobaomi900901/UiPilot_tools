@@ -3,7 +3,7 @@ import { safePublicPluginIconUrl } from './plugin-icon-url'
 export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'currency' | 'date' | 'timeZone' | 'unit' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
 export type ResultFavoriteTarget =
-  | Readonly<{ kind: 'publicPlugin'; pluginId: string }>
+  | Readonly<{ kind: 'publicPlugin'; pluginId: string; commandId: string }>
   | Readonly<{ kind: 'builtin'; feature: BuiltinFeature }>
 export type ResultFavorite = Readonly<{ target: ResultFavoriteTarget; favorite: boolean }>
 
@@ -19,6 +19,7 @@ export type LauncherResultActivation =
     }
   | {
       kind: 'mainResultActivation'
+      commandId: string
       pluginId: string
       commandLabel: string
       initialArgument: string
@@ -67,6 +68,7 @@ export interface SearchResponse {
 }
 
 export interface MainResultCommandContext {
+  commandId: string
   pluginId: string
   commandLabel: string
   argument: string
@@ -228,14 +230,21 @@ export interface PublicPluginPrepareNetwork extends PublicPluginInventoryNetwork
   readonly requiresNetworkConsent: boolean
 }
 
+export interface PublicPluginInventoryCommand {
+  commandId: string
+  defaultName: string
+  effectiveName: string
+  nameOverride: string | null
+  favorite: boolean
+}
+
 export interface PublicPluginInventoryItem {
   pluginId: string
   name: string
   description: string | null
   version: string
   source: 'localPackage'
-  defaultName: string
-  effectiveName: string
+  commands: readonly PublicPluginInventoryCommand[]
   enabled: boolean
   fault: PublicPluginFault | null
   generation: number
@@ -386,9 +395,9 @@ export interface LauncherClient {
   cancelPublicPlugin(input: { token: string }): Promise<void>
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
   setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean; expectedInventoryRevision?: U64Decimal }): Promise<void>
-  setPublicPluginFavorite(input: { pluginId: string; favorite: boolean }): Promise<void>
+  setPublicPluginFavorite(input: { pluginId: string; commandId: string; favorite: boolean }): Promise<void>
   setBuiltinFeatureFavorite(input: { feature: BuiltinFeature; favorite: boolean }): Promise<void>
-  setPublicPluginEffectiveName(input: { pluginId: string; nameOverride: string | null }): Promise<void>
+  setPublicPluginEffectiveName(input: { pluginId: string; commandId: string; nameOverride: string | null }): Promise<void>
   savePublicPluginSettings(input: { input: { pluginId: string; settings: Readonly<Record<string, string | number | boolean>>; secrets: Readonly<Record<string, string | null>> } }): Promise<void>
   uninstallPublicPlugin(input: { pluginId: string; retainData: boolean }): Promise<void>
   listPlugins(): Promise<PluginInventorySnapshot>
@@ -547,6 +556,7 @@ export interface PluginPanelSnapshot {
   focusRequestId?: U64Decimal
 }
 export interface MainResultCommandSnapshot {
+  commandId: string
   pluginId: string
   commandLabel: string
   suffixControl: ControlKey
@@ -858,9 +868,25 @@ function parsePublicSettingView(value: unknown): PublicSettingView | null {
 
 function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null {
   const item = plainRecord(value)
-  const keys = ['defaultName', 'description', 'effectiveName', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'network', 'permissions', 'pluginId', 'settings', 'source', 'version']
-  if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.defaultName !== 'string' || typeof item.effectiveName !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.iconUrl !== null && safePublicPluginIconUrl(item.iconUrl) === undefined) || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
+  const keys = ['commands', 'description', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'network', 'permissions', 'pluginId', 'settings', 'source', 'version']
+  if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.iconUrl !== null && safePublicPluginIconUrl(item.iconUrl) === undefined) || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
   if (!Array.isArray(item.permissions) || !exactDenseArray(item.permissions) || !Array.isArray(item.settings) || !exactDenseArray(item.settings)) return null
+  if (!Array.isArray(item.commands) || !exactDenseArray(item.commands) || item.commands.length < 1 || item.commands.length > 16) return null
+  const commands: PublicPluginInventoryCommand[] = []
+  const commandIds = new Set<string>()
+  const effectiveNames = new Set<string>()
+  for (const valueCommand of item.commands) {
+    const command = plainRecord(valueCommand)
+    if (!command || !exactKeys(command, ['commandId', 'defaultName', 'effectiveName', 'favorite', 'nameOverride']) ||
+      typeof command.commandId !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.commandId) || commandIds.has(command.commandId) ||
+      typeof command.defaultName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.defaultName) ||
+      typeof command.effectiveName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.effectiveName) || effectiveNames.has(command.effectiveName) ||
+      (command.nameOverride !== null && (typeof command.nameOverride !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.nameOverride))) ||
+      command.effectiveName !== (command.nameOverride ?? command.defaultName) || typeof command.favorite !== 'boolean') return null
+    commandIds.add(command.commandId)
+    effectiveNames.add(command.effectiveName)
+    commands.push(command as unknown as PublicPluginInventoryCommand)
+  }
   const permissions: PublicPermissionView[] = []
   for (const valuePermission of item.permissions) {
     const permission = plainRecord(valuePermission)
@@ -878,7 +904,7 @@ function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null
   if (network === undefined) return null
   const networkPermission = permissions.find(({ permission }) => permission === 'network.https')
   if ((network === null) !== (networkPermission === undefined)) return null
-  return { ...(item as unknown as PublicPluginInventoryItem), network, permissions, settings }
+  return { ...(item as unknown as PublicPluginInventoryItem), commands, network, permissions, settings }
 }
 
 export function parsePublicPluginInventory(value: unknown): PublicPluginInventory | null {

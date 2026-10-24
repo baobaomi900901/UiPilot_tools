@@ -1416,10 +1416,13 @@ pub(crate) fn set_plugin_favorite(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
     plugin_id: String,
+    command_id: String,
     favorite: bool,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    service.manager()?.set_favorite(&plugin_id, favorite)?;
+    service
+        .manager()?
+        .set_command_favorite(&plugin_id, &command_id, favorite)?;
     Ok(())
 }
 
@@ -1431,12 +1434,13 @@ pub(crate) fn set_plugin_effective_name(
     quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
+    command_id: String,
     name_override: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
     let manager = service.manager()?;
     manager.replace_external_reserved_names(quicklinks.commands())?;
-    let mutation = manager.rename(&plugin_id, name_override.as_deref())?;
+    let mutation = manager.rename_command(&plugin_id, &command_id, name_override.as_deref())?;
     plugin_window::teardown_current(&app, window_controller.inner().as_ref(), &plugin_id);
     Ok(mutation)
 }
@@ -3351,6 +3355,7 @@ fn submitted_main_result_command(
 ) -> Option<MainResultCommandContext> {
     (submit && route.output_mode == PublicOutputMode::MainResult).then(|| {
         MainResultCommandContext {
+            command_id: route.command_id.clone(),
             plugin_id: route.plugin_id.clone(),
             command_label: route.command_label.clone(),
             argument: route.input.clone(),
@@ -3495,6 +3500,7 @@ fn publish_public_main_results(
         .into_iter()
         .map(|result| {
             let action = result.copy_text.clone().map(|text| ResultAction::CopyText {
+                command_id: Some(route.command_id.clone()),
                 plugin_id: route.plugin_id.clone(),
                 generation: route.generation,
                 text,
@@ -3891,7 +3897,8 @@ fn public_plugin_completion_result(
     let subtitle = Some(
         suggestion
             .summary
-            .clone()
+            .as_ref()
+            .map(|summary| format!("{} · {}", suggestion.display_name, summary))
             .unwrap_or_else(|| suggestion.display_name.clone()),
     );
     let activation = match suggestion.output_mode {
@@ -3902,6 +3909,7 @@ fn public_plugin_completion_result(
         )?,
         PublicOutputMode::MainResult => LauncherResultActivation::main_result_activation(
             suggestion.plugin_id.clone(),
+            suggestion.command_id.clone(),
             suggestion.effective_name.clone(),
             argument.unwrap_or("").to_owned(),
             suggestion.favorite,
@@ -3913,8 +3921,11 @@ fn public_plugin_completion_result(
             suggestion.favorite,
         )?,
     };
-    let favorite =
-        ResultFavorite::public_plugin(suggestion.plugin_id.clone(), suggestion.favorite)?;
+    let favorite = ResultFavorite::public_plugin(
+        suggestion.plugin_id.clone(),
+        suggestion.command_id.clone(),
+        suggestion.favorite,
+    )?;
     Some((
         crate::model::ResultItem {
             result_id: String::new(),
@@ -5061,25 +5072,50 @@ pub(crate) async fn execute_result(
             open_web_search: crate::web_search::open_search,
             open_quicklink: crate::browser_open::open_url,
             copy_builtin: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
-            copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
-                if public_plugins
-                    .manager()
-                    .is_ok_and(|manager| manager.can_copy_text(plugin_id, generation))
-                {
-                    return app
-                        .clipboard()
-                        .write_text(text.to_owned())
-                        .map_err(|_| PluginCopyError::SideEffectFailed);
-                }
-                plugins.copy_text(plugin_id, generation, || {
-                    app.clipboard().write_text(text.to_owned()).map_err(|_| ())
-                })
+            copy_plugin: |plugin_id: &str,
+                          command_id: Option<&str>,
+                          generation: u64,
+                          text: &str| {
+                copy_plugin_text_with(
+                    command_id,
+                    |command_id| {
+                        if !public_plugins.manager().is_ok_and(|manager| {
+                            manager.can_copy_text(plugin_id, command_id, generation)
+                        }) {
+                            return Err(PluginCopyError::PermissionDenied);
+                        }
+                        app.clipboard()
+                            .write_text(text.to_owned())
+                            .map_err(|_| PluginCopyError::SideEffectFailed)
+                    },
+                    || {
+                        plugins.copy_text(plugin_id, generation, || {
+                            app.clipboard().write_text(text.to_owned()).map_err(|_| ())
+                        })
+                    },
+                )
             },
             clear_and_hide: || clear_and_hide_reason(registry, &window, HideReason::LaunchHandoff),
             increment: |app_id: &str| settings.increment_use_count(app_id, &cache).map_err(|_| ()),
         },
     )
     .await
+}
+
+// A public command's denied authority can never be reinterpreted by the internal plugin manager.
+fn copy_plugin_text_with<P, L>(
+    command_id: Option<&str>,
+    public_copy: P,
+    legacy_copy: L,
+) -> Result<(), PluginCopyError>
+where
+    P: FnOnce(&str) -> Result<(), PluginCopyError>,
+    L: FnOnce() -> Result<(), PluginCopyError>,
+{
+    match command_id {
+        Some(command_id) => public_copy(command_id),
+        None => legacy_copy(),
+    }
 }
 
 struct ClipboardExecution<R, A, F, W, Q, B, P, H, S> {
@@ -5106,7 +5142,7 @@ where
     W: FnOnce(WebSearchEngine, &str) -> Result<(), ()>,
     Q: FnOnce(url::Url) -> Result<(), ()>,
     B: FnOnce(&str) -> Result<(), ()>,
-    P: FnOnce(&str, u64, &str) -> Result<(), PluginCopyError>,
+    P: FnOnce(&str, Option<&str>, u64, &str) -> Result<(), PluginCopyError>,
     H: FnOnce() -> Result<(), CommandError>,
     S: FnOnce(&str) -> Result<(), ()>,
 {
@@ -5138,14 +5174,17 @@ where
         return Ok(ExecuteOutcome::TextCopied);
     }
     if let ResultAction::CopyText {
+        command_id,
         plugin_id,
         generation,
         text,
     } = &action
     {
-        copy_plugin(plugin_id, *generation, text).map_err(|error| match error {
-            PluginCopyError::PermissionDenied => CommandError::plugin_permission_denied(),
-            PluginCopyError::SideEffectFailed => CommandError::clipboard_write_failed(),
+        copy_plugin(plugin_id, command_id.as_deref(), *generation, text).map_err(|error| {
+            match error {
+                PluginCopyError::PermissionDenied => CommandError::plugin_permission_denied(),
+                PluginCopyError::SideEffectFailed => CommandError::clipboard_write_failed(),
+            }
         })?;
         clear_and_hide()?;
         return Ok(ExecuteOutcome::TextCopied);
@@ -5776,6 +5815,7 @@ mod tests {
             1,
             vec![
                 PublicCommandSuggestion {
+                    command_id: "default".into(),
                     plugin_id: "com.example.alpha-return".into(),
                     effective_name: "alpha-return".into(),
                     display_name: "Public Plugin Alpha Return".into(),
@@ -5789,6 +5829,7 @@ mod tests {
                     output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
+                    command_id: "default".into(),
                     plugin_id: "com.example.alpha-window".into(),
                     effective_name: "alpha-window".into(),
                     display_name: "Public Plugin Alpha Window".into(),
@@ -5812,18 +5853,23 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("/alpha-return", Some("返回示例文本到主界面"), false,),
+                (
+                    "/alpha-return",
+                    Some("Public Plugin Alpha Return · 返回示例文本到主界面"),
+                    false,
+                ),
                 ("/alpha-window", Some("Public Plugin Alpha Window"), false,),
             ]
         );
         assert!(matches!(
             &response.items[0].activation,
             crate::model::LauncherResultActivation::MainResultActivation {
+                command_id,
                 plugin_id,
                 command_label,
                 initial_argument,
                 favorite: false,
-            } if plugin_id == "com.example.alpha-return" &&
+            } if command_id == "default" && plugin_id == "com.example.alpha-return" &&
                 command_label == "alpha-return" && initial_argument.is_empty()
         ));
         assert!(matches!(
@@ -5899,6 +5945,7 @@ mod tests {
     #[test]
     fn public_plugin_prompt_and_dispatch_decisions_preserve_activation_modes() {
         let mut route = PublicPluginRoute {
+            command_id: "default".into(),
             plugin_id: "com.example.demo".into(),
             generation: 1,
             activation_id: 1,
@@ -5975,6 +6022,7 @@ mod tests {
     #[test]
     fn favorite_completion_origin_preview_commit_and_rejection_matrix() {
         let mut route = PublicPluginRoute {
+            command_id: "default".into(),
             plugin_id: "com.example.demo".into(),
             generation: 1,
             activation_id: 1,
@@ -6042,6 +6090,7 @@ mod tests {
 
     fn command_suggestion(name: &str) -> PublicCommandSuggestion {
         PublicCommandSuggestion {
+            command_id: "default".into(),
             plugin_id: format!("com.example.{name}"),
             effective_name: name.into(),
             display_name: format!("Plugin {name}"),
@@ -6079,6 +6128,7 @@ mod tests {
             serde_json::to_value(item.activation).unwrap(),
             serde_json::json!({
                 "kind": "mainResultActivation",
+                "commandId": "default",
                 "pluginId": "com.example.demo-return",
                 "commandLabel": "demo-return",
                 "initialArgument": "",
@@ -6099,6 +6149,7 @@ mod tests {
     #[test]
     fn panel_activation_rows_emit_panel_activation_with_initial_argument_rules() {
         let panel = PublicCommandSuggestion {
+            command_id: "default".into(),
             plugin_id: "com.example.panel".into(),
             effective_name: "panel".into(),
             display_name: "Panel".into(),
@@ -6486,7 +6537,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&response.items[1]).unwrap()["favorite"],
             serde_json::json!({
-                "target": { "kind": "publicPlugin", "pluginId": "com.example.alpha" },
+                "target": { "kind": "publicPlugin", "pluginId": "com.example.alpha", "commandId": "default" },
                 "favorite": true,
             })
         );
@@ -6954,6 +7005,7 @@ mod tests {
             host_key_focus: crate::public_plugins::PanelHostKeyFocus::Content,
         };
         let mut route = PublicPluginRoute {
+            command_id: "default".into(),
             plugin_id: identity.plugin_id.clone(),
             generation: identity.generation,
             activation_id: identity.activation_id,
@@ -10098,8 +10150,44 @@ mod tests",
         use super::*;
         use crate::plugins::PluginCopyError;
 
+        #[test]
+        fn denied_public_command_never_falls_back_to_legacy_copy_authority() {
+            for id in ["unknown", "constructor"] {
+                let clipboard = Cell::new(0);
+                let legacy = Cell::new(0);
+                let result = super::super::copy_plugin_text_with(
+                    Some(id),
+                    |saved_id| {
+                        assert_eq!(saved_id, id);
+                        Err(PluginCopyError::PermissionDenied)
+                    },
+                    || {
+                        // The internal manager would allow the same owner and clipboard write.
+                        legacy.set(legacy.get() + 1);
+                        clipboard.set(clipboard.get() + 1);
+                        Ok(())
+                    },
+                );
+                assert_eq!(result, Err(PluginCopyError::PermissionDenied));
+                assert_eq!(legacy.get(), 0);
+                assert_eq!(clipboard.get(), 0);
+            }
+            let clipboard = Cell::new(0);
+            super::super::copy_plugin_text_with(
+                None,
+                |_| panic!("internal copy has no public command"),
+                || {
+                    clipboard.set(1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(clipboard.get(), 1);
+        }
+
         fn copy_action() -> ResultAction {
             ResultAction::CopyText {
+                command_id: None,
                 plugin_id: "plugin".into(),
                 generation: 1,
                 text: "copy me".into(),
@@ -10139,7 +10227,7 @@ mod tests",
                             assert_eq!(text, "14");
                             Ok(())
                         },
-                        copy_plugin: |_: &str, _: u64, _: &str| unreachable!(),
+                        copy_plugin: |_: &str, _: Option<&str>, _: u64, _: &str| unreachable!(),
                         clear_and_hide: || {
                             trace.borrow_mut().push("clear-hide");
                             Ok(())
@@ -10165,7 +10253,7 @@ mod tests",
                         open_web_search: no_web_search,
                         open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
-                        copy_plugin: |_: &str, _: u64, _: &str| {
+                        copy_plugin: |_: &str, _: Option<&str>, _: u64, _: &str| {
                             Err(PluginCopyError::PermissionDenied)
                         },
                         clear_and_hide: || {
@@ -10200,7 +10288,11 @@ mod tests",
                         open_web_search: no_web_search,
                         open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
-                        copy_plugin: |plugin_id: &str, generation: u64, text: &str| {
+                        copy_plugin: |plugin_id: &str,
+                                      command_id: Option<&str>,
+                                      generation: u64,
+                                      text: &str| {
+                            assert_eq!(command_id, None);
                             trace.borrow_mut().push("permission");
                             assert_eq!(plugin_id, "plugin");
                             assert_eq!(generation, 1);
@@ -10239,7 +10331,7 @@ mod tests",
                         open_web_search: no_web_search,
                         open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
-                        copy_plugin: |_: &str, _: u64, _: &str| {
+                        copy_plugin: |_: &str, _: Option<&str>, _: u64, _: &str| {
                             Err(PluginCopyError::SideEffectFailed)
                         },
                         clear_and_hide: || {
@@ -10267,7 +10359,7 @@ mod tests",
                         open_web_search: no_web_search,
                         open_quicklink: no_quicklink,
                         copy_builtin: |_: &str| unreachable!(),
-                        copy_plugin: |_: &str, _: u64, _: &str| {
+                        copy_plugin: |_: &str, _: Option<&str>, _: u64, _: &str| {
                             side_effects.set(side_effects.get() + 1);
                             Ok(())
                         },

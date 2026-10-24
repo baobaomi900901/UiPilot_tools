@@ -131,8 +131,7 @@ pub(crate) struct PublicPluginInventoryItem {
     pub(crate) description: Option<String>,
     pub(crate) version: String,
     pub(crate) source: &'static str,
-    pub(crate) default_name: String,
-    pub(crate) effective_name: String,
+    pub(crate) commands: Vec<PublicPluginInventoryCommand>,
     pub(crate) enabled: bool,
     pub(crate) fault: Option<PublicPluginFault>,
     pub(crate) generation: u64,
@@ -140,6 +139,16 @@ pub(crate) struct PublicPluginInventoryItem {
     pub(crate) settings: Vec<PublicSettingView>,
     pub(crate) icon_url: Option<String>,
     pub(crate) network: Option<PublicPluginInventoryNetwork>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicPluginInventoryCommand {
+    pub(crate) command_id: String,
+    pub(crate) default_name: String,
+    pub(crate) effective_name: String,
+    pub(crate) name_override: Option<String>,
+    pub(crate) favorite: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -168,6 +177,7 @@ pub(crate) struct PublicSettingView {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicPluginRoute {
+    pub(crate) command_id: String,
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
     pub(crate) activation_id: u64,
@@ -189,6 +199,7 @@ pub(crate) struct PublicPluginRoute {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicCommandSuggestion {
+    pub(crate) command_id: String,
     pub(crate) plugin_id: String,
     pub(crate) effective_name: String,
     pub(crate) display_name: String,
@@ -1308,12 +1319,18 @@ impl PublicPluginManager {
                 return Err(PublicPluginManagementError::Unavailable);
             }
             let reservation = self.bundles.reserve(&runtime.plugin_id)?;
-            let prepared_state = self.state.prepare_activation(
+            let prepared_state = match self.state.prepare_activation(
                 &candidate.runtime.manifest,
                 effective_permission_grants,
                 runtime.generation,
                 Some(candidate.runtime.digest.clone()),
-            )?;
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.unstage(&runtime.label);
+                    return Err(error.into());
+                }
+            };
             (reservation, prepared_state)
         };
         let destination = package_destination(
@@ -1690,9 +1707,19 @@ impl PublicPluginManager {
         Ok(commit)
     }
 
+    #[cfg(test)]
     pub(crate) fn rename(
         &self,
         plugin_id: &str,
+        name_override: Option<&str>,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        self.rename_command(plugin_id, "default", name_override)
+    }
+
+    pub(crate) fn rename_command(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
         name_override: Option<&str>,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
         let (bundle, reservation, prepared_state) = {
@@ -1704,11 +1731,11 @@ impl PublicPluginManager {
             bundle
                 .runtime
                 .manifest
-                .command_by_id("default")
+                .command_by_id(command_id)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             let Some(prepared_state) =
                 self.state
-                    .prepare_rename(plugin_id, "default", name_override)?
+                    .prepare_rename(plugin_id, command_id, name_override)?
             else {
                 return Ok(mutation_from_config(&bundle.config));
             };
@@ -1733,9 +1760,19 @@ impl PublicPluginManager {
         Ok(mutation_from_config(&config))
     }
 
+    #[cfg(test)]
     pub(crate) fn set_favorite(
         &self,
         plugin_id: &str,
+        favorite: bool,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        self.set_command_favorite(plugin_id, "default", favorite)
+    }
+
+    pub(crate) fn set_command_favorite(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
         favorite: bool,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
         let (bundle, reservation, prepared_state) = {
@@ -1750,11 +1787,11 @@ impl PublicPluginManager {
             bundle
                 .runtime
                 .manifest
-                .command_by_id("default")
+                .command_by_id(command_id)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             let Some(prepared_state) = self
                 .state
-                .prepare_set_favorite(plugin_id, "default", favorite)?
+                .prepare_set_favorite(plugin_id, command_id, favorite)?
             else {
                 return Ok(mutation_from_config(&bundle.config));
             };
@@ -2458,22 +2495,23 @@ impl PublicPluginManager {
                     }
                 })
                 .collect::<Result<Vec<_>, PublicPluginManagementError>>()?;
-            let command = snapshot
-                .manifest
-                .legacy_command()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
             items.push(PublicPluginInventoryItem {
                 plugin_id: config.plugin_id.clone(),
                 name: snapshot.manifest.name.clone(),
                 description: snapshot.manifest.description.clone(),
                 version: config.version.clone(),
                 source: "localPackage",
-                default_name: command.default_name.clone(),
-                effective_name: config
-                    .command("default")
-                    .ok_or(PublicPluginManagementError::Unavailable)?
-                    .effective_name
-                    .clone(),
+                commands: config
+                    .commands
+                    .iter()
+                    .map(|(id, command)| PublicPluginInventoryCommand {
+                        command_id: id.clone(),
+                        default_name: command.default_name.clone(),
+                        effective_name: command.effective_name.clone(),
+                        name_override: command.name_override.clone(),
+                        favorite: command.favorite,
+                    })
+                    .collect(),
                 enabled: config.enabled,
                 fault: config.fault,
                 generation: config.active_generation,
@@ -2498,7 +2536,11 @@ impl PublicPluginManager {
                 }),
             });
         }
-        items.sort_by(|left, right| left.effective_name.cmp(&right.effective_name));
+        items.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+        });
         Ok(PublicPluginInventory {
             revision: revision.to_string(),
             items,
@@ -2546,7 +2588,11 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
-            let Some(command_config) = config.command("default") else {
+            let Some((command_id, command_config)) = config
+                .commands
+                .iter()
+                .find(|(_, command)| command.effective_name == effective_name)
+            else {
                 continue;
             };
             if self
@@ -2566,9 +2612,10 @@ impl PublicPluginManager {
             }
             let command = snapshot
                 .manifest
-                .legacy_command()
+                .command_by_id(command_id)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             return Ok(Some(PublicPluginRoute {
+                command_id: command_id.clone(),
                 plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
                 activation_id: bundle.activation_id,
@@ -2638,16 +2685,16 @@ impl PublicPluginManager {
             {
                 continue;
             }
-            let command = snapshot
-                .manifest
-                .legacy_command()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let Some(command) = snapshot.manifest.legacy_command() else {
+                return Ok(None);
+            };
             if command.output_mode != PublicOutputMode::Panel
                 || command.activation_mode != PublicActivationMode::Submit
             {
                 return Ok(None);
             }
             return Ok(Some(PublicPluginRoute {
+                command_id: "default".into(),
                 plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
                 activation_id: bundle.activation_id,
@@ -2693,43 +2740,44 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
-            let Some(command_config) = config.command("default") else {
-                continue;
-            };
-            if !config.installed
-                || !config.enabled
-                || config.fault.is_some()
-                || config.active_generation != snapshot.generation
-                || bundle.runtime_recovery_needed
-                || (!command_config.effective_name.starts_with(prefix)
-                    && !snapshot
-                        .manifest
-                        .name
-                        .to_lowercase()
-                        .contains(&folded_prefix))
-            {
-                continue;
+            for (command_id, command_config) in &config.commands {
+                if !config.installed
+                    || !config.enabled
+                    || config.fault.is_some()
+                    || config.active_generation != snapshot.generation
+                    || bundle.runtime_recovery_needed
+                    || (!command_config.effective_name.starts_with(prefix)
+                        && !snapshot
+                            .manifest
+                            .name
+                            .to_lowercase()
+                            .contains(&folded_prefix))
+                {
+                    continue;
+                }
+                let command = snapshot
+                    .manifest
+                    .command_by_id(command_id)
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                suggestions.push(PublicCommandSuggestion {
+                    command_id: command_id.clone(),
+                    plugin_id: config.plugin_id.clone(),
+                    effective_name: command_config.effective_name.clone(),
+                    display_name: snapshot.manifest.name.clone(),
+                    summary: command.summary.clone(),
+                    icon_url: snapshot.icon_url(),
+                    favorite: command_config.favorite,
+                    input_required: command.input_required,
+                    output_mode: command.output_mode,
+                });
             }
-            let command = snapshot
-                .manifest
-                .legacy_command()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            suggestions.push(PublicCommandSuggestion {
-                plugin_id: config.plugin_id.clone(),
-                effective_name: command_config.effective_name.clone(),
-                display_name: snapshot.manifest.name.clone(),
-                summary: command.summary.clone(),
-                icon_url: snapshot.icon_url(),
-                favorite: command_config.favorite,
-                input_required: command.input_required,
-                output_mode: command.output_mode,
-            });
         }
         suggestions.sort_by(|left, right| {
             right.favorite.cmp(&left.favorite).then_with(|| {
                 left.effective_name
                     .cmp(&right.effective_name)
                     .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+                    .then_with(|| left.command_id.cmp(&right.command_id))
             })
         });
         Ok(suggestions)
@@ -2744,36 +2792,36 @@ impl PublicPluginManager {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
-            let Some(command_config) = config.command("default") else {
-                continue;
-            };
-            if !config.installed
-                || !config.enabled
-                || config.fault.is_some()
-                || config.active_generation != snapshot.generation
-                || bundle.runtime_recovery_needed
-                || (!command_config.favorite
-                    && !command_config
-                        .effective_name
-                        .to_lowercase()
-                        .contains(&folded_query))
-            {
-                continue;
+            for (command_id, command_config) in &config.commands {
+                if !config.installed
+                    || !config.enabled
+                    || config.fault.is_some()
+                    || config.active_generation != snapshot.generation
+                    || bundle.runtime_recovery_needed
+                    || (!command_config.favorite
+                        && !command_config
+                            .effective_name
+                            .to_lowercase()
+                            .contains(&folded_query))
+                {
+                    continue;
+                }
+                let command = snapshot
+                    .manifest
+                    .command_by_id(command_id)
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                suggestions.push(PublicCommandSuggestion {
+                    command_id: command_id.clone(),
+                    plugin_id: config.plugin_id.clone(),
+                    effective_name: command_config.effective_name.clone(),
+                    display_name: snapshot.manifest.name.clone(),
+                    summary: command.summary.clone(),
+                    icon_url: snapshot.icon_url(),
+                    favorite: command_config.favorite,
+                    input_required: command.input_required,
+                    output_mode: command.output_mode,
+                });
             }
-            let command = snapshot
-                .manifest
-                .legacy_command()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            suggestions.push(PublicCommandSuggestion {
-                plugin_id: config.plugin_id.clone(),
-                effective_name: command_config.effective_name.clone(),
-                display_name: snapshot.manifest.name.clone(),
-                summary: command.summary.clone(),
-                icon_url: snapshot.icon_url(),
-                favorite: command_config.favorite,
-                input_required: command.input_required,
-                output_mode: command.output_mode,
-            });
         }
         suggestions.sort_by(|left, right| {
             right
@@ -2781,6 +2829,7 @@ impl PublicPluginManager {
                 .cmp(&left.favorite)
                 .then_with(|| left.effective_name.cmp(&right.effective_name))
                 .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+                .then_with(|| left.command_id.cmp(&right.command_id))
         });
         Ok(suggestions)
     }
@@ -3070,14 +3119,48 @@ impl PublicPluginManager {
         bundle.runtime.icon_url()
     }
 
-    pub(crate) fn can_copy_text(&self, plugin_id: &str, generation: u64) -> bool {
+    pub(crate) fn invocation_command_id(
+        &self,
+        request: &ScheduledPluginRequest,
+    ) -> Result<Option<String>, PublicPluginManagementError> {
+        let bundle = self
+            .bundles
+            .confirmed_bundle(&request.context.plugin_id)?
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        if !bundle.config.installed
+            || !bundle.config.enabled
+            || bundle.config.fault.is_some()
+            || bundle.runtime.generation != request.context.plugin_generation
+            || bundle.activation_id != request.candidate.activation_id
+            || bundle.admission_epoch != request.candidate.admission_epoch
+            || bundle
+                .config
+                .command(&request.candidate.command_id)
+                .is_none()
+            || bundle
+                .runtime
+                .manifest
+                .command_by_id(&request.candidate.command_id)
+                .is_none()
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        Ok(bundle
+            .runtime
+            .manifest
+            .is_multi_command()
+            .then(|| request.candidate.command_id.clone()))
+    }
+
+    pub(crate) fn can_copy_text(&self, plugin_id: &str, command_id: &str, generation: u64) -> bool {
         self.bundles
             .bundle(plugin_id)
             .ok()
             .flatten()
             .is_some_and(|bundle| {
                 let config = &bundle.config;
-                config.installed
+                config.command(command_id).is_some()
+                    && config.installed
                     && config.enabled
                     && config.fault.is_none()
                     && config.active_generation == generation
@@ -5014,6 +5097,7 @@ mod tests {
             .scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: "com.example.network".into(),
                     plugin_generation: bundle.runtime.generation,
                     activation_id: bundle.activation_id,
@@ -5984,6 +6068,7 @@ mod tests {
         let replacement = manager
             .scheduler
             .reserve(PluginRequestCandidate {
+                command_id: "default".into(),
                 plugin_id: running.candidate.plugin_id.clone(),
                 plugin_generation: running.candidate.plugin_generation,
                 activation_id: running.candidate.activation_id,
@@ -6942,12 +7027,355 @@ mod tests {
 
         let value = serde_json::to_value(manager.inventory().unwrap()).unwrap();
         assert_eq!(value["items"][0]["pluginId"], "com.example.activation");
-        assert_eq!(value["items"][0]["effectiveName"], "activation");
+        assert_eq!(
+            value["items"][0]["commands"][0]["effectiveName"],
+            "activation"
+        );
         assert_eq!(value["items"][0]["source"], "localPackage");
         assert!(value["items"][0].get("runtime").is_none());
         assert!(value["items"][0].get("outputMode").is_none());
         assert!(value.to_string().find("runtime.js").is_none());
     }
+    fn multi_manager(dir: &TestDir) -> PublicPluginManager {
+        PublicPluginManager::load_with_timer_dependencies(
+            dir.path(),
+            PublicPluginHost {
+                version: [0, 5, 0],
+                ..PublicPluginHost::current(PublicPlatform::Windows)
+            },
+            ["find".into(), "math".into()],
+            Arc::new(MessageCenterService::load(dir.path())),
+            Arc::new(TestClock::default()),
+            Arc::new(TestPublisher::successful()),
+        )
+        .unwrap()
+    }
+
+    fn write_multi_package(root: &Path, version: &str, second_name: &str, reverse: bool) {
+        write_package(root, version, version);
+        let path = root.join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("command");
+        manifest["minimumHostVersion"] = json!("0.5.0");
+        manifest["permissions"] = json!(["clipboard.write"]);
+        let mut commands = vec![
+            json!({"id":"upper", "defaultName":"upper", "summary":"Uppercase", "activationMode":"live", "outputMode":"mainResult", "inputRequired":false}),
+            json!({"id":"constructor", "defaultName":second_name, "summary":"Lowercase", "activationMode":"submit", "outputMode":"mainResult", "inputRequired":true, "inputPlaceholder":"Text"}),
+        ];
+        if reverse {
+            commands.reverse();
+        }
+        manifest["commands"] = json!(commands);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn install_multi(manager: &PublicPluginManager, path: &Path) {
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(path), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::ClipboardWrite]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn multi_command_conflicts_reject_the_entire_install_or_upgrade() {
+        for upgrade in [false, true] {
+            for conflict in ["custom", "occupied", "find", "quick"] {
+                let dir = TestDir::new("multi-atomic-conflicts");
+                let manager = multi_manager(&dir);
+                let other = dir.path().join("other");
+                write_discovery_package(&other, "com.example.other", "Other", "occupied", "Other");
+                install_discovery_package(&manager, &other, Instant::now());
+                manager
+                    .replace_external_reserved_names(["quick".into()])
+                    .unwrap();
+                if upgrade || conflict == "custom" {
+                    write_multi_package(&dir.source(), "1.0.0", "lower", false);
+                    install_multi(&manager, &dir.source());
+                    manager
+                        .rename_command("com.example.activation", "upper", Some("custom"))
+                        .unwrap();
+                    manager
+                        .set_command_favorite("com.example.activation", "upper", true)
+                        .unwrap();
+                    manager
+                        .set_command_favorite("com.example.activation", "constructor", true)
+                        .unwrap();
+                    if !upgrade {
+                        manager.uninstall("com.example.activation", true).unwrap();
+                    }
+                }
+                let before = manager.state.config("com.example.activation").unwrap();
+                let inventory_before = manager.inventory().unwrap();
+                let state_path = dir
+                    .path()
+                    .join("public-plugins/state/com.example.activation/state.json");
+                let bytes_before = fs::read(&state_path).ok();
+                write_multi_package(&dir.source(), "2.0.0", conflict, true);
+                let now = Instant::now();
+                let prepared = manager
+                    .prepare("main", source(&dir.source()), now)
+                    .expect("candidate manifest must be valid before full-set registration");
+                let outcome = manager.commit_with_readiness(
+                    "main",
+                    &prepared.token,
+                    BTreeSet::from([PublicPermission::ClipboardWrite]),
+                    now,
+                    |_| true,
+                );
+                assert!(
+                    matches!(outcome, Err(PublicPluginManagementError::NameConflict)),
+                    "upgrade={upgrade} conflict={conflict}"
+                );
+                assert!(
+                    manager.lock_data().unwrap().staged_by_label.is_empty(),
+                    "rejected candidate must be unstaged"
+                );
+                assert_eq!(
+                    manager.state.config("com.example.activation").unwrap(),
+                    before
+                );
+                assert_eq!(fs::read(&state_path).ok(), bytes_before);
+                assert_eq!(manager.inventory().unwrap(), inventory_before);
+                assert!(manager.route("/occupied input").unwrap().is_some());
+                if upgrade {
+                    assert_eq!(
+                        manager
+                            .route("/custom original")
+                            .unwrap()
+                            .unwrap()
+                            .command_id,
+                        "upper"
+                    );
+                    assert_eq!(
+                        manager
+                            .route("/lower original")
+                            .unwrap()
+                            .unwrap()
+                            .command_id,
+                        "constructor"
+                    );
+                    assert_eq!(manager.runtime_candidates().unwrap().len(), 2);
+                } else {
+                    assert!(manager.route("/upper input").unwrap().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_command_not_committed_keeps_old_set_and_success_publishes_full_reordered_set() {
+        let dir = TestDir::new("multi-atomic-durable");
+        let manager = multi_manager(&dir);
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        install_multi(&manager, &dir.source());
+        manager
+            .rename_command("com.example.activation", "upper", Some("custom"))
+            .unwrap();
+        manager
+            .set_command_favorite("com.example.activation", "constructor", true)
+            .unwrap();
+        let before = manager
+            .state
+            .config("com.example.activation")
+            .unwrap()
+            .unwrap();
+        let inventory_before = manager.inventory().unwrap();
+        let current = dir
+            .path()
+            .join("public-plugins/state/com.example.activation/state.json");
+        let raw = fs::read(&current).unwrap();
+        let backup = current.with_file_name("state.json.backup");
+        if backup.exists() {
+            fs::remove_file(&backup).unwrap();
+        }
+        fs::create_dir(&backup).unwrap();
+        write_multi_package(&dir.source(), "2.0.0", "lower-v2", true);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let readiness = AtomicU64::new(0);
+        assert!(manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::ClipboardWrite]),
+                now,
+                |_| {
+                    readiness.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            )
+            .is_err());
+        assert_eq!(readiness.load(Ordering::Relaxed), 1);
+        assert_eq!(fs::read(&current).unwrap(), raw);
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.activation")
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(manager.inventory().unwrap(), inventory_before);
+        assert!(manager
+            .bundles
+            .confirmed_bundle("com.example.activation")
+            .unwrap()
+            .is_some());
+        assert!(manager.route("/lower-v2").unwrap().is_none());
+        assert_eq!(
+            manager.route("/custom").unwrap().unwrap().command_id,
+            "upper"
+        );
+        assert_eq!(
+            manager.route("/lower").unwrap().unwrap().command_id,
+            "constructor"
+        );
+        let owner_packages = manager.packages_root.join("com.example.activation");
+        assert_eq!(fs::read_dir(&owner_packages).unwrap().count(), 1);
+        fs::remove_dir(&backup).unwrap();
+        install_multi(&manager, &dir.source());
+        let after = manager
+            .state
+            .config("com.example.activation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, "2.0.0");
+        assert_eq!(after.commands.len(), 2);
+        assert_eq!(
+            after.command("upper").unwrap().name_override.as_deref(),
+            Some("custom")
+        );
+        assert!(after.command("constructor").unwrap().favorite);
+        assert!(manager.route("/lower").unwrap().is_none());
+        assert_eq!(
+            manager
+                .route("/lower-v2 kept  input")
+                .unwrap()
+                .unwrap()
+                .input,
+            "kept  input"
+        );
+        assert!(manager.can_copy_text(
+            "com.example.activation",
+            "constructor",
+            after.active_generation
+        ));
+        assert!(!manager.can_copy_text(
+            "com.example.activation",
+            "missing",
+            after.active_generation
+        ));
+        assert!(!manager.can_copy_text(
+            "com.example.activation",
+            "constructor",
+            before.active_generation
+        ));
+    }
+
+    #[test]
+    fn copy_authority_remains_bound_to_id_after_name_takeover_and_reorder() {
+        use crate::result_registry::{QueryDomain, ResultAction, ResultRegistry};
+        let dir = TestDir::new("multi-copy-name-takeover");
+        let manager = multi_manager(&dir);
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        install_multi(&manager, &dir.source());
+        let route = manager.route("/lower text").unwrap().unwrap();
+        let registry = ResultRegistry::default();
+        registry.on_show("copy-owner".into());
+        let token = registry
+            .begin_query(QueryDomain::Plugin, "copy-owner", 1)
+            .unwrap();
+        let action = ResultAction::CopyText {
+            plugin_id: route.plugin_id.clone(),
+            command_id: Some(route.command_id.clone()),
+            generation: route.generation,
+            text: "original private".into(),
+        };
+        let (request, results) = registry
+            .publish_if_latest(
+                token,
+                vec![((), action.clone())],
+                || true,
+                |request, results| (request, results),
+            )
+            .unwrap();
+        manager
+            .rename_command("com.example.activation", "constructor", Some("renamed"))
+            .unwrap();
+        let other = dir.path().join("other");
+        write_discovery_package(&other, "com.example.other", "Other", "lower", "New owner");
+        install_discovery_package(&manager, &other, Instant::now());
+        assert_eq!(
+            manager.route("/lower text").unwrap().unwrap().plugin_id,
+            "com.example.other"
+        );
+        assert_eq!(registry.resolve(&request, &results[0].0).unwrap(), action);
+        // Name takeover cannot rewrite the opaque action's original owner or command.
+        assert!(manager.can_copy_text(&route.plugin_id, &route.command_id, route.generation));
+        write_multi_package(&dir.source(), "2.0.0", "lower-v2", true);
+        install_multi(&manager, &dir.source());
+        let current = manager.route("/renamed text").unwrap().unwrap();
+        assert_eq!(current.command_id, "constructor");
+        assert!(!manager.can_copy_text(&route.plugin_id, &route.command_id, route.generation));
+        assert!(manager.can_copy_text(&current.plugin_id, &current.command_id, current.generation));
+        // Even with the current generation, a removed/unknown ID has no authority.
+        assert!(!manager.can_copy_text(&current.plugin_id, "lower", current.generation));
+    }
+
+    #[test]
+    fn multi_command_routes_and_inventory_cover_the_full_set_without_default() {
+        let dir = TestDir::new("multi-routes");
+        write_package(&dir.source(), "1.0.0", "multi");
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("command");
+        manifest["minimumHostVersion"] = json!("0.5.0");
+        manifest["commands"] = json!([
+            {"id":"upper", "defaultName":"upper", "summary":"Uppercase", "activationMode":"live", "outputMode":"mainResult", "inputRequired":false},
+            {"id":"constructor", "defaultName":"lower", "summary":"Lowercase", "activationMode":"submit", "outputMode":"mainResult", "inputRequired":true, "inputPlaceholder":"Text"}
+        ]);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let manager = PublicPluginManager::load_with_timer_dependencies(
+            dir.path(),
+            PublicPluginHost {
+                version: [0, 5, 0],
+                ..PublicPluginHost::current(PublicPlatform::Windows)
+            },
+            ["find".into(), "math".into()],
+            Arc::new(MessageCenterService::load(dir.path())),
+            Arc::new(TestClock::default()),
+            Arc::new(TestPublisher::successful()),
+        )
+        .unwrap();
+        install_discovery_package(&manager, &dir.source(), Instant::now());
+        assert_eq!(
+            manager.route("/upper A  B").unwrap().unwrap().command_id,
+            "upper"
+        );
+        assert_eq!(
+            manager.route("/lower C  D").unwrap().unwrap().command_id,
+            "constructor"
+        );
+        let inventory = serde_json::to_value(manager.inventory().unwrap()).unwrap();
+        assert_eq!(
+            inventory["items"][0]["commands"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(manager.command_suggestions("").unwrap().len(), 2);
+        assert_eq!(manager.runtime_candidates().unwrap().len(), 1);
+        assert!(manager
+            .panel_route("com.example.activation", "")
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn public_route_preserves_internal_spaces_and_honors_activation_mode() {
         let dir = TestDir::new("route");
@@ -6965,6 +7393,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             PublicPluginRoute {
+                command_id: "default".into(),
                 plugin_id: "com.example.activation".into(),
                 generation: 1,
                 activation_id: manager.activation_id("com.example.activation").unwrap(),
@@ -7019,6 +7448,7 @@ mod tests {
             manager.command_suggestions("d").unwrap(),
             vec![
                 PublicCommandSuggestion {
+                    command_id: "default".into(),
                     plugin_id: "com.example.demo-return".into(),
                     effective_name: "demo-return".into(),
                     display_name: "Public Plugin Demo Return".into(),
@@ -7029,6 +7459,7 @@ mod tests {
                     output_mode: PublicOutputMode::MainResult,
                 },
                 PublicCommandSuggestion {
+                    command_id: "default".into(),
                     plugin_id: "com.example.demo-win".into(),
                     effective_name: "demo-win".into(),
                     display_name: "Public Plugin Demo Window".into(),
@@ -7051,6 +7482,7 @@ mod tests {
         assert_eq!(
             manager.launcher_command_suggestions("WIN").unwrap(),
             vec![PublicCommandSuggestion {
+                command_id: "default".into(),
                 plugin_id: "com.example.demo-win".into(),
                 effective_name: "demo-win".into(),
                 display_name: "Public Plugin Demo Window".into(),
@@ -7808,6 +8240,7 @@ mod tests {
             .scheduler
             .enqueue(
                 PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: route.plugin_id.clone(),
                     plugin_generation: route.generation,
                     activation_id: route.activation_id,
@@ -7926,6 +8359,7 @@ mod tests {
             .scheduler
             .enqueue(
                 crate::public_plugins::PluginRequestCandidate {
+                    command_id: "default".into(),
                     plugin_id: plugin_id.into(),
                     plugin_generation: generation,
                     activation_id,
@@ -9466,7 +9900,12 @@ mod tests {
                     .unwrap();
                 let running = dispatch_network_scheduled(&manager);
                 assert_eq!(
-                    manager.inventory().unwrap().items[0].effective_name,
+                    manager.inventory().unwrap().items[0]
+                        .commands
+                        .iter()
+                        .find(|command| command.command_id == "default")
+                        .unwrap()
+                        .effective_name,
                     "network"
                 );
                 assert_eq!(
@@ -9625,7 +10064,12 @@ mod tests {
                 before
             );
             assert_eq!(
-                reloaded.inventory().unwrap().items[0].effective_name,
+                reloaded.inventory().unwrap().items[0]
+                    .commands
+                    .iter()
+                    .find(|command| command.command_id == "default")
+                    .unwrap()
+                    .effective_name,
                 "network"
             );
             assert!(reloaded.route("/network").unwrap().is_some());

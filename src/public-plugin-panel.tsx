@@ -106,7 +106,7 @@ function PublicPluginRow({
             <h3>{plugin.name}</h3>
             <span>·</span>
             <span>v{plugin.version}</span>
-            <span className="public-plugin-command"><code>/{plugin.effectiveName}</code></span>
+            <span className="public-plugin-command">{plugin.commands.map((command) => <code key={command.commandId}>/{command.effectiveName}</code>)}</span>
             {plugin.fault ? <span className="plugin-fault-label">运行故障</span> : null}
           </div>
           {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
@@ -203,7 +203,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
   const operationPending = useRef(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [name, setName] = useState(plugin.effectiveName)
+  const [names, setNames] = useState<Record<string, string>>(() => Object.fromEntries(plugin.commands.map((command) => [command.commandId, command.effectiveName])))
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [networkConsent, setNetworkConsent] = useState<{ plugin: PublicPluginInventoryItem; revision: string; origin: HTMLElement } | null>(null)
   const [clearKey, setClearKey] = useState<string | null>(null)
@@ -334,15 +334,16 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
     )
   }
 
-  const saveName = async (nameOverride: string | null) => {
+  const saveName = async (commandId: string, nameOverride: string | null) => {
     if (busy) return
-    const nextName = nameOverride ?? plugin.defaultName
-    if (nameOverride !== null && nameOverride === plugin.effectiveName) return
+    const command = plugin.commands.find((command) => command.commandId === commandId)
+    if (!command || nameOverride === command.nameOverride) return
+    const nextName = nameOverride ?? command.defaultName
     setBusy(true)
     setError('')
     try {
-      await client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, nameOverride })
-      setName(nextName)
+      await client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, commandId, nameOverride })
+      setNames((current) => ({ ...current, [commandId]: nextName }))
       await reload()
     } catch {
       setError('无法保存启动键，请重试。')
@@ -356,23 +357,23 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
       <dl className="public-plugin-detail-list">
         <dt className="public-detail-name-term">启动键</dt>
         <dd className="public-detail-name-value">
-          <div className="public-detail-name-control">
+          {plugin.commands.map((command) => <div className="public-detail-name-control" key={command.commandId}>
             <Input
-              aria-label="启动键"
-              value={name}
+              aria-label={plugin.commands.length === 1 ? "启动键" : `启动键 ${command.commandId}`}
+              value={Object.prototype.hasOwnProperty.call(names, command.commandId) ? names[command.commandId] : command.effectiveName}
               disabled={busy}
-              onChange={(event) => setName(event.target.value)}
-              onBlur={(event) => void saveName(event.currentTarget.value)}
+              onChange={(event) => setNames((current) => ({ ...current, [command.commandId]: event.target.value }))}
+              onBlur={(event) => void saveName(command.commandId, event.currentTarget.value)}
             />
             <Tooltip title="恢复默认">
               <Button
-                aria-label="恢复默认启动键"
+                aria-label={plugin.commands.length === 1 ? "恢复默认启动键" : `恢复默认启动键 ${command.commandId}`}
                 icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />}
                 disabled={busy}
-                onClick={() => void saveName(null)}
+                onClick={() => void saveName(command.commandId, null)}
               />
             </Tooltip>
-          </div>
+          </div>)}
         </dd>
         <dt>版本号</dt>
         <dd>{plugin.version}</dd>
