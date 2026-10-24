@@ -118,9 +118,9 @@
 
 **Dependencies:** Task 5；设计 §13、§16.14–15。Task 1 已提供新形态声明 metadata；本任务收口诊断与人类输出，Host target 仍 0.4.0。
 
-- [ ] 将逐项语义规则拆为可保留多个 findings 的定位规则，携带精确 pointer，并仅为语法有效且唯一 ID 的条目赋 commandId；包级/共享资源 issue 不带命令身份。
-- [ ] 贯通内部 ManifestValidationIssue、report issue、collector 存储/比较/去重和 human renderer。不同项各有稳定 pointer/rule rank；保持已有 phase、code、exit code、100 条上限及截断，不能以名称或数组序号伪造 ID。
-- [ ] 目录、archive、pack 嵌入 validate report 复用同一结果；legacy JSON key 集合、issue 字段和人类文本锁定 golden。新增诊断字段只在新形态出现，不因 nullable 字段输出 null。
+- [x] 将逐项语义规则拆为可保留多个 findings 的定位规则，携带精确 pointer，并仅为语法有效且唯一 ID 的条目赋 commandId；包级/共享资源 issue 不带命令身份。
+- [x] 贯通内部 ManifestValidationIssue、report issue、collector 存储/比较/去重和 human renderer。不同项各有稳定 pointer/rule rank；保持已有 phase、code、exit code、100 条上限及截断，不能以名称或数组序号伪造 ID。
+- [x] 目录、archive、pack 嵌入 validate report 复用同一结果；legacy JSON key 集合、issue 字段和人类文本锁定 golden。新增诊断字段只在新形态出现，不因 nullable 字段输出 null。
 
 **Distinct test coverage:** 双命令同时语义失败均保留；missing/invalid/duplicate ID 的每个 offending pointer 无 commandId；重复名称的有效唯一 IDs 保留；重排变 pointer/顺序、不变身份；runtime 资源缺失无 commandId；schema-invalid 无 plugin，semantic/API/platform 失败保留声明 metadata；非法 JSON byte offset 不变。人类输出在 ID 可用时显示 ID+pointer，ID 不可用时仅 exact pointer；legacy valid/invalid 目录与 archive JSON/human golden 不加字段，pack 嵌入同报告。超过 100 findings 的 phase、顺序、truncated 稳定。此时 .5 包的目标版本不兼容 issue 是预期；成功包/pack 的生产 CLI 验收在 Task 8 版本切换后执行，不新增未设计的 CLI --host-version 旗标。
 
