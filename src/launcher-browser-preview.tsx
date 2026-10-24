@@ -125,6 +125,28 @@ function updatePreviewPlugin(pluginId: string, update: (plugin: PublicPluginInve
   }
 }
 
+const commandPreview = previewParameters.has('commands')
+const commandPreviewCount = previewParameters.get('commands') === '16' ? 16 : 2
+const commandPreviewPlugin: PublicPluginInventoryItem = {
+  pluginId: 'com.uipilot.multi-preview', name: 'Command Demo', description: '同包命令独立管理预览。',
+  version: '0.1.0', source: 'localPackage', enabled: true, fault: null, generation: 1, iconUrl: null,
+  commands: Array.from({ length: commandPreviewCount }, (_, index) => ({
+    commandId: index === 1 ? 'constructor' : index === 0 ? 'upper' : `command-${index + 1}`,
+    defaultName: commandPreviewCount === 16 ? `long-command-name-number-${String(index + 1).padStart(2, '0')}` : index === 0 ? 'upper' : 'lower',
+    effectiveName: commandPreviewCount === 16 ? `long-command-name-number-${String(index + 1).padStart(2, '0')}` : index === 0 ? 'upper' : 'lower',
+    nameOverride: null, favorite: false,
+  })), network: null, permissions: [], settings: [],
+}
+if (commandPreview) previewPublicPlugins = { ...previewPublicPlugins, items: [commandPreviewPlugin] }
+let commandScenarioPending = true
+async function beforeCommandMutation() {
+  if (previewParameters.get('commandScenario') === 'delay') await new Promise<void>((resolve) => window.setTimeout(resolve, 2500))
+  if (commandScenarioPending && previewParameters.get('commandScenario') === 'error') {
+    commandScenarioPending = false
+    throw new Error('Synthetic command conflict')
+  }
+}
+
 const previewLegacyPlugins: PluginInventorySnapshot = {
   revision: '1',
   items: [
@@ -206,6 +228,18 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
         hasDefaultAction: false,
       }],
     }
+  }
+  if (commandPreview) {
+    const plugin = previewPublicPlugins.items[0]!
+    const normalized = query.trim().toLowerCase().replace(/^\//u, '')
+    return { requestId: `browser-preview-${querySequence}`, items: plugin.commands
+      .filter((command) => !normalized || command.effectiveName.includes(normalized))
+      .map((command) => ({ resultId: `preview-${command.commandId}`, title: `${plugin.name} /${command.effectiveName}`,
+        activation: { kind: 'mainResultActivation' as const, pluginId: plugin.pluginId, commandId: command.commandId,
+          commandLabel: command.effectiveName, initialArgument: '', favorite: command.favorite },
+        favorite: { target: { kind: 'publicPlugin' as const, pluginId: plugin.pluginId, commandId: command.commandId }, favorite: command.favorite },
+        hasDefaultAction: false,
+      })) }
   }
   const icon = await loadAppIcon()
   const items: ResultItem[] = [
@@ -338,9 +372,19 @@ const client: LauncherClient = {
       permissions: plugin.permissions.map((permission) => permission.permission === 'network.https' ? { ...permission, granted } : permission),
     }))
   },
-  setPublicPluginFavorite: async ({ pluginId, commandId, favorite }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, favorite } : command) })) },
+  setPublicPluginFavorite: async ({ pluginId, commandId, favorite }) => {
+    await beforeCommandMutation()
+    if (previewParameters.get('commandScenario') === 'remove') {
+      updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId !== commandId) }))
+      return
+    }
+    updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, favorite } : command) })) },
   setBuiltinFeatureFavorite: async () => undefined,
-  setPublicPluginEffectiveName: async ({ pluginId, commandId, nameOverride }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, nameOverride, effectiveName: nameOverride ?? command.defaultName } : command) })) },
+  setPublicPluginEffectiveName: async ({ pluginId, commandId, nameOverride }) => {
+    await beforeCommandMutation()
+    const name = nameOverride ?? previewPublicPlugins.items.find((plugin) => plugin.pluginId === pluginId)?.commands.find((command) => command.commandId === commandId)?.defaultName
+    if (!name || !/^[a-z][a-z0-9-]{0,31}$/u.test(name) || name === 'conflict' || previewPublicPlugins.items.some((plugin) => plugin.commands.some((command) => (plugin.pluginId !== pluginId || command.commandId !== commandId) && command.effectiveName === name))) throw new Error('Synthetic command conflict')
+    updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, nameOverride, effectiveName: nameOverride ?? command.defaultName } : command) })) },
   savePublicPluginSettings: async ({ input }) => {
     await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
     updatePreviewPlugin(input.pluginId, (plugin) => ({ ...plugin, settings: plugin.settings.map((setting) =>

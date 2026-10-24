@@ -1612,3 +1612,85 @@ fn valid_schema_one_credential_order_normalization_keeps_raw_and_does_not_repair
         .contains(&PublicPermission::NetworkHttps));
     assert_eq!(fs::read(path).unwrap(), raw);
 }
+
+#[test]
+fn per_command_favorite_restart_noop_and_restore_conflicts_preserve_exact_state() {
+    for conflict in ["sibling", "other-package", "builtin", "quicklink"] {
+        let dir = TestDir::new(&format!("pair-favorite-restore-{conflict}"));
+        let plugin = multi_manifest(&[("constructor", "old"), ("b", "bee")]);
+        let store = PluginStateStore::load(dir.path(), []).unwrap();
+        install(&store, &plugin);
+        let config = publish_change(
+            &store,
+            store
+                .prepare_set_favorite(&plugin.plugin_id, "constructor", true)
+                .unwrap(),
+        );
+        assert!(config.command("constructor").unwrap().favorite);
+        assert!(!config.command("b").unwrap().favorite);
+        let path = dir.path().join(&plugin.plugin_id).join("state.json");
+        let bytes = fs::read(&path).unwrap();
+        let revision = store.inventory_revision().unwrap();
+        assert!(store
+            .prepare_set_favorite(&plugin.plugin_id, "constructor", true)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(store.inventory_revision().unwrap(), revision);
+        publish_change(
+            &store,
+            store
+                .prepare_rename(&plugin.plugin_id, "constructor", Some("custom"))
+                .unwrap(),
+        );
+        drop(store);
+        let store = PluginStateStore::load(
+            dir.path(),
+            if conflict == "builtin" {
+                vec!["old".into()]
+            } else {
+                vec![]
+            },
+        )
+        .unwrap();
+        let restarted = store.config(&plugin.plugin_id).unwrap().unwrap();
+        assert!(restarted.command("constructor").unwrap().favorite);
+        assert!(!restarted.command("b").unwrap().favorite);
+        assert_eq!(
+            restarted.command("constructor").unwrap().effective_name,
+            "custom"
+        );
+        match conflict {
+            "sibling" => {
+                publish_change(
+                    &store,
+                    store
+                        .prepare_rename(&plugin.plugin_id, "b", Some("old"))
+                        .unwrap(),
+                );
+            }
+            "other-package" => {
+                install(&store, &manifest("com.example.other", "old", json!([])));
+            }
+            "quicklink" => {
+                store
+                    .replace_external_reserved_names(["old".into()])
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let before = store.config(&plugin.plugin_id).unwrap().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let revision = store.inventory_revision().unwrap();
+        assert!(
+            matches!(
+                store.prepare_rename(&plugin.plugin_id, "constructor", None),
+                Err(PluginStateError::NameConflict { .. })
+            ),
+            "{conflict}"
+        );
+        assert_eq!(store.config(&plugin.plugin_id).unwrap().unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(store.inventory_revision().unwrap(), revision);
+    }
+}

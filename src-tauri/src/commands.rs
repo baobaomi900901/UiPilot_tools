@@ -1436,6 +1436,43 @@ pub(crate) fn set_public_plugin_network_access(
     )
 }
 
+// Request injection preserves actual top-level key presence. In particular,
+// Tauri's Option<String> CommandArg normalizes both absent and null to None.
+// Keep authorization and membership resolution shared with the real-IPC probes.
+fn resolve_management_command(
+    label: &str,
+    request: &tauri::ipc::Request<'_>,
+    contains: impl FnOnce(&str) -> Result<bool, CommandError>,
+) -> Result<String, CommandError> {
+    require_main_label(label)?;
+    let tauri::ipc::InvokeBody::Json(serde_json::Value::Object(body)) = request.body() else {
+        return Err(PublicPluginManagementError::Unavailable.into());
+    };
+    let command_id = match body.get("commandId") {
+        None => "default",
+        Some(serde_json::Value::String(id)) => id.as_str(),
+        Some(_) => return Err(PublicPluginManagementError::Unavailable.into()),
+    };
+    if !contains(command_id)? {
+        return Err(PublicPluginManagementError::Unavailable.into());
+    }
+    Ok(command_id.to_owned())
+}
+
+fn contains_management_command(
+    service: &PublicPluginService,
+    plugin_id: &str,
+    command_id: &str,
+) -> Result<bool, CommandError> {
+    Ok(service.manager()?.inventory()?.items.iter().any(|plugin| {
+        plugin.plugin_id == plugin_id
+            && plugin
+                .commands
+                .iter()
+                .any(|command| command.command_id == command_id)
+    }))
+}
+
 #[tauri::command]
 pub(crate) fn set_plugin_favorite(
     window: WebviewWindow,
@@ -1443,10 +1480,13 @@ pub(crate) fn set_plugin_favorite(
     registries: State<'_, ResultRegistries>,
     plugins: State<'_, Arc<PluginManager>>,
     plugin_id: String,
-    command_id: String,
+    request: tauri::ipc::Request<'_>,
     favorite: bool,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
+    let command_id = resolve_management_command(window.label(), &request, |id| {
+        contains_management_command(service.inner().as_ref(), &plugin_id, id)
+    })?;
     finish_public_plugin_management(
         service.set_command_favorite(&plugin_id, &command_id, favorite),
         registries.main(),
@@ -1466,10 +1506,13 @@ pub(crate) fn set_plugin_effective_name(
     quicklinks: State<'_, Arc<QuicklinksStore>>,
     window_controller: State<'_, Arc<PluginWindowController>>,
     plugin_id: String,
-    command_id: String,
+    request: tauri::ipc::Request<'_>,
     name_override: Option<String>,
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
+    let command_id = resolve_management_command(window.label(), &request, |id| {
+        contains_management_command(service.inner().as_ref(), &plugin_id, id)
+    })?;
     let manager = service.manager()?;
     manager.replace_external_reserved_names(quicklinks.commands())?;
     finish_public_plugin_management(
@@ -11015,5 +11058,141 @@ mod tests",
             1
         );
         assert!(!production.contains("#[cfg(test)]\nfn execute_file_action_with<I, E>("));
+    }
+}
+
+#[cfg(test)]
+mod command_management_ipc_tests {
+    use super::CommandError;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+    use tauri::{Manager, State, WebviewWindow};
+
+    #[derive(Default)]
+    struct Probe {
+        commands: Vec<String>,
+        reads: usize,
+        writes: Vec<(String, String, Value)>,
+    }
+    fn resolve_probe(
+        label: &str,
+        request: &tauri::ipc::Request<'_>,
+        probe: &Mutex<Probe>,
+    ) -> Result<String, CommandError> {
+        super::resolve_management_command(label, request, |id| {
+            let mut probe = probe.lock().unwrap();
+            probe.reads += 1;
+            Ok(probe.commands.iter().any(|command| command == id))
+        })
+    }
+    #[tauri::command]
+    fn favorite_probe<R: tauri::Runtime>(
+        window: WebviewWindow<R>,
+        probe: State<'_, Mutex<Probe>>,
+        plugin_id: String,
+        request: tauri::ipc::Request<'_>,
+        favorite: bool,
+    ) -> Result<(), CommandError> {
+        let id = resolve_probe(window.label(), &request, probe.inner())?;
+        let mut probe = probe.lock().unwrap();
+        probe.writes.push((plugin_id, id, json!(favorite)));
+        Ok(())
+    }
+    #[tauri::command]
+    fn rename_probe<R: tauri::Runtime>(
+        window: WebviewWindow<R>,
+        probe: State<'_, Mutex<Probe>>,
+        plugin_id: String,
+        request: tauri::ipc::Request<'_>,
+        name_override: Option<String>,
+    ) -> Result<(), CommandError> {
+        let id = resolve_probe(window.label(), &request, probe.inner())?;
+        let mut probe = probe.lock().unwrap();
+        probe.writes.push((plugin_id, id, json!(name_override)));
+        Ok(())
+    }
+    #[test]
+    fn generated_ipc_preserves_absent_only_legacy_command_id_and_guards_protected_resolution() {
+        for command in ["favorite_probe", "rename_probe"] {
+            for has_default in [true, false] {
+                let app = tauri::test::mock_builder()
+                    .manage(Mutex::new(Probe {
+                        commands: if has_default {
+                            vec!["default".into(), "upper".into(), "constructor".into()]
+                        } else {
+                            vec!["upper".into(), "constructor".into()]
+                        },
+                        ..Probe::default()
+                    }))
+                    .invoke_handler(tauri::generate_handler![favorite_probe, rename_probe])
+                    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                    .unwrap();
+                let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                    .build()
+                    .unwrap();
+                let secondary =
+                    tauri::WebviewWindowBuilder::new(&app, "secondary", Default::default())
+                        .build()
+                        .unwrap();
+                for (id, accepted) in [
+                    (None, has_default),
+                    (Some(json!(null)), false),
+                    (Some(json!("")), false),
+                    (Some(json!("bad id")), false),
+                    (Some(json!("unknown")), false),
+                    (Some(json!(1)), false),
+                    (Some(json!(false)), false),
+                    (Some(json!("constructor")), true),
+                    (Some(json!("upper")), true),
+                ] {
+                    for (window, allowed) in [(&main, true), (&secondary, false)] {
+                        let mut body = json!({ "pluginId": "com.example.multi", "favorite": true, "nameOverride": "new-name" });
+                        if let Some(id) = &id {
+                            body["commandId"] = id.clone();
+                        }
+                        let before = {
+                            let probe = app.state::<Mutex<Probe>>();
+                            let probe = probe.lock().unwrap();
+                            (probe.reads, probe.writes.len())
+                        };
+                        let result = tauri::test::get_ipc_response(
+                            window,
+                            tauri::webview::InvokeRequest {
+                                cmd: command.into(),
+                                callback: tauri::ipc::CallbackFn(0),
+                                error: tauri::ipc::CallbackFn(1),
+                                url: "http://tauri.localhost".parse().unwrap(),
+                                body: tauri::ipc::InvokeBody::Json(body.clone()),
+                                headers: Default::default(),
+                                invoke_key: tauri::test::INVOKE_KEY.into(),
+                            },
+                        );
+                        assert_eq!(
+                            result.is_ok(),
+                            accepted && allowed,
+                            "{command} default={has_default} caller={} body={body}",
+                            window.label()
+                        );
+                        let probe = app.state::<Mutex<Probe>>();
+                        let probe = probe.lock().unwrap();
+                        if !allowed {
+                            assert_eq!(result.unwrap_err()["code"], "invalidCaller");
+                            assert_eq!(
+                                probe.reads, before.0,
+                                "unauthorized caller must not read membership"
+                            );
+                        }
+                        if !(accepted && allowed) {
+                            assert_eq!(probe.writes.len(), before.1);
+                        } else {
+                            assert_eq!(
+                                probe.writes.last().unwrap().1,
+                                id.as_ref().and_then(Value::as_str).unwrap_or("default")
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

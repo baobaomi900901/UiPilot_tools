@@ -29,7 +29,7 @@ import {
 import ReactMarkdown from 'react-markdown'
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 
-import type { LauncherCore } from './launcher-core'
+import { sameFavoriteTarget, type LauncherCore } from './launcher-core'
 import { MessageCenterPanel } from './message-center-panel'
 import { bindNativeTextInput } from './native-input'
 import { PluginIcon } from './plugin-icon'
@@ -41,6 +41,7 @@ import type {
   PluginPanelBounds,
   PublicPluginInventoryItem,
   QuicklinksSnapshot,
+  ResultFavoriteTarget,
   ResultIconKind,
   SettingsTabKey,
   ThemePreference,
@@ -437,7 +438,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
-  const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string } | null>(null)
+  const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string; session: number } | null>(null)
+  const detailSession = useRef(0)
+  const detailReload = useRef(0)
   const selectedPublicPlugin = publicPluginDetail?.plugin ?? null
   const [quicklinksStatus, setQuicklinksStatus] = useState<QuicklinksUiStatus | null>(null)
   const colorScheme = resolveUiColorScheme(snapshot.theme, systemDark)
@@ -457,10 +460,15 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const restoreSettingsTabFocus = useRef(false)
   const activeSettingsTab = snapshot.settingsTab
   const optionRefs = useRef(new Map<number, HTMLElement>())
+  const [favoriteMenuVersion, setFavoriteMenuVersion] = useState(0)
   const favoriteFocusTarget = useRef<{
     invocationId: string | undefined
     viewEpoch: number
     queryControlValue: string
+    target: ResultFavoriteTarget
+    origin: HTMLElement | null
+    moved: boolean
+    menuOpen: boolean
   } | undefined>(undefined)
   const fileOptionRefs = useRef(new Map<number, HTMLElement>())
   const ready = useRef(false)
@@ -479,7 +487,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }, [colorScheme])
 
   useEffect(() => {
-    if (snapshot.view !== 'settings') setPublicPluginDetail(null)
+    if (snapshot.view !== 'settings') { detailSession.current++; setPublicPluginDetail(null) }
   }, [snapshot.view])
 
   const selectedPublicPluginId = selectedPublicPlugin?.pluginId
@@ -748,11 +756,22 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     }
   }, [snapshot.results, snapshot.selectedIndex, snapshot.view])
 
+  useEffect(() => {
+    const onFocus = (event: FocusEvent) => {
+      const pending = favoriteFocusTarget.current
+      const element = event.target
+      if (!pending || !(element instanceof HTMLElement) || element === document.body || element === pending.origin || element.closest('[role="menu"]')) return
+      pending.moved = true
+    }
+    document.addEventListener('focusin', onFocus)
+    return () => document.removeEventListener('focusin', onFocus)
+  }, [])
+
   useLayoutEffect(() => {
     const target = favoriteFocusTarget.current
     if (!target) return
     if (
-      snapshot.view !== 'launcher' ||
+      target.moved || snapshot.view !== 'launcher' ||
       snapshot.invocationId !== target.invocationId ||
       snapshot.viewEpoch !== target.viewEpoch ||
       snapshot.queryControlValue !== target.queryControlValue
@@ -760,17 +779,18 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       favoriteFocusTarget.current = undefined
       return
     }
-    if (snapshot.favoriteMutationPending || snapshot.searchPending) return
-    const result = snapshot.results[0]
-    if (!result) return
+    if (target.menuOpen || snapshot.favoriteMutationPending || snapshot.searchPending) return
+    const result = snapshot.results.find((item) => item.favorite && sameFavoriteTarget(item.favorite.target, target.target)) ?? snapshot.results[0]
     const frame = window.requestAnimationFrame(() => {
-      const option = optionRefs.current.get(result.key)
+      if (favoriteFocusTarget.current !== target || target.moved) return
+      const option = result ? optionRefs.current.get(result.key) : queryRef.current
       if (!option?.isConnected) return
+      favoriteFocusTarget.current = undefined
       option.focus()
-      if (document.activeElement === option) favoriteFocusTarget.current = undefined
     })
     return () => window.cancelAnimationFrame(frame)
   }, [
+    favoriteMenuVersion,
     snapshot.favoriteMutationPending,
     snapshot.invocationId,
     snapshot.queryControlValue,
@@ -1155,6 +1175,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
         tabIndex={-1}
         onClick={() => core.activateResult(index)}
+        onFocus={() => core.selectResult(index)}
         onContextMenu={resultFavorite ? (event) => event.preventDefault() : undefined}
         ref={(element) => {
           if (element) optionRefs.current.set(item.key, element)
@@ -1220,13 +1241,28 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               invocationId: snapshot.invocationId,
               viewEpoch: snapshot.viewEpoch,
               queryControlValue: snapshot.queryControlValue,
+              target: resultFavorite.target,
+              origin: optionRefs.current.get(item.key) ?? null,
+              moved: false,
+              menuOpen: false,
             }
             core.setPluginFavorite(index, !resultFavorite.favorite)
           },
         }}
         onOpenChange={(open) => {
-          if (open) core.openPluginContextMenu(index)
-          else core.closePluginContextMenu()
+          if (open) {
+            favoriteFocusTarget.current = {
+              invocationId: snapshot.invocationId, viewEpoch: snapshot.viewEpoch,
+              queryControlValue: snapshot.queryControlValue, target: resultFavorite.target,
+              origin: optionRefs.current.get(item.key) ?? null, moved: false, menuOpen: true,
+            }
+            core.openPluginContextMenu(index)
+          } else {
+            const pending = favoriteFocusTarget.current
+            if (pending && sameFavoriteTarget(pending.target, resultFavorite.target)) pending.menuOpen = false
+            setFavoriteMenuVersion((version) => version + 1)
+            core.closePluginContextMenu()
+          }
         }}
       >
         {row}
@@ -1956,13 +1992,15 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     }
   }
   const closePublicPluginDetail = () => {
+    detailSession.current++
+    detailReload.current++
     restoreSettingsTabFocus.current = true
     setPublicPluginDetail(null)
   }
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} onOpenDetails={(plugin, revision) => setPublicPluginDetail({ plugin, revision })} />
+        <PublicPluginPanel client={core.client} onOpenDetails={(plugin, revision) => setPublicPluginDetail({ plugin, revision, session: ++detailSession.current })} />
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2122,15 +2160,19 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         <div className="settings-scroll-content">
           <PublicPluginDetail
             client={core.client}
-            key={selectedPublicPlugin.pluginId}
+            key={`${selectedPublicPlugin.pluginId}:${publicPluginDetail!.session}`}
             plugin={selectedPublicPlugin}
             inventoryRevision={publicPluginDetail!.revision}
             reload={async () => {
+              const session = publicPluginDetail!.session
+              if (detailSession.current !== session) return
+              const request = ++detailReload.current
               const inventory = await core.client.listPublicPlugins()
+              if (detailSession.current !== session || detailReload.current !== request) return
               setPublicPluginDetail((current) => {
-                if (current?.plugin.pluginId !== selectedPublicPlugin.pluginId) return current
+                if (current?.session !== session || current.plugin.pluginId !== selectedPublicPlugin.pluginId) return current
                 const plugin = inventory.items.find(({ pluginId }) => pluginId === current.plugin.pluginId)
-                return plugin ? { plugin, revision: inventory.revision } : null
+                return plugin ? { plugin, revision: inventory.revision, session } : null
               })
             }}
           />

@@ -16,9 +16,16 @@ fn main() {
             );
             println!("cargo:rustc-link-arg-bin=uipilot-everything-installer=/MANIFEST:EMBED");
         } else {
+            // Cargo's tests-only linker args omit lib unit tests. Embed the same
+            // Common Controls dependency for every ordinary Windows link target;
+            // preserve Tauri's app resource manifest and the separate helper path.
+            println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
             println!(
-                "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+                "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
             );
+            // The app already embeds Tauri's complete manifest via resource.lib.
+            // Keep that resource instead of generating a second manifest with ID 1.
+            println!("cargo:rustc-link-arg-bin=uipilot=/MANIFEST:NO");
         }
     }
     if helper_build {

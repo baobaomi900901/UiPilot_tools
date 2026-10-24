@@ -81,6 +81,7 @@ export interface LauncherCore {
   readonly deleteQuicklink: () => Promise<void>
   readonly setPanelBounds: (input: { sessionEpoch: U64Decimal; bounds: PluginPanelBounds }) => void
   readonly settlePanelHostInputFocus: (input: PluginPanelFocusHostInputEvent & { focused: boolean }) => void
+  readonly selectResult: (index: number) => void
   readonly activateResult: (index: number) => void
   readonly openPluginContextMenu: (index: number) => void
   readonly closePluginContextMenu: () => void
@@ -619,7 +620,7 @@ function pluginFavoriteActivation(activation: LauncherResultActivation) {
     : undefined
 }
 
-function sameFavoriteTarget(left: ResultFavoriteTarget, right: ResultFavoriteTarget): boolean {
+export function sameFavoriteTarget(left: ResultFavoriteTarget, right: ResultFavoriteTarget): boolean {
   if (left.kind !== right.kind) return false
   return left.kind === 'publicPlugin'
     ? left.pluginId === (right as Extract<ResultFavoriteTarget, { kind: 'publicPlugin' }>).pluginId && left.commandId === (right as Extract<ResultFavoriteTarget, { kind: 'publicPlugin' }>).commandId
@@ -3371,6 +3372,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     )
   }
 
+  function selectResult(index: number): void {
+    if (destroyed || model.view !== 'launcher' || !Number.isInteger(index) || index < 0 || index >= model.results.length || model.selectedIndex === index) return
+    invalidateFavoriteInteraction()
+    model.selectedIndex = index
+    publish(true)
+  }
+
   function activateResult(index: number): void {
     if (
       sequenceExhausted ||
@@ -3889,6 +3897,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     deleteQuicklink,
     setPanelBounds,
     settlePanelHostInputFocus,
+    selectResult,
     activateResult,
     openPluginContextMenu,
     closePluginContextMenu,

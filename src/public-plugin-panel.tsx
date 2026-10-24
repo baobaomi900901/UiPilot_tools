@@ -1,6 +1,6 @@
 import { Button, Input, Modal, Popconfirm, Spin, Switch, Tooltip } from 'antd'
-import { FolderOpen, RefreshCw, Undo2, Upload } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { FolderOpen, RefreshCw, Star, Undo2, Upload } from 'lucide-react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { parseU64Decimal } from './protocol'
 import { PluginIcon } from './plugin-icon'
@@ -106,7 +106,10 @@ function PublicPluginRow({
             <h3>{plugin.name}</h3>
             <span>·</span>
             <span>v{plugin.version}</span>
-            <span className="public-plugin-command">{plugin.commands.map((command) => <code key={command.commandId}>/{command.effectiveName}</code>)}</span>
+            <span className="public-plugin-command" title={plugin.commands.map((command) => `${command.commandId}: /${command.effectiveName}`).join(' · ')}>
+              {plugin.commands.slice(0, 1).map((command) => <code key={command.commandId}>/{command.effectiveName}</code>)}
+              {plugin.commands.length > 1 ? <span className="public-plugin-command-count">共 {plugin.commands.length} 条命令</span> : null}
+            </span>
             {plugin.fault ? <span className="plugin-fault-label">运行故障</span> : null}
           </div>
           {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
@@ -193,6 +196,134 @@ function CredentialBindings({ credentials, settings = [], addedIds = [] }: {
   )
 }
 
+// Each command owns its drafts and continuations; package settings remain singular.
+function PublicPluginCommandRow({ client, pluginId, command, revision, reload, single }: {
+  client: LauncherClient
+  pluginId: string
+  command: PublicPluginInventoryItem['commands'][number]
+  revision: string
+  reload: () => Promise<void>
+  single: boolean
+}) {
+  const [draft, setDraft] = useState(command.effectiveName)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const touched = useRef(false)
+  const row = useRef<HTMLDivElement>(null)
+  const alive = useRef(true)
+  const currentRevision = useRef(revision)
+  currentRevision.current = revision
+  const sequence = useRef(0)
+  const pending = useRef(false)
+  const focusReturn = useRef<{ origin: HTMLElement; moved: boolean } | null>(null)
+  const previousCommand = useRef(command)
+  useEffect(() => {
+    alive.current = true
+    const onFocus = (event: FocusEvent) => {
+      if (focusReturn.current && event.target !== document.body && event.target !== focusReturn.current.origin) focusReturn.current.moved = true
+    }
+    document.addEventListener('focusin', onFocus)
+    return () => { alive.current = false; sequence.current++; document.removeEventListener('focusin', onFocus) }
+  }, [])
+  useLayoutEffect(() => {
+    // Any new inventory revision retires continuations admitted against the old one.
+    if (pending.current) focusReturn.current = null
+    sequence.current++
+    pending.current = false
+    setBusy(false)
+    setError('')
+    setNotice('')
+    const previous = previousCommand.current
+    if (previous.effectiveName !== command.effectiveName || previous.nameOverride !== command.nameOverride) {
+      setDraft(command.effectiveName)
+      touched.current = false
+    }
+    previousCommand.current = command
+  }, [revision, command.effectiveName, command.nameOverride])
+  useLayoutEffect(() => {
+    const focus = focusReturn.current
+    if (busy || !focus) return
+    focusReturn.current = null
+    if (focus.moved) return
+    const active = document.activeElement
+    if (active !== document.body && active !== focus.origin) return
+    const target = focus.origin.isConnected ? focus.origin : row.current?.querySelector<HTMLInputElement>('input')
+    if (target?.isConnected && !target.matches(':disabled')) target.focus()
+  }, [busy])
+  const mutate = async (operation: () => Promise<void>, success: () => void, failure: string, origin?: HTMLElement) => {
+    if (pending.current) return
+    pending.current = true
+    const token = ++sequence.current
+    const ownerRevision = revision
+    const owns = () => alive.current && sequence.current === token && currentRevision.current === ownerRevision
+    if (origin) focusReturn.current = { origin, moved: false }
+    setBusy(true); setError(''); setNotice('')
+    try {
+      await operation()
+      if (!owns()) return
+      success()
+    } catch {
+      if (!owns()) return
+      setError(failure)
+      return
+    } finally {
+      if (owns()) { pending.current = false; setBusy(false) }
+    }
+    if (!owns()) return
+    try { await reload() } catch {
+      if (owns()) setError('操作已完成，无法刷新当前状态，请返回列表刷新后核对。')
+    }
+  }
+  const save = (nameOverride: string | null, origin?: HTMLElement) => {
+    if (pending.current) return
+    if (nameOverride === command.nameOverride) {
+      setDraft(command.effectiveName); touched.current = false; setError('')
+      return
+    }
+    void mutate(
+      () => client.setPublicPluginEffectiveName({ pluginId, commandId: command.commandId, nameOverride }),
+      () => { setDraft(nameOverride ?? command.defaultName); touched.current = false; setNotice('已保存') },
+      '无法保存启动键，请检查名称冲突后重试。', origin,
+    )
+  }
+  const suffix = single ? '' : ` ${command.commandId}`
+  return (
+    <div className="public-command-row" data-command-id={command.commandId} aria-busy={busy} ref={row}>
+      {!single ? <code className="public-command-id" title={command.commandId}>{command.commandId}</code> : null}
+      <form className="public-detail-name-control" onSubmit={(event) => { event.preventDefault(); save(draft, document.activeElement instanceof HTMLElement ? document.activeElement : undefined) }}>
+        <Input aria-label={`启动键${suffix}`} placeholder="输入启动键" value={draft} readOnly={busy}
+          onChange={(event) => { touched.current = true; setDraft(event.target.value) }}
+          onBlur={(event) => {
+            // Tab/click into a row action gives that action sole ownership (especially restore).
+            if (!touched.current || row.current?.contains(event.relatedTarget as Node | null)) return
+            save(event.currentTarget.value)
+          }}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return
+            if (event.key === 'Enter') { event.preventDefault(); save(draft, event.currentTarget) }
+            if (event.key === 'Escape' && (touched.current || error)) {
+              event.preventDefault(); event.stopPropagation(); setDraft(command.effectiveName); touched.current = false; setError('')
+            }
+          }} />
+        <Button htmlType="submit" aria-label={`保存启动键${suffix}`} disabled={busy}>保存</Button>
+        <Tooltip title="恢复默认"><Button aria-label={`恢复默认启动键${suffix}`} icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy}
+          onClick={(event) => save(null, event.currentTarget)} /></Tooltip>
+        <Tooltip title={command.favorite ? '取消常用' : '设为常用'}><Button
+          aria-label={`${command.favorite ? '取消常用' : '设为常用'}${suffix}`} aria-pressed={command.favorite} disabled={busy}
+          icon={<Star aria-hidden size={16} strokeWidth={1.8} fill={command.favorite ? 'currentColor' : 'none'} />}
+          onClick={(event) => void mutate(
+            () => client.setPublicPluginFavorite({ pluginId, commandId: command.commandId, favorite: !command.favorite }),
+            () => setNotice(command.favorite ? '已取消常用' : '已设为常用'), '无法更改常用状态，请重试。', event.currentTarget,
+          )} /></Tooltip>
+      </form>
+      <div className="public-command-feedback" aria-live="polite">
+        {error ? <span role="alert" className="plugin-row-error">{error}</span> : busy ? '保存中…' : notice}
+      </div>
+    </div>
+  )
+}
+
 export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
@@ -203,7 +334,6 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
   const operationPending = useRef(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [names, setNames] = useState<Record<string, string>>(() => Object.fromEntries(plugin.commands.map((command) => [command.commandId, command.effectiveName])))
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [networkConsent, setNetworkConsent] = useState<{ plugin: PublicPluginInventoryItem; revision: string; origin: HTMLElement } | null>(null)
   const [clearKey, setClearKey] = useState<string | null>(null)
@@ -334,46 +464,14 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
     )
   }
 
-  const saveName = async (commandId: string, nameOverride: string | null) => {
-    if (busy) return
-    const command = plugin.commands.find((command) => command.commandId === commandId)
-    if (!command || nameOverride === command.nameOverride) return
-    const nextName = nameOverride ?? command.defaultName
-    setBusy(true)
-    setError('')
-    try {
-      await client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, commandId, nameOverride })
-      setNames((current) => ({ ...current, [commandId]: nextName }))
-      await reload()
-    } catch {
-      setError('无法保存启动键，请重试。')
-    } finally {
-      setBusy(false)
-    }
-  }
-
   return (
     <section className="public-plugin-detail" aria-labelledby="public-plugin-detail-title" aria-busy={busy}>
       <dl className="public-plugin-detail-list">
         <dt className="public-detail-name-term">启动键</dt>
         <dd className="public-detail-name-value">
-          {plugin.commands.map((command) => <div className="public-detail-name-control" key={command.commandId}>
-            <Input
-              aria-label={plugin.commands.length === 1 ? "启动键" : `启动键 ${command.commandId}`}
-              value={Object.prototype.hasOwnProperty.call(names, command.commandId) ? names[command.commandId] : command.effectiveName}
-              disabled={busy}
-              onChange={(event) => setNames((current) => ({ ...current, [command.commandId]: event.target.value }))}
-              onBlur={(event) => void saveName(command.commandId, event.currentTarget.value)}
-            />
-            <Tooltip title="恢复默认">
-              <Button
-                aria-label={plugin.commands.length === 1 ? "恢复默认启动键" : `恢复默认启动键 ${command.commandId}`}
-                icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />}
-                disabled={busy}
-                onClick={() => void saveName(command.commandId, null)}
-              />
-            </Tooltip>
-          </div>)}
+          {plugin.commands.map((command) => <PublicPluginCommandRow key={command.commandId}
+            client={client} pluginId={plugin.pluginId} command={command} revision={inventoryRevision}
+            reload={reload} single={plugin.commands.length === 1} />)}
         </dd>
         <dt>版本号</dt>
         <dd>{plugin.version}</dd>

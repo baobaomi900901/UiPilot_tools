@@ -100,6 +100,7 @@ tauri-plugin-single-instance = "2"
 webview2-com = "=0.38.2"
 
 [dev-dependencies]
+tauri = { version = "2.11.3", features = ["test"] }
 rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
 
 [profile.dev]

@@ -8260,6 +8260,7 @@ describe('real adapter and startup', () => {
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
     await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', commandId: 'default', favorite: true })
+    await main.client.setPublicPluginEffectiveName({ pluginId: 'com.example.multi', commandId: 'constructor', nameOverride: null })
     await main.client.setBuiltinFeatureFavorite({ feature: 'find', favorite: true })
     await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
@@ -8290,6 +8291,7 @@ describe('real adapter and startup', () => {
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
       ['set_plugin_favorite', [{ commandId: 'default', pluginId: 'com.uipilot.demo-win', favorite: true }]],
+      ['set_plugin_effective_name', [{ pluginId: 'com.example.multi', commandId: 'constructor', nameOverride: null }]],
       ['set_builtin_feature_favorite', [{ input: { feature: 'find', favorite: true } }]],
       ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
@@ -9091,6 +9093,24 @@ describe('credential consent and settings', () => {
     })
   }
 
+  it('releases package busy state after a command favorite advances the inventory revision', async () => {
+    const ui = await setup()
+    try {
+      await ui.open()
+      const pending = deferred<void>()
+      vi.mocked(ui.client.savePublicPluginSettings).mockReturnValueOnce(pending.promise)
+      const secret = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
+      await enter(secret, 'synthetic-value')
+      await act(async () => button('保存 Current API token').click())
+      expect(secret.readOnly).toBe(true)
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, commands: item.commands.map((command) => ({ ...command, favorite: true })) }] })
+      await act(async () => button('设为常用').click())
+      await vi.waitFor(() => expect(button('取消常用')).not.toBeNull())
+      await act(async () => pending.resolve())
+      await vi.waitFor(() => expect(secret.readOnly).toBe(false))
+      expect(ui.host.querySelector('.public-plugin-detail')?.getAttribute('aria-busy')).toBe('false')
+    } finally { await ui.cleanup() }
+  })
   it('shows candidate binding keys and change markers; cancel preserves the installed version', async () => {
     const ui = await setup()
     try {
@@ -9399,4 +9419,276 @@ it('preserves constructor command identity and rejects sibling favorite and comm
   core.keyDown('Enter', false)
   await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
   expect(core.getSnapshot().mainResultCommand).toMatchObject({ commandId: 'constructor', suffix: 'retry  input' })
+})
+
+
+describe('independent command management', () => {
+  async function setup(dark = false, count = 2) {
+    installMatchMedia(dark)
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
+    let inventory = { revision: '10', items: [{
+      pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage' as const,
+      commands: [
+        { commandId: 'upper', defaultName: 'upper', effectiveName: 'upper', nameOverride: null as string | null, favorite: false },
+        { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null as string | null, favorite: false },
+        ...Array.from({ length: Math.max(0, count - 2) }, (_, index) => ({ commandId: `command-${index + 3}`, defaultName: `long-command-name-number-${index + 3}`, effectiveName: `long-command-name-number-${index + 3}`, nameOverride: null as string | null, favorite: false })),
+      ], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
+    }] }
+    vi.mocked(fake.client.listPublicPlugins).mockImplementation(async () => structuredClone(inventory))
+    const update = (commandId: string, values: Partial<typeof inventory.items[number]['commands'][number]>) => {
+      inventory = { ...inventory, revision: String(Number(inventory.revision) + 1), items: inventory.items.map((plugin) => ({ ...plugin,
+        commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, ...values } : command),
+      })) }
+    }
+    vi.mocked(fake.client.setPublicPluginEffectiveName).mockImplementation(async ({ commandId, nameOverride }) => {
+      update(commandId, { nameOverride, effectiveName: nameOverride ?? (commandId === 'upper' ? 'upper' : 'lower') })
+    })
+    vi.mocked(fake.client.setPublicPluginFavorite).mockImplementation(async ({ commandId, favorite }) => update(commandId, { favorite }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    await act(async () => fake.emit(shown('command-ui', 'settings')))
+    await activateSettingsTab(mounted.host, '插件')
+    const open = async () => { await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click()) }
+    await open()
+    return { ...fake, ...mounted, core, open, update, async cleanup() { await mounted.unmount(); core.destroy() } }
+  }
+  const button = (host: HTMLElement, label: string) => host.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!
+  const input = (host: HTMLElement, id: string) => host.querySelector<HTMLInputElement>(`input[aria-label="启动键 ${id}"]`)!
+  const enter = async (element: HTMLInputElement, value: string) => {
+    await act(async () => {
+      element.focus()
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(element, value)
+      element.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  it.each([false, true])('saves and favorites constructor independently with per-row pending state, dark=%s', async (dark) => {
+    const ui = await setup(dark)
+    try {
+      const pending = deferred<void>()
+      vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(() => pending.promise)
+      await enter(input(ui.host, 'upper'), 'changed')
+      await act(async () => input(ui.host, 'upper').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })))
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'changed' })
+      expect(input(ui.host, 'upper').readOnly).toBe(true)
+      expect(input(ui.host, 'constructor').readOnly).toBe(false)
+      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
+      await act(async () => button(ui.host, '设为常用 constructor').click())
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'constructor', favorite: true })
+      await vi.waitFor(() => expect(button(ui.host, '取消常用 constructor')).not.toBeNull())
+      expect(button(ui.host, '设为常用 upper')).not.toBeNull()
+      await act(async () => pending.resolve())
+      expect(input(ui.host, 'constructor').value).toBe('lower')
+    } finally { await ui.cleanup() }
+  })
+  it.each([false, true])('preserves a conflicted draft, Escape resets editing, and dirty restore sends only null, dark=%s', async (dark) => {
+    const ui = await setup(dark)
+    try {
+      vi.mocked(ui.client.setPublicPluginEffectiveName).mockRejectedValueOnce(new Error('conflict'))
+      await enter(input(ui.host, 'upper'), 'lower')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      await vi.waitFor(() => expect(ui.host.querySelector('[role="alert"]')?.textContent).toContain('无法保存启动键'))
+      expect(input(ui.host, 'upper').value).toBe('lower')
+      expect(ui.host.querySelector('[data-command-id="constructor"] [role="alert"]')).toBeNull()
+      const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+      await act(async () => input(ui.host, 'upper').dispatchEvent(escape))
+      expect(escape.defaultPrevented).toBe(true)
+      expect(input(ui.host, 'upper').value).toBe('upper')
+      expect(ui.host.querySelector('.public-plugin-detail')).not.toBeNull()
+      await enter(input(ui.host, 'upper'), 'dirty')
+      const restore = button(ui.host, '恢复默认启动键 upper')
+      await act(async () => {
+        input(ui.host, 'upper').dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: restore }))
+        restore.click()
+      })
+      // Current stored null is a no-op; dirty draft is still restored without a competing blur write.
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(1)
+      expect(input(ui.host, 'upper').value).toBe('upper')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      await vi.waitFor(() => expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'upper' }))
+      await act(async () => button(ui.host, '恢复默认启动键 upper').click())
+      await vi.waitFor(() => expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null }))
+    } finally { await ui.cleanup() }
+  })
+  it('bounds a sixteen-command package summary and exposes every identity in the single detail', async () => {
+    const ui = await setup(false, 16)
+    try {
+      expect(ui.host.querySelectorAll('.public-command-row')).toHaveLength(16)
+      expect(input(ui.host, 'constructor')).not.toBeNull()
+      expect(input(ui.host, 'command-16')?.value).toBe('long-command-name-number-16')
+      await act(async () => button(ui.host, '返回插件列表').click())
+      const row = ui.host.querySelector('.public-plugin-item')!
+      expect(row.querySelector('.plugin-title-line h3')?.textContent).toBe('Multi')
+      expect(row.querySelectorAll('.public-plugin-command code')).toHaveLength(1)
+      expect(row.querySelector('.public-plugin-command-count')?.textContent).toContain('16')
+      expect(row.querySelector('.public-plugin-command')?.getAttribute('title')).toContain('constructor: /lower')
+      expect(row.querySelector('.public-plugin-command')?.getAttribute('title')).toContain('command-16: /long-command-name-number-16')
+      expect(row.querySelectorAll('.public-plugin-actions .ant-switch')).toHaveLength(1)
+    } finally { await ui.cleanup() }
+  })
+  it('keeps a deliberate sibling focus move when a current save completes', async () => {
+    const ui = await setup()
+    try {
+      const pending = deferred<void>()
+      vi.mocked(ui.client.setPublicPluginEffectiveName).mockReturnValueOnce(pending.promise)
+      await enter(input(ui.host, 'upper'), 'changed')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      await act(async () => input(ui.host, 'constructor').focus())
+      await act(async () => pending.resolve())
+      await vi.waitFor(() => expect(input(ui.host, 'upper').readOnly).toBe(false))
+      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+    } finally { await ui.cleanup() }
+  })
+  it('retires pending row focus ownership when a newer inventory revision arrives', async () => {
+    const ui = await setup()
+    try {
+      const pending = deferred<void>()
+      vi.mocked(ui.client.setPublicPluginEffectiveName).mockReturnValueOnce(pending.promise)
+      await enter(input(ui.host, 'upper'), 'changed')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      await act(async () => input(ui.host, 'upper').blur())
+      expect(document.activeElement).toBe(document.body)
+      const inventory = await ui.client.listPublicPlugins()
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ ...inventory, revision: '99', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'upper') })) })
+      await act(async () => button(ui.host, '设为常用 constructor').click())
+      await vi.waitFor(() => expect(input(ui.host, 'constructor')).toBeNull())
+      expect(document.activeElement).toBe(document.body)
+      await act(async () => pending.resolve())
+      expect(document.activeElement).toBe(document.body)
+    } finally { await ui.cleanup() }
+  })
+  it('does not let an old completion reload or focus a reopened detail of the same package', async () => {
+    const ui = await setup()
+    try {
+      const pending = deferred<void>()
+      vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(() => pending.promise)
+      await enter(input(ui.host, 'upper'), 'old-draft')
+      await act(async () => button(ui.host, '保存启动键 upper').click())
+      await act(async () => button(ui.host, '返回插件列表').click())
+      await ui.open()
+      await enter(input(ui.host, 'constructor'), 'new-draft')
+      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
+      await act(async () => pending.resolve())
+      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
+      expect(input(ui.host, 'constructor').value).toBe('new-draft')
+      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+    } finally { await ui.cleanup() }
+  })
+})
+
+
+it.each(['pair', 'removed', 'empty', 'moved'] as const)('restores favorite focus to its exact pair or legal fallback without stealing moved focus: %s', async (scenario) => {
+  installMatchMedia(false)
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+  const fake = fakeClient()
+  const pending = deferred<void>()
+  let refreshed = false
+  const result = (commandId: string) => ({ resultId: 'same-result-id', title: 'Same visible title',
+    activation: { kind: 'mainResultActivation' as const, pluginId: 'com.example.multi', commandId, commandLabel: commandId, initialArgument: '', favorite: refreshed },
+    favorite: { target: { kind: 'publicPlugin' as const, pluginId: 'com.example.multi', commandId }, favorite: refreshed }, hasDefaultAction: false,
+  })
+  vi.mocked(fake.client.searchApps).mockImplementation(async () => ({ requestId: `menu-${refreshed}`, items: refreshed && scenario === 'empty' ? [] : refreshed && scenario === 'removed' ? [result('upper')] : [result('upper'), result('constructor')] }))
+  vi.mocked(fake.client.setPublicPluginFavorite).mockReturnValueOnce(pending.promise)
+  const core = createLauncherCore(fake.client); await core.start()
+  const mounted = await mountLauncherView(core)
+  try {
+    await act(async () => fake.emit(shown(`pair-menu-${scenario}`)))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    const target = mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!
+    await act(async () => target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await vi.waitFor(() => expect(document.querySelector('[role="menuitem"]')).not.toBeNull())
+    await act(async () => document.querySelector<HTMLElement>('[role="menuitem"]')!.click())
+    expect(fake.client.setPublicPluginFavorite).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'constructor', favorite: true })
+    const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    if (scenario === 'moved') {
+      await act(async () => { target.focus(); query.focus() })
+    }
+    refreshed = true
+    await act(async () => pending.resolve())
+    await vi.waitFor(() => expect(core.getSnapshot().favoriteMutationPending || core.getSnapshot().searchPending).toBe(false))
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)) })
+    const options = mounted.host.querySelectorAll<HTMLElement>('[role="option"]')
+    await vi.waitFor(() => expect(document.activeElement).toBe(scenario === 'moved' || scenario === 'empty' ? query : scenario === 'pair' ? options[1] : options[0]))
+    if (scenario === 'pair') await vi.waitFor(() => expect(options[1]?.getAttribute('aria-selected')).toBe('true'))
+  } finally { await mounted.unmount(); core.destroy() }
+})
+
+
+
+
+
+it('rejects sibling favorite payloads and business-result favorites while accepting constructor entries', async () => {
+  const { core, client, emit } = await startedCore()
+  const activation = { kind: 'mainResultActivation' as const, pluginId: 'com.example.multi', commandId: 'constructor', commandLabel: 'lower', initialArgument: '', favorite: false }
+  const favorite = (commandId: string) => ({ target: { kind: 'publicPlugin' as const, pluginId: activation.pluginId, commandId }, favorite: false })
+  vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'strict-pairs', items: [
+    { resultId: 'same', title: 'Same', activation, favorite: favorite('upper') },
+    { resultId: 'same', title: 'Same', activation: executeActivation, favorite: favorite('constructor') },
+    { resultId: 'same', title: 'Same', activation, favorite: favorite('constructor') },
+  ] })
+  emit(shown('strict-pairs'))
+  await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+  expect(core.getSnapshot().results[0]?.favorite?.target).toEqual(favorite('constructor').target)
+  core.openPluginContextMenu(0); core.setPluginFavorite(0, true)
+  expect(client.setPublicPluginFavorite).toHaveBeenCalledWith({ pluginId: activation.pluginId, commandId: 'constructor', favorite: true })
+  core.destroy()
+})
+
+it('does not let a pending favorite for A refresh or update same-package B with identical result IDs and names', async () => {
+  const { core, client, emit } = await startedCore()
+  const pending = deferred<void>()
+  vi.mocked(client.setPublicPluginFavorite).mockReturnValueOnce(pending.promise)
+  vi.mocked(client.searchApps).mockImplementation(async ({ query, querySequence }) => {
+    const commandId = query === 'a' ? 'upper' : 'constructor'
+    return { requestId: `pair-${querySequence}`, items: [{ resultId: 'same', title: 'Same',
+      activation: { kind: 'mainResultActivation', pluginId: 'com.example.multi', commandId, commandLabel: commandId, initialArgument: '', favorite: false },
+      favorite: { target: { kind: 'publicPlugin', pluginId: 'com.example.multi', commandId }, favorite: false },
+    }] }
+  })
+  emit(shown('same-package-favorite'))
+  core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'a', inputType: 'insertText' })
+  await vi.waitFor(() => expect(core.getSnapshot().results[0]?.favorite?.target).toMatchObject({ commandId: 'upper' }))
+  core.openPluginContextMenu(0); core.setPluginFavorite(0, true)
+  core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'b', inputType: 'insertText' })
+  await vi.waitFor(() => expect(core.getSnapshot().results[0]?.favorite?.target).toMatchObject({ commandId: 'constructor' }))
+  const reads = vi.mocked(client.searchApps).mock.calls.length
+  pending.resolve(); await pending.promise
+  await vi.waitFor(() => expect(core.getSnapshot().favoriteMutationPending).toBe(false))
+  expect(client.searchApps).toHaveBeenCalledTimes(reads)
+  expect(core.getSnapshot().results[0]?.favorite).toMatchObject({ target: { commandId: 'constructor' }, favorite: false })
+  core.destroy()
+})
+
+
+it.each([[false, false], [true, false], [false, true], [true, true]])('returns cancelled favorite-menu focus to its pair unless focus moved, dark=%s moved=%s', async (dark, moved) => {
+  installMatchMedia(dark)
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+  const fake = fakeClient()
+  vi.mocked(fake.client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
+  vi.mocked(fake.client.searchApps).mockResolvedValue({ requestId: 'cancel-menu', items: ['upper', 'constructor'].map((commandId) => ({
+    resultId: commandId, title: commandId,
+    activation: { kind: 'mainResultActivation', pluginId: 'com.example.multi', commandId, commandLabel: commandId, initialArgument: '', favorite: false },
+    favorite: { target: { kind: 'publicPlugin', pluginId: 'com.example.multi', commandId }, favorite: false },
+  })) })
+  const core = createLauncherCore(fake.client); await core.start()
+  const mounted = await mountLauncherView(core)
+  try {
+    await act(async () => fake.emit(shown('cancel-menu')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(2))
+    const target = mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!
+    await act(async () => target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    await vi.waitFor(() => expect(document.querySelector('[role="menuitem"]')).not.toBeNull())
+    const menu = document.querySelector<HTMLElement>('[role="menuitem"]')!
+    const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    await act(async () => {
+      menu.focus()
+      if (moved) query.focus()
+      menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }))
+      await new Promise((resolve) => setTimeout(resolve, 80))
+    })
+    await vi.waitFor(() => expect(document.activeElement).toBe(moved ? query : target))
+    expect(fake.client.setPublicPluginFavorite).not.toHaveBeenCalled()
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+  } finally { await mounted.unmount(); core.destroy() }
 })
