@@ -358,6 +358,8 @@ function fakeClient() {
     preparePublicPlugin: vi.fn(async () => { throw new Error('not prepared') }),
     commitPublicPlugin: vi.fn(async () => undefined),
     cancelPublicPlugin: vi.fn(async () => undefined),
+    getPublicPluginDiagnostics: vi.fn(async ({ pluginId }) => ({ schemaVersion: 1, hostVersion: '0.7.0', platform: 'windows', pluginId, state: null, lastOperation: null })),
+    copyPublicPluginDiagnostics: vi.fn(async () => undefined),
     setPublicPluginEnabled: vi.fn(async () => undefined),
     setPublicPluginNetworkAccess: vi.fn(async () => undefined),
     setPublicPluginFavorite: vi.fn(async () => undefined),
@@ -7921,7 +7923,7 @@ describe('React view and accessibility', () => {
       name: 'Public Plugin Demo Window',
       version: '1.0.2',
       permissions: ['ui.window', 'clipboard.history.read', 'clipboard.history.paste'],
-      isUpdate: false,
+      isUpdate: false, operation: 'install', previousVersion: null,
       sourceVerified: false,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
       network: null,
@@ -7967,7 +7969,7 @@ describe('React view and accessibility', () => {
       name: 'Network Plugin',
       version: '1.1.0',
       permissions: ['network.https'],
-      isUpdate: true,
+      isUpdate: true, operation: 'replace', previousVersion: '1.0.0',
       sourceVerified: false,
       iconUrl: null,
       network: {
@@ -8023,7 +8025,7 @@ describe('React view and accessibility', () => {
         ...base,
         token: 'public-prepare-0000000000000005-0000000000000006',
         version: '1.0.0',
-        isUpdate: false,
+        isUpdate: false, operation: 'install', previousVersion: null,
         network: {
           httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [],
           addedHttpsHosts: ['api.example.com', 'auth.example.com'], addedCredentialIds: [],
@@ -8034,7 +8036,7 @@ describe('React view and accessibility', () => {
         ...base,
         token: 'public-prepare-0000000000000007-0000000000000008',
         version: '1.1.0',
-        isUpdate: true,
+        isUpdate: true, operation: 'replace', previousVersion: '1.0.0',
         network: {
           httpsHosts: ['api.example.com'], credentials: [],
           addedHttpsHosts: [], addedCredentialIds: [],
@@ -9117,7 +9119,7 @@ describe('credential consent and settings', () => {
     const ui = await setup()
     try {
       vi.mocked(ui.client.selectPublicPluginDirectory).mockResolvedValue('synthetic-candidate')
-      vi.mocked(ui.client.preparePublicPlugin).mockResolvedValue({ token: 'candidate', pluginId: item.pluginId, name: item.name, version: '2.0.0', permissions: ['network.https'], isUpdate: true, sourceVerified: false, iconUrl: null,
+      vi.mocked(ui.client.preparePublicPlugin).mockResolvedValue({ token: 'candidate', pluginId: item.pluginId, name: item.name, version: '2.0.0', permissions: ['network.https'], isUpdate: true, operation: 'replace', previousVersion: '1.0.0', sourceVerified: false, iconUrl: null,
         network: { ...item.network, credentials: [{ ...credential, settingKey: 'candidate-token' }], addedHttpsHosts: [], addedCredentialIds: ['service-token'], requiresNetworkConsent: true } })
       await act(async () => button('选择开发目录').click())
       const consent = ui.host.querySelector('.public-network-consent')!

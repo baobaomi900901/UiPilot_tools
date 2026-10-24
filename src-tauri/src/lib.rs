@@ -455,6 +455,8 @@ pub fn run() {
             commands::delete_quicklink,
             commands::choose_quicklink_icon,
             commands::prepare_public_plugin_install,
+            commands::get_public_plugin_diagnostics,
+            commands::copy_public_plugin_diagnostics,
             commands::commit_public_plugin_install,
             commands::cancel_public_plugin_install,
             commands::set_plugin_enabled,

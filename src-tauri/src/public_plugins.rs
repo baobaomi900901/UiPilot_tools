@@ -3,6 +3,7 @@ mod activation_bundle;
 mod alarm_asset;
 mod data_call_gate;
 mod delayed_messages;
+pub(crate) mod diagnostics;
 mod icon;
 mod manifest;
 // Task 4 wires the verified transport behind PluginHttpsBroker.
@@ -48,8 +49,8 @@ pub(crate) use activation::{
     parse_main_result_response, parse_panel_response, parse_window_response,
     PublicCommandSuggestion, PublicMainResult, PublicPanelResponse, PublicPluginInstallSource,
     PublicPluginInventory, PublicPluginManagementError, PublicPluginManager, PublicPluginMutation,
-    PublicPluginPrepareSummary, PublicPluginRoute, PublicPluginWindowIdentity,
-    PublicRuntimeCandidate, PublicWindowResponse, WindowStorageError,
+    PublicPluginPrepareSummary, PublicPluginRefreshTarget, PublicPluginRoute,
+    PublicPluginWindowIdentity, PublicRuntimeCandidate, PublicWindowResponse, WindowStorageError,
 };
 #[cfg(test)]
 pub(crate) use alarm_asset::AlarmAssetIdentity;
@@ -1702,7 +1703,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 6, 0],
+            version: [0, 7, 0],
             api_version: 1,
         }
     }

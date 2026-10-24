@@ -62,6 +62,10 @@ use super::{
     ReservedPluginRequest, ScheduledPluginRequest, ValidatedAlarmAsset,
 };
 
+use super::diagnostics::{
+    self, CommitOutcome, DiagnosticReport, DiagnosticState, Observations, Operation, Phase,
+};
+
 const PREPARE_TTL: Duration = Duration::from_secs(5 * 60);
 const RUNTIME_HOST_PATH: &str = "__uipilot_runtime.html";
 const RUNTIME_FAULT_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -83,6 +87,20 @@ impl PublicPluginInstallSource {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PublicPluginRefreshTarget {
+    pub(crate) plugin_id: String,
+    pub(crate) expected_inventory_revision: String,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PrepareOperation {
+    Install,
+    Replace,
+    DevelopmentRefresh,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicPluginPrepareSummary {
@@ -92,6 +110,8 @@ pub(crate) struct PublicPluginPrepareSummary {
     pub(crate) version: String,
     pub(crate) permissions: Vec<PublicPermission>,
     pub(crate) is_update: bool,
+    pub(crate) operation: PrepareOperation,
+    pub(crate) previous_version: Option<String>,
     pub(crate) source_verified: bool,
     pub(crate) icon_url: Option<String>,
     pub(crate) network: Option<PublicPluginPrepareNetwork>,
@@ -287,8 +307,12 @@ pub(crate) struct PublicPluginUninstallCommit {
     receipt: Option<PluginOwnerCleanupReceipt>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum PublicPluginManagementError {
+    RefreshTargetMismatch,
+    RefreshVersionMismatch,
+    StaleInventory,
     InvalidPackage,
     IncompatiblePlatform,
     IncompatibleApi,
@@ -300,6 +324,7 @@ pub(crate) enum PublicPluginManagementError {
     ExpiredToken,
     InvalidCaller,
     DataCleanupPending,
+    #[serde(rename = "pluginUnavailable")]
     Unavailable,
 }
 
@@ -363,6 +388,9 @@ impl From<ReservationError> for PublicPluginUninstallCommitFailure {
 impl PublicPluginManagementError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
+            Self::RefreshTargetMismatch => "refreshTargetMismatch",
+            Self::RefreshVersionMismatch => "refreshVersionMismatch",
+            Self::StaleInventory => "staleInventory",
             Self::InvalidPackage => "invalidPackage",
             Self::IncompatiblePlatform => "incompatiblePlatform",
             Self::IncompatibleApi => "incompatibleApi",
@@ -495,6 +523,8 @@ pub(crate) struct PublicIconAsset {
 }
 
 struct PendingActivation {
+    operation: Operation,
+    refresh_target: Option<PublicPluginRefreshTarget>,
     caller_label: String,
     expires_at: Instant,
     prepared: PreparedPublicPlugin,
@@ -553,6 +583,7 @@ pub(crate) struct PublicPluginManager {
     after_state_durable: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     data: Mutex<ActivationData>,
     runtime_faults: Mutex<HashMap<(String, u64), RuntimeFaultWindow>>,
+    observations: Observations,
     next_token: AtomicU64,
     next_uninstall_transaction: AtomicU64,
 }
@@ -787,6 +818,7 @@ impl PublicPluginManager {
                 ..ActivationData::default()
             }),
             runtime_faults: Mutex::new(HashMap::new()),
+            observations: Observations::default(),
             next_token: AtomicU64::new(1),
             next_uninstall_transaction: AtomicU64::new(1),
         };
@@ -1020,127 +1052,218 @@ impl PublicPluginManager {
         self.clipboard_history.store_path_for_test(plugin_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         &self,
         caller_label: &str,
         source: PublicPluginInstallSource,
         now: Instant,
     ) -> Result<PublicPluginPrepareSummary, PublicPluginManagementError> {
-        if caller_label.is_empty() {
+        self.prepare_targeted(caller_label, source, None, now)
+    }
+
+    pub(crate) fn prepare_targeted(
+        &self,
+        caller_label: &str,
+        source: PublicPluginInstallSource,
+        refresh_target: Option<PublicPluginRefreshTarget>,
+        now: Instant,
+    ) -> Result<PublicPluginPrepareSummary, PublicPluginManagementError> {
+        if caller_label != "main" {
             return Err(PublicPluginManagementError::InvalidCaller);
         }
-        if self.bundles.is_terminal() {
-            return Err(PublicPluginManagementError::Unavailable);
-        }
-        let _mutation = self.lock_mutation()?;
-        self.cleanup_expired(now)?;
-        let prepared =
-            stage_public_package(source.into_package_source(), &self.staging_root, &self.host)?;
-        if self
-            .owner_cleanup
-            .is_blocked(&prepared.manifest.plugin_id)
-            .map_err(|_| PublicPluginManagementError::Unavailable)?
-        {
-            return Err(PublicPluginManagementError::DataCleanupPending);
-        }
-        let icon = if prepared.resources.contains_key(ICON_PATH) {
-            Some(
-                fs::read(prepared.package_root.join(ICON_PATH))
-                    .map_err(|_| PublicPluginManagementError::InvalidPackage)?,
-            )
-        } else {
-            None
-        };
-        let previous_config = self.state.config(&prepared.manifest.plugin_id)?;
-        let previous_declared_https_hosts = previous_config
+        let mut observation = refresh_target
             .as_ref()
-            .filter(|config| config.installed)
-            .map(|config| self.installed_manifest(config))
-            .transpose()?
-            .and_then(|manifest| manifest.network)
-            .map_or_else(BTreeSet::new, |network| {
-                network.https_hosts.into_iter().collect()
+            .filter(|t| valid_plugin_id(&t.plugin_id))
+            .and_then(|t| {
+                self.observations
+                    .start(&t.plugin_id, Operation::DevelopmentRefresh)
             });
-        let previous_declared_credentials = previous_config
-            .as_ref()
-            .filter(|config| config.installed)
-            .map(|config| self.installed_manifest(config))
-            .transpose()?
-            .as_ref()
-            .map(super::state::manifest_credentials)
-            .unwrap_or_default();
-        let credentials = super::state::manifest_credentials(&prepared.manifest);
-        let added_credential_ids = credentials
-            .iter()
-            .filter(|credential| !previous_declared_credentials.contains(credential))
-            .map(|credential| credential.id.clone())
-            .collect::<Vec<_>>();
-        let candidate_https_hosts = prepared
-            .manifest
-            .network
-            .as_ref()
-            .map_or_else(BTreeSet::new, |network| {
-                network.https_hosts.iter().cloned().collect()
-            });
-        let added_https_hosts = candidate_https_hosts
-            .difference(&previous_declared_https_hosts)
-            .cloned()
-            .collect::<Vec<_>>();
-        let is_update = previous_config
-            .as_ref()
-            .is_some_and(|config| config.installed);
-        let requires_network_consent = !candidate_https_hosts.is_empty()
-            && (!is_update || !added_https_hosts.is_empty() || !added_credential_ids.is_empty());
-        let network =
-            prepared
+        let result = (|| {
+            if self.bundles.is_terminal() {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let _mutation = self.lock_mutation()?;
+            if let Some(target) = &refresh_target {
+                if !valid_plugin_id(&target.plugin_id)
+                    || !matches!(
+                        source,
+                        PublicPluginInstallSource::DevelopmentDirectory { .. }
+                    )
+                {
+                    return Err(PublicPluginManagementError::RefreshTargetMismatch);
+                }
+                let revision = target
+                    .expected_inventory_revision
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| v.to_string() == target.expected_inventory_revision)
+                    .ok_or(PublicPluginManagementError::StaleInventory)?;
+                if self.state.inventory_revision()? != revision {
+                    return Err(PublicPluginManagementError::StaleInventory);
+                }
+                if !self
+                    .state
+                    .config(&target.plugin_id)?
+                    .is_some_and(|c| c.installed)
+                {
+                    return Err(PublicPluginManagementError::RefreshTargetMismatch);
+                }
+            }
+            self.cleanup_expired(now)?;
+            let prepared =
+                stage_public_package(source.into_package_source(), &self.staging_root, &self.host)?;
+            if self
+                .owner_cleanup
+                .is_blocked(&prepared.manifest.plugin_id)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?
+            {
+                return Err(PublicPluginManagementError::DataCleanupPending);
+            }
+            let icon = if prepared.resources.contains_key(ICON_PATH) {
+                Some(
+                    fs::read(prepared.package_root.join(ICON_PATH))
+                        .map_err(|_| PublicPluginManagementError::InvalidPackage)?,
+                )
+            } else {
+                None
+            };
+            let previous_config = self.state.config(&prepared.manifest.plugin_id)?;
+            if let Some(target) = &refresh_target {
+                if prepared.manifest.plugin_id != target.plugin_id {
+                    return Err(PublicPluginManagementError::RefreshTargetMismatch);
+                }
+                if !previous_config
+                    .as_ref()
+                    .is_some_and(|c| c.installed && c.version == prepared.manifest.version)
+                {
+                    return Err(PublicPluginManagementError::RefreshVersionMismatch);
+                }
+            }
+            let operation = if refresh_target.is_some() {
+                Operation::DevelopmentRefresh
+            } else if previous_config.as_ref().is_some_and(|c| c.installed) {
+                Operation::Replace
+            } else {
+                Operation::Prepare
+            };
+            if observation.is_none() {
+                observation = self
+                    .observations
+                    .start(&prepared.manifest.plugin_id, operation);
+            }
+            let previous_declared_https_hosts = previous_config
+                .as_ref()
+                .filter(|config| config.installed)
+                .map(|config| self.installed_manifest(config))
+                .transpose()?
+                .and_then(|manifest| manifest.network)
+                .map_or_else(BTreeSet::new, |network| {
+                    network.https_hosts.into_iter().collect()
+                });
+            let previous_declared_credentials = previous_config
+                .as_ref()
+                .filter(|config| config.installed)
+                .map(|config| self.installed_manifest(config))
+                .transpose()?
+                .as_ref()
+                .map(super::state::manifest_credentials)
+                .unwrap_or_default();
+            let credentials = super::state::manifest_credentials(&prepared.manifest);
+            let added_credential_ids = credentials
+                .iter()
+                .filter(|credential| !previous_declared_credentials.contains(credential))
+                .map(|credential| credential.id.clone())
+                .collect::<Vec<_>>();
+            let candidate_https_hosts = prepared
                 .manifest
                 .network
                 .as_ref()
-                .map(|network| PublicPluginPrepareNetwork {
-                    https_hosts: network.https_hosts.clone(),
-                    added_https_hosts,
-                    credentials,
-                    added_credential_ids,
-                    requires_network_consent,
+                .map_or_else(BTreeSet::new, |network| {
+                    network.https_hosts.iter().cloned().collect()
                 });
-        let token_number = self
-            .next_token
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-        let token = format!(
-            "public-prepare-{:016x}-{token_number:016x}",
-            std::process::id()
-        );
-        let summary = PublicPluginPrepareSummary {
-            token: token.clone(),
-            plugin_id: prepared.manifest.plugin_id.clone(),
-            name: prepared.manifest.name.clone(),
-            version: prepared.manifest.version.clone(),
-            permissions: prepared.manifest.permissions.clone(),
-            is_update,
-            source_verified: false,
-            icon_url: icon.as_ref().map(|_| icon::prepared_url(&token)),
-            network,
-        };
-        let expires_at = now
-            .checked_add(PREPARE_TTL)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        self.lock_data()?.pending.insert(
-            token,
-            PendingActivation {
-                caller_label: caller_label.into(),
-                expires_at,
-                prepared,
-                icon,
-                previous_config,
-                previous_declared_https_hosts,
-                previous_declared_credentials,
-                requires_network_consent,
-            },
-        );
-        Ok(summary)
+            let added_https_hosts = candidate_https_hosts
+                .difference(&previous_declared_https_hosts)
+                .cloned()
+                .collect::<Vec<_>>();
+            let is_update = previous_config
+                .as_ref()
+                .is_some_and(|config| config.installed);
+            let requires_network_consent = !candidate_https_hosts.is_empty()
+                && (!is_update
+                    || !added_https_hosts.is_empty()
+                    || !added_credential_ids.is_empty());
+            let network =
+                prepared
+                    .manifest
+                    .network
+                    .as_ref()
+                    .map(|network| PublicPluginPrepareNetwork {
+                        https_hosts: network.https_hosts.clone(),
+                        added_https_hosts,
+                        credentials,
+                        added_credential_ids,
+                        requires_network_consent,
+                    });
+            let token_number = self
+                .next_token
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            let token = format!(
+                "public-prepare-{:016x}-{token_number:016x}",
+                std::process::id()
+            );
+            let summary = PublicPluginPrepareSummary {
+                token: token.clone(),
+                plugin_id: prepared.manifest.plugin_id.clone(),
+                name: prepared.manifest.name.clone(),
+                version: prepared.manifest.version.clone(),
+                permissions: prepared.manifest.permissions.clone(),
+                is_update,
+                operation: match operation {
+                    Operation::DevelopmentRefresh => PrepareOperation::DevelopmentRefresh,
+                    Operation::Replace => PrepareOperation::Replace,
+                    _ => PrepareOperation::Install,
+                },
+                previous_version: previous_config
+                    .as_ref()
+                    .filter(|c| c.installed)
+                    .map(|c| c.version.clone()),
+                source_verified: false,
+                icon_url: icon.as_ref().map(|_| icon::prepared_url(&token)),
+                network,
+            };
+            let expires_at = now
+                .checked_add(PREPARE_TTL)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            self.lock_data()?.pending.insert(
+                token,
+                PendingActivation {
+                    operation,
+                    refresh_target,
+                    caller_label: caller_label.into(),
+                    expires_at,
+                    prepared,
+                    icon,
+                    previous_config,
+                    previous_declared_https_hosts,
+                    previous_declared_credentials,
+                    requires_network_consent,
+                },
+            );
+            diagnostics::phase(
+                &mut observation,
+                Phase::Complete,
+                CommitOutcome::NotAttempted,
+            );
+            Ok(summary)
+        })();
+        if let Some(observation) = observation {
+            observation.finish(&result);
+        }
+        result
     }
 
     pub(crate) fn cancel(
@@ -1200,125 +1323,12 @@ impl PublicPluginManager {
     where
         F: FnOnce(&PublicRuntimeCandidate) -> bool,
     {
-        let (
-            pending,
-            previous_config,
-            effective_permission_grants,
-            candidate,
-            runtime,
-            previous_runtime_label,
-            previous_activation_id,
-        ) = {
-            let _mutation = self.lock_mutation()?;
-            let pending = {
-                let mut data = self.lock_data()?;
-                let pending = data
-                    .pending
-                    .get(token)
-                    .ok_or(PublicPluginManagementError::InvalidToken)?;
-                if pending.expires_at <= now {
-                    data.pending.remove(token);
-                    return Err(PublicPluginManagementError::ExpiredToken);
-                }
-                if pending.caller_label != caller_label {
-                    return Err(PublicPluginManagementError::PermissionDenied);
-                }
-                data.pending
-                    .remove(token)
-                    .ok_or(PublicPluginManagementError::InvalidToken)?
-            };
-            let declared = pending
-                .prepared
-                .manifest
-                .permissions
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            if declared != permission_grants {
-                return Err(PublicPluginManagementError::PermissionDenied);
-            }
-            let previous_config = self.state.config(&pending.prepared.manifest.plugin_id)?;
-            if previous_config != pending.previous_config {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let current_declared_https_hosts = previous_config
-                .as_ref()
-                .filter(|config| config.installed)
-                .map(|config| self.installed_manifest(config))
-                .transpose()?
-                .and_then(|manifest| manifest.network)
-                .map_or_else(BTreeSet::new, |network| {
-                    network.https_hosts.into_iter().collect()
-                });
-            let current_declared_credentials = previous_config
-                .as_ref()
-                .filter(|config| config.installed)
-                .map(|config| self.installed_manifest(config))
-                .transpose()?
-                .as_ref()
-                .map(super::state::manifest_credentials)
-                .unwrap_or_default();
-            if current_declared_credentials != pending.previous_declared_credentials
-                || current_declared_https_hosts != pending.previous_declared_https_hosts
-            {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let previous_network_granted = previous_config.as_ref().is_some_and(|config| {
-                config
-                    .permission_grants
-                    .contains(&PublicPermission::NetworkHttps)
-                    && !pending.previous_declared_https_hosts.is_empty()
-                    && config.network_https_hosts_grant == pending.previous_declared_https_hosts
-                    && config.network_credentials_grant == pending.previous_declared_credentials
-            });
-            let mut effective_permission_grants = declared;
-            if pending.prepared.manifest.network.is_some()
-                && !pending.requires_network_consent
-                && !previous_network_granted
-            {
-                effective_permission_grants.remove(&PublicPermission::NetworkHttps);
-            }
-            let generation = previous_config
-                .as_ref()
-                .map_or(Some(1), |config| config.active_generation.checked_add(1))
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let runtime_snapshot = Arc::new(snapshot_from_prepared(&pending.prepared, generation)?);
-            let activation_id = self
-                .activation_ids
-                .allocate()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let admission_epoch = self
-                .admission_epochs
-                .allocate()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let candidate = Arc::new(ActivationCandidate::new(
-                runtime_snapshot,
-                pending.prepared.alarm.as_ref(),
-                activation_id,
-                admission_epoch,
-            ));
-            let runtime = candidate.runtime.candidate(
-                candidate.activation_id,
-                candidate.admission_epoch,
-                candidate.runtime_recovery_needed,
-            );
-            let previous_bundle = self
-                .bundles
-                .bundle(&runtime.plugin_id)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            let previous_runtime_label = previous_bundle
-                .as_ref()
-                .map(|bundle| bundle.runtime.label.clone());
-            let previous_activation_id =
-                previous_bundle.as_ref().map(|bundle| bundle.activation_id);
-            let replaced = self
-                .lock_data()?
-                .staged_by_label
-                .insert(runtime.label.clone(), Arc::clone(&candidate));
-            if replaced.is_some() {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            (
+        if caller_label != "main" {
+            return Err(PublicPluginManagementError::InvalidCaller);
+        }
+        let mut observation = None;
+        let result = (|| {
+            let (
                 pending,
                 previous_config,
                 effective_permission_grants,
@@ -1326,175 +1336,340 @@ impl PublicPluginManager {
                 runtime,
                 previous_runtime_label,
                 previous_activation_id,
-            )
-        };
-
-        if !readiness(&runtime) {
-            self.unstage(&runtime.label);
-            return Err(PublicPluginManagementError::RuntimeNotReady);
-        }
-
-        let (reservation, prepared_state) = {
-            let _mutation = self.lock_mutation()?;
-            if self.state.config(&runtime.plugin_id)? != previous_config
-                || self
-                    .bundles
-                    .bundle(&runtime.plugin_id)?
+            ) = {
+                let _mutation = self.lock_mutation()?;
+                let pending = {
+                    let mut data = self.lock_data()?;
+                    let pending = data
+                        .pending
+                        .get(token)
+                        .ok_or(PublicPluginManagementError::InvalidToken)?;
+                    if pending.expires_at <= now {
+                        data.pending.remove(token);
+                        return Err(PublicPluginManagementError::ExpiredToken);
+                    }
+                    if pending.caller_label != caller_label {
+                        return Err(PublicPluginManagementError::PermissionDenied);
+                    }
+                    data.pending
+                        .remove(token)
+                        .ok_or(PublicPluginManagementError::InvalidToken)?
+                };
+                observation = self
+                    .observations
+                    .start(&pending.prepared.manifest.plugin_id, pending.operation);
+                if let Some(target) = &pending.refresh_target {
+                    if target.plugin_id != pending.prepared.manifest.plugin_id
+                        || !pending.previous_config.as_ref().is_some_and(|c| {
+                            c.installed && c.version == pending.prepared.manifest.version
+                        })
+                    {
+                        return Err(PublicPluginManagementError::RefreshTargetMismatch);
+                    }
+                }
+                let declared = pending
+                    .prepared
+                    .manifest
+                    .permissions
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if declared != permission_grants {
+                    return Err(PublicPluginManagementError::PermissionDenied);
+                }
+                let previous_config = self.state.config(&pending.prepared.manifest.plugin_id)?;
+                if previous_config != pending.previous_config {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let current_declared_https_hosts = previous_config
                     .as_ref()
-                    .map(|bundle| bundle.activation_id)
-                    != previous_activation_id
-            {
+                    .filter(|config| config.installed)
+                    .map(|config| self.installed_manifest(config))
+                    .transpose()?
+                    .and_then(|manifest| manifest.network)
+                    .map_or_else(BTreeSet::new, |network| {
+                        network.https_hosts.into_iter().collect()
+                    });
+                let current_declared_credentials = previous_config
+                    .as_ref()
+                    .filter(|config| config.installed)
+                    .map(|config| self.installed_manifest(config))
+                    .transpose()?
+                    .as_ref()
+                    .map(super::state::manifest_credentials)
+                    .unwrap_or_default();
+                if current_declared_credentials != pending.previous_declared_credentials
+                    || current_declared_https_hosts != pending.previous_declared_https_hosts
+                {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let previous_network_granted = previous_config.as_ref().is_some_and(|config| {
+                    config
+                        .permission_grants
+                        .contains(&PublicPermission::NetworkHttps)
+                        && !pending.previous_declared_https_hosts.is_empty()
+                        && config.network_https_hosts_grant == pending.previous_declared_https_hosts
+                        && config.network_credentials_grant == pending.previous_declared_credentials
+                });
+                let mut effective_permission_grants = declared;
+                if pending.prepared.manifest.network.is_some()
+                    && !pending.requires_network_consent
+                    && !previous_network_granted
+                {
+                    effective_permission_grants.remove(&PublicPermission::NetworkHttps);
+                }
+                let generation = previous_config
+                    .as_ref()
+                    .map_or(Some(1), |config| config.active_generation.checked_add(1))
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let runtime_snapshot =
+                    Arc::new(snapshot_from_prepared(&pending.prepared, generation)?);
+                let activation_id = self
+                    .activation_ids
+                    .allocate()
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let admission_epoch = self
+                    .admission_epochs
+                    .allocate()
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let candidate = Arc::new(ActivationCandidate::new(
+                    runtime_snapshot,
+                    pending.prepared.alarm.as_ref(),
+                    activation_id,
+                    admission_epoch,
+                ));
+                let runtime = candidate.runtime.candidate(
+                    candidate.activation_id,
+                    candidate.admission_epoch,
+                    candidate.runtime_recovery_needed,
+                );
+                let previous_bundle = self
+                    .bundles
+                    .bundle(&runtime.plugin_id)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                let previous_runtime_label = previous_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.runtime.label.clone());
+                let previous_activation_id =
+                    previous_bundle.as_ref().map(|bundle| bundle.activation_id);
+                let replaced = self
+                    .lock_data()?
+                    .staged_by_label
+                    .insert(runtime.label.clone(), Arc::clone(&candidate));
+                if replaced.is_some() {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                (
+                    pending,
+                    previous_config,
+                    effective_permission_grants,
+                    candidate,
+                    runtime,
+                    previous_runtime_label,
+                    previous_activation_id,
+                )
+            };
+
+            diagnostics::phase(
+                &mut observation,
+                Phase::Readiness,
+                CommitOutcome::NotAttempted,
+            );
+            if !readiness(&runtime) {
                 self.unstage(&runtime.label);
-                return Err(PublicPluginManagementError::Unavailable);
+                return Err(PublicPluginManagementError::RuntimeNotReady);
             }
-            let reservation = self.bundles.reserve(&runtime.plugin_id)?;
-            let prepared_state = match self.state.prepare_activation(
-                &candidate.runtime.manifest,
-                effective_permission_grants,
-                runtime.generation,
-                Some(candidate.runtime.digest.clone()),
-            ) {
-                Ok(prepared) => prepared,
+
+            let (reservation, prepared_state) = {
+                let _mutation = self.lock_mutation()?;
+                if self.state.config(&runtime.plugin_id)? != previous_config
+                    || self
+                        .bundles
+                        .bundle(&runtime.plugin_id)?
+                        .as_ref()
+                        .map(|bundle| bundle.activation_id)
+                        != previous_activation_id
+                {
+                    self.unstage(&runtime.label);
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let reservation = self.bundles.reserve(&runtime.plugin_id)?;
+                let prepared_state = match self.state.prepare_activation(
+                    &candidate.runtime.manifest,
+                    effective_permission_grants,
+                    runtime.generation,
+                    Some(candidate.runtime.digest.clone()),
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.unstage(&runtime.label);
+                        return Err(error.into());
+                    }
+                };
+                (reservation, prepared_state)
+            };
+            let destination = package_destination(
+                &self.packages_root,
+                &runtime.plugin_id,
+                &candidate.runtime.digest,
+            );
+            diagnostics::phase(
+                &mut observation,
+                Phase::Persistence,
+                CommitOutcome::NotAttempted,
+            );
+            let created = match pending.prepared.persist(&destination) {
+                Ok(created) => created,
                 Err(error) => {
                     self.unstage(&runtime.label);
                     return Err(error.into());
                 }
             };
-            (reservation, prepared_state)
-        };
-        let destination = package_destination(
-            &self.packages_root,
-            &runtime.plugin_id,
-            &candidate.runtime.digest,
-        );
-        let created = match pending.prepared.persist(&destination) {
-            Ok(created) => created,
-            Err(error) => {
-                self.unstage(&runtime.label);
-                return Err(error.into());
-            }
-        };
-        reservation.begin_committing()?;
-        match self.state.persist_prepared(&prepared_state) {
-            DurableStateOutcome::Committed => reservation.mark_durable()?,
-            DurableStateOutcome::NotCommitted => {
-                if !self.state.revalidate_previous(&prepared_state) {
+            reservation.begin_committing()?;
+            diagnostics::phase(&mut observation, Phase::Persistence, CommitOutcome::Unknown);
+            match self.state.persist_prepared(&prepared_state) {
+                DurableStateOutcome::Committed => {
+                    diagnostics::phase(
+                        &mut observation,
+                        Phase::Publication,
+                        CommitOutcome::Committed,
+                    );
+                    reservation.mark_durable()?;
+                }
+                DurableStateOutcome::NotCommitted => {
+                    if !self.state.revalidate_previous(&prepared_state) {
+                        self.close_network_authority_with_effects(
+                            &runtime.plugin_id,
+                            Some(effects),
+                        );
+                        return Err(PublicPluginManagementError::Unavailable);
+                    }
+                    diagnostics::phase(
+                        &mut observation,
+                        Phase::Persistence,
+                        CommitOutcome::NotCommitted,
+                    );
+                    reservation.rollback_not_committed()?;
+                    if created {
+                        package::remove_package_tree(destination);
+                    }
+                    self.unstage(&runtime.label);
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                DurableStateOutcome::Unknown => {
                     self.close_network_authority_with_effects(&runtime.plugin_id, Some(effects));
                     return Err(PublicPluginManagementError::Unavailable);
                 }
-                reservation.rollback_not_committed()?;
-                if created {
-                    package::remove_package_tree(destination);
-                }
-                self.unstage(&runtime.label);
-                return Err(PublicPluginManagementError::Unavailable);
             }
-            DurableStateOutcome::Unknown => {
-                self.close_network_authority_with_effects(&runtime.plugin_id, Some(effects));
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-        }
 
-        let affected_plugin = runtime.plugin_id.clone();
-        let result = (|| {
-            let _mutation = self.lock_mutation()?;
-            let mut network_transition = self
-                .network_authority
-                .begin_transition()
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            effects.retired.extend(
-                self.scheduler
-                    .retire_plugin_requests(&runtime.plugin_id)
-                    .map_err(|_| PublicPluginManagementError::Unavailable)?,
-            );
-            effects.changed = true;
-            let expired = self
-                .scheduler
-                .invalidate_plugin(
-                    &runtime.plugin_id,
-                    Some((
-                        runtime.generation,
-                        runtime.activation_id,
-                        runtime.admission_epoch,
-                    )),
-                )
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            if let Some(expired) = expired.as_ref() {
-                network_transition.invalidate_context(expired);
-            }
-            network_transition
-                .set_plugin_authority(&runtime.plugin_id, None)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            self.activate_runtime_data_gate(&runtime)?;
-            self.cancel_delayed_messages(&runtime.plugin_id);
-            let timer_effects = previous_config
-                .as_ref()
-                .zip(previous_activation_id)
-                .map(|(config, activation_id)| {
-                    self.cancel_timer_generation(
+            let affected_plugin = runtime.plugin_id.clone();
+            let result = (|| {
+                let _mutation = self.lock_mutation()?;
+                let mut network_transition = self
+                    .network_authority
+                    .begin_transition()
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                effects.retired.extend(
+                    self.scheduler
+                        .retire_plugin_requests(&runtime.plugin_id)
+                        .map_err(|_| PublicPluginManagementError::Unavailable)?,
+                );
+                effects.changed = true;
+                let expired = self
+                    .scheduler
+                    .invalidate_plugin(
                         &runtime.plugin_id,
-                        config.active_generation,
-                        activation_id,
+                        Some((
+                            runtime.generation,
+                            runtime.activation_id,
+                            runtime.admission_epoch,
+                        )),
                     )
-                })
-                .unwrap_or_default();
-            let mut data = self.lock_data()?;
-            let staged_matches = data
-                .staged_by_label
-                .get(&runtime.label)
-                .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
-            if !staged_matches {
-                return Err(PublicPluginManagementError::Unavailable);
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                if let Some(expired) = expired.as_ref() {
+                    network_transition.invalidate_context(expired);
+                }
+                network_transition
+                    .set_plugin_authority(&runtime.plugin_id, None)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                self.activate_runtime_data_gate(&runtime)?;
+                self.cancel_delayed_messages(&runtime.plugin_id);
+                let timer_effects = previous_config
+                    .as_ref()
+                    .zip(previous_activation_id)
+                    .map(|(config, activation_id)| {
+                        self.cancel_timer_generation(
+                            &runtime.plugin_id,
+                            config.active_generation,
+                            activation_id,
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut data = self.lock_data()?;
+                let staged_matches = data
+                    .staged_by_label
+                    .get(&runtime.label)
+                    .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
+                if !staged_matches {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                self.clear_runtime_faults(&runtime.plugin_id)?;
+                let config = self.state.publish_prepared(prepared_state)?;
+                let runtime_active = config.enabled && config.fault.is_none();
+                reservation.publish(runtime_active.then(|| candidate.bundle(config.clone())))?;
+                let staged = data
+                    .staged_by_label
+                    .remove(&runtime.label)
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                data.active_by_plugin.remove(&runtime.plugin_id);
+                if runtime_active {
+                    data.active_by_plugin
+                        .insert(runtime.plugin_id.clone(), Arc::clone(&staged.runtime));
+                }
+                let authority = checked_network_authority_snapshot(
+                    &self.bundles,
+                    &self.state,
+                    &self.secrets,
+                    &config,
+                    &candidate.runtime,
+                    runtime.activation_id,
+                    runtime.admission_epoch,
+                )?;
+                network_transition
+                    .set_plugin_authority(&runtime.plugin_id, authority)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                drop(data);
+                let commit = PublicActivationCommit {
+                    mutation: mutation_from_config(&config),
+                    runtime,
+                    previous_runtime_label,
+                };
+                drop(_mutation);
+                self.apply_timer_post_lock_effects(timer_effects);
+                self.refresh_clipboard_history_authorization()?;
+                if let Some(previous_digest) = previous_config
+                    .as_ref()
+                    .and_then(|config| config.package_digest.as_deref())
+                    .filter(|digest| *digest != candidate.runtime.digest)
+                {
+                    package::remove_package_tree(package_destination(
+                        &self.packages_root,
+                        &candidate.runtime.manifest.plugin_id,
+                        previous_digest,
+                    ));
+                }
+                Ok(commit)
+            })();
+            if result.is_err() {
+                self.close_network_authority_with_effects(&affected_plugin, Some(effects));
             }
-            self.clear_runtime_faults(&runtime.plugin_id)?;
-            let config = self.state.publish_prepared(prepared_state)?;
-            let runtime_active = config.enabled && config.fault.is_none();
-            reservation.publish(runtime_active.then(|| candidate.bundle(config.clone())))?;
-            let staged = data
-                .staged_by_label
-                .remove(&runtime.label)
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            data.active_by_plugin.remove(&runtime.plugin_id);
-            if runtime_active {
-                data.active_by_plugin
-                    .insert(runtime.plugin_id.clone(), Arc::clone(&staged.runtime));
+            if result.is_ok() {
+                diagnostics::phase(&mut observation, Phase::Complete, CommitOutcome::Committed);
             }
-            let authority = checked_network_authority_snapshot(
-                &self.bundles,
-                &self.state,
-                &self.secrets,
-                &config,
-                &candidate.runtime,
-                runtime.activation_id,
-                runtime.admission_epoch,
-            )?;
-            network_transition
-                .set_plugin_authority(&runtime.plugin_id, authority)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            drop(data);
-            let commit = PublicActivationCommit {
-                mutation: mutation_from_config(&config),
-                runtime,
-                previous_runtime_label,
-            };
-            drop(_mutation);
-            self.apply_timer_post_lock_effects(timer_effects);
-            self.refresh_clipboard_history_authorization()?;
-            if let Some(previous_digest) = previous_config
-                .as_ref()
-                .and_then(|config| config.package_digest.as_deref())
-                .filter(|digest| *digest != candidate.runtime.digest)
-            {
-                package::remove_package_tree(package_destination(
-                    &self.packages_root,
-                    &candidate.runtime.manifest.plugin_id,
-                    previous_digest,
-                ));
-            }
-            Ok(commit)
+            result
         })();
-        if result.is_err() {
-            self.close_network_authority_with_effects(&affected_plugin, Some(effects));
+        if let Some(observation) = observation {
+            observation.finish(&result);
         }
         result
     }
@@ -1529,185 +1704,214 @@ impl PublicPluginManager {
         if !enabled {
             return self.disable_plugin(plugin_id, effects);
         }
-        let (before, candidate, runtime, previous_runtime_label) = {
-            let _mutation = self.lock_mutation()?;
-            let before = self
-                .state
-                .config(plugin_id)?
-                .filter(|config| config.installed)
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let current_bundle = self
-                .bundles
-                .bundle(plugin_id)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            if before.enabled == enabled {
-                return Ok(PublicEnabledCommit {
-                    mutation: mutation_from_config(&before),
-                    runtime: current_bundle.map(|bundle| {
-                        bundle.runtime.candidate(
-                            bundle.activation_id,
-                            bundle.admission_epoch,
-                            bundle.runtime_recovery_needed,
-                        )
-                    }),
-                    closed_runtime_label: None,
-                });
-            }
-            let generation = before
-                .active_generation
-                .checked_add(1)
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let digest = before
-                .package_digest
-                .as_deref()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let package_root = package_destination(&self.packages_root, plugin_id, digest);
-            let (snapshot, alarm) =
-                load_runtime_snapshot(&package_root, &self.host, digest, generation)?;
-            if snapshot.manifest.plugin_id != plugin_id
-                || snapshot.manifest.version != before.version
-            {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let activation_id = self
-                .activation_ids
-                .allocate()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let admission_epoch = self
-                .admission_epochs
-                .allocate()
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            let candidate = Arc::new(ActivationCandidate::new(
-                Arc::new(snapshot),
-                alarm.as_ref(),
-                activation_id,
-                admission_epoch,
-            ));
-            let runtime = candidate.runtime.candidate(
-                candidate.activation_id,
-                candidate.admission_epoch,
-                candidate.runtime_recovery_needed,
-            );
-            let replaced = self
-                .lock_data()?
-                .staged_by_label
-                .insert(runtime.label.clone(), Arc::clone(&candidate));
-            if replaced.is_some() {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let previous_runtime_label = self
-                .lock_data()?
-                .active_by_plugin
-                .get(plugin_id)
-                .map(|snapshot| snapshot.label.clone());
-            (before, candidate, runtime, previous_runtime_label)
-        };
-
-        if !readiness(&runtime) {
-            self.unstage(&runtime.label);
-            return Err(PublicPluginManagementError::RuntimeNotReady);
-        }
-
-        let (reservation, prepared_state) = {
-            let _mutation = self.lock_mutation()?;
-            if self.state.config(plugin_id)? != Some(before.clone())
-                || self.bundles.bundle(plugin_id)?.is_some()
-            {
-                self.unstage(&runtime.label);
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let staged_matches = self
-                .lock_data()?
-                .staged_by_label
-                .get(&runtime.label)
-                .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
-            if !staged_matches {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let reservation = self.bundles.reserve(plugin_id)?;
-            let prepared_state = self
-                .state
-                .prepare_enable_with_generation(plugin_id, runtime.generation)?;
-            (reservation, prepared_state)
-        };
-
-        self.make_state_durable_with_effects(&reservation, &prepared_state, Some(effects))?;
+        let mut observation = valid_plugin_id(plugin_id)
+            .then(|| self.observations.start(plugin_id, Operation::Enable))
+            .flatten();
         let result = (|| {
-            let _mutation = self.lock_mutation()?;
-            let staged_matches = self
-                .lock_data()?
-                .staged_by_label
-                .get(&runtime.label)
-                .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
-            if !staged_matches {
-                return Err(PublicPluginManagementError::Unavailable);
-            }
-            let mut network_transition = self
-                .network_authority
-                .begin_transition()
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            effects.retired.extend(
-                self.scheduler
-                    .retire_plugin_requests(plugin_id)
-                    .map_err(|_| PublicPluginManagementError::Unavailable)?,
-            );
-            effects.changed = true;
-            let expired = self
-                .scheduler
-                .invalidate_plugin(
-                    plugin_id,
-                    Some((
-                        runtime.generation,
-                        runtime.activation_id,
-                        runtime.admission_epoch,
-                    )),
-                )
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            if let Some(expired) = expired.as_ref() {
-                network_transition.invalidate_context(expired);
-            }
-            network_transition
-                .set_plugin_authority(plugin_id, None)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            self.activate_runtime_data_gate(&runtime)?;
-            self.cancel_delayed_messages(plugin_id);
-            let timer_effects = Vec::new();
-            self.clear_runtime_faults(plugin_id)?;
-            let config = self.state.publish_prepared(prepared_state)?;
-            reservation.publish(Some(candidate.bundle(config.clone())))?;
-            let authority = checked_network_authority_snapshot(
-                &self.bundles,
-                &self.state,
-                &self.secrets,
-                &config,
-                &candidate.runtime,
-                runtime.activation_id,
-                runtime.admission_epoch,
-            )?;
-            network_transition
-                .set_plugin_authority(plugin_id, authority)
-                .map_err(|_| PublicPluginManagementError::Unavailable)?;
-            let mut data = self.lock_data()?;
-            let staged = data
-                .staged_by_label
-                .remove(&runtime.label)
-                .filter(|staged| Arc::ptr_eq(staged, &candidate))
-                .ok_or(PublicPluginManagementError::Unavailable)?;
-            data.active_by_plugin
-                .insert(plugin_id.into(), Arc::clone(&staged.runtime));
-            drop(data);
-            let commit = PublicEnabledCommit {
-                mutation: mutation_from_config(&config),
-                runtime: Some(runtime),
-                closed_runtime_label: previous_runtime_label,
+            let (before, candidate, runtime, previous_runtime_label) = {
+                let _mutation = self.lock_mutation()?;
+                let before = self
+                    .state
+                    .config(plugin_id)?
+                    .filter(|config| config.installed)
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let current_bundle = self
+                    .bundles
+                    .bundle(plugin_id)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                if before.enabled == enabled {
+                    return Ok(PublicEnabledCommit {
+                        mutation: mutation_from_config(&before),
+                        runtime: current_bundle.map(|bundle| {
+                            bundle.runtime.candidate(
+                                bundle.activation_id,
+                                bundle.admission_epoch,
+                                bundle.runtime_recovery_needed,
+                            )
+                        }),
+                        closed_runtime_label: None,
+                    });
+                }
+                let generation = before
+                    .active_generation
+                    .checked_add(1)
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let digest = before
+                    .package_digest
+                    .as_deref()
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let package_root = package_destination(&self.packages_root, plugin_id, digest);
+                let (snapshot, alarm) =
+                    load_runtime_snapshot(&package_root, &self.host, digest, generation)?;
+                if snapshot.manifest.plugin_id != plugin_id
+                    || snapshot.manifest.version != before.version
+                {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let activation_id = self
+                    .activation_ids
+                    .allocate()
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let admission_epoch = self
+                    .admission_epochs
+                    .allocate()
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                let candidate = Arc::new(ActivationCandidate::new(
+                    Arc::new(snapshot),
+                    alarm.as_ref(),
+                    activation_id,
+                    admission_epoch,
+                ));
+                let runtime = candidate.runtime.candidate(
+                    candidate.activation_id,
+                    candidate.admission_epoch,
+                    candidate.runtime_recovery_needed,
+                );
+                let replaced = self
+                    .lock_data()?
+                    .staged_by_label
+                    .insert(runtime.label.clone(), Arc::clone(&candidate));
+                if replaced.is_some() {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let previous_runtime_label = self
+                    .lock_data()?
+                    .active_by_plugin
+                    .get(plugin_id)
+                    .map(|snapshot| snapshot.label.clone());
+                (before, candidate, runtime, previous_runtime_label)
             };
-            drop(_mutation);
-            self.apply_timer_post_lock_effects(timer_effects);
-            self.refresh_clipboard_history_authorization()?;
-            Ok(commit)
+
+            diagnostics::phase(
+                &mut observation,
+                Phase::Readiness,
+                CommitOutcome::NotAttempted,
+            );
+            if !readiness(&runtime) {
+                self.unstage(&runtime.label);
+                return Err(PublicPluginManagementError::RuntimeNotReady);
+            }
+
+            let (reservation, prepared_state) = {
+                let _mutation = self.lock_mutation()?;
+                if self.state.config(plugin_id)? != Some(before.clone())
+                    || self.bundles.bundle(plugin_id)?.is_some()
+                {
+                    self.unstage(&runtime.label);
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let staged_matches = self
+                    .lock_data()?
+                    .staged_by_label
+                    .get(&runtime.label)
+                    .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
+                if !staged_matches {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let reservation = self.bundles.reserve(plugin_id)?;
+                let prepared_state = self
+                    .state
+                    .prepare_enable_with_generation(plugin_id, runtime.generation)?;
+                (reservation, prepared_state)
+            };
+
+            self.make_state_durable_observed(
+                &reservation,
+                &prepared_state,
+                Some(effects),
+                &mut observation,
+            )?;
+            diagnostics::phase(
+                &mut observation,
+                Phase::Publication,
+                CommitOutcome::Committed,
+            );
+            let result = (|| {
+                let _mutation = self.lock_mutation()?;
+                let staged_matches = self
+                    .lock_data()?
+                    .staged_by_label
+                    .get(&runtime.label)
+                    .is_some_and(|staged| Arc::ptr_eq(staged, &candidate));
+                if !staged_matches {
+                    return Err(PublicPluginManagementError::Unavailable);
+                }
+                let mut network_transition = self
+                    .network_authority
+                    .begin_transition()
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                effects.retired.extend(
+                    self.scheduler
+                        .retire_plugin_requests(plugin_id)
+                        .map_err(|_| PublicPluginManagementError::Unavailable)?,
+                );
+                effects.changed = true;
+                let expired = self
+                    .scheduler
+                    .invalidate_plugin(
+                        plugin_id,
+                        Some((
+                            runtime.generation,
+                            runtime.activation_id,
+                            runtime.admission_epoch,
+                        )),
+                    )
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                if let Some(expired) = expired.as_ref() {
+                    network_transition.invalidate_context(expired);
+                }
+                network_transition
+                    .set_plugin_authority(plugin_id, None)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                self.activate_runtime_data_gate(&runtime)?;
+                self.cancel_delayed_messages(plugin_id);
+                let timer_effects = Vec::new();
+                self.clear_runtime_faults(plugin_id)?;
+                let config = self.state.publish_prepared(prepared_state)?;
+                reservation.publish(Some(candidate.bundle(config.clone())))?;
+                let authority = checked_network_authority_snapshot(
+                    &self.bundles,
+                    &self.state,
+                    &self.secrets,
+                    &config,
+                    &candidate.runtime,
+                    runtime.activation_id,
+                    runtime.admission_epoch,
+                )?;
+                network_transition
+                    .set_plugin_authority(plugin_id, authority)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
+                let mut data = self.lock_data()?;
+                let staged = data
+                    .staged_by_label
+                    .remove(&runtime.label)
+                    .filter(|staged| Arc::ptr_eq(staged, &candidate))
+                    .ok_or(PublicPluginManagementError::Unavailable)?;
+                data.active_by_plugin
+                    .insert(plugin_id.into(), Arc::clone(&staged.runtime));
+                drop(data);
+                let commit = PublicEnabledCommit {
+                    mutation: mutation_from_config(&config),
+                    runtime: Some(runtime),
+                    closed_runtime_label: previous_runtime_label,
+                };
+                drop(_mutation);
+                self.apply_timer_post_lock_effects(timer_effects);
+                self.refresh_clipboard_history_authorization()?;
+                Ok(commit)
+            })();
+            if result.is_err() {
+                self.close_network_authority_with_effects(plugin_id, Some(effects));
+            }
+            result
         })();
-        if result.is_err() {
-            self.close_network_authority_with_effects(plugin_id, Some(effects));
+        if result.is_ok() {
+            if let Some(attempt) = &mut observation {
+                attempt.observation.phase = Phase::Complete;
+            }
+        }
+        if let Some(observation) = observation {
+            observation.finish(&result);
         }
         result
     }
@@ -2598,6 +2802,53 @@ impl PublicPluginManager {
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         self.finish_uninstall_cleanup(&committed, &settings)?;
         Ok(committed.runtime_label)
+    }
+
+    pub(crate) fn diagnostics(
+        &self,
+        plugin_id: &str,
+    ) -> Result<DiagnosticReport, PublicPluginManagementError> {
+        if !valid_plugin_id(plugin_id) {
+            return Err(PublicPluginManagementError::InvalidPackage);
+        }
+        let last_operation = self.observations.latest(plugin_id);
+        let state = (|| -> Result<DiagnosticState, PublicPluginManagementError> {
+            let _mutation = self.lock_mutation()?;
+            let bundle = self.bundles.confirmed_bundle(plugin_id)?;
+            let revision = self.state.inventory_revision()?.to_string();
+            match self.state.config(plugin_id)?.filter(|c| c.installed) {
+                None => Ok(DiagnosticState::NotInstalled {
+                    inventory_revision: revision,
+                }),
+                Some(config) => {
+                    if config.enabled
+                        && config.fault.is_none()
+                        && !bundle.as_ref().is_some_and(|b| b.config == config)
+                    {
+                        return Err(PublicPluginManagementError::Unavailable);
+                    }
+                    self.installed_manifest(&config)?;
+                    Ok(DiagnosticState::Installed {
+                        package_version: config.version,
+                        generation: config.active_generation.to_string(),
+                        inventory_revision: revision,
+                        enabled: config.enabled,
+                        fault: config.fault,
+                    })
+                }
+            }
+        })()
+        .ok();
+        let report = DiagnosticReport {
+            schema_version: 1,
+            host_version: env!("CARGO_PKG_VERSION").into(),
+            platform: self.host.platform,
+            plugin_id: plugin_id.into(),
+            state,
+            last_operation,
+        };
+        report.preview()?;
+        Ok(report)
     }
 
     pub(crate) fn inventory(&self) -> Result<PublicPluginInventory, PublicPluginManagementError> {
@@ -4369,11 +4620,23 @@ impl PublicPluginManager {
         &self,
         reservation: &ActivationReservation,
         prepared: &PreparedStateCommit,
-        mut effects: Option<&mut ManagementEffects>,
+        effects: Option<&mut ManagementEffects>,
     ) -> Result<(), PublicPluginManagementError> {
+        self.make_state_durable_observed(reservation, prepared, effects, &mut None)
+    }
+    fn make_state_durable_observed(
+        &self,
+        reservation: &ActivationReservation,
+        prepared: &PreparedStateCommit,
+        mut effects: Option<&mut ManagementEffects>,
+        observation: &mut Option<diagnostics::Attempt<'_>>,
+    ) -> Result<(), PublicPluginManagementError> {
+        diagnostics::phase(observation, Phase::Persistence, CommitOutcome::NotAttempted);
         reservation.begin_committing()?;
+        diagnostics::phase(observation, Phase::Persistence, CommitOutcome::Unknown);
         match self.state.persist_prepared(prepared) {
             DurableStateOutcome::Committed => {
+                diagnostics::phase(observation, Phase::Publication, CommitOutcome::Committed);
                 reservation.mark_durable()?;
                 #[cfg(test)]
                 if let Some(hook) = self.after_state_durable.lock().unwrap().clone() {
@@ -4389,6 +4652,7 @@ impl PublicPluginManager {
                     );
                     return Err(PublicPluginManagementError::Unavailable);
                 }
+                diagnostics::phase(observation, Phase::Persistence, CommitOutcome::NotCommitted);
                 reservation.rollback_not_committed()?;
                 Err(PublicPluginManagementError::Unavailable)
             }
@@ -6661,6 +6925,192 @@ mod tests {
             .permission_grants
             .contains(&PublicPermission::NetworkHttps));
         assert!(config.network_https_hosts_grant.is_empty());
+    }
+
+    #[test]
+    fn recovery_target_binds_identity_version_revision_and_full_config() {
+        let dir = TestDir::new("recovery-target");
+        write_package(&dir.source(), "1.0.0", "A");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let first = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let observation = manager
+            .diagnostics("com.example.activation")
+            .unwrap()
+            .last_operation
+            .unwrap();
+        assert_eq!(observation.phase, Phase::Complete);
+        assert_eq!(
+            observation.state_commit_outcome,
+            CommitOutcome::NotAttempted
+        );
+        manager
+            .commit_with_readiness("main", &first.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        manager
+            .set_enabled_with_readiness("com.example.activation", true, |_| {
+                panic!("healthy enable must not probe")
+            })
+            .unwrap();
+        assert_eq!(
+            manager
+                .diagnostics("com.example.activation")
+                .unwrap()
+                .last_operation
+                .unwrap()
+                .state_commit_outcome,
+            CommitOutcome::NotAttempted
+        );
+        let target = || PublicPluginRefreshTarget {
+            plugin_id: "com.example.activation".into(),
+            expected_inventory_revision: manager.state.inventory_revision().unwrap().to_string(),
+        };
+        let mut stale = target();
+        stale.expected_inventory_revision = "0".into();
+        assert_eq!(
+            manager.prepare_targeted("main", source(&dir.source()), Some(stale), now),
+            Err(PublicPluginManagementError::StaleInventory)
+        );
+        assert_eq!(
+            manager.prepare_targeted("plugin-runtime", source(&dir.source()), Some(target()), now),
+            Err(PublicPluginManagementError::InvalidCaller)
+        );
+        let mut wrong = target();
+        wrong.plugin_id = "com.example.other".into();
+        assert_eq!(
+            manager.prepare_targeted("main", source(&dir.source()), Some(wrong), now),
+            Err(PublicPluginManagementError::RefreshTargetMismatch)
+        );
+        write_package(&dir.source(), "1.1.0", "wrong-version");
+        assert_eq!(
+            manager.prepare_targeted("main", source(&dir.source()), Some(target()), now),
+            Err(PublicPluginManagementError::RefreshVersionMismatch)
+        );
+        write_package(&dir.source(), "1.0.0", "B");
+        let prepared = manager
+            .prepare_targeted("main", source(&dir.source()), Some(target()), now)
+            .unwrap();
+        assert_eq!(prepared.operation, PrepareOperation::DevelopmentRefresh);
+        assert_eq!(prepared.previous_version.as_deref(), Some("1.0.0"));
+        // A changed target cannot be silently adopted by this already issued token.
+        manager
+            .rename("com.example.activation", Some("changed"))
+            .unwrap();
+        assert_eq!(
+            manager.commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true),
+            Err(PublicPluginManagementError::Unavailable)
+        );
+        assert_eq!(
+            manager.commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true),
+            Err(PublicPluginManagementError::InvalidToken)
+        );
+        let prepared = manager
+            .prepare_targeted("main", source(&dir.source()), Some(target()), now)
+            .unwrap();
+        // An unrelated durable owner change after prepare must not invalidate the captured target.
+        let other = dir.path().join("other-source");
+        write_package(&other, "1.0.0", "other");
+        let manifest = other.join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["pluginId"] = "com.example.other".into();
+        value["command"]["defaultName"] = "other".into();
+        fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        let unrelated = manager.prepare("main", source(&other), now).unwrap();
+        manager
+            .commit_with_readiness("main", &unrelated.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let report = manager.diagnostics("com.example.activation").unwrap();
+        assert_eq!(
+            report.last_operation.unwrap().operation,
+            Operation::DevelopmentRefresh
+        );
+        assert!(
+            matches!(report.state, Some(DiagnosticState::Installed { package_version, .. }) if package_version == "1.0.0")
+        );
+    }
+
+    #[test]
+    fn recovery_diagnostics_capture_real_durable_outcomes_and_authoritative_absence() {
+        for failure in [
+            "readiness",
+            "notCommitted",
+            "revalidate",
+            "unknown",
+            "publication",
+        ] {
+            let dir = TestDir::new("recovery-diagnostic-outcome");
+            write_package(&dir.source(), "1.0.0", "A");
+            let manager = manager(&dir);
+            let now = Instant::now();
+            assert!(matches!(
+                manager.diagnostics("com.example.absent").unwrap().state,
+                Some(DiagnosticState::NotInstalled { .. })
+            ));
+            let first = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness("main", &first.token, BTreeSet::new(), now, |_| true)
+                .unwrap();
+            write_package(&dir.source(), "1.0.0", "B");
+            let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+            let current = dir
+                .path()
+                .join("public-plugins/state/com.example.activation/state.json");
+            if failure == "notCommitted" || failure == "revalidate" {
+                let backup = current.with_file_name("state.json.backup");
+                if backup.exists() {
+                    fs::remove_file(&backup).unwrap();
+                }
+                fs::create_dir(&backup).unwrap();
+            }
+            if failure == "revalidate" {
+                fs::write(&current, b"different authoritative bytes").unwrap();
+            }
+            if failure == "unknown" {
+                fs::remove_file(&current).unwrap();
+                fs::create_dir(&current).unwrap();
+            }
+            if failure == "publication" {
+                std::thread::scope(|scope| {
+                    let _ = scope
+                        .spawn(|| {
+                            let _guard = manager.runtime_faults.lock().unwrap();
+                            panic!("synthetic diagnostic publication failure");
+                        })
+                        .join();
+                });
+            }
+            assert!(manager
+                .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| failure
+                    != "readiness")
+                .is_err());
+            let report = manager.diagnostics("com.example.activation").unwrap();
+            let observed = report.last_operation.unwrap();
+            assert_eq!(observed.operation, Operation::Replace);
+            assert_eq!(
+                observed.phase,
+                match failure {
+                    "readiness" => Phase::Readiness,
+                    "publication" => Phase::Publication,
+                    _ => Phase::Persistence,
+                }
+            );
+            assert_eq!(
+                observed.state_commit_outcome,
+                match failure {
+                    "readiness" => CommitOutcome::NotAttempted,
+                    "notCommitted" => CommitOutcome::NotCommitted,
+                    "unknown" | "revalidate" => CommitOutcome::Unknown,
+                    _ => CommitOutcome::Committed,
+                }
+            );
+            assert_eq!(
+                report.state.is_some(),
+                failure == "readiness" || failure == "notCommitted"
+            );
+        }
     }
 
     #[test]

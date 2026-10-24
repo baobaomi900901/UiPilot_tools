@@ -357,7 +357,7 @@ const client: LauncherClient = {
   selectPublicPluginDirectory: async () => 'synthetic-credential-preview',
   preparePublicPlugin: async () => ({
     token: 'synthetic-credential-preview', pluginId: credentialPreviewPlugin.pluginId,
-    name: 'Credential Demo', version: '0.2.0', permissions: ['network.https'], isUpdate: true,
+    name: 'Credential Demo', version: '0.2.0', permissions: ['network.https'], isUpdate: true, operation: 'replace', previousVersion: '1.0.0',
     sourceVerified: false, iconUrl: null,
     network: { httpsHosts: ['api.example.com'], addedHttpsHosts: [],
       credentials: [{ id: 'service-token', settingKey: 'candidate-token', host: 'api.example.com', type: 'bearer' }],
@@ -372,6 +372,8 @@ const client: LauncherClient = {
     }))
   },
   cancelPublicPlugin: async () => undefined,
+  getPublicPluginDiagnostics: async ({ pluginId }) => ({ schemaVersion: 1, hostVersion: '0.7.0', platform: 'windows', pluginId, state: null, lastOperation: null }),
+  copyPublicPluginDiagnostics: async () => { throw { code: 'pluginUnavailable' } },
   setPublicPluginEnabled: async ({ pluginId, enabled }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, enabled })) },
   setPublicPluginNetworkAccess: async ({ pluginId, granted, expectedInventoryRevision }) => {
     if (granted && previewScenarioPending && previewParameters.get('credentialScenario') === 'stale') {

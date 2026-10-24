@@ -266,6 +266,8 @@ export interface PublicPluginPrepareSummary {
   version: string
   permissions: readonly PublicPermission[]
   isUpdate: boolean
+  operation: 'install' | 'replace' | 'developmentRefresh'
+  previousVersion: string | null
   sourceVerified: boolean
   iconUrl: string | null
   network: PublicPluginPrepareNetwork | null
@@ -390,8 +392,10 @@ export interface LauncherClient {
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
   selectPublicPluginDirectory(): Promise<string | null>
-  preparePublicPlugin(input: { source: { kind: 'archive' | 'developmentDirectory'; path: string } }): Promise<PublicPluginPrepareSummary>
+  preparePublicPlugin(input: { source: { kind: 'archive' | 'developmentDirectory'; path: string }; refreshTarget?: { pluginId: string; expectedInventoryRevision: string } }): Promise<PublicPluginPrepareSummary>
   commitPublicPlugin(input: { input: { token: string; permissionGrants: readonly PublicPermission[] } }): Promise<void>
+  getPublicPluginDiagnostics(input: { pluginId: string }): Promise<PublicPluginDiagnosticReport>
+  copyPublicPluginDiagnostics(input: { report: PublicPluginDiagnosticReport }): Promise<void>
   cancelPublicPlugin(input: { token: string }): Promise<void>
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
   setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean; expectedInventoryRevision?: U64Decimal }): Promise<void>
@@ -922,10 +926,13 @@ export function parsePublicPluginInventory(value: unknown): PublicPluginInventor
 
 export function parsePublicPluginPrepareSummary(value: unknown): PublicPluginPrepareSummary | null {
   const summary = plainRecord(value)
-  const keys = ['iconUrl', 'isUpdate', 'name', 'network', 'permissions', 'pluginId', 'sourceVerified', 'token', 'version']
+  const keys = ['iconUrl', 'isUpdate', 'name', 'network', 'operation', 'permissions', 'pluginId', 'previousVersion', 'sourceVerified', 'token', 'version']
   if (!summary || !exactKeys(summary, keys)) return null
   if (typeof summary.token !== 'string' || summary.token.length === 0 || typeof summary.pluginId !== 'string' || !PUBLIC_PLUGIN_ID.test(summary.pluginId)) return null
   if (typeof summary.name !== 'string' || summary.name.length === 0 || !canonicalVersion(summary.version)) return null
+  if (!['install', 'replace', 'developmentRefresh'].includes(summary.operation as string)) return null
+  if (summary.operation === 'install' ? summary.isUpdate !== false || summary.previousVersion !== null : summary.isUpdate !== true || !canonicalVersion(summary.previousVersion)) return null
+  if (summary.operation === 'developmentRefresh' && summary.previousVersion !== summary.version) return null
   if (typeof summary.isUpdate !== 'boolean' || typeof summary.sourceVerified !== 'boolean') return null
   if (summary.iconUrl !== null && safePublicPluginIconUrl(summary.iconUrl) === undefined) return null
   if (!Array.isArray(summary.permissions) || Object.getPrototypeOf(summary.permissions) !== Array.prototype || !exactDenseArray(summary.permissions)) return null
@@ -1399,4 +1406,50 @@ export function parseFileSearchResponse(value: unknown): FileSearchResponse | nu
     if (parseFileResultItem(response.items[index]) === null) return null
   }
   return response as unknown as FileSearchResponse
+}
+
+
+export type PublicPluginManagementCode = 'invalidPackage' | 'incompatiblePlatform' | 'incompatibleApi' | 'unsupportedPermission' | 'permissionDenied' | 'runtimeNotReady' | 'nameConflict' | 'invalidToken' | 'expiredToken' | 'invalidCaller' | 'dataCleanupPending' | 'pluginUnavailable' | 'refreshTargetMismatch' | 'refreshVersionMismatch' | 'staleInventory'
+export interface PublicPluginDiagnosticReport {
+  schemaVersion: 1
+  hostVersion: string
+  platform: 'windows' | 'macos'
+  pluginId: string
+  state: null | { status: 'notInstalled'; inventoryRevision: string } | { status: 'installed'; packageVersion: string; generation: string; inventoryRevision: string; enabled: boolean; fault: PublicPluginFault | null }
+  lastOperation: null | { operation: 'prepare' | 'developmentRefresh' | 'replace' | 'enable'; phase: 'validation' | 'readiness' | 'persistence' | 'publication' | 'complete'; errorCode: PublicPluginManagementCode | null; stateCommitOutcome: 'notAttempted' | 'committed' | 'notCommitted' | 'unknown' }
+}
+const managementCodes = new Set<string>(['invalidPackage', 'incompatiblePlatform', 'incompatibleApi', 'unsupportedPermission', 'permissionDenied', 'runtimeNotReady', 'nameConflict', 'invalidToken', 'expiredToken', 'invalidCaller', 'dataCleanupPending', 'pluginUnavailable', 'refreshTargetMismatch', 'refreshVersionMismatch', 'staleInventory'])
+// Copy and preview share this canonical field order with Rust's explicit DTO.
+export function formatPublicPluginDiagnostics(report: PublicPluginDiagnosticReport): string { return JSON.stringify(report, null, 2) }
+function diagnosticRecord(value: unknown): Record<string, unknown> | null {
+  const record = plainRecord(value)
+  if (!record || Object.values(Object.getOwnPropertyDescriptors(record)).some((descriptor) => !('value' in descriptor) || !descriptor.enumerable)) return null
+  return record
+}
+export function parsePublicPluginDiagnostics(value: unknown): PublicPluginDiagnosticReport | null {
+  const r = diagnosticRecord(value)
+  if (!r || !exactKeys(r, ['hostVersion', 'lastOperation', 'platform', 'pluginId', 'schemaVersion', 'state']) || r.schemaVersion !== 1 || !canonicalVersion(r.hostVersion) || !['windows', 'macos'].includes(r.platform as string) || typeof r.pluginId !== 'string' || r.pluginId.length > 64 || !PUBLIC_PLUGIN_ID.test(r.pluginId)) return null
+  let state: PublicPluginDiagnosticReport['state'] = null
+  if (r.state !== null) {
+    const st = diagnosticRecord(r.state)
+    if (!st || !canonicalU64(st.inventoryRevision)) return null
+    if (st.status === 'notInstalled') {
+      if (!exactKeys(st, ['inventoryRevision', 'status'])) return null
+      state = { status: 'notInstalled', inventoryRevision: st.inventoryRevision }
+    } else if (st.status === 'installed') {
+      if (!exactKeys(st, ['enabled', 'fault', 'generation', 'inventoryRevision', 'packageVersion', 'status']) || !canonicalVersion(st.packageVersion) || !canonicalU64(st.generation) || st.generation === '0' || typeof st.enabled !== 'boolean' || (st.fault !== null && st.fault !== 'runtimeUnavailable' && st.fault !== 'consecutiveFailures') || (st.enabled && st.fault !== null)) return null
+      state = { status: 'installed', packageVersion: st.packageVersion, generation: st.generation, inventoryRevision: st.inventoryRevision, enabled: st.enabled, fault: st.fault }
+    } else return null
+  }
+  let lastOperation: PublicPluginDiagnosticReport['lastOperation'] = null
+  if (r.lastOperation !== null) {
+    const op = diagnosticRecord(r.lastOperation)
+    if (!op || !exactKeys(op, ['errorCode', 'operation', 'phase', 'stateCommitOutcome']) || !['prepare', 'developmentRefresh', 'replace', 'enable'].includes(op.operation as string) || !['validation', 'readiness', 'persistence', 'publication', 'complete'].includes(op.phase as string) || !['notAttempted', 'committed', 'notCommitted', 'unknown'].includes(op.stateCommitOutcome as string) || (op.errorCode !== null && (typeof op.errorCode !== 'string' || !managementCodes.has(op.errorCode)))) return null
+    if ((op.phase === 'validation' || op.phase === 'readiness') && op.stateCommitOutcome !== 'notAttempted') return null
+    if (op.phase === 'publication' && op.stateCommitOutcome !== 'committed') return null
+    if (op.phase === 'complete' && (!['notAttempted', 'committed'].includes(op.stateCommitOutcome as string) || op.errorCode !== null)) return null
+    lastOperation = { operation: op.operation, phase: op.phase, errorCode: op.errorCode, stateCommitOutcome: op.stateCommitOutcome } as PublicPluginDiagnosticReport['lastOperation']
+  }
+  const report: PublicPluginDiagnosticReport = { schemaVersion: 1, hostVersion: r.hostVersion, platform: r.platform as 'windows' | 'macos', pluginId: r.pluginId, state, lastOperation }
+  return new TextEncoder().encode(formatPublicPluginDiagnostics(report)).length <= 16384 ? report : null
 }

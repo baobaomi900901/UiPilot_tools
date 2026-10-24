@@ -1274,11 +1274,43 @@ pub(crate) fn prepare_public_plugin_install(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
     source: PublicPluginInstallSource,
+    refresh_target: Option<crate::public_plugins::PublicPluginRefreshTarget>,
 ) -> Result<PublicPluginPrepareSummary, CommandError> {
     require_main_window(&window)?;
-    Ok(service
-        .manager()?
-        .prepare(window.label(), source, Instant::now())?)
+    Ok(service.manager()?.prepare_targeted(
+        window.label(),
+        source,
+        refresh_target,
+        Instant::now(),
+    )?)
+}
+
+#[tauri::command]
+pub(crate) fn get_public_plugin_diagnostics(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    plugin_id: String,
+) -> Result<crate::public_plugins::diagnostics::DiagnosticReport, CommandError> {
+    require_main_window(&window)?;
+    Ok(service.manager()?.diagnostics(&plugin_id)?)
+}
+
+#[tauri::command]
+pub(crate) fn copy_public_plugin_diagnostics(
+    window: WebviewWindow,
+    report: crate::public_plugins::diagnostics::DiagnosticReport,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    Ok(crate::public_plugins::diagnostics::copy_report(
+        &report,
+        |preview| {
+            window
+                .app_handle()
+                .clipboard()
+                .write_text(preview)
+                .map_err(|_| ())
+        },
+    )?)
 }
 
 #[tauri::command]
@@ -7059,6 +7091,8 @@ mod tests {
             "set_file_preview_preference",
             "hide_launcher",
             "list_public_plugins",
+            "get_public_plugin_diagnostics",
+            "copy_public_plugin_diagnostics",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
@@ -7360,6 +7394,7 @@ mod tests {
         let source = include_str!("commands.rs").replace("\r\n", "\n");
         for command in [
             "list_public_plugins",
+            "get_public_plugin_diagnostics",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",

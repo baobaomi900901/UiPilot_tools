@@ -296,3 +296,14 @@ Action names match `^[a-z][a-z0-9.-]{0,63}$`. Payload is required (explicit null
 One unresolved call and one physical Runtime slot per plugin are enforced by Host. Busy rejects rather than queueing/retrying. Do not await requests inside `onUpdate` or `onHostKey`; wait until Ready. Host command submission cancels action ownership but waits for the running handler to finish or its original 30-second deadline before dispatching another handler. Close, reload, replacement, disable, permission/credential changes and faults revoke the exact old API context. Already-admitted effects may finish: cancellation after save does not mean “not saved”; reload before deliberate retry.
 
 Fixed Error.name values: `InvalidPanelRequestError`, `PanelRequestBusyError`, `ExpiredPanelSession`, `PanelRequestCancelledError`, `PanelRequestTimeoutError`, `InvalidPanelResponseError`, `PanelRequestFailedError`, `PanelRequestUnavailableError`. Business validation belongs in ordinary data (for example `{ok:false, code:"missing-variable"}`); unexpected handler errors expose no plugin stack or arbitrary native text. There is no Window RPC, multi-command panel, streaming, AbortSignal or new clipboard API.
+
+
+## Host 0.7.0：本地开发刷新、恢复和诊断
+
+“刷新列表”只重新读取已安装清单。“重新载入开发目录”位于插件详情，需要重新选择 package 目录，将其复制、验证为不可变快照；它只接受当前插件 ID 和完全相同的规范版本。宿主不监听目录，也不记住源路径。准备后仍需确认完整权限、HTTPS 主机及凭据绑定。此前关闭且声明未变的网络访问不会自动开启。改版本（包括降级）请在列表使用“选择开发目录”或“选择插件包”。确认使用一次性令牌；尝试提交后需重新选择，不能重复提交旧确认。
+
+刷新成功会关闭旧面板/窗口，请重新运行命令查看新代码。刷新保持停用/故障状态；修复代码后需显式“重新启用”。已经启用的插件再次启用不会重启健康 Runtime。静态验证或就绪失败保留旧包；只有验证了旧落盘字节的确定未提交情况才可继续使用旧配置。状态未确认时应重启宿主后核对；持久化后发布失败并不等于回滚。
+
+插件包 semver、Host 版本、SDK API v1、插件私有数据 schemaVersion 相互独立。刷新不会主动清除插件数据；包替换/降级也不会转换或恢复私有 JSON。插件作者应验证完整数据文档，遇到未知/较新数据版本时阻止写入，不能静默重置。宿主没有自动数据迁移、包历史回滚或备份恢复功能。已获准的旧请求效果仍可能完成；取消或保存失败不能证明数据/远端效果未发生，重试前先重新读取。
+
+详情中的“查看诊断”提供显式允许字段构造的 JSON 预览；“复制此诊断”仅复制当前预览快照，不自动更新、上传或读取剪贴板。报告含 Host/平台、插件 ID/版本、已确认配置状态及最新管理操作阶段/固定错误码，不含内容、路径、设置、私有数据、凭据、域名、请求 ID 或原始异常。状态 null 表示未知；enabled 不是 Runtime 健康证明。最新操作仅驻留内存，最多 64 个插件槽，重启清空。stateCommitOutcome 只描述 Host 配置持久化，不描述插件业务数据或远端效果。

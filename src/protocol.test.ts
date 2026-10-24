@@ -134,7 +134,7 @@ describe('public plugin timer protocol', () => {
       name: 'Network',
       version: '1.1.0',
       permissions: ['network.https'],
-      isUpdate: true,
+      isUpdate: true, operation: 'replace', previousVersion: '1.0.0',
       sourceVerified: false,
       iconUrl: null,
       network: {
@@ -152,13 +152,13 @@ describe('public plugin timer protocol', () => {
       expect(parsePublicPluginPrepareSummary({ ...prepared, network: { ...credentialNetwork, credentials } })).toBeNull()
     }
     expect(parsePublicPluginPrepareSummary({ ...prepared, network: { ...credentialNetwork, addedCredentialIds: ['unknown'] } })).toBeNull()
-    expect(parsePublicPluginPrepareSummary({ ...prepared, isUpdate: false, network: { ...credentialNetwork,
+    expect(parsePublicPluginPrepareSummary({ ...prepared, isUpdate: false, operation: 'install', previousVersion: null, network: { ...credentialNetwork,
       addedHttpsHosts: credentialNetwork.httpsHosts, addedCredentialIds: [] } })).toBeNull()
 
     expect(parsePublicPluginPrepareSummary({ ...prepared, permissions: [], network: null })).not.toBeNull()
     expect(parsePublicPluginPrepareSummary({
       ...prepared,
-      isUpdate: false,
+      isUpdate: false, operation: 'install', previousVersion: null,
       network: { ...prepared.network, addedHttpsHosts: ['auth.example.com'], addedCredentialIds: [] },
     })).toBeNull()
     for (const network of [

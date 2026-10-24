@@ -1,3 +1,4 @@
+import { parsePublicPluginDiagnostics } from './protocol'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -121,6 +122,16 @@ export const client: LauncherClient = {
     const prepared = parsePublicPluginPrepareSummary(value)
     if (!prepared) throw { code: 'pluginInstallFailed', message: 'public plugin prepare failed' }
     return prepared
+  },
+  getPublicPluginDiagnostics: async (input) => {
+    const report = parsePublicPluginDiagnostics(await invoke<unknown>('get_public_plugin_diagnostics', input))
+    if (!report) throw { code: 'pluginUnavailable' }
+    return report
+  },
+  copyPublicPluginDiagnostics: async (input) => {
+    const report = parsePublicPluginDiagnostics(input.report)
+    if (!report) throw { code: 'invalidPackage' }
+    await invoke('copy_public_plugin_diagnostics', { report })
   },
   commitPublicPlugin: async (input) => { await invoke('commit_public_plugin_install', input) },
   cancelPublicPlugin: async (input) => { await invoke('cancel_public_plugin_install', input) },

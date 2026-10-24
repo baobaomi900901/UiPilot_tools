@@ -2844,3 +2844,10 @@ label,
 .public-plugin-item .plugin-title-line h3 { flex-shrink: 0; max-width: 100%; }
 
 .public-plugin-detail-list .public-detail-name-term { align-self: start; }
+
+.public-detail-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.public-plugin-recovery { border-top: 1px solid var(--uipilot-ui-border); padding-top: 12px; margin-top: 12px; }
+.public-recovery-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.public-recovery-help, .public-diagnostic-preview p { color: var(--uipilot-ui-muted-foreground); font-size: 12px; margin: 8px 0; }
+.public-diagnostic-preview pre { max-height: 280px; overflow: auto; font-size: 12px; padding: 12px; border: 1px solid var(--uipilot-ui-border); border-radius: 6px; background: var(--uipilot-ui-surface); color: var(--uipilot-ui-foreground); white-space: pre-wrap; overflow-wrap: anywhere; }
+.public-diagnostic-preview pre:focus-visible { outline: 1px solid var(--uipilot-ui-hairline-strong); }
