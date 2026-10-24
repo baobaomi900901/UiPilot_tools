@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令实施计划
 
-状态：已通过独立计划复审，主 agent 依据现有自主规划与开发授权正式纳入。M4 最终源码 `761a9e4` 已批准，完成记录为 `430be00`；Task 1 已完成并通过独立规格/质量评审（实现 `2dae8c3`，测试证据修正 `380c747`）；Task 2 已完成并通过独立规格/质量评审（实现 `08a0f7e`，严格对象解码修正 `61fb019`）；Task 3 已完成并通过独立规格/质量评审（`bd8707a`）；Task 4 已完成并通过独立规格/质量评审（实现 `2f8a5aa`，并发事务修正 `40e89de`）；Task 5 已完成并通过独立规格/质量评审（实现 `20ee2cb`，异步状态修正 `80ece01`）；Tasks 6–8 待执行，M2-A 尚未完成。
+状态：八项实施任务已完成；最终源码 `b84bda3` 已通过默认配置的全仓验证及 Task 8 / 整批 M2-A 独立规格与质量评审（PASS / Approved，无新增发现）。此前各任务的修复与验证证据保存在进度账本和验收索引中。0.5.0 可运行验收包已构建；真实 Windows Host 人工验收待用户执行，不能据此把完整 M2 或整个本地基座标为完成。
 
 > **For agentic workers:** 使用 `subagent-driven-development`；单写者顺序实施，每任务通过独立 Spec 与 Quality 双门禁后才可开始下一任务。
 
@@ -13,7 +13,7 @@
 ## Governing references and readiness gate
 
 - 唯一技术合同：[M2-A 设计](../specs/2026-10-23-plugin-multi-command-draft.md)。设计与本八任务计划已通过独立评审；以下任务引用其精确节号，不重新定义 DTO、事件顺序或安全边界。
-- 阶段边界：[路线图](../specs/2026-10-23-local-plugin-foundation-design.md)。M2-A 不等于完整 M2，不解锁 M3；统一 actions/onAction、每命令快捷键、独立别名集合、多命令 panel/window 均不在本计划。
+- 阶段边界：[路线图](../specs/2026-10-23-local-plugin-foundation-design.md)。M2-A 不等于完整 M2，也不单独提供 M3 的业务动作合同；统一 actions/onAction、每命令快捷键、独立别名集合、多命令 panel/window 均不在本计划。2026-10-24 方向审核后，M3 依赖稳定身份与另行评审的有限业务动作合同，不再以 M2-C 原生快捷键完成为硬前置。
 - [计划指南](../../agents/implementation-plan-guidelines.md) 优先于泛用模板；[UI 规范](../../ui-guidelines.md) 用于所有宿主表面；SDK/示例任务先读 [开发指南](../../plugin-sdk/public-plugin-developer-guide.md)。本任务是明确的宿主开发，允许改 host/CLI/SDK。
 - **执行前置门禁已满足：** M4 Task 6 与整批最终评审通过，最终两文件 UI/文档差异已核对且不改变本计划假设；M2-A 设计与计划经独立复审后由 controller 正式纳入。真实 Windows Host 人工验收仍 pending，不作为已执行证据。Task 1 起按以下顺序执行。
 
@@ -147,11 +147,11 @@
 
 **Dependencies:** Task 7；设计 §1、§12、§16 全矩阵；所有任务双门禁关闭。此任务才允许 Host current/CLI target/应用版本从 .4 一起到 .5。
 
-- [ ] 统一发布版本与 lockfile package 条目，保持 CLI 自身包版本和旧功能最低版本不变；区分精确 current 断言与历史 .4 fixture，不能全局替换 0.4.0。Host network User-Agent 及其精确字节断言同一提交改为 `UiPilot-Plugin/0.5.0`。原子加入正式 demo-multi package，所有参考包发现/测试/SDK 集合继续非空且全覆盖。
-- [ ] 为生产 CLI 成功验证和 pack 增加双命令/单项数组 fixture。延续现有 isolated CLI smoke 的 Node permission、network trap 和 bundle 审计：validate 保留临时目录只读边界及既有 Windows 系统路径例外；pack 为祖先元数据检查保留现有较宽读取许可，写入严格限于唯一临时输出目录，不宣称 pack 被禁止读取仓库或父目录。目录/归档报告等价、重复 pack 字节/hash 一致、已有输出不覆盖、失败不产包，绝不运行插件 Runtime。
-- [ ] 沿 M1 已跟踪归档接缝，用刚构建的生产 0.5 CLI 从最终 demo-multi package 生成并提交 `tests/fixtures/public-plugin-pack/multi-command.uipilot-plugin`。Rust 测试 `cli_multi_command_pack_fixture_stages_on_0_5_0` 以 include_bytes! 将完全相同的字节交给全新 TestRoot staging，验证完整命令集合及资源字节。isolated consumer smoke 把 demo-multi 加入 copy/pack 集合，使用本次 verify 重新构建的已安装 CLI 产包，在清理临时目录前逐字节及 SHA-256 比较该 tracked fixture；不使用旧 dist、不在测试中重写 fixture、不跳过缺失前提。root 保留 Rust-before-CLI 顺序，最终完整通过证明两端消费字节相同。历史 .4 Host 拒绝新包、.4 凭据旧包继续兼容。升级/删除/包回退/重启的完整矩阵引用前任务行为测试证据，发现跨任务缺口才新增聚焦回归。
-- [ ] 运行完整 verify 协调器并记录日志及真实 exit code；随后按各任务 base..head 与 M4 最终批准 baseline..HEAD 生成最终 diff 包，派发独立最终 Spec+Quality review，统一修复全部最终 findings 并重跑覆盖修复的检查。记录真实 Windows Host/UI/焦点/剪贴板验收的已执行证据或明确 pending，不把浏览器/单测替代它。
-- [ ] 发布说明明确 schema-2 后旧宿主二进制降级不保证、仅新 Host 运行旧包及在新 Host 内包回退受支持；路线图只更新 M2-A，完整 M2 actions/快捷键处置及 M3 继续未完成。没有远程发布/push/安装器部署步骤。
+- [x] 统一发布版本与 lockfile package 条目，保持 CLI 自身包版本和旧功能最低版本不变；区分精确 current 断言与历史 .4 fixture，不能全局替换 0.4.0。Host network User-Agent 及其精确字节断言同一提交改为 `UiPilot-Plugin/0.5.0`。原子加入正式 demo-multi package，所有参考包发现/测试/SDK 集合继续非空且全覆盖。
+- [x] 为生产 CLI 成功验证和 pack 增加双命令/单项数组 fixture。延续现有 isolated CLI smoke 的 Node permission、network trap 和 bundle 审计：validate 保留临时目录只读边界及既有 Windows 系统路径例外；pack 为祖先元数据检查保留现有较宽读取许可，写入严格限于唯一临时输出目录，不宣称 pack 被禁止读取仓库或父目录。目录/归档报告等价、重复 pack 字节/hash 一致、已有输出不覆盖、失败不产包，绝不运行插件 Runtime。
+- [x] 沿 M1 已跟踪归档接缝，用刚构建的生产 0.5 CLI 从最终 demo-multi package 生成并提交 `tests/fixtures/public-plugin-pack/multi-command.uipilot-plugin`。Rust 测试 `cli_multi_command_pack_fixture_stages_on_0_5_0` 以 include_bytes! 将完全相同的字节交给全新 TestRoot staging，验证完整命令集合及资源字节。isolated consumer smoke 把 demo-multi 加入 copy/pack 集合，使用本次 verify 重新构建的已安装 CLI 产包，在清理临时目录前逐字节及 SHA-256 比较该 tracked fixture；不使用旧 dist、不在测试中重写 fixture、不跳过缺失前提。root 保留 Rust-before-CLI 顺序，最终完整通过证明两端消费字节相同。历史 .4 Host 拒绝新包、.4 凭据旧包继续兼容。升级/删除/包回退/重启的完整矩阵引用前任务行为测试证据，发现跨任务缺口才新增聚焦回归。
+- [x] 运行完整 verify 协调器并记录日志及真实 exit code；随后按各任务 base..head 与 M4 最终批准 baseline..HEAD 生成最终 diff 包，派发独立最终 Spec+Quality review，统一修复全部最终 findings 并重跑覆盖修复的检查。记录真实 Windows Host/UI/焦点/剪贴板验收的已执行证据或明确 pending，不把浏览器/单测替代它。
+- [x] 发布说明明确 schema-2 后旧宿主二进制降级不保证、仅新 Host 运行旧包及在新 Host 内包回退受支持；路线图只更新 M2-A，完整 M2 actions/快捷键处置及 M3 继续未完成。没有远程发布/push/安装器部署步骤。
 
 **Distinct test coverage:** current/CLI target/根 Cargo/Tauri/lock 及 broker User-Agent 同为 0.5.0，旧功能门槛和 CLI 0.1.0 独立；生产 CLI 新包 valid、确定性 pack 和隔离 consumer 均通过；Rust 实际 stage 的 tracked fixture 与本次 fresh isolated CLI pack 的字节及 SHA-256 完全相同，任何漂移令门禁失败；Host 完整命令集合与 CLI 报告一致，新旧包都在自动发现集合；root verify 无 skip 规避。最终 reviewer 逐条核对设计 §16.1–17、reservation/shutdown 与保存 override 语义的跨任务证据；人工 Host 未跑时结果明确记为 pending，不宣称真实系统总验收完成。
 

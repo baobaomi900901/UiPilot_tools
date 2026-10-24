@@ -75,4 +75,4 @@ Windows Host `0.4.0+` 支持将已授权的 secret 作为精确 HTTPS host 的 b
 
 Host 与独立 CLI 的 Host target 已同步至 `0.5.0`。一个 `commands` 包可提供 1–16 条独立搜索、执行、改启动名和收藏的 mainResult 命令，共用一个 Runtime、设置、存储、权限和包级生命周期。完整离线参考包见 [demo-multi](examples/public-plugins/com.uipilot.demo-multi/README.md)。旧 `command` 包及历史功能最低版本保持兼容；CLI npm 包仍为 `0.1.0`，Manifest/API、inventory/report schema 仍为 1，内部 state schema 为 2。
 
-新 Host 内支持旧包与按普通校验、授权和冲突规则回退插件包版本。一旦正常事务或必要恢复写入 state schema 2，只懂 schema 1 的旧 Host 二进制不保证可读取该数据目录，不提供自动回写旧 schema。M2-A 的最终独立评审与真实 Windows Host 人工验收单独登记；此发布准备不代表完整 M2 的 actions/onAction、每命令快捷键、独立别名集合、多命令 panel/window 或 M3 已完成，也不包含在线发布。
+新 Host 内支持旧包与按普通校验、授权和冲突规则回退插件包版本。一旦正常事务或必要恢复写入 state schema 2，只懂 schema 1 的旧 Host 二进制不保证可读取该数据目录，不提供自动回写旧 schema。M2-A 在 `b84bda3` 已通过全仓自动验证和最终独立代码评审，真实 Windows Host 人工验收仍待执行；此交付不代表完整 M2 的 actions/onAction、每命令快捷键、独立别名集合、多命令 panel/window 或 M3 已完成，也不包含在线发布。

@@ -1,6 +1,6 @@
 # M2-A 多 mainResult 命令设计
 
-状态：已通过独立设计评审，主 agent 依据现有自主规划与开发授权正式纳入；实施以配套计划及逐任务评审为门禁。
+状态：设计与八项实施任务已完成；最终源码 `b84bda3` 的自动门禁及整批独立评审通过。真实 Windows Host 人工验收仍待执行。
 日期：2026-10-23。范围：本地插件基座隔离 worktree。
 基线：M4 最终源码 `761a9e4` 已独立复审 PASS / Approved，开放问题为零；完成记录 `430be00`。真实 Windows Host 人工验收仍 pending。
 本文采用 0.5.0、16 项上限、一个替换式启动名覆盖、严格 state schema 2 和增量 CLI 报告，规范性继承 [M4 设计](2026-10-23-plugin-credential-consumption-draft.md)第 6–6.2 节。实现顺序见 [M2-A 实施计划](../plans/2026-10-23-local-plugin-foundation-m2a.md)。
@@ -11,7 +11,7 @@
 
 M2-A 交付稳定 `(pluginId, commandId)`、多 mainResult 注册、独立收藏及每命令一个启动名覆盖。路线图中的“别名身份”在本切片仅指该既有覆盖：覆盖替换 effectiveName，释放旧路由，不使原名成为同时有效的第二别名。独立别名集合与每命令快捷键另行设计。
 
-本切片不增加多命令 panel/window、次级结果 actions 数组、统一动作合同、`onAction`、插件间调用或每命令权限。完整 M2 仍需已评审并实现的统一结果动作切片，以及对快捷键范围的明确处置。M2-A 完成不代表完整 M2 完成，不满足 M3 对完整 M2 的依赖，也不冻结 M3 所需动作合同。
+本切片不增加多命令 panel/window、次级结果 actions 数组、统一动作合同、`onAction`、插件间调用或每命令权限。完整 M2 仍需已评审并实现的统一结果动作切片，以及对快捷键范围的明确处置。M2-A 完成不代表完整 M2 完成，也不冻结 M3 所需动作合同。2026-10-24 方向审核后，M3 的前置条件调整为本切片的稳定身份与另行评审的有限业务动作合同；M2-C 原生快捷键不再作为 M3 的硬前置，仍保留为后续能力。
 
 Manifest 继续 `schemaVersion: 1`、`apiVersion: 1`；M2-A 首次发布宿主版本为 **0.5.0**，唯一能力常量 `MULTI_COMMAND_MIN_HOST = 0.5.0`，Rust、CLI、schema 语义说明及 SDK 文档一致。所有 `commands` 包，包括单项数组，都必须声明 `minimumHostVersion >= 0.5.0`；声明高于运行目标版本仍不兼容。数组固定为 **1..16** 项。
 
