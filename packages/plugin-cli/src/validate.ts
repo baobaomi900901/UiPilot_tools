@@ -4,7 +4,7 @@ import { PLUGIN_CLI_HOST_VERSION } from './contracts.js'
 import { validateManifest, type ManifestValidationIssue, type PublicManifestV1 } from './manifest.js'
 import type { PackageSnapshot } from './package-policy.js'
 import { PngValidationError, validatePluginIcon } from './png-validator.js'
-import { IssueCollector } from './report.js'
+import { hasCommandDiagnostics, IssueCollector, withCommandDiagnostics } from './report.js'
 import { validateTimerAlarmWav, WavValidationError } from './wav-validator.js'
 
 const ALARM_PATH = 'assets/sounds/timer-alarm.wav'
@@ -116,6 +116,7 @@ export function validateSnapshot(
   const issues = new IssueCollector()
   const manifestBytes = snapshot.files.get('plugin.json')
   let manifest: PublicManifestV1 | undefined
+  let commandDiagnostics = false
   if (!manifestBytes) {
     issues.add({
       phaseRank: 20,
@@ -127,6 +128,7 @@ export function validateSnapshot(
   } else {
     const result = validateManifest(manifestBytes, platform)
     manifest = result.manifest
+    commandDiagnostics = hasCommandDiagnostics(result)
     result.issues.forEach((issue, index) => {
       issues.add({
         phaseRank: manifestPhase(issue),
@@ -145,7 +147,7 @@ export function validateSnapshot(
   }
   validateIndependentResources(snapshot, issues)
   const finished = issues.finish()
-  return {
+  return withCommandDiagnostics<PluginValidationReportV1>({
     schemaVersion: 1,
     valid: finished.issues.length === 0,
     source: { kind: snapshot.kind, path: sourcePath },
@@ -167,5 +169,5 @@ export function validateSnapshot(
       : {}),
     truncated: finished.truncated,
     issues: finished.issues,
-  }
+  }, commandDiagnostics)
 }

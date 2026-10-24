@@ -1,5 +1,6 @@
 import validateSchema, { type StandaloneValidationError } from './generated/manifest-validator.mjs'
 import { normalizeNfc } from './unicode.js'
+import { withCommandDiagnostics } from './report.js'
 import { StrictJsonError, parseStrictJson } from './strict-json.js'
 import { PLUGIN_CLI_HOST_VERSION, type PluginPlatform, type PluginValidationIssueCode } from './contracts.js'
 
@@ -460,6 +461,15 @@ export function validateManifest(
       ],
     }
   }
+  const result = validateParsedManifest(value, platform, hostVersion)
+  return withCommandDiagnostics(result, record(value) && Object.hasOwn(value, 'commands'))
+}
+
+function validateParsedManifest(
+  value: unknown,
+  platform: PluginPlatform,
+  hostVersion: readonly [number, number, number],
+): ManifestValidationResult {
   if (!validateSchema(value)) {
     const identities = diagnosticCommandIds(value)
     return { ok: false, issues: (validateSchema.errors ?? []).map(error => schemaIssue(error, identities)) }

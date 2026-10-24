@@ -5,6 +5,19 @@ import {
   type PluginValidationIssueCode,
 } from './contracts.js'
 
+// Formatting provenance belongs to in-process validation objects, never the V1 wire report.
+// Weak ownership lets manifest results and reports expire with their callers.
+const commandDiagnosticSources = new WeakSet<object>()
+
+export function withCommandDiagnostics<T extends object>(value: T, enabled = true): T {
+  if (enabled) commandDiagnosticSources.add(value)
+  return value
+}
+
+export function hasCommandDiagnostics(value: object): boolean {
+  return commandDiagnosticSources.has(value)
+}
+
 export interface OrderedIssue extends PluginValidationIssue {
   phaseRank: number
   ruleRank: number

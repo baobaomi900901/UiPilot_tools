@@ -1,3 +1,4 @@
+import { hasCommandDiagnostics } from './report.js'
 import type {
   PackPackage,
   PluginCliErrorV1,
@@ -96,9 +97,8 @@ export function renderCliError(
   return JSON.stringify({ schemaVersion: 1, error: { code, message } } satisfies PluginCliErrorV1)
 }
 
-function hasCommandContext(report: PluginValidationReportV1, issue: PluginValidationIssue): boolean {
-  return report.plugin?.commands !== undefined ||
-    (issue.location?.kind === 'jsonPointer' && /^\/commands(?:\/|$)/u.test(issue.location.value))
+function hasCommandContext(report: PluginValidationReportV1): boolean {
+  return hasCommandDiagnostics(report) || report.plugin?.commands !== undefined
 }
 
 function renderHumanIssue(issue: PluginValidationIssue, commandContext: boolean): string {
@@ -115,7 +115,7 @@ export function renderHumanReport(report: PluginValidationReportV1): string {
   }
   const lines = [`Invalid UiPilot public plugin (${report.issues.length} issue${report.issues.length === 1 ? '' : 's'}).`]
   for (const issue of report.issues) {
-    lines.push(renderHumanIssue(issue, hasCommandContext(report, issue)))
+    lines.push(renderHumanIssue(issue, hasCommandContext(report)))
   }
   if (report.truncated) lines.push('Additional issues were omitted.')
   return lines.join('\n')
@@ -142,12 +142,12 @@ export async function runCli(
       if (parsed.json) text = JSON.stringify(report)
       else if (!report.created) {
         text = report.error.code + ': ' + report.error.message
-        if (report.validation) {
+        if (report.validation && hasCommandContext(report.validation)) {
           const validation = report.validation
-          for (const issue of validation.issues) if (hasCommandContext(validation, issue)) {
+          for (const issue of validation.issues) {
             text += '\n' + renderHumanIssue(issue, true)
           }
-          if (validation.truncated && validation.issues.some(issue => hasCommandContext(validation, issue))) {
+          if (validation.truncated && validation.issues.length > 0) {
             text += '\nAdditional issues were omitted.'
           }
         }
