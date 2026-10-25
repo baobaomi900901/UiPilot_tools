@@ -2165,6 +2165,8 @@ label,
   background: var(--uipilot-ui-accent);
 }
 
+.public-plugin-detail-view .ant-switch.ant-switch-checked,
+.public-plugin-detail-view .ant-switch.ant-switch-checked:not(.ant-switch-disabled):hover,
 .public-plugin-item .ant-switch.ant-switch-checked,
 .public-plugin-item .ant-switch.ant-switch-checked:not(.ant-switch-disabled):hover,
 .find-surface .ant-switch.ant-switch-checked,
