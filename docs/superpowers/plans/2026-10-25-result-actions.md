@@ -19,10 +19,10 @@
 
 **Dependencies:** 独立设计审核通过；设计“Manifest, compatibility and public SDK”至“Completion, cancellation and failures”。
 
-- [ ] 声明式opt-in、精确结果/action解析、onAction readiness/调用/snapshot、Host/schema/CLI/SDK与0.10版本一致。
-- [ ] registry私有动作bundle、opaque IDs、一次性snapshot claim、source lease及所有使源不可用的失效入口；绑定新main-only IPC与严格DTO。
-- [ ] 在共享admission/mutation/authority/scheduler/registry顺序内原子受理和completion claim+replace；固定typed outcomes，网络/API租约失效，后台deadline与单次settlement。
-- [ ] 聚焦检查、自审、原子提交；报告.superpowers/sdd/local-foundation/result-actions-task-1-report.md，冻结供Task2消费的Rust DTO/IPC。
+- [x] 声明式opt-in、精确结果/action解析、onAction readiness/调用/snapshot、Host/schema/CLI/SDK与0.10版本一致。
+- [x] registry私有动作bundle、opaque IDs、一次性snapshot claim、source lease及所有使源不可用的失效入口；绑定新main-only IPC与严格DTO。
+- [x] 在共享admission/mutation/authority/scheduler/registry顺序内原子受理和completion claim+replace；固定typed outcomes，网络/API租约失效，后台deadline与单次settlement。
+- [x] 聚焦检查、自审、原子提交；报告.superpowers/sdd/local-foundation/result-actions-task-1-report.md，冻结供Task2消费的Rust DTO/IPC。
 
 **Distinct test coverage:** optional absent/false/true及不兼容manifest；旧invocation/parse不变；实际adapter/ACL拒绝非main/未知/缺失字段与旧execute绕过。跨command/set相同business ID不别名；Busy不消耗、重复/失败消耗、precommit失败无ghost请求。registry每个退休入口使旧API失权但JS物理槽仍占用；新命令等待。初次onCommand发布及动作完成均须在权限/确认owner保护内，不能用无条件authorize回调；旧完成在权限撤销/新query之后不得发布；completion后的正常成功不要求已过期facade。真实共享admission barrier与legacy reserve commit/cancel、公共操作partial error；无锁倒序。emit不确定且无后续输入时watchdog自主完成/重建、只settle一次、不损伤新generation。copy使用假executor验证权限与副作用受理，不碰真实剪贴板。
 
