@@ -382,6 +382,57 @@ impl PluginWindowController {
         })
     }
 
+    // Native callbacks own a document, which can be reused by a later submit. Check the current
+    // session under the core lock and reserve a short lease across native hide + final revocation.
+    // Submit/uninstall already wait for these short leases; Runtime actions never use this count.
+    fn begin_document_hide(
+        self: &Arc<Self>,
+        plugin_id: &str,
+        document_generation: u64,
+        only_if_blurred: bool,
+    ) -> Option<PluginWindowCallLease> {
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
+        let window = core.windows.get_mut(plugin_id)?;
+        if window.document_generation != document_generation
+            || window.document_revoked
+            || window.timer_session.phase == TimerSessionPhase::Closing
+            || (only_if_blurred
+                && (window.focused
+                    || window.pinned
+                    || window.phase != PluginWindowPhase::Visible
+                    || window.timer_session.phase != TimerSessionPhase::Active))
+        {
+            return None;
+        }
+        let owner = window.owner.clone();
+        let session_generation = window.timer_session.generation;
+        window.runtime_request.take();
+        window.timer_session.phase = TimerSessionPhase::Closing;
+        let matches = |window: &WindowState| {
+            window.owner == owner
+                && window.document_generation == document_generation
+                && window.timer_session.generation == session_generation
+        };
+        while core
+            .windows
+            .get(plugin_id)
+            .is_some_and(|window| matches(window) && window.timer_session.in_flight > 0)
+        {
+            core = self.changed.wait(core).ok()?;
+        }
+        let window = core.windows.get_mut(plugin_id).filter(|window| {
+            matches(window)
+                && !window.document_revoked
+                && window.timer_session.phase == TimerSessionPhase::Closing
+        })?;
+        window.timer_session.in_flight = 1;
+        Some(PluginWindowCallLease {
+            controller: Arc::clone(self),
+            owner,
+            session_generation,
+        })
+    }
+
     pub(crate) fn begin_timer_session_close(&self, plugin_id: &str) -> bool {
         let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         let Some(window) = core.windows.get_mut(plugin_id) else {
@@ -495,6 +546,26 @@ impl PluginWindowController {
         true
     }
 
+    fn observe_document_focus(
+        &self,
+        plugin_id: &str,
+        document_generation: u64,
+        focused: bool,
+    ) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let Some(window) = core.windows.get_mut(plugin_id).filter(|window| {
+            window.document_generation == document_generation && !window.document_revoked
+        }) else {
+            return false;
+        };
+        window.focused = focused;
+        self.changed.notify_all();
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_focus(&self, plugin_id: &str, focused: bool) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
@@ -507,6 +578,7 @@ impl PluginWindowController {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn has_focus(&self, plugin_id: &str) -> bool {
         self.core
             .lock()
@@ -623,36 +695,51 @@ impl PluginWindowController {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(crate) fn invalidate_generation(&self, plugin_id: &str, generation: u64) -> bool {
+        self.invalidate_generation_with(plugin_id, generation, || ())
+            .is_some()
+    }
+
+    // `capture` may only clone a native handle from the Tauri manager; it must not execute native
+    // operations. Generation/owner/document checks and capture share this lock. Effects run later.
+    fn invalidate_generation_with<T>(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        capture: impl FnOnce() -> T,
+    ) -> Option<T> {
         let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-        if core
+        let window = core
+            .windows
+            .get_mut(plugin_id)
+            .filter(|window| window.generation == generation)?;
+        let owner = window.owner.clone();
+        let document_generation = window.document_generation;
+        let session_generation = window.timer_session.generation;
+        window.runtime_request.take();
+        window.timer_session.phase = TimerSessionPhase::Closing;
+        let matches = |window: &WindowState| {
+            window.generation == generation
+                && window.owner == owner
+                && window.document_generation == document_generation
+                && window.timer_session.generation == session_generation
+        };
+        while core
             .windows
             .get(plugin_id)
-            .is_none_or(|window| window.generation != generation)
+            .is_some_and(|window| matches(window) && window.timer_session.in_flight > 0)
         {
-            return false;
+            core = self.changed.wait(core).ok()?;
         }
-        if let Some(window) = core.windows.get_mut(plugin_id) {
-            window.runtime_request.take();
-            window.timer_session.phase = TimerSessionPhase::Closing;
+        // Condvar waiting releases the lock; never capture or remove a replacement on wake.
+        if !core.windows.get(plugin_id).is_some_and(matches) {
+            return None;
         }
-        while core.windows.get(plugin_id).is_some_and(|window| {
-            window.generation == generation && window.timer_session.in_flight > 0
-        }) {
-            let Ok(next) = self.changed.wait(core) else {
-                return false;
-            };
-            core = next;
-        }
-        let removed = core
-            .windows
-            .get(plugin_id)
-            .is_some_and(|window| window.generation == generation);
-        if removed {
-            core.windows.remove(plugin_id);
-            self.changed.notify_all();
-        }
-        removed
+        let native_handle = capture();
+        core.windows.remove(plugin_id);
+        self.changed.notify_all();
+        Some(native_handle)
     }
 
     pub(crate) fn wait_for(
@@ -1351,7 +1438,8 @@ fn create_window(
             event_controller.revoke_document(&plugin_id, document_generation);
         }
         tauri::WindowEvent::Focused(true) => {
-            let observed = event_controller.observe_focus(&plugin_id, true);
+            let observed = event_controller.observe_document_focus(&plugin_id, document_generation, true);
+            if !observed { return; }
             eprintln!(
                 "[DEBUG-plugin-window-focus] focus-event plugin_id={} focused=true observed={observed} hide_admitted={}",
                 plugin_id,
@@ -1359,7 +1447,8 @@ fn create_window(
             );
         }
         tauri::WindowEvent::Focused(false) => {
-            let observed = event_controller.observe_focus(&plugin_id, false);
+            let observed = event_controller.observe_document_focus(&plugin_id, document_generation, false);
+            if !observed { return; }
             eprintln!(
                 "[DEBUG-plugin-window-focus] focus-event plugin_id={} focused=false observed={observed} hide_admitted={}",
                 plugin_id,
@@ -1372,26 +1461,11 @@ fn create_window(
             std::thread::spawn(move || {
                 std::thread::sleep(PLUGIN_BLUR_RECHECK_DELAY);
                 let _ = blur_app.run_on_main_thread(move || {
-                    let focused = blur_controller.has_focus(&blur_plugin_id);
-                    let hide_admitted = blur_controller.should_hide_on_blur(&blur_plugin_id);
-                    eprintln!(
-                        "[DEBUG-plugin-window-focus] blur-recheck plugin_id={} focused={focused} hide_admitted={hide_admitted}",
-                        blur_plugin_id
+                    let result = hide_document(
+                        &blur_controller, &blur_plugin_id, document_generation, true,
+                        || blur_shell.hide().is_ok(), || { let _ = blur_shell.destroy(); },
                     );
-                    if !focused && hide_admitted {
-                        let result = hide_and_revoke(
-                            blur_controller.as_ref(),
-                            &blur_plugin_id,
-                            || blur_shell.hide().is_ok(),
-                            || {
-                                let _ = blur_shell.destroy();
-                            },
-                        );
-                        eprintln!(
-                            "[DEBUG-plugin-window-focus] auto-hide plugin_id={} result={result:?}",
-                            blur_plugin_id
-                        );
-                    }
+                    eprintln!("[DEBUG-plugin-window-focus] auto-hide plugin_id={} result={result:?}", blur_plugin_id);
                 });
             });
         }
@@ -1399,18 +1473,10 @@ fn create_window(
             let lifecycle = event_app.state::<Arc<lifecycle::LifecycleCoordinator>>();
             if lifecycle.should_prevent_close() {
                 api.prevent_close();
-                if hide_and_revoke(
-                    event_controller.as_ref(),
-                    &plugin_id,
-                    || event_shell.hide().is_ok(),
-                    || {
-                        let _ = event_shell.destroy();
-                    },
-                )
-                .is_ok()
-                {
-                    event_controller.close(&plugin_id);
-                }
+                let _ = hide_document(
+                    &event_controller, &plugin_id, document_generation, false,
+                    || event_shell.hide().is_ok(), || { let _ = event_shell.destroy(); },
+                );
             }
         }
         tauri::WindowEvent::Moved(position) if event_controller.owns_plugin(&plugin_id) => {
@@ -1583,6 +1649,33 @@ pub(crate) fn commit(
     Ok(())
 }
 
+// Callers supply the shell handle captured when this document's native callbacks were created.
+// The short lease prevents replacement between admission and effect, without holding core on UI calls.
+fn hide_document(
+    controller: &Arc<PluginWindowController>,
+    plugin_id: &str,
+    document_generation: u64,
+    only_if_blurred: bool,
+    hide: impl FnOnce() -> bool,
+    destroy: impl FnOnce(),
+) -> Result<bool, PublicPluginManagementError> {
+    let Some(_native_effect) =
+        controller.begin_document_hide(plugin_id, document_generation, only_if_blurred)
+    else {
+        return Ok(false);
+    };
+    if hide() {
+        if !controller.finish_timer_session_hide(plugin_id, true) || !controller.close(plugin_id) {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        Ok(true)
+    } else {
+        controller.revoke_document(plugin_id, document_generation);
+        destroy();
+        Err(PublicPluginManagementError::Unavailable)
+    }
+}
+
 fn hide_and_revoke(
     controller: &PluginWindowController,
     plugin_id: &str,
@@ -1705,12 +1798,14 @@ pub(crate) fn teardown(
     plugin_id: &str,
     generation: u64,
 ) {
-    if controller.invalidate_generation(plugin_id, generation) {
-        if let Some(label) = plugin_shell_label(plugin_id) {
-            if let Some(window) = app.get_window(&label) {
-                let _ = window.destroy();
-            }
-        }
+    let Some(label) = plugin_shell_label(plugin_id) else {
+        return;
+    };
+    // Lookup is inside the identity lock; native destruction uses this captured handle outside it.
+    if let Some(Some(window)) =
+        controller.invalidate_generation_with(plugin_id, generation, || app.get_window(&label))
+    {
+        let _ = window.destroy();
     }
 }
 #[cfg(test)]
@@ -1762,7 +1857,7 @@ mod tests {
             }
         }
         let source: String = include_str!("plugin_window.rs")
-            .split("#[cfg(test)]")
+            .split("mod tests {")
             .next()
             .unwrap()
             .chars()
@@ -1790,6 +1885,215 @@ mod tests {
             PluginWindowPhase::Visible
         ));
         assert!(controller.activate_timer_session(&next));
+    }
+
+    #[test]
+    fn window_action_review_stale_native_focus_does_not_mutate_replacement() {
+        let controller = PluginWindowController::default();
+        let initial = controller.submit(owner("old-native", 1, "old")).unwrap();
+        let next = owner("new-native", 2, "new");
+        let replacement = controller.submit(next.clone()).unwrap();
+        assert!(controller.advance(
+            &next,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible
+        ));
+        assert!(controller.activate_timer_session(&next));
+        assert!(controller.observe_document_focus(
+            &next.plugin_id,
+            replacement.document_generation,
+            true
+        ));
+        assert!(!controller.observe_document_focus(
+            &next.plugin_id,
+            initial.document_generation,
+            false
+        ));
+        assert!(controller.has_focus(&next.plugin_id));
+        assert!(controller.is_current(&next, PluginWindowPhase::Visible));
+    }
+
+    #[test]
+    fn window_action_review_cleanup_captures_old_native_handle_before_replacement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let controller = PluginWindowController::default();
+        let old = owner("cleanup-old", 1, "old");
+        controller.submit(old.clone()).unwrap();
+        let old_native = Arc::new(AtomicUsize::new(0));
+        let new_native = Arc::new(AtomicUsize::new(0));
+        let native_by_label = Mutex::new(old_native.clone());
+        let captured = controller
+            .invalidate_generation_with(&old.plugin_id, 1, || {
+                assert!(
+                    controller.core.try_lock().is_err(),
+                    "identity validation and handle capture share one lock"
+                );
+                native_by_label.lock().unwrap().clone()
+            })
+            .unwrap();
+        assert!(
+            controller.core.try_lock().is_ok(),
+            "native effects run with the core lock released"
+        );
+        // Retirement -> replacement -> native effect is a deterministic interleaving.
+        let replacement = owner("cleanup-new", 2, "new");
+        controller.submit(replacement.clone()).unwrap();
+        *native_by_label.lock().unwrap() = new_native.clone();
+        captured.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(old_native.load(Ordering::SeqCst), 1);
+        assert_eq!(new_native.load(Ordering::SeqCst), 0);
+        assert!(controller.is_current(&replacement, PluginWindowPhase::AwaitingReady));
+        assert!(controller
+            .invalidate_generation_with(&replacement.plugin_id, 1, || panic!(
+                "stale cleanup must not capture replacement"
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn window_action_review_blur_and_close_ignore_replaced_native_document() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let controller = Arc::new(PluginWindowController::default());
+        let old = controller.submit(owner("old-event", 1, "old")).unwrap();
+        let next = owner("replacement-event", 2, "new");
+        let replacement = controller.submit(next.clone()).unwrap();
+        assert!(controller.advance(
+            &next,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible
+        ));
+        assert!(controller.activate_timer_session(&next));
+        let native_calls = AtomicUsize::new(0);
+        // This is the delayed callback's actual execution point, after replacement won.
+        assert!(!hide_document(
+            &controller,
+            &next.plugin_id,
+            old.document_generation,
+            true,
+            || {
+                native_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+            || {
+                native_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        )
+        .unwrap());
+        assert!(controller.set_pinned(&next.plugin_id, true));
+        assert!(!hide_document(
+            &controller,
+            &next.plugin_id,
+            old.document_generation,
+            false,
+            || {
+                native_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+            || {
+                native_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        )
+        .unwrap());
+        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
+        let core = controller.core.lock().unwrap();
+        let window = &core.windows[&next.plugin_id];
+        assert!(window.pinned);
+        assert_eq!(window.timer_session.phase, TimerSessionPhase::Active);
+        assert_eq!(window.document_generation, replacement.document_generation);
+        assert_eq!(window.owner, next);
+    }
+
+    #[test]
+    fn window_action_review_blur_reused_document_owns_latest_session_and_native_lease() {
+        let controller = Arc::new(PluginWindowController::default());
+        let first = owner("reuse-old", 1, "old");
+        let initial = controller.submit(first.clone()).unwrap();
+        assert!(controller.advance(
+            &first,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible
+        ));
+        assert!(controller.activate_timer_session(&first));
+        let latest = owner("reuse-new", 1, "new");
+        let reused = controller.submit(latest.clone()).unwrap();
+        assert_eq!(initial.document_generation, reused.document_generation);
+        assert!(controller.advance(
+            &latest,
+            PluginWindowPhase::AwaitingAck,
+            PluginWindowPhase::Visible
+        ));
+        assert!(controller.activate_timer_session(&latest));
+        assert!(controller.observe_document_focus(
+            &latest.plugin_id,
+            initial.document_generation,
+            false
+        ));
+        assert!(hide_document(
+            &controller,
+            &latest.plugin_id,
+            initial.document_generation,
+            true,
+            || {
+                {
+                    let core = controller
+                        .core
+                        .try_lock()
+                        .expect("native effect must not hold core lock");
+                    let window = &core.windows[&latest.plugin_id];
+                    assert_eq!(window.owner, latest);
+                    assert_eq!(
+                        window.timer_session.in_flight, 1,
+                        "short native-effect lease blocks submit through final revocation"
+                    );
+                    assert_eq!(window.timer_session.phase, TimerSessionPhase::Closing);
+                }
+                // hide may synchronously emit native callbacks. They must reject instead of waiting
+                // on their own native-effect lease on the UI thread.
+                assert!(controller
+                    .begin_document_hide(&latest.plugin_id, initial.document_generation, false)
+                    .is_none());
+                true
+            },
+            || panic!("successful native hide must not destroy")
+        )
+        .unwrap());
+        let core = controller.core.lock().unwrap();
+        let window = &core.windows[&latest.plugin_id];
+        assert_eq!(window.owner, latest);
+        assert_eq!(window.timer_session.phase, TimerSessionPhase::Revoked);
+        assert_eq!(window.timer_session.in_flight, 0);
+    }
+
+    #[test]
+    fn window_action_review_blur_failure_revokes_document_without_reentrant_wait() {
+        let controller = Arc::new(PluginWindowController::default());
+        let first = owner("failure", 1, "old");
+        let initial = controller.submit(first.clone()).unwrap();
+        assert!(controller.advance(
+            &first,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible
+        ));
+        assert!(controller.activate_timer_session(&first));
+        assert!(hide_document(
+            &controller,
+            &first.plugin_id,
+            initial.document_generation,
+            true,
+            || false,
+            || {
+                assert!(controller.core.try_lock().is_ok());
+                assert!(controller.revoke_document(&first.plugin_id, initial.document_generation));
+                assert!(controller
+                    .begin_document_hide(&first.plugin_id, initial.document_generation, false)
+                    .is_none());
+            }
+        )
+        .is_err());
+        let replacement = controller
+            .submit(owner("failure-reopened", 1, "new"))
+            .unwrap();
+        assert_ne!(replacement.document_generation, initial.document_generation);
     }
 
     #[test]
@@ -2332,27 +2636,32 @@ mod tests {
     #[test]
     fn blur_event_rechecks_observed_focus_before_hiding() {
         let source = include_str!("plugin_window.rs").replace("\r\n", "\n");
-        let handler = source
+        let handler: String = source
             .split("shell.on_window_event(move |event|")
             .nth(1)
             .and_then(|tail| tail.split("    Ok(())").next())
-            .expect("plugin window event handler source markers are missing");
-        assert!(handler.contains("event_controller.observe_focus(&plugin_id, true)"));
-        assert!(handler.contains("event_controller.observe_focus(&plugin_id, false)"));
+            .expect("native event handler is missing")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(handler.contains(
+            "event_controller.observe_document_focus(&plugin_id,document_generation,true)"
+        ));
+        assert!(handler.contains(
+            "event_controller.observe_document_focus(&plugin_id,document_generation,false)"
+        ));
         let deferred = handler
             .find("std::thread::spawn")
-            .expect("blur handling must leave the event callback");
+            .expect("blur must leave the event callback");
         let wait = handler
             .find("std::thread::sleep(PLUGIN_BLUR_RECHECK_DELAY)")
-            .expect("blur handling must allow transient child focus to settle");
-        let focus_recheck = handler
-            .find("blur_controller.has_focus(&blur_plugin_id)")
-            .expect("blur handling must recheck observed focus");
+            .expect("transient child focus must settle");
         let hide = handler
-            .find("hide_and_revoke(")
-            .expect("blur handling must retain unpinned auto-hide");
-
-        assert!(deferred < wait && wait < focus_recheck && focus_recheck < hide);
+            .find("hide_document(")
+            .expect("document-bound native hide is missing");
+        assert!(deferred < wait && wait < hide);
+        assert!(handler.contains("&blur_controller,&blur_plugin_id,document_generation,true"));
+        assert!(handler.contains("&event_controller,&plugin_id,document_generation,false"));
         assert!(!handler.contains("blur_shell.is_focused()"));
     }
 

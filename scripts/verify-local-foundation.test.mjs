@@ -221,12 +221,15 @@ test('Host release versions agree while the CLI package version stays independen
   const read = name => readFileSync(path.join(repositoryRoot, name), 'utf8').replaceAll('\r\n', '\n');
   const root = JSON.parse(read('package.json'));
   const lock = JSON.parse(read('package-lock.json'));
-  assert.equal(root.version, '0.8.0');
+  assert.equal(root.version, '0.9.0');
   assert.equal(lock.version, root.version);
   assert.equal(lock.packages[''].version, root.version);
   assert.equal(JSON.parse(read('src-tauri/tauri.conf.json')).version, root.version);
-  assert.match(read('src-tauri/Cargo.toml'), /\[package\][\s\S]*?\nversion = "0\.8\.0"/);
-  assert.match(read('src-tauri/Cargo.lock'), /name = "uipilot"\nversion = "0\.8\.0"/);
+  assert.match(read('src-tauri/Cargo.toml'), /\[package\][\s\S]*?\nversion = "0\.9\.0"/);
+  assert.match(read('src-tauri/Cargo.lock'), /name = "uipilot"\nversion = "0\.9\.0"/);
+  const runtimeVersion = read('src-tauri/src/public_plugins.rs').match(/impl PublicPluginHost \{[\s\S]*?version: \[(\d+), (\d+), (\d+)\]/);
+  assert.ok(runtimeVersion, 'real runtime Host version is missing');
+  assert.equal(runtimeVersion.slice(1).join('.'), root.version);
   assert.equal(JSON.parse(read('packages/plugin-cli/package.json')).version, '0.1.0');
   assert.equal(lock.packages['packages/plugin-cli'].version, '0.1.0');
 });
