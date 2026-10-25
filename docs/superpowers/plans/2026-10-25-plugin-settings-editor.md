@@ -15,11 +15,11 @@
 
 **Dependencies:** 已接受设计。普通设置复用savePublicPluginSettings，不改wire API；所有非secret四类全覆盖。公共插件代码前先读public-plugin-developer-guide及schema/API，参考demo-return/multi。
 
-- [ ] 提取字段编辑组件，按设计实现dirty patch/校验/取消/未设置和secret隔离。
-- [ ] 接入详情的互斥busy、已接受inventory和异步session所有权；实现失败不确定提示与重新读取恢复。
-- [ ] 创建无副作用的settings-demo及1.0.1兼容升级生成脚本，明确人可读输出；不动recovery数据或旧fixtures。
-- [ ] 同步Host0.8.0及CLI target，更新相关当前版本断言和最小使用说明。
-- [ ] 运行聚焦检查与构建，自审提交；将完整结果写入.superpowers/sdd/local-foundation/settings-editor-report.md。
+- [x] 提取字段编辑组件，按设计实现dirty patch/校验/取消/未设置和secret隔离。
+- [x] 接入详情的互斥busy、已接受inventory和异步session所有权；实现失败不确定提示与重新读取恢复。
+- [x] 创建无副作用的settings-demo及1.0.1兼容升级生成脚本，明确人可读输出；不动recovery数据或旧fixtures。
+- [x] 同步Host0.8.0及CLI target，更新相关当前版本断言和最小使用说明。
+- [x] 运行聚焦检查与构建，自审提交；将完整结果写入.superpowers/sdd/local-foundation/settings-editor-report.md。
 
 **Distinct coverage:** 仅变化普通字段进入IPC/secret不发送；unset不被隐式初始化；空数字/范围错误不提交；原型特殊key正确；失败保留草稿且不盲重试；成功+刷新失败明确区分；pending重复提交只调用一次；关闭重开/换插件后旧完成不刷新新详情；定义变化不能静默覆盖；保存与开发重载互斥。Runtime测试当前设置读取及无存储写入。
 
@@ -28,3 +28,12 @@
 ## 主agent交付与人工检查点
 
 独立评审Task1整个diff，解决阻塞项；冻结源码后构建acceptance独立exe与5资源，校验稳定输入/新exe/两包及旧交付不变，写中文用例。用户先测默认值→四类保存生效→重启保留，再测取消、校验、升级保留和键盘双主题。源码实现、自动验证、人工验收分别记录；本轮不计完整基座完成。
+## 2026-10-25 0.8.0普通设置交付状态
+
+普通设置编辑纵向交付已实现：四类字段、仅变化字段提交、未设置值保护、取消修改、错误校验、保存结果不确定时重新读取核对、详情异步所有权及与凭据/网络/开发重载互斥。独立设置演示提供1.0.0/1.0.1两个本地包，Runtime每次读取设置，无存储或网络副作用。源码11979bc，审核修复fe3e196；最终Spec PASS/Quality PASS，无遗留发现。审核修复了连续重新读取失败丢失已确认保存结果提示，以及SDK教程当前版本文案。
+
+聚焦检查：UI16、示例2、CLI52、验证协调器18通过，类型/前端构建及离线cargo check通过；旧Vite体积提示仍为非阻塞债务。未机械重跑全仓。最终原生build exit0，700项输入稳定、两包及五资源核对，旧程序未覆盖。
+
+当前交付 `.superpowers/deliveries/uipilot-0.8.0-acceptance/uipilot.exe`，实际版本0.8.0，acceptance数据标识保留；源码fe3e1960cfc8d1bed9e987293431775cf0dfff2e，SHA256 8da8b172a8e55940cd4c104990c32691a17fbba39aa3a40f86278a33acfe6479。本次后续状态提交只改文档，不改变程序。
+
+人工检查仍待用户：安装/默认值、四项编辑生效、重启保留、取消及数字校验、兼容升级保留、双主题键盘和旧数据回归。首批只下发前三项。普通设置UI已交付不等于人工通过，整个Raycast式基座仍未完成。
