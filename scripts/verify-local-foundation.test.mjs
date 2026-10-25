@@ -206,9 +206,9 @@ test('unreleased multi-package fixture adds tests and SDK contracts without rele
 
 test('release repository inventory includes the complete multi-command package', () => {
   const found = discover(repositoryRoot);
-  assert.equal(found.tests.length, 18);
-  assert.equal(found.contracts.length, 12);
-  assert.equal(found.packages.length, 15);
+  assert.equal(found.tests.length, 19);
+  assert.equal(found.contracts.length, 13);
+  assert.equal(found.packages.length, 16);
   assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-multi')));
   assert.ok(found.contracts.some(file => file.includes('com.uipilot.demo-multi')));
   assert.ok(found.packages.some(file => file.includes('com.uipilot.demo-multi')));
@@ -217,6 +217,9 @@ test('release repository inventory includes the complete multi-command package',
   assert.ok(found.tests.some(file => file.includes('com.uipilot.json-workbench')));
   assert.ok(found.contracts.some(file => file.includes('com.uipilot.json-workbench')));
   assert.ok(found.packages.some(file => file.includes('com.uipilot.json-workbench')));
+  assert.ok(found.tests.some(file => file.includes('com.uipilot.text-snippet')));
+  assert.ok(found.contracts.some(file => file.includes('com.uipilot.text-snippet')));
+  assert.ok(found.packages.some(file => file.includes('com.uipilot.text-snippet')));
 });
 
 
