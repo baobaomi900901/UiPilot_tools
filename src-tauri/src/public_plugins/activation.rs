@@ -2875,8 +2875,15 @@ impl PublicPluginManager {
                         .get(&config.plugin_id)
                         .map(Arc::as_ref)
                 });
-            let Some(snapshot) = snapshot else {
-                continue;
+            // Disabled replacements discard the probe Runtime. Load validated management
+            // metadata without publishing a bundle, asset route, or execution authority.
+            let installed_snapshot;
+            let snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => {
+                    installed_snapshot = self.installed_snapshot(&config)?;
+                    &installed_snapshot
+                }
             };
             let scope = super::PluginDataScope::new(&config.plugin_id)
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
@@ -3457,6 +3464,13 @@ impl PublicPluginManager {
                             .active_by_plugin
                             .get(&plugin_id)
                             .cloned()
+                    })
+                    .or_else(|| {
+                        // Only management UI may read a discarded probe's installed icon.
+                        if caller_label != "main" {
+                            return None;
+                        }
+                        self.installed_snapshot(&config).ok().map(Arc::new)
                     })?;
                 if !config.installed
                     || config.active_generation != generation
@@ -4561,6 +4575,13 @@ impl PublicPluginManager {
         &self,
         config: &EffectivePluginConfig,
     ) -> Result<PublicManifestV1, PublicPluginManagementError> {
+        Ok(self.installed_snapshot(config)?.manifest)
+    }
+
+    fn installed_snapshot(
+        &self,
+        config: &EffectivePluginConfig,
+    ) -> Result<RuntimeSnapshot, PublicPluginManagementError> {
         let digest = config
             .package_digest
             .as_deref()
@@ -4575,7 +4596,7 @@ impl PublicPluginManager {
         {
             return Err(PublicPluginManagementError::Unavailable);
         }
-        Ok(snapshot.manifest)
+        Ok(snapshot)
     }
 
     fn manifest_for_label(&self, label: &str) -> Option<PublicManifestV1> {
@@ -7030,6 +7051,144 @@ mod tests {
         assert!(
             matches!(report.state, Some(DiagnosticState::Installed { package_version, .. }) if package_version == "1.0.0")
         );
+    }
+
+    #[test]
+    fn recovery_refresh_disabled_retains_inventory_and_can_explicitly_enable() {
+        for fault in [None, Some(PublicPluginFault::RuntimeUnavailable)] {
+            let dir = TestDir::new("recovery-refresh-disabled");
+            write_package(&dir.source(), "1.0.0", "original");
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let icon_bytes = fs::read(
+                workspace.join("examples/public-plugins/com.uipilot.demo-win/package/icon.png"),
+            )
+            .unwrap();
+            fs::write(dir.source().join(ICON_PATH), &icon_bytes).unwrap();
+            let manager = manager(&dir);
+            let now = Instant::now();
+            let plugin_id = "com.example.activation";
+            let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+            let installed = manager
+                .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+                .unwrap();
+            manager.rename(plugin_id, Some("retained-name")).unwrap();
+            manager.set_favorite(plugin_id, true).unwrap();
+            manager
+                .save_settings(
+                    plugin_id,
+                    &BTreeMap::from([("compact".into(), json!(true))]),
+                )
+                .unwrap();
+            let scope = super::super::PluginDataScope::new(plugin_id).unwrap();
+            let saved = json!({"schemaVersion": 1, "count": 7});
+            manager
+                .storage
+                .set(&scope, plugin_id, "snapshot", saved.clone())
+                .unwrap();
+            match fault {
+                Some(fault) => {
+                    manager.disable_plugin_for_fault(plugin_id, fault).unwrap();
+                }
+                None => {
+                    manager
+                        .set_enabled_with_readiness(plugin_id, false, |_| {
+                            panic!("disable must not probe")
+                        })
+                        .unwrap();
+                }
+            }
+            let before = manager.state.config(plugin_id).unwrap().unwrap();
+            write_package(&dir.source(), "1.0.0", "repaired");
+            let target = PublicPluginRefreshTarget {
+                plugin_id: plugin_id.into(),
+                expected_inventory_revision: manager.inventory().unwrap().revision,
+            };
+            let prepared = manager
+                .prepare_targeted("main", source(&dir.source()), Some(target), now)
+                .unwrap();
+            let refreshed = manager
+                .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+                .unwrap();
+            let inventory = manager.inventory().unwrap();
+            let item = inventory
+                .items
+                .iter()
+                .find(|item| item.plugin_id == plugin_id)
+                .expect("disabled refreshed plugin must remain manageable in inventory");
+            assert!(!item.enabled);
+            assert_eq!(item.fault, fault);
+            assert_eq!(item.version, "1.0.0");
+            assert_eq!(item.generation, refreshed.mutation.generation);
+            assert_eq!(item.commands[0].effective_name, "retained-name");
+            assert!(item.commands[0].favorite);
+            assert_eq!(item.settings[0].value, Some(json!(true)));
+            let icon_path = tauri::Url::parse(item.icon_url.as_ref().unwrap())
+                .unwrap()
+                .path()
+                .to_owned();
+            assert_eq!(
+                manager
+                    .icon_asset("main", &icon_path, now)
+                    .expect("disabled refreshed icon must remain available to management UI")
+                    .bytes,
+                icon_bytes
+            );
+            let shell = crate::plugin_window::plugin_shell_label(plugin_id).unwrap();
+            assert!(manager.icon_asset(&shell, &icon_path, now).is_none());
+            assert!(manager
+                .icon_asset(&refreshed.runtime.label, &icon_path, now)
+                .is_none());
+            let after = manager.state.config(plugin_id).unwrap().unwrap();
+            assert_eq!(after.commands, before.commands);
+            assert_eq!(after.settings, before.settings);
+            assert_eq!(after.permission_grants, before.permission_grants);
+            assert_eq!(after.fault, before.fault);
+            assert!(!after.enabled);
+            assert_eq!(
+                manager.storage.get(&scope, plugin_id, "snapshot").unwrap(),
+                Some(saved.clone())
+            );
+            // Reading management metadata must not publish either the old or probe Runtime.
+            assert!(manager.bundles.bundle(plugin_id).unwrap().is_none());
+            assert!(manager.route("/retained-name").unwrap().is_none());
+            assert!(manager
+                .asset(&installed.runtime.label, "/dist/runtime.js")
+                .is_none());
+            assert!(manager
+                .asset(&refreshed.runtime.label, "/dist/runtime.js")
+                .is_none());
+            assert!(manager
+                .manifest_for_label(&refreshed.runtime.label)
+                .is_none());
+            assert!(staging_is_empty(&manager));
+            assert!(!manager
+                .data
+                .lock()
+                .unwrap()
+                .active_by_plugin
+                .contains_key(plugin_id));
+            let enabled = manager
+                .set_enabled_with_readiness(plugin_id, true, |runtime| {
+                    assert!(manager
+                        .asset(&runtime.label, "/dist/runtime.js")
+                        .is_some_and(|asset| String::from_utf8(asset.bytes)
+                            .unwrap()
+                            .contains("repaired")));
+                    true
+                })
+                .unwrap();
+            assert!(enabled.mutation.enabled);
+            let item = manager.inventory().unwrap().items.remove(0);
+            assert!(item.enabled);
+            assert_eq!(item.fault, None);
+            assert_eq!(item.commands[0].effective_name, "retained-name");
+            assert!(item.commands[0].favorite);
+            assert_eq!(
+                manager.storage.get(&scope, plugin_id, "snapshot").unwrap(),
+                Some(saved)
+            );
+            assert!(manager.route("/retained-name").unwrap().is_some());
+        }
     }
 
     #[test]

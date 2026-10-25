@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { PublicPluginRecovery } from './public-plugin-panel'
+import { PublicPluginPanel, PublicPluginRecovery } from './public-plugin-panel'
 import type { LauncherClient, PublicPluginDiagnosticReport, PublicPluginInventoryItem, PublicPluginPrepareSummary } from './protocol'
 
 const plugin: PublicPluginInventoryItem = { pluginId: 'com.example.recovery', name: 'Recovery', version: '1.0.0', description: null, source: 'localPackage', commands: [], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
@@ -20,6 +20,30 @@ beforeEach(() => {
   host = document.createElement('div'); document.body.append(host); root=createRoot(host)
 })
 afterEach(async () => { await act(async () => root.unmount()); host.remove() })
+describe('public plugin list commit feedback', () => {
+  it.each([false, true])('keeps safe failure after successful inventory reload (update=%s) and consumes confirmation', async (isUpdate) => {
+    const client = {
+      ...clientFixture(),
+      listPublicPlugins: vi.fn(async () => ({ revision: '2', items: [] })),
+    }
+    client.preparePublicPlugin.mockResolvedValue({ ...prepared, isUpdate, operation: isUpdate ? 'replace' : 'install', previousVersion: isUpdate ? '0.9.0' : null })
+    client.commitPublicPlugin.mockRejectedValueOnce({ code: 'runtimeNotReady', message: 'PRIVATE_SENTINEL' })
+    await act(async () => root.render(<PublicPluginPanel client={client as unknown as LauncherClient} />))
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!.click())
+    await click(isUpdate ? '确认更新' : '确认安装')
+    expect(client.commitPublicPlugin).toHaveBeenCalledOnce()
+    expect(client.listPublicPlugins).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('.public-prepare')).toBeNull()
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('未能就绪')
+    expect(host.textContent).not.toContain('PRIVATE_SENTINEL')
+    const select = host.querySelector<HTMLButtonElement>('button[aria-label="选择开发目录"]')!
+    expect(select.disabled).toBe(false)
+    await act(async () => select.click())
+    expect(client.preparePublicPlugin).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('.public-prepare')).not.toBeNull()
+  })
+})
+
 describe('public plugin recovery', () => {
   it('binds refresh target and consumes confirmation after a failed one-use commit', async () => {
     const client=clientFixture(); client.commitPublicPlugin.mockRejectedValueOnce({ code: 'runtimeNotReady', message: 'PRIVATE_SENTINEL' }); const reload=await mount(client)

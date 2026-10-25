@@ -846,12 +846,16 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
     const confirmation = prepared
     setBusy(true); setError(''); setNotice('')
     let committed = false
+    let operationError = ''
     try {
       await client.commitPublicPlugin({ input: { token: confirmation.token, permissionGrants: [...confirmation.permissions] } })
       committed = true; setNotice('插件包已安装。')
-    } catch (failure) { setError(publicPluginRecoveryError(failure)) }
+    } catch (failure) { operationError = publicPluginRecoveryError(failure) }
     finally { restorePreparedOrigin.current = true; setPrepared(null) }
-    try { await reload() } catch { setError(committed ? '操作已完成。无法刷新当前状态，请刷新列表后核对。' : '操作未完成，无法刷新当前状态，请刷新列表并查看诊断。') }
+    try {
+      await reload()
+      setError(operationError)
+    } catch { setError(committed ? '操作已完成。无法刷新当前状态，请刷新列表后核对。' : '操作未完成，无法刷新当前状态，请刷新列表并查看诊断。') }
     mutationPending.current = false; setBusy(false)
   }
   const filteredPlugins = pluginFilter && inventory
