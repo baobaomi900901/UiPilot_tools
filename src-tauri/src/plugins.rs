@@ -637,16 +637,18 @@ impl PluginManager {
         .build()
         .map_err(|error| io::Error::other(error.to_string()))?;
         attach_process_failed_handler(&window, move || {
-            let registry = failure_app.state::<ResultRegistry>();
-            failed_manager.runtime_failed(&identity_for_failure, &registry);
+            let registries = failure_app.state::<crate::result_registry::ResultRegistries>();
+            failed_manager.runtime_failed(&identity_for_failure, registries.main());
+            cleanup_retired_public_result_actions(&failure_app, registries.main());
         })?;
         let destroyed_manager = Arc::clone(self);
         let identity_for_destroyed = identity;
         let destroyed_app = app.clone();
         window.on_window_event(move |event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
-                let registry = destroyed_app.state::<ResultRegistry>();
-                destroyed_manager.runtime_failed(&identity_for_destroyed, &registry);
+                let registries = destroyed_app.state::<crate::result_registry::ResultRegistries>();
+                destroyed_manager.runtime_failed(&identity_for_destroyed, registries.main());
+                cleanup_retired_public_result_actions(&destroyed_app, registries.main());
             }
         });
         Ok(window)
@@ -928,7 +930,7 @@ impl PluginManager {
         } else {
             false
         };
-        let revision = match self.promote_candidate(
+        let promotion = self.promote_candidate(
             registry,
             &candidate,
             &identity,
@@ -941,7 +943,9 @@ impl PluginManager {
                     commit_prepared_install(&prepared)
                 }
             },
-        ) {
+        );
+        cleanup_retired_public_result_actions(app, registry);
+        let revision = match promotion {
             Ok(revision) => revision,
             Err(error) => {
                 if journal_started {
@@ -1068,14 +1072,16 @@ impl PluginManager {
                 return Err(error);
             }
         };
-        let revision = match self.promote_candidate(
+        let promotion = self.promote_candidate(
             registry,
             &candidate,
             &identity,
             &attempt,
             Some(&old_identity),
             || Ok(()),
-        ) {
+        );
+        cleanup_retired_public_result_actions(app, registry);
+        let revision = match promotion {
             Ok(revision) => revision,
             Err(error) => {
                 fs::remove_file(&previous_receipt)
@@ -1223,7 +1229,7 @@ impl PluginManager {
                 ],
             })?;
             write_prepared_transaction(&config.transaction_root, &transaction)?;
-            let revision = match self.promote_candidate(
+            let promotion = self.promote_candidate(
                 registry,
                 &candidate,
                 &identity,
@@ -1241,7 +1247,9 @@ impl PluginManager {
                     );
                     Ok(())
                 },
-            ) {
+            );
+            cleanup_retired_public_result_actions(app, registry);
+            let revision = match promotion {
                 Ok(revision) => revision,
                 Err(error) => {
                     self.discard_staged(app, &identity);
@@ -1278,62 +1286,66 @@ impl PluginManager {
                 &[&package_receipt_id, &runtime_receipt_id],
             )?;
             write_prepared_transaction(&config.transaction_root, &transaction)?;
-            let _admission = self
-                .admission
-                .write()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            let mut manager_state = self
-                .state
-                .get()
-                .ok_or(PluginManagementError::Unavailable)?
-                .write()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            let active_index = manager_state
-                .active
-                .entries
-                .iter()
-                .position(|entry| entry.id == plugin_id && entry.identity() == old_identity)
-                .ok_or(PluginManagementError::Unavailable)?;
-            let next_revision = manager_state
-                .inventory_revision
-                .checked_add(1)
-                .ok_or(PluginManagementError::Unavailable)?;
-            let epoch = registry
-                .reserve_plugin_epoch()
-                .map_err(|_| PluginManagementError::Unavailable)?;
-            if commit_active_state(&state_path, &empty_state).is_err() {
+            let deletion = (|| {
+                let _admission = self
+                    .admission
+                    .write()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                let mut manager_state = self
+                    .state
+                    .get()
+                    .ok_or(PluginManagementError::Unavailable)?
+                    .write()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                let active_index = manager_state
+                    .active
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == plugin_id && entry.identity() == old_identity)
+                    .ok_or(PluginManagementError::Unavailable)?;
+                let next_revision = manager_state
+                    .inventory_revision
+                    .checked_add(1)
+                    .ok_or(PluginManagementError::Unavailable)?;
+                let epoch = registry
+                    .reserve_plugin_epoch()
+                    .map_err(|_| PluginManagementError::Unavailable)?;
+                if commit_active_state(&state_path, &empty_state).is_err() {
+                    registry
+                        .cancel_reserved_plugin_epoch(epoch)
+                        .expect("plugin epoch reservation changed while admission was held");
+                    return Err(PluginManagementError::Unavailable);
+                }
+                update_transaction_phase(
+                    &config.transaction_root,
+                    PluginTransactionPhase::StateCommitted,
+                    Vec::new(),
+                )
+                .expect("plugin delete-last journal phase failed after durable state commit");
+                manager_state.active.entries.remove(active_index);
+                manager_state.ownership.remove(&old_identity);
+                manager_state.inventory_revision = next_revision;
                 registry
-                    .cancel_reserved_plugin_epoch(epoch)
-                    .expect("plugin epoch reservation changed while admission was held");
-                return Err(PluginManagementError::Unavailable);
-            }
-            update_transaction_phase(
-                &config.transaction_root,
-                PluginTransactionPhase::StateCommitted,
-                Vec::new(),
-            )
-            .expect("plugin delete-last journal phase failed after durable state commit");
-            manager_state.active.entries.remove(active_index);
-            manager_state.ownership.remove(&old_identity);
-            manager_state.inventory_revision = next_revision;
-            registry
-                .commit_reserved_plugin_epoch(epoch)
-                .expect("plugin epoch reservation changed after durable delete commit");
-            drop(manager_state);
-            if let Ok(mut pending) = self.pending.write() {
-                pending.retain(|_, query| {
-                    if query.plugin_id == plugin_id {
-                        let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-            if let Ok(mut disabled) = self.disabled.write() {
-                disabled.remove(&old_identity.window_label);
-            }
-            next_revision
+                    .commit_reserved_plugin_epoch(epoch)
+                    .expect("plugin epoch reservation changed after durable delete commit");
+                drop(manager_state);
+                if let Ok(mut pending) = self.pending.write() {
+                    pending.retain(|_, query| {
+                        if query.plugin_id == plugin_id {
+                            let _ = query.sender.send(Err(PluginQueryError::RuntimeDisabled));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                if let Ok(mut disabled) = self.disabled.write() {
+                    disabled.remove(&old_identity.window_label);
+                }
+                Ok(next_revision)
+            })();
+            cleanup_retired_public_result_actions(app, registry);
+            deletion?
         };
 
         if let Some(window) = app.get_webview_window(&old_identity.window_label) {
@@ -1740,6 +1752,14 @@ impl PluginManager {
     fn allocate_request_id(&self) -> String {
         let previous = self.next_request.fetch_add(1, Ordering::Relaxed);
         format!("plugin-request-{:016x}", previous + 1)
+    }
+}
+
+// Admission/catalog guards are released before this call. Keep the outer legacy
+// transaction mutex intact: cleanup never re-enters it or legacy admission.
+fn cleanup_retired_public_result_actions(app: &AppHandle, registry: &ResultRegistry) {
+    if let Some(service) = app.try_state::<Arc<crate::public_plugins::PublicPluginService>>() {
+        service.cleanup_retired_result_actions(registry);
     }
 }
 
@@ -7539,6 +7559,135 @@ mod tests {
             manager
         }
 
+        #[test]
+        fn result_action_review_legacy_invalidation_drains_before_later_cleanup_and_keeps_physical_slot(
+        ) {
+            use crate::public_plugins::result_action::{
+                ResultActionErrorCode, ResultActionOutcome,
+            };
+            for path in ["commit", "cancel", "runtime-failure", "runtime-overflow"] {
+                let root = TestRoot::new();
+                root.write_plugin("plugin", valid_manifest("plugin", "/plugin"));
+                let legacy = manager(&root);
+                let worker_legacy = legacy.clone();
+                let (reached, phase) = mpsc::channel();
+                let (release, continue_cleanup) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    crate::public_plugins::with_running_result_action_for_test(
+                        worker_legacy.clone(),
+                        |service, public, registry, action, receiver| {
+                            let _transaction = worker_legacy.mutation.lock().unwrap();
+                            if path.starts_with("runtime") {
+                                let identity = worker_legacy.route("/plugin").unwrap().identity();
+                                if path == "runtime-overflow" {
+                                    worker_legacy
+                                        .state
+                                        .get()
+                                        .unwrap()
+                                        .write()
+                                        .unwrap()
+                                        .inventory_revision = u64::MAX;
+                                }
+                                worker_legacy.runtime_failed(&identity, registry);
+                            } else {
+                                let old = worker_legacy.route("/plugin").unwrap().identity();
+                                let candidate = worker_legacy
+                                    .state
+                                    .get()
+                                    .unwrap()
+                                    .read()
+                                    .unwrap()
+                                    .active
+                                    .entries[0]
+                                    .clone();
+                                let (candidate, identity, attempt) =
+                                    worker_legacy.stage_candidate("plugin", candidate).unwrap();
+                                worker_legacy.runtime_ready(&identity);
+                                let promoted = worker_legacy.promote_candidate(
+                                    registry,
+                                    &candidate,
+                                    &identity,
+                                    &attempt,
+                                    Some(&old),
+                                    || {
+                                        if path == "commit" {
+                                            Ok(())
+                                        } else {
+                                            Err(crate::plugins::PluginManagementError::Unavailable)
+                                        }
+                                    },
+                                );
+                                assert_eq!(promoted.is_ok(), path == "commit");
+                            }
+                            // This is the immediate post-admission/state-lock phase used by the native callsites.
+                            assert!(worker_legacy.admission.try_write().is_ok());
+                            assert!(worker_legacy.state.get().unwrap().try_write().is_ok());
+                            service.cleanup_retired_result_actions(registry);
+                            assert!(matches!(
+                                receiver.try_recv(),
+                                Ok(ResultActionOutcome::Failed {
+                                    code: ResultActionErrorCode::ActionCancelled,
+                                    source_consumed: true
+                                })
+                            ));
+                            assert!(!service.settle_result_action(
+                                &action.context,
+                                ResultActionErrorCode::ActionTimedOut
+                            ));
+                            let next = service
+                                .schedule_command(
+                                    public.route("/demo next").unwrap().unwrap(),
+                                    2,
+                                    "/demo next".into(),
+                                    std::time::Instant::now(),
+                                )
+                                .unwrap();
+                            assert!(
+                                next.dispatch.is_none(),
+                                "retirement must not free the physical handler"
+                            );
+                            reached.send(()).unwrap();
+                            continue_cleanup
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap();
+                        },
+                    )
+                });
+                phase.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(legacy.admission.try_write().is_ok());
+                assert!(
+                    legacy.mutation.try_lock().is_err(),
+                    "later receipt work must keep legacy transaction serialization"
+                );
+                release.send(()).unwrap();
+                worker.join().unwrap();
+            }
+        }
+        #[test]
+        fn result_action_review_native_invalidation_callpoints_drain_before_rollback_receipts_and_error_propagation(
+        ) {
+            let source = include_str!("plugins.rs");
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(normalized.matches("cleanup_retired_public_result_actions(app, registry); let revision = match promotion").count(),3);
+            assert!(normalized
+                .contains("})(); cleanup_retired_public_result_actions(app, registry); deletion?"));
+            for (owner, manager, identity) in [
+                ("failure_app", "failed_manager", "identity_for_failure"),
+                (
+                    "destroyed_app",
+                    "destroyed_manager",
+                    "identity_for_destroyed",
+                ),
+            ] {
+                assert!(normalized.contains(&format!(
+                    "{owner}.state::<crate::result_registry::ResultRegistries>()"
+                )));
+                assert!(normalized.contains(&format!("{manager}.runtime_failed(&{identity}, registries.main()); cleanup_retired_public_result_actions(&{owner}, registries.main());")));
+            }
+            assert!(!normalized.contains("state::<ResultRegistry>()"));
+        }
+
         fn public_management_waits_for_legacy_durable_reservation(commit: bool) {
             use crate::result_registry::{QueryDomain, ResultAction};
 
@@ -7614,6 +7763,7 @@ mod tests {
                         ] {
                             assert!(!outcome.changed);
                             crate::commands::finish_public_plugin_management(
+                                service,
                                 outcome,
                                 &public_registry,
                                 &public_manager,
@@ -7630,6 +7780,7 @@ mod tests {
                         assert!(outcome.result.is_ok());
                         changed_tx.send(()).unwrap();
                         crate::commands::finish_public_plugin_management(
+                            service,
                             outcome,
                             &public_registry,
                             &public_manager,

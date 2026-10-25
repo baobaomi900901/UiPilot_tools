@@ -98,6 +98,8 @@ export interface CopyTextDefaultAction {
 }
 
 export interface PluginResult {
+  actions?: never
+  defaultActionId?: never
   id: string
   title: string
   subtitle?: string | null
@@ -336,6 +338,7 @@ export type PluginResultAction =
   | { id: string; title: string; type: 'copyText'; text: string }
   | { id: string; title: string; type: 'runtime'; payload: JsonValue }
 export interface PluginActionResult {
+  defaultAction?: never
   id: string
   title: string
   subtitle?: string | null

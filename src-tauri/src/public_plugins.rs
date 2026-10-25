@@ -110,6 +110,20 @@ pub(crate) fn with_settings_service_for_test(
     tests::with_settings_service_for_test(operation);
 }
 
+#[cfg(test)]
+pub(crate) fn with_running_result_action_for_test(
+    legacy: Arc<crate::plugins::PluginManager>,
+    operation: impl FnOnce(
+        &PublicPluginService,
+        &PublicPluginManager,
+        &crate::result_registry::ResultRegistry,
+        &ScheduledPluginRequest,
+        &mpsc::Receiver<result_action::ResultActionOutcome>,
+    ),
+) {
+    tests::with_running_result_action_for_test(legacy, operation);
+}
+
 pub(crate) type PublicSubmissionResult = Result<PublicPluginResponse, PluginRuntimeError>;
 
 enum ContentActionIdentity {

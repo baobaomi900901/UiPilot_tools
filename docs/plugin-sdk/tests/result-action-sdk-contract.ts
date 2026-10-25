@@ -10,3 +10,10 @@ const onAction: PluginActionHandler = async (invocation, api): Promise<MainResul
 }
 const module: PluginRuntimeModule = { onCommand: async invocation => ({ requestId: invocation.requestId, results: [] }), onAction }
 void module
+
+// @ts-expect-error A result cannot declare both named actions and a legacy default action.
+const bothForms: MainResultResponse = { requestId: 'r', results: [{ id: 'x', title: 'x', actions: [], defaultAction: { type: 'copyText', text: 'x' } }] }
+// @ts-expect-error A default named action requires the named actions result form.
+const missingNamedActions: MainResultResponse = { requestId: 'r', results: [{ id: 'x', title: 'x', defaultActionId: 'copy' }] }
+void bothForms
+void missingNamedActions

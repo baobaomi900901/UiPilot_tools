@@ -1361,8 +1361,13 @@ pub(crate) async fn commit_public_plugin_install(
             effects,
         )
     });
-    let result =
-        finish_public_plugin_management(outcome, registries.main(), plugins.inner(), || {});
+    let result = finish_public_plugin_management(
+        service.inner().as_ref(),
+        outcome,
+        registries.main(),
+        plugins.inner(),
+        || {},
+    );
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.previous_runtime_label.as_deref());
@@ -1421,8 +1426,13 @@ pub(crate) async fn set_plugin_enabled(
             effects,
         )
     });
-    let result =
-        finish_public_plugin_management(outcome, registries.main(), plugins.inner(), || {});
+    let result = finish_public_plugin_management(
+        service.inner().as_ref(),
+        outcome,
+        registries.main(),
+        plugins.inner(),
+        || {},
+    );
     match result {
         Ok(commit) => {
             PublicPluginService::destroy_runtime(&app, commit.closed_runtime_label.as_deref());
@@ -1457,6 +1467,7 @@ pub(crate) fn set_public_plugin_network_access(
 ) -> Result<PublicPluginMutation, CommandError> {
     require_main_window(&window)?;
     finish_public_plugin_management(
+        service.inner().as_ref(),
         service.set_network_access_outcome(
             &plugin_id,
             granted,
@@ -1520,6 +1531,7 @@ pub(crate) fn set_plugin_favorite(
         contains_management_command(service.inner().as_ref(), &plugin_id, id)
     })?;
     finish_public_plugin_management(
+        service.inner().as_ref(),
         service.set_command_favorite(&plugin_id, &command_id, favorite),
         registries.main(),
         plugins.inner(),
@@ -1548,6 +1560,7 @@ pub(crate) fn set_plugin_effective_name(
     let manager = service.manager()?;
     manager.replace_external_reserved_names(quicklinks.commands())?;
     finish_public_plugin_management(
+        service.inner().as_ref(),
         service.rename_command(&plugin_id, &command_id, name_override.as_deref()),
         registries.main(),
         plugins.inner(),
@@ -1581,6 +1594,7 @@ pub(crate) fn save_plugin_settings(
 }
 
 pub(crate) fn finish_public_plugin_management<T>(
+    service: &PublicPluginService,
     outcome: crate::public_plugins::ManagementOutcome<T>,
     registry: &ResultRegistry,
     plugins: &PluginManager,
@@ -1591,6 +1605,7 @@ pub(crate) fn finish_public_plugin_management<T>(
         // have been released before taking legacy admission. The method releases
         // admission before cleanup, which may re-enter other host services.
         plugins.invalidate_plugin_results(registry);
+        service.cleanup_retired_result_actions(registry);
         cleanup();
     }
     Ok(outcome.result?)
@@ -1604,7 +1619,7 @@ fn save_plugin_settings_with(
     teardown: impl FnOnce(),
 ) -> Result<PublicPluginMutation, CommandError> {
     let outcome = service.save_settings(&input.plugin_id, &input.settings, &input.secrets);
-    finish_public_plugin_management(outcome, registry, plugins, teardown)
+    finish_public_plugin_management(service, outcome, registry, plugins, teardown)
 }
 
 #[tauri::command]
@@ -1624,8 +1639,13 @@ pub(crate) fn uninstall_plugin(
     let outcome = service.manage_with_effects(|manager, effects| {
         manager.begin_uninstall_with_effects(&plugin_id, retain_data, effects)
     });
-    let Some(mut transaction) =
-        finish_public_plugin_management(outcome, registries.main(), plugins.inner(), || {})?
+    let Some(mut transaction) = finish_public_plugin_management(
+        service.inner().as_ref(),
+        outcome,
+        registries.main(),
+        plugins.inner(),
+        || {},
+    )?
     else {
         return Ok(());
     };
@@ -10601,6 +10621,7 @@ mod tests",
                     let changed = matches!(case, "rename" | "partial-error");
                     let cleanup = Cell::new(false);
                     let result = super::super::finish_public_plugin_management(
+                        service,
                         outcome,
                         &registry,
                         &crate::plugins::PluginManager::new(),

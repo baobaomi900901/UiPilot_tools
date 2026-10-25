@@ -12511,4 +12511,97 @@ mod tests {
         assert!(fresh.result_publication.as_ref().unwrap().live());
         assert_ne!(captured.result_publication, fresh.result_publication);
     }
+    #[tokio::test]
+    async fn result_action_review_plugin_domain_invalidation_cancels_pending_network_without_deadline(
+    ) {
+        use super::super::result_action::*;
+        let dir = TestDir::new("result-action-review-network-cancel");
+        write_network_package(&dir.source(), "1.0.0", &["api.example.com"]);
+        opt_in_result_package(&dir.source());
+        let (authority, started) = PluginNetworkAuthorityGate::blocking_for_test();
+        let manager = Arc::new(manager_with_network_authority(&dir, authority));
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let route = manager.route("/network").unwrap().unwrap();
+        let (registry, origin) = result_action_fixture(&manager, route.clone(), false);
+        let service = Arc::new(super::super::PublicPluginService::default());
+        assert!(service.manager.set(manager.clone()).is_ok());
+        let legacy = Arc::new(crate::plugins::PluginManager::new());
+        let (arm, _watch) = mpsc::channel();
+        let (action, receiver) = service
+            .prepare_result_action_with_observer(legacy.clone(), registry.clone(), origin, || {
+                Ok(arm)
+            })
+            .unwrap();
+        let pending = tokio::spawn({
+            let manager = manager.clone();
+            let context = action.context.clone();
+            let caller = super::super::parse_runtime_label(&route.runtime_label).unwrap();
+            async move {
+                manager
+                    .request_network(
+                        caller,
+                        super::super::PluginNetworkCommandInput {
+                            context,
+                            request: network_request(),
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let outcome = super::super::ManagementOutcome {
+            result: Err::<(), _>(PublicPluginManagementError::Unavailable),
+            changed: true,
+        };
+        assert!(crate::commands::finish_public_plugin_management(
+            &service,
+            outcome,
+            &registry,
+            &legacy,
+            || {}
+        )
+        .is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(PluginNetworkErrorCode::ExpiredRequest)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ResultActionOutcome::Failed {
+                code: ResultActionErrorCode::ActionCancelled,
+                source_consumed: true
+            })
+        ));
+        assert!(
+            !service.settle_result_action(&action.context, ResultActionErrorCode::ActionTimedOut)
+        );
+        let next = service
+            .schedule_command(
+                manager.route("/network next").unwrap().unwrap(),
+                2,
+                "/network next".into(),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(next.dispatch.is_none());
+        assert!(manager
+            .expire_network_timeouts(action.deadline - Duration::from_millis(1))
+            .unwrap()
+            .is_empty());
+    }
 }

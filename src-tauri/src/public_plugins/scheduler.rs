@@ -931,6 +931,7 @@ impl PluginRequestScheduler {
             let new_generation = previous_generation
                 .checked_add(1)
                 .ok_or(PluginScheduleError::GenerationExhausted)?;
+            let counts_as_fault = running.current && running.request.candidate.owner.live();
             queue.result_publication.revoke();
             queue.rebind_waiting_generation(new_generation);
             queue.generation = new_generation;
@@ -943,7 +944,7 @@ impl PluginRequestScheduler {
                 previous_generation,
                 new_generation,
                 has_waiting: queue.waiting.is_some(),
-                counts_as_fault: running.current && running.request.candidate.owner.live(),
+                counts_as_fault,
             });
         }
         Ok(replacements)

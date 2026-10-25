@@ -3965,3 +3965,115 @@ fn result_action_rejected_unsent_bind_preserves_and_returns_the_exact_latest_suc
         super::PluginContextStatus::Current
     );
 }
+
+#[test]
+fn result_action_review_current_timeout_faults_but_retired_timeout_does_not() {
+    use std::sync::mpsc;
+    for retirement in ["current", "source", "logical"] {
+        let root = TestRoot::new("result-action-review-timeout-fault");
+        let (service, manager, registry, origin) = result_action_service(&root);
+        let source = origin.ticket.request_id().to_owned();
+        let (arm, _watch) = mpsc::channel();
+        let (action, _receiver) = service
+            .prepare_result_action_with_observer(
+                Arc::new(crate::plugins::PluginManager::new()),
+                registry.clone(),
+                origin,
+                || Ok(arm),
+            )
+            .unwrap();
+        match retirement {
+            "source" => {
+                registry.retire_result_actions(&source);
+            }
+            "logical" => manager.retire_panel_action(&action.context),
+            _ => {}
+        }
+        let replacement = manager.expire_network_timeouts(action.deadline).unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(
+            replacement[0].counts_as_fault,
+            retirement == "current",
+            "{retirement}"
+        );
+    }
+}
+#[test]
+fn result_action_review_management_invalidation_settles_immediately_even_on_partial_error() {
+    use super::result_action::*;
+    use std::sync::mpsc;
+    for partial_error in [false, true] {
+        let root = TestRoot::new("result-action-review-management-cleanup");
+        let (service, manager, registry, origin) = result_action_service(&root);
+        let legacy = Arc::new(crate::plugins::PluginManager::new());
+        let (arm, _watch) = mpsc::channel();
+        let (action, receiver) = service
+            .prepare_result_action_with_observer(legacy.clone(), registry.clone(), origin, || {
+                Ok(arm)
+            })
+            .unwrap();
+        let result = crate::commands::finish_public_plugin_management(
+            &service,
+            super::ManagementOutcome {
+                result: if partial_error {
+                    Err(super::PublicPluginManagementError::Unavailable)
+                } else {
+                    Ok(())
+                },
+                changed: true,
+            },
+            &registry,
+            &legacy,
+            || {},
+        );
+        assert_eq!(result.is_err(), partial_error);
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::ActionCancelled,
+                    source_consumed: true
+                })
+            ),
+            "invalidation must settle the pending caller before returning"
+        );
+        assert!(
+            !service.settle_result_action(&action.context, ResultActionErrorCode::ActionTimedOut)
+        );
+        assert_eq!(
+            manager.scheduler().context_status(&action.context),
+            super::PluginContextStatus::Expired
+        );
+        let next = service
+            .schedule_command(
+                manager.route("/demo next").unwrap().unwrap(),
+                2,
+                "/demo next".into(),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            next.dispatch.is_none(),
+            "retirement must retain physical JS occupancy"
+        );
+    }
+}
+
+pub(super) fn with_running_result_action_for_test(
+    legacy: Arc<crate::plugins::PluginManager>,
+    operation: impl FnOnce(
+        &PublicPluginService,
+        &PublicPluginManager,
+        &crate::result_registry::ResultRegistry,
+        &super::ScheduledPluginRequest,
+        &std::sync::mpsc::Receiver<super::result_action::ResultActionOutcome>,
+    ),
+) {
+    let root = TestRoot::new("result-action-review-legacy");
+    let (service, manager, registry, origin) = result_action_service(&root);
+    let (arm, _watch) = std::sync::mpsc::channel();
+    let (action, receiver) = service
+        .prepare_result_action_with_observer(legacy, registry.clone(), origin, || Ok(arm))
+        .unwrap();
+    operation(&service, &manager, &registry, &action, &receiver);
+}
