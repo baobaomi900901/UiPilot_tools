@@ -54,7 +54,8 @@ label,
 .file-preview,
 .file-toolbar,
 .settings-tabs,
-.settings-tab-panel {
+.settings-tab-panel,
+.settings-detail-panel {
   app-region: no-drag;
 }
 
