@@ -34,6 +34,7 @@ import {
   type ClassifiedTextRecord,
   type ControlKey,
   type ExecuteOutcome,
+  type ResultActionOutcome,
   type FileResultItem,
   type FileSearchResponse,
   type LauncherClient,
@@ -336,6 +337,8 @@ function fakeClient() {
     setThemePreference: vi.fn(async () => undefined),
     setWebSearchEngine: vi.fn(async () => undefined),
     executeResult: vi.fn(async () => ({ status: 'launchRequested' }) satisfies ExecuteOutcome),
+    executeResultAction: vi.fn(async () => ({ kind: 'copied' }) satisfies ResultActionOutcome),
+    retireResultActions: vi.fn(async () => undefined),
     openPluginPanel: vi.fn(async () => ({
       sessionEpoch: '1',
       pluginId: 'com.uipilot.demo-panel',
@@ -408,6 +411,294 @@ function fakeClient() {
 function u64(value: string) {
   return parseU64Decimal(value)!
 }
+
+describe('main result actions', () => {
+  const command = { pluginId: 'com.uipilot.actions', commandId: 'transform', commandLabel: 'actions', argument: 'hello' }
+  function response(requestId = 'req-actions', defaultAction = true): SearchResponse {
+    return { requestId, mainResultCommand: command, items: [0, 1].map((index) => ({
+      resultId: `item-${requestId}-${index}`, title: `Result ${index}`, activation: executeActivation,
+      hasDefaultAction: defaultAction,
+      actions: [{ actionId: `action-${requestId}-${index}`, title: '复制' }, { actionId: `save-${requestId}-${index}`, title: '保存' }],
+      ...(defaultAction ? { defaultActionId: `action-${requestId}-${index}` } : {}),
+    })) }
+  }
+  async function setup(defaultAction = true) {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (input) => input.submit ? response('req-actions', defaultAction) : null)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('action-owner'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/actions hello', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    return { ...fake, core }
+  }
+
+  it('opens the menu for a no-default row and executes only the explicitly chosen action once', async () => {
+    const { core, client } = await setup(false)
+    core.keyDown('Enter', false)
+    expect(core.getSnapshot().resultActionMenu).toEqual({ resultKey: core.getSnapshot().results[0]!.key })
+    expect(client.executeResult).not.toHaveBeenCalled()
+    expect(client.executeResultAction).not.toHaveBeenCalled()
+    const pending = deferred<ResultActionOutcome>()
+    vi.mocked(client.executeResultAction).mockReturnValue(pending.promise)
+    core.executeResultAction(0, 'save-req-actions-0')
+    core.executeResultAction(1, 'save-req-actions-1')
+    expect(client.executeResultAction).toHaveBeenCalledExactlyOnceWith({ requestId: 'req-actions', resultId: 'item-req-actions-0', actionId: 'save-req-actions-0' })
+    pending.resolve({ kind: 'copied' })
+    await vi.waitFor(() => expect(core.getSnapshot().status).toBe('已复制'))
+    expect(core.getSnapshot().resultActionsDisabled).toBe(true)
+    expect(core.getSnapshot().resultActionRerun).toBe(true)
+    core.keyDown('Enter', false)
+    expect(client.executeResultAction).toHaveBeenCalledOnce()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    core.rerunResultCommand()
+    expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ submit: true, query: '/actions hello' }))
+    expect(client.executeResultAction).toHaveBeenCalledOnce()
+    core.destroy()
+  })
+
+  it.each(['staleRequest', 'unknownResult', 'actionFailed', 'actionInvalidResponse', 'actionTimedOut', 'actionUnavailable', 'clipboardWriteFailed', 'actionBusy'] as const)('handles %s with the reported source consumption policy', async (code) => {
+    const { core, client } = await setup()
+    const consumed = !['staleRequest', 'unknownResult', 'actionBusy'].includes(code)
+    vi.mocked(client.executeResultAction).mockResolvedValue({ kind: 'failed', code, sourceConsumed: consumed })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot().resultActionsDisabled).toBe(code !== 'actionBusy')
+    expect(core.getSnapshot().resultActionRerun).toBe(code !== 'actionBusy')
+    if (code === 'staleRequest' || code === 'unknownResult') expect(core.getSnapshot().status).toBe('结果已过期，请重新运行')
+    if (consumed) expect(core.getSnapshot().status).toBe('操作未完成，请重新读取核对后再运行')
+    if (code === 'actionBusy') {
+      core.keyDown('Enter', false)
+      expect(client.executeResultAction).toHaveBeenCalledTimes(2)
+    }
+    core.destroy()
+  })
+
+  it('installs fresh handles after a highlight change without autoexecution or suffix replacement', async () => {
+    const { core, client } = await setup()
+    const pending = deferred<ResultActionOutcome>()
+    vi.mocked(client.executeResultAction).mockReturnValueOnce(pending.promise)
+    const suffix = core.getSnapshot().mainResultCommand!.suffixControl
+    core.keyDown('Enter', false)
+    core.selectResult(1)
+    pending.resolve({ kind: 'resultsUpdated', response: response('req-fresh') })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('Result 0'))
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot().selectedIndex).toBe(0)
+    expect(core.getSnapshot().mainResultCommand!.suffixControl).toBe(suffix)
+    expect(client.executeResultAction).toHaveBeenCalledOnce()
+    core.keyDown('Enter', false)
+    expect(client.executeResultAction).toHaveBeenLastCalledWith({ requestId: 'req-fresh', resultId: 'item-req-fresh-0', actionId: 'action-req-fresh-0' })
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.destroy()
+  })
+
+  it.each(['success', 'failure', 'reject'] as const)('retires before debounce and ignores old %s while a new action is pending', async (kind) => {
+    const { core, client } = await setup()
+    const old = deferred<ResultActionOutcome>()
+    const next = deferred<ResultActionOutcome>()
+    vi.mocked(client.executeResultAction).mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise)
+    core.keyDown('Enter', false)
+    vi.mocked(client.searchApps).mockImplementation(async (input) => input.submit
+      ? { ...response('req-next'), mainResultCommand: { ...command, argument: 'next' } } : null)
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().mainResultCommand!.suffixControl, value: 'next', inputType: 'insertText' })
+    expect(client.retireResultActions).toHaveBeenCalledWith({ requestId: 'req-actions' })
+    expect(core.getSnapshot().executePending).toBe(false)
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    core.keyDown('Enter', false)
+    expect(core.getSnapshot().executePending).toBe(true)
+    expect(core.getSnapshot().status).toBe('正在执行动作…')
+    if (kind === 'success') old.resolve({ kind: 'resultsUpdated', response: response('req-too-late') })
+    else if (kind === 'failure') old.resolve({ kind: 'failed', code: 'actionTimedOut', sourceConsumed: true })
+    else old.reject(new Error('private failure'))
+    await Promise.resolve(); await Promise.resolve()
+    expect(core.getSnapshot().executePending).toBe(true)
+    expect(core.getSnapshot().status).toBe('正在执行动作…')
+    expect(core.getSnapshot().mainResultCommand?.suffix).toBe('next')
+    next.resolve({ kind: 'copied' })
+    await vi.waitFor(() => expect(core.getSnapshot().status).toBe('已复制'))
+    core.destroy()
+  })
+
+  it('retires on settings departure and suppresses a late completion', async () => {
+    const { core, client } = await setup()
+    const pending = deferred<ResultActionOutcome>()
+    vi.mocked(client.executeResultAction).mockReturnValueOnce(pending.promise)
+    core.keyDown('Enter', false)
+    core.navigate('settings')
+    expect(client.retireResultActions).toHaveBeenCalledWith({ requestId: 'req-actions' })
+    pending.resolve({ kind: 'resultsUpdated', response: response('req-too-late') })
+    await Promise.resolve(); await Promise.resolve()
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(core.getSnapshot().results).toHaveLength(0)
+    core.destroy()
+  })
+
+  it.each(['footer', 'context', 'keyboard', 'no-default'] as const)('routes the %s entry to the same action menu without a row default', async (entry) => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client } = await setup(entry !== 'no-default')
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+      await act(async () => input.focus())
+      const actions = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="动作 Ctrl+K"]')
+      expect(actions).not.toBeNull()
+      if (entry === 'footer') await act(async () => { actions!.focus(); actions!.click() })
+      else if (entry === 'context') await act(async () => mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })))
+      else await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', {
+        key: entry === 'keyboard' ? 'k' : 'Enter', ctrlKey: entry === 'keyboard', bubbles: true, cancelable: true,
+      })))
+      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull())
+      expect(client.executeResult).not.toHaveBeenCalled()
+      expect(client.executeResultAction).not.toHaveBeenCalled()
+      const save = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((element) => element.textContent === '保存')!
+      await act(async () => save.click())
+      const selected = entry === 'context' ? 1 : 0
+      await vi.waitFor(() => expect(client.executeResultAction).toHaveBeenCalledExactlyOnceWith({ requestId: 'req-actions', resultId: `item-req-actions-${selected}`, actionId: `save-req-actions-${selected}` }))
+      expect(client.executeResult).not.toHaveBeenCalled()
+      expect(mounted.host.querySelector<HTMLButtonElement>('button[aria-label="动作 Ctrl+K"]')!.disabled).toBe(true)
+      expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent === '重新运行')).toBe(true)
+      if (entry === 'footer') await vi.waitFor(() => expect(document.activeElement).toBe(input))
+    } finally { core.destroy(); await mounted.unmount() }
+  })
+
+  it('keeps suffix caret and routes Tab through actions and Settings; Escape closes the menu first', async () => {
+    installMatchMedia(true)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client } = await setup()
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+      const actions = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="动作 Ctrl+K"]')!
+      const settings = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="打开设置"]')!
+      expect(settings).not.toBeNull()
+      await act(async () => { input.focus(); input.setSelectionRange(2, 2) })
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })))
+      expect(document.activeElement).toBe(actions)
+      await act(async () => actions.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })))
+      expect(document.activeElement).toBe(settings)
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true })))
+      expect(core.getSnapshot().resultActionMenu).toBeUndefined()
+      await act(async () => { input.focus(); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })) })
+      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull())
+      await act(async () => document.querySelector<HTMLElement>('[role="menu"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
+      expect(core.getSnapshot().resultActionMenu).toBeUndefined()
+      expect(client.hideLauncher).not.toHaveBeenCalled()
+      await vi.waitFor(() => expect(document.activeElement).toBe(input))
+      expect(input.selectionStart).toBe(2)
+    } finally { core.destroy(); await mounted.unmount() }
+  })
+
+  it('routes menu Home/End/arrows/Enter and Tab without dispatching the row default', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client } = await setup()
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
+      const key = async (element: Element, value: string, keyCode: number) => act(async () => element.dispatchEvent(new KeyboardEvent('keydown', { key: value, keyCode, which: keyCode, bubbles: true, cancelable: true })))
+      await act(async () => { input.focus(); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })) })
+      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull())
+      const menu = document.querySelector<HTMLElement>('[role="menu"]')!
+      await key(menu, 'End', 35)
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('保存'))
+      await key(document.activeElement!, 'Home', 36)
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('复制'))
+      await key(document.activeElement!, 'ArrowDown', 40)
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('保存'))
+      await key(document.activeElement!, 'ArrowUp', 38)
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('复制'))
+      await key(document.activeElement!, 'Tab', 9)
+      expect(core.getSnapshot().resultActionMenu).toBeUndefined()
+      expect(document.activeElement).toBe(mounted.host.querySelector('button[aria-label="动作 Ctrl+K"]'))
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })))
+      const reopened = document.querySelector<HTMLElement>('[role="menu"]')!
+      await key(reopened, 'End', 35)
+      await key(document.activeElement!, 'Enter', 13)
+      await vi.waitFor(() => expect(client.executeResultAction).toHaveBeenCalledExactlyOnceWith({ requestId: 'req-actions', resultId: 'item-req-actions-0', actionId: 'save-req-actions-0' }))
+      expect(client.executeResult).not.toHaveBeenCalled()
+    } finally { core.destroy(); await mounted.unmount() }
+  })
+
+  it('handles an empty replacement atomically and ignores late retirement settlement', async () => {
+    const { core, client } = await setup()
+    const retirement = deferred<void>()
+    vi.mocked(client.retireResultActions).mockReturnValueOnce(retirement.promise)
+    core.rerunResultCommand() // Only an explicit consumed-source control may resubmit.
+    expect(client.retireResultActions).not.toHaveBeenCalled()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().resultActionRerun).toBe(true))
+    vi.mocked(client.searchApps).mockResolvedValue(response('req-new'))
+    core.rerunResultCommand()
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    retirement.reject(new Error('private retirement failure'))
+    await Promise.resolve(); await Promise.resolve()
+    expect(core.getSnapshot().status).toBe('')
+    const suffix = core.getSnapshot().mainResultCommand!.suffixControl
+    vi.mocked(client.executeResultAction).mockResolvedValueOnce({ kind: 'resultsUpdated', response: { ...response('req-empty'), items: [] } })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(0))
+    expect(core.getSnapshot().selectedIndex).toBe(-1)
+    expect(core.getSnapshot().executePending).toBe(false)
+    expect(core.getSnapshot().mainResultCommand!.suffixControl).toBe(suffix)
+    core.destroy()
+  })
+
+  it('accepts action results from a live command and never falls back for malformed action metadata', async () => {
+    const fake = fakeClient()
+    let malformed = false
+    vi.mocked(fake.client.searchApps).mockImplementation(async () => ({
+      ...response(), items: malformed ? [{ ...response().items[0]!, defaultActionId: 'missing' }] : response().items,
+    }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('live-actions'))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    expect(core.getSnapshot().mainResultCommand).toMatchObject({ commandId: 'transform', suffix: 'hello' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().resultActionRerun).toBe(true))
+    expect(fake.client.executeResultAction).toHaveBeenCalledOnce()
+    malformed = true
+    core.rerunResultCommand()
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(0))
+    core.keyDown('Enter', false)
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.executeResultAction).toHaveBeenCalledOnce()
+    core.destroy()
+  })
+
+  it('retires a composing or hidden source before its late copy feedback', async () => {
+    for (const departure of ['composition', 'hidden'] as const) {
+      const { core, client, emitHidden } = await setup()
+      const pending = deferred<ResultActionOutcome>()
+      vi.mocked(client.executeResultAction).mockReturnValueOnce(pending.promise)
+      core.keyDown('Enter', false)
+      if (departure === 'composition') core.text({ kind: 'compositionStart', control: core.getSnapshot().mainResultCommand!.suffixControl })
+      else emitHidden()
+      expect(client.retireResultActions).toHaveBeenCalledWith({ requestId: 'req-actions' })
+      pending.resolve({ kind: 'copied' })
+      await Promise.resolve(); await Promise.resolve()
+      expect(core.getSnapshot().status).not.toBe('已复制')
+      expect(core.getSnapshot().executePending).toBe(false)
+      core.destroy()
+    }
+  })
+
+  it('retires an initially empty main-result source on edit even without row metadata', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValue({ ...response('req-empty-initial'), items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('empty-action-source'))
+    await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand).toBeDefined())
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().mainResultCommand!.suffixControl, value: 'edited', inputType: 'insertText' })
+    expect(fake.client.retireResultActions).toHaveBeenCalledWith({ requestId: 'req-empty-initial' })
+    core.destroy()
+  })
+})
 
 function panelItem(initialArgument: string, pluginId = 'com.uipilot.demo-panel') {
   return {
@@ -8264,6 +8555,8 @@ describe('real adapter and startup', () => {
       completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
     })
     await main.client.executeResult({ requestId: 'req-1', resultId: 'result-1' })
+    await main.client.executeResultAction({ requestId: 'req-1', resultId: 'result-1', actionId: 'action-1' })
+    await main.client.retireResultActions({ requestId: 'req-1' })
     await main.client.loadSettings()
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
@@ -8295,6 +8588,8 @@ describe('real adapter and startup', () => {
         completionOrigin: { phase: 'preview', pluginId: 'com.uipilot.demo-win' },
       }]],
       ['execute_result', [{ requestId: 'req-1', resultId: 'result-1' }]],
+      ['execute_result_action', [{ request: { requestId: 'req-1', resultId: 'result-1', actionId: 'action-1' } }]],
+      ['retire_result_actions', [{ request: { requestId: 'req-1' } }]],
       ['load_settings', []],
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],

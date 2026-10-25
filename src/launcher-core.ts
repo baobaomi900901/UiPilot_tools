@@ -1,4 +1,6 @@
 import {
+  parseResultActionMetadata,
+  parseResultActionOutcome,
   compareDecimalRevision,
   parseFileSearchResponse,
   parseLauncherShown,
@@ -83,6 +85,10 @@ export interface LauncherCore {
   readonly settlePanelHostInputFocus: (input: PluginPanelFocusHostInputEvent & { focused: boolean }) => void
   readonly selectResult: (index: number) => void
   readonly activateResult: (index: number) => void
+  readonly openResultActionMenu: (index?: number) => void
+  readonly closeResultActionMenu: () => void
+  readonly executeResultAction: (index: number, actionId: string) => void
+  readonly rerunResultCommand: () => void
   readonly openPluginContextMenu: (index: number) => void
   readonly closePluginContextMenu: () => void
   readonly setPluginFavorite: (index: number, favorite: boolean) => void
@@ -109,6 +115,7 @@ export interface LauncherCore {
 }
 
 interface PrivateApplicationResult extends ViewResult {
+  defaultActionId?: string
   kind: 'application'
   resultId: string
   activation: LauncherResultActivation
@@ -198,6 +205,9 @@ interface Model {
   executePending: boolean
   hidePending: boolean
   favoriteMutationPending: boolean
+  resultActionsDisabled: boolean
+  resultActionMenu?: Readonly<{ resultKey: number }>
+  resultActionRerun: boolean
   shownNotice?: string
   commandHint?: string
   status: string
@@ -335,6 +345,22 @@ interface ApplicationSearchOwner {
     phase: 'preview' | 'commit'
     pluginId: string
   }
+}
+
+interface ResultActionOwner {
+  token: number
+  epoch: number
+  invocationId: string
+  sequence: number
+  query: string
+  control: ControlKey
+  controlValue: string
+  requestId: string
+  resultId: string
+  actionId: string
+  pluginId: string
+  commandId: string
+  commandLabel: string
 }
 
 interface MinuteRefreshOwner {
@@ -683,7 +709,7 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation }) =>
+    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation, actions }) =>
       Object.freeze({
         key,
         title,
@@ -693,6 +719,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(iconKind === undefined ? {} : { iconKind }),
         ...(detail === undefined ? {} : { detail }),
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
+        ...(actions === undefined ? {} : { actions }),
         ...(favorite === undefined
           ? {}
           : {
@@ -824,6 +851,9 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     executePending: model.executePending,
     hidePending: model.hidePending,
     favoriteMutationPending: model.favoriteMutationPending,
+    resultActionsDisabled: model.resultActionsDisabled || (model.executePending && model.results.some((row) => row.actions !== undefined)),
+    resultActionRerun: model.resultActionRerun,
+    ...(model.resultActionMenu === undefined ? {} : { resultActionMenu: model.resultActionMenu }),
     ...(model.shownNotice === undefined ? {} : { shownNotice: model.shownNotice }),
     ...(model.commandHint === undefined ? {} : { commandHint: model.commandHint }),
     status:
@@ -860,6 +890,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     executePending: false,
     hidePending: false,
     favoriteMutationPending: false,
+    resultActionsDisabled: false,
+    resultActionRerun: false,
     status: '',
     settingsUncertain: false,
     settingsLoadStatus: 'loading',
@@ -928,6 +960,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let favoriteInteraction: FavoriteInteractionOwner | undefined
   let favoriteMutation: FavoriteMutationOwner | undefined
   let favoriteMenuConsumed = false
+  let resultActionSource: string | undefined
+  let resultActionOwner: ResultActionOwner | undefined
   let panelActionToken = 0
   let panelSubmissionToken = 0
   let panelBoundsToken = 0
@@ -1081,6 +1115,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function clearResults(): void {
+    retireResultActionSource()
+    model.resultActionsDisabled = false
+    model.resultActionRerun = false
     model.requestId = undefined
     model.results = []
     model.selectedIndex = -1
@@ -1868,6 +1905,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function beginSearch(submit = false, showPending = true, quietRefresh = false): void {
+    retireResultActionSource()
     if (!quietRefresh) cancelMinuteRefresh()
     const invocationId = model.invocationId
     if (!invocationId || (model.query !== '/find' && fileCommand(model.query) !== null) || sequenceExhausted) return
@@ -2030,9 +2068,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     model.searchPending = false
     if (response !== null) {
-      const mainResultCommand = captured.submit
-        ? safeMainResultCommand(response.mainResultCommand)
-        : undefined
+      const mainResultCommand = safeMainResultCommand(response.mainResultCommand)
       const activeCommand = model.mainResultCommand
       if ((response.mainResultCommand !== undefined && !mainResultCommand) ||
           (mainResultCommand && activeCommand &&
@@ -2041,11 +2077,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         return
       }
       if (mainResultCommand) activateMainResultCommand(mainResultCommand)
+      retireResultActionSource()
       model.requestId = response.requestId
       model.commandHint = safeCommandHint(response.commandHint)
       const applications: PrivateApplicationResult[] = response.items.flatMap((item: ResultItem) => {
+        const actionMetadata = parseResultActionMetadata(item)
+        if (actionMetadata === null) return []
         const activation = safeLauncherActivation(item.activation)
         if (activation === undefined || typeof item.resultId !== 'string' ||
+            (actionMetadata !== undefined && activation.kind !== 'executeResult') ||
             (activation.kind === 'executeResult' && item.resultId.length === 0) ||
             (activation.kind === 'informational' && item.hasDefaultAction !== false)) return []
         const icon = safeApplicationIcon(item.icon)
@@ -2069,9 +2109,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           ...(item.detail === undefined ? {} : { detail: item.detail }),
           ...(favorite === undefined ? {} : { favorite }),
           ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
+          ...(actionMetadata === undefined ? {} : actionMetadata),
         }]
       })
       model.results = applications
+      // Empty main-result sets have no row capability marker; retiring a legacy empty set is a Host no-op.
+      if (applications.some((row) => row.actions !== undefined) || (mainResultCommand && applications.length === 0)) {
+        resultActionSource = response.requestId
+      }
+      model.resultActionsDisabled = false
+      model.resultActionRerun = false
       model.selectedIndex = model.results.length ? 0 : -1
       model.status = model.results.length || model.commandHint ? '' : '未找到应用'
       scheduleMinuteRefresh(captured, response.refreshAtUtc)
@@ -2383,6 +2430,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     notice: import('./protocol').LifecycleNotice | null,
     source: 'native' | 'local',
   ): void {
+    retireResultActionSource()
     cancelMinuteRefresh()
     invalidateFavoriteInteraction()
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
@@ -2894,13 +2942,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function hidden(): void {
     if (destroyed) return
+    const retiredActions = retireResultActionSource()
     cancelMinuteRefresh()
     const discardedPanel = discardPanelUi()
     const discardedQuicklinks = discardQuicklinksUi()
     const wasHiding = model.hidePending
     model.hidePending = false
     const resetView = resetHiddenNonLauncherView()
-    publish(discardedPanel || discardedQuicklinks || wasHiding || resetView)
+    publish(retiredActions || discardedPanel || discardedQuicklinks || wasHiding || resetView)
   }
 
   function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): void {
@@ -3301,6 +3350,151 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
   }
 
+  /** Send retirement before scheduling any debounced query or departing the source view. */
+  function retireResultActionSource(): boolean {
+    const requestId = resultActionSource
+    const changed = requestId !== undefined || resultActionOwner !== undefined || model.resultActionMenu !== undefined
+    resultActionSource = undefined
+    model.resultActionMenu = undefined
+    if (resultActionOwner) {
+      resultActionOwner = undefined
+      executeToken = ++token
+      model.executePending = false
+    }
+    if (requestId) {
+      if (model.results.some((row) => row.actions !== undefined)) {
+        model.resultActionsDisabled = true
+        model.resultActionRerun = true
+      }
+      try { void client.retireResultActions({ requestId }).catch(() => {}) } catch { /* Local retirement is immediate. */ }
+    }
+    return changed
+  }
+
+  function openResultActionMenu(index = model.selectedIndex): void {
+    if (destroyed || sequenceExhausted || model.view !== 'launcher' || model.launcherMode !== 'applications' ||
+        !Number.isInteger(index) || model.executePending || model.resultActionsDisabled) return
+    const result = model.results[index]
+    if (!result?.actions?.length || !resultActionSource || model.requestId !== resultActionSource) return
+    invalidateFavoriteInteraction()
+    model.selectedIndex = index
+    model.resultActionMenu = Object.freeze({ resultKey: result.key })
+    publish(true)
+  }
+
+  function closeResultActionMenu(): void {
+    if (!model.resultActionMenu) return
+    model.resultActionMenu = undefined
+    publish(true)
+  }
+
+  function ownsResultAction(owner: ResultActionOwner): boolean {
+    const command = model.mainResultCommand
+    return !destroyed && resultActionOwner === owner && owner.token === executeToken &&
+      model.view === 'launcher' && model.launcherMode === 'applications' && !model.hidePending &&
+      owner.epoch === model.viewEpoch && owner.invocationId === model.invocationId &&
+      owner.sequence === model.querySequence && owner.query === model.query && owner.query === model.queryControlValue &&
+      owner.requestId === model.requestId && owner.requestId === resultActionSource &&
+      owner.control === command?.suffix.key && owner.controlValue === command.suffix.value && owner.controlValue === command.suffix.draft &&
+      owner.pluginId === command.pluginId && owner.commandId === command.commandId && owner.commandLabel === command.commandLabel
+  }
+
+  const actionUncertain = '操作未完成，请重新读取核对后再运行'
+
+  function failResultAction(owner: ResultActionOwner, status: string, disabled: boolean): void {
+    if (!ownsResultAction(owner)) return
+    resultActionOwner = undefined
+    model.executePending = false
+    model.resultActionMenu = undefined
+    model.resultActionsDisabled = disabled
+    model.resultActionRerun = disabled
+    model.status = status
+    publish(true)
+  }
+
+  function executeResultAction(index: number, actionId: string): void {
+    const command = model.mainResultCommand
+    const row = model.results[index]
+    const requestId = model.requestId
+    if (destroyed || sequenceExhausted || model.view !== 'launcher' || model.launcherMode !== 'applications' ||
+        !Number.isInteger(index) || model.executePending || model.resultActionsDisabled || !model.invocationId ||
+        !command || !row?.actions?.some((action) => action.actionId === actionId) ||
+        !requestId || requestId !== resultActionSource || !row.resultId) return
+    const owner: ResultActionOwner = {
+      token: ++token, epoch: model.viewEpoch, invocationId: model.invocationId, sequence: model.querySequence,
+      query: model.query, control: command.suffix.key, controlValue: command.suffix.value,
+      requestId, resultId: row.resultId, actionId,
+      pluginId: command.pluginId, commandId: command.commandId, commandLabel: command.commandLabel,
+    }
+    executeToken = owner.token
+    resultActionOwner = owner
+    model.resultActionMenu = undefined
+    model.executePending = true
+    model.shownNotice = undefined
+    model.status = '正在执行动作…'
+    publish(true)
+    let pending: Promise<unknown>
+    try { pending = client.executeResultAction({ requestId, resultId: owner.resultId, actionId }) }
+    catch (error) { pending = Promise.reject(error) }
+    void pending.then((value) => {
+      if (!ownsResultAction(owner)) return
+      const outcome = parseResultActionOutcome(value)
+      if (!outcome) { failResultAction(owner, actionUncertain, true); return }
+      if (outcome.kind === 'copied') { failResultAction(owner, '已复制', true); return }
+      if (outcome.kind === 'failed') {
+        const stale = outcome.code === 'staleRequest' || outcome.code === 'unknownResult'
+        const status = stale ? '结果已过期，请重新运行'
+          : outcome.sourceConsumed ? actionUncertain
+          : outcome.code === 'actionBusy' ? '插件正忙，请稍后再试'
+          : outcome.code === 'pluginPermissionDenied' ? '插件无权执行此动作'
+          : '动作暂不可用，请稍后再试'
+        failResultAction(owner, status, stale || outcome.sourceConsumed)
+        return
+      }
+      const response = outcome.response
+      const context = safeMainResultCommand(response.mainResultCommand)
+      if (!context || context.pluginId !== owner.pluginId || context.commandId !== owner.commandId ||
+          context.commandLabel !== owner.commandLabel || context.argument !== owner.controlValue || response.requestId === owner.requestId) {
+        failResultAction(owner, actionUncertain, true)
+        return
+      }
+      // Prepare the complete replacement before touching the current source. No search/default execution path is used.
+      const rows: PrivateApplicationResult[] = response.items.map((item) => ({
+        kind: 'application', key: resultKey++, resultId: item.resultId, activation: { kind: 'executeResult' },
+        title: item.title, ...(item.subtitle === undefined ? {} : { subtitle: item.subtitle }),
+        ...(item.detail === undefined ? {} : { detail: item.detail }),
+        ...(safePublicPluginIconUrl(item.pluginIconUrl) === undefined ? {} : { pluginIconUrl: safePublicPluginIconUrl(item.pluginIconUrl) }),
+        hasDefaultAction: item.hasDefaultAction,
+        ...parseResultActionMetadata(item)!,
+      }))
+      resultActionOwner = undefined
+      resultActionSource = response.requestId
+      model.executePending = false
+      model.resultActionsDisabled = false
+      model.resultActionRerun = false
+      model.resultActionMenu = undefined
+      model.requestId = response.requestId
+      activateMainResultCommand(context)
+      model.results = rows
+      model.selectedIndex = rows.length ? 0 : -1
+      model.commandHint = safeCommandHint(response.commandHint)
+      model.status = rows.length || model.commandHint ? '' : '没有结果'
+      publish(true)
+    }, () => failResultAction(owner, actionUncertain, true))
+  }
+
+  function rerunResultCommand(): void {
+    if (destroyed || !model.resultActionRerun || model.executePending || model.searchPending ||
+        model.view !== 'launcher' || model.launcherMode !== 'applications' || !model.mainResultCommand || sequenceExhausted) return
+    clearResults()
+    model.status = ''
+    model.shownNotice = undefined
+    cancelSlashSearch()
+    if (!advanceApplicationSequence()) return
+    beginSearch(true)
+    publish(true)
+  }
+
   function executeSelection(): void {
     if (model.view !== 'launcher' || model.executePending) return
     invalidateFavoriteInteraction()
@@ -3308,6 +3502,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (model.launcherMode === 'applications') {
       const selected = model.results[model.selectedIndex]
       if (!selected || selected.refreshDisabled) return
+      if (selected.actions !== undefined) {
+        if (selected.defaultActionId) executeResultAction(model.selectedIndex, selected.defaultActionId)
+        else openResultActionMenu()
+        return
+      }
       if (selected.activation.kind === 'completion') {
         applyEdit(selected.activation.completionText)
         return
@@ -3375,6 +3574,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function selectResult(index: number): void {
     if (destroyed || model.view !== 'launcher' || !Number.isInteger(index) || index < 0 || index >= model.results.length || model.selectedIndex === index) return
     invalidateFavoriteInteraction()
+    model.resultActionMenu = undefined
     model.selectedIndex = index
     publish(true)
   }
@@ -3494,6 +3694,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   async function requestHide(): Promise<void> {
     if (destroyed || model.hidePending) return
+    retireResultActionSource()
     cancelMinuteRefresh()
     model.shownNotice = undefined
     model.status = ''
@@ -3583,6 +3784,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function keyDown(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean): void {
     if (destroyed || isComposing) return
     if (key === 'Escape') {
+      if (model.resultActionMenu) { closeResultActionMenu(); return }
       if (model.view === 'settings') navigate('launcher')
       else if (model.launcherMode === 'quicklinks') closeQuicklinks()
       else void requestHide()
@@ -3668,6 +3870,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const selectedIndex = (model.selectedIndex + offset + model.results.length) % model.results.length
     if (selectedIndex === model.selectedIndex) return
     invalidateFavoriteInteraction()
+    model.resultActionMenu = undefined
     model.selectedIndex = selectedIndex
     publish(true)
   }
@@ -3748,6 +3951,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function destroy(): void {
     if (destroyed) return
+    retireResultActionSource()
     cancelMinuteRefresh()
     destroyed = true
     cancelSlashSearch()
@@ -3899,6 +4103,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     settlePanelHostInputFocus,
     selectResult,
     activateResult,
+    openResultActionMenu,
+    closeResultActionMenu,
+    executeResultAction,
+    rerunResultCommand,
     openPluginContextMenu,
     closePluginContextMenu,
     setPluginFavorite,

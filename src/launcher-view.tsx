@@ -469,6 +469,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const restoreSettingsTabFocus = useRef(false)
   const activeSettingsTab = snapshot.settingsTab
   const optionRefs = useRef(new Map<number, HTMLElement>())
+  const actionsButtonRef = useRef<HTMLButtonElement | null>(null)
+  const rerunButtonRef = useRef<HTMLButtonElement | null>(null)
+  const actionFocusTarget = useRef<{
+    invocationId: string | undefined
+    viewEpoch: number
+    querySequence: number
+    value: string
+    resultKey: number
+    origin: HTMLElement | null
+    moved: boolean
+  } | undefined>(undefined)
   const [favoriteMenuVersion, setFavoriteMenuVersion] = useState(0)
   const favoriteFocusTarget = useRef<{
     invocationId: string | undefined
@@ -785,6 +796,9 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
   useEffect(() => {
     const onFocus = (event: FocusEvent) => {
+      const actionTarget = actionFocusTarget.current
+      if (actionTarget && event.target instanceof HTMLElement && event.target !== document.body &&
+          event.target !== actionTarget.origin && !event.target.closest('[role="menu"]')) actionTarget.moved = true
       const pending = favoriteFocusTarget.current
       const element = event.target
       if (!pending || !(element instanceof HTMLElement) || element === document.body || element === pending.origin || element.closest('[role="menu"]')) return
@@ -793,6 +807,27 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     document.addEventListener('focusin', onFocus)
     return () => document.removeEventListener('focusin', onFocus)
   }, [])
+
+  useLayoutEffect(() => {
+    const target = actionFocusTarget.current
+    if (!target) return
+    if (target.moved || snapshot.view !== 'launcher' || target.invocationId !== snapshot.invocationId ||
+        target.viewEpoch !== snapshot.viewEpoch || target.querySequence !== snapshot.querySequence ||
+        target.value !== snapshot.queryControlValue || !snapshot.results.some((row) => row.key === target.resultKey)) {
+      actionFocusTarget.current = undefined
+      return
+    }
+    if (snapshot.resultActionMenu) return
+    const frame = window.requestAnimationFrame(() => {
+      if (actionFocusTarget.current !== target || target.moved) return
+      actionFocusTarget.current = undefined
+      const origin = target.origin?.isConnected && !target.origin.hasAttribute('disabled') ? target.origin : null
+      const fallback = mainResultInputRef.current ?? queryRef.current
+      if (origin && origin !== document.body) origin.focus()
+      else fallback?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [snapshot.resultActionMenu, snapshot.invocationId, snapshot.viewEpoch, snapshot.querySequence, snapshot.queryControlValue, snapshot.results, snapshot.view])
 
   useLayoutEffect(() => {
     const target = favoriteFocusTarget.current
@@ -854,6 +889,30 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     : snapshot.messageCenter.status === 'ready'
       ? snapshot.messageCenter.unreadCount ?? 0
       : 0
+  const launcherResultsActive = snapshot.view === 'launcher' && !file && !panelActive
+  const captureActionFocus = (index = snapshot.selectedIndex) => {
+    const row = snapshot.results[index]
+    if (!row) return
+    actionFocusTarget.current = {
+      invocationId: snapshot.invocationId, viewEpoch: snapshot.viewEpoch, querySequence: snapshot.querySequence,
+      value: snapshot.queryControlValue, resultKey: row.key,
+      origin: document.activeElement instanceof HTMLElement ? document.activeElement : null, moved: false,
+    }
+  }
+  const openActions = () => { captureActionFocus(); core.openResultActionMenu() }
+  const settingsControl = (
+    <Tooltip title="设置">
+      <span className="launcher-settings-control">
+        <Badge className={`launcher-settings-badge${snapshot.messageCenter.status === 'unavailable' ? ' is-unavailable' : ''}`}
+          count={messageBadgeCount} offset={[-2, 2]} overflowCount={99} size="small">
+          <Button
+            aria-label="打开设置" className="launcher-settings-button" disabled={!snapshot.invocationId}
+            icon={<Settings aria-hidden size={16} strokeWidth={1.8} />}
+            onMouseDown={(event) => event.preventDefault()} onClick={() => core.navigate('settings')} size="small" type="text" />
+        </Badge>
+      </span>
+    </Tooltip>
+  )
   const indexedLauncherResults = snapshot.results.map((item, index) => ({ item, index }))
   const hasLauncherQuery = snapshot.queryControlValue !== ''
   const isApplicationResult = ({ item }: (typeof indexedLauncherResults)[number]) =>
@@ -903,9 +962,18 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
     if (!['ArrowUp', 'ArrowDown', 'Enter', 'Escape'].includes(event.key)) return
     const isComposing = composing(event)
     if (!isComposing) event.preventDefault()
+    if (event.key === 'Enter' && !isComposing && statusResult?.actions && !statusResult.hasDefaultAction) captureActionFocus()
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
   }
   const launcherTabKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (!launcherResultsActive) return
+    if (event.key.toLowerCase() === 'k' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !composing(event)) {
+      if (!statusResult?.actions?.length) return
+      event.preventDefault()
+      event.stopPropagation()
+      openActions()
+      return
+    }
     if (
       event.key !== 'Tab' ||
       event.ctrlKey ||
@@ -916,19 +984,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
     const input = mainResultInputRef.current ?? queryRef.current
     if (!input || input.disabled) return
-    const settingsButton = event.currentTarget.querySelector<HTMLElement>('.launcher-settings-button:not([disabled])')
+    const settingsButton = input.closest('.launcher-surface')?.querySelector<HTMLElement>('.launcher-settings-button') ?? null
+    const controls = [input, actionsButtonRef.current, rerunButtonRef.current, settingsButton]
+      .filter((element): element is HTMLElement => element !== null && !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true')
     event.preventDefault()
-    if (!settingsButton || settingsButton.getAttribute('aria-disabled') === 'true') {
-      input.focus()
-      return
-    }
-    if (event.shiftKey) {
-      if (document.activeElement === input) settingsButton.focus()
-      else input.focus()
-      return
-    }
-    if (document.activeElement === settingsButton) input.focus()
-    else settingsButton.focus()
+    event.stopPropagation()
+    const origin = actionFocusTarget.current?.origin
+    const active = controls.includes(document.activeElement as HTMLElement) ? document.activeElement : origin
+    const index = controls.indexOf(active as HTMLElement)
+    actionFocusTarget.current = undefined
+    core.closeResultActionMenu()
+    controls[(index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length]?.focus()
   }
   const mainResultKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Backspace' && !composing(event)) {
@@ -1193,6 +1259,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
 
   const renderLauncherResult = (item: (typeof snapshot.results)[number], index: number) => {
     const resultFavorite = item.favorite
+    const hasActions = Boolean(item.actions?.length)
     const row = (
       <div
         key={item.key}
@@ -1201,9 +1268,12 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         aria-selected={snapshot.selectedIndex === index}
         className={snapshot.selectedIndex === index ? 'result-row is-selected' : 'result-row'}
         tabIndex={-1}
-        onClick={() => core.activateResult(index)}
+        onClick={() => {
+          if (hasActions && !item.hasDefaultAction) captureActionFocus(index)
+          core.activateResult(index)
+        }}
         onFocus={() => core.selectResult(index)}
-        onContextMenu={resultFavorite ? (event) => event.preventDefault() : undefined}
+        onContextMenu={resultFavorite || hasActions ? (event) => event.preventDefault() : undefined}
         ref={(element) => {
           if (element) optionRefs.current.set(item.key, element)
           else optionRefs.current.delete(item.key)
@@ -1252,18 +1322,56 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         </span>
       </div>
     )
-    if (!resultFavorite) return row
+    if (!resultFavorite && !hasActions) return row
     return (
       <Dropdown
         key={item.key}
         trigger={['contextMenu']}
+        open={hasActions ? snapshot.resultActionMenu?.resultKey === item.key : undefined}
+        autoFocus={hasActions}
         menu={{
-          items: [{
-            key: 'favorite',
-            label: resultFavorite.favorite ? '取消常用' : '设为常用',
-            disabled: snapshot.favoriteMutationPending,
-          }],
-          onClick: () => {
+          className: hasActions ? 'launcher-result-action-menu' : undefined,
+          'aria-label': hasActions ? '结果动作' : '结果菜单',
+          items: [
+            ...(item.actions ?? []).map((action, actionIndex) => ({ key: `action-${actionIndex}`, label: action.title, disabled: snapshot.resultActionsDisabled })),
+            ...(hasActions && resultFavorite ? [{ key: 'separator', type: 'divider' as const }] : []),
+            ...(resultFavorite ? [{
+              key: 'favorite',
+              label: resultFavorite.favorite ? '取消常用' : '设为常用',
+              disabled: snapshot.favoriteMutationPending,
+            }] : []),
+          ],
+          onKeyDownCapture: (event) => {
+            if (composing(event)) return
+            if (hasActions && ['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter'].includes(event.key)) {
+              event.preventDefault()
+              event.stopPropagation()
+              const items = [...event.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])')]
+              if (!items.length) return
+              const current = items.indexOf(document.activeElement as HTMLElement)
+              if (event.key === 'Enter') { if (current >= 0) items[current]?.click(); return }
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+                : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+              items[next]?.focus()
+              return
+            }
+            if (event.key === 'Escape' && hasActions) {
+              event.preventDefault()
+              event.stopPropagation()
+              core.closeResultActionMenu()
+            } else if (event.key === 'Tab' && hasActions) {
+              event.stopPropagation()
+              launcherTabKeyDown(event)
+            }
+          },
+          onClick: ({ key, domEvent }) => {
+            domEvent.stopPropagation()
+            if (key.startsWith('action-')) {
+              const action = item.actions?.[Number(key.slice('action-'.length))]
+              if (action) core.executeResultAction(index, action.actionId)
+              return
+            }
+            if (!resultFavorite) return
             favoriteFocusTarget.current = {
               invocationId: snapshot.invocationId,
               viewEpoch: snapshot.viewEpoch,
@@ -1277,6 +1385,14 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           },
         }}
         onOpenChange={(open) => {
+          if (hasActions) {
+            if (open) {
+              captureActionFocus(index)
+              core.openResultActionMenu(index)
+            } else core.closeResultActionMenu()
+            return
+          }
+          if (!resultFavorite) return
           if (open) {
             favoriteFocusTarget.current = {
               invocationId: snapshot.invocationId, viewEpoch: snapshot.viewEpoch,
@@ -1298,7 +1414,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   }
 
   const launcher = (
-    <section className="launcher-view" aria-label="应用启动器" onKeyDownCapture={launcherTabKeyDown}>
+    <section className="launcher-view" aria-label="应用启动器">
       <div className="launcher-query-region">
         {mainResultCommand ? (
           <div className="panel-input-row panel-input-shell main-result-input-shell">
@@ -1334,6 +1450,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               placeholder="请输入参数"
               role="combobox"
               spellCheck={false}
+              suffix={settingsControl}
               onKeyDown={mainResultKeyDown}
               onBound={reportMainResultBound}
               onUnbound={reportMainResultUnbound}
@@ -1362,30 +1479,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               aria-activedescendant={
                 snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
               }
-              suffix={(
-                <Tooltip title="设置">
-                  <span className="launcher-settings-control">
-                    <Badge
-                      className={`launcher-settings-badge${snapshot.messageCenter.status === 'unavailable' ? ' is-unavailable' : ''}`}
-                      count={messageBadgeCount}
-                      offset={[-2, 2]}
-                      overflowCount={99}
-                      size="small"
-                    >
-                      <Button
-                        aria-label="打开设置"
-                        className="launcher-settings-button"
-                        disabled={!snapshot.invocationId}
-                        icon={<Settings aria-hidden size={16} strokeWidth={1.8} />}
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => core.navigate('settings')}
-                        size="small"
-                        type="text"
-                      />
-                    </Badge>
-                  </span>
-                </Tooltip>
-              )}
+              suffix={settingsControl}
               onKeyDown={queryKeyDown}
               onBound={reportQueryBound}
               onBindingFailed={reportFailed}
@@ -2300,16 +2394,30 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
         <main
           className={panelActive ? 'launcher-surface is-panel-active' : 'launcher-surface'}
           data-color-scheme={colorScheme}
-          onKeyDownCapture={preventBrowserFind}
+          onKeyDownCapture={(event) => { preventBrowserFind(event); launcherTabKeyDown(event) }}
         >
           <div className="launcher-region launcher-section-region">
             {snapshot.view === 'launcher' ? (quicklinksPanel ?? panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
           </div>
           {snapshot.view === 'launcher' || status.length > 0 ? (
             <div className="launcher-region launcher-status-region">
-              <div className="status-region" role="status" aria-live="polite" aria-atomic="true">
+              <div className={`status-region${launcherResultsActive && snapshot.resultActionRerun
+                ? snapshot.status === '已复制' ? ' is-action-success' : ' is-action-error'
+                : launcherResultsActive && snapshot.executePending && statusResult?.actions ? ' is-action-pending' : ''}`}
+                role="status" aria-live="polite" aria-atomic="true">
                 {status}
               </div>
+              {launcherResultsActive && (statusResult?.actions?.length || snapshot.resultActionRerun) ? (
+                <div className="launcher-footer-actions">
+                  {statusResult?.actions?.length ? (
+                    <button ref={actionsButtonRef} type="button" aria-label="动作 Ctrl+K" aria-haspopup="menu"
+                      aria-expanded={snapshot.resultActionMenu !== undefined} disabled={snapshot.resultActionsDisabled}
+                      onClick={openActions}>动作 <kbd>Ctrl+K</kbd></button>
+                  ) : null}
+                  {snapshot.resultActionRerun ? <button ref={rerunButtonRef} type="button"
+                    disabled={snapshot.executePending || snapshot.searchPending} onClick={core.rerunResultCommand}>重新运行</button> : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
         </main>

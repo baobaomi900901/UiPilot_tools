@@ -1,11 +1,56 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  parseResultActionMetadata,
+  parseResultActionOutcome,
   parsePluginTimerStartInput,
   parsePluginTimerState,
   parsePublicPluginInventory,
   parsePublicPluginPrepareSummary,
 } from './protocol'
+
+describe('main result action protocol', () => {
+  it('accepts only opaque display metadata with consistent explicit defaults', () => {
+    const actions = [{ actionId: 'action-1', title: '复制' }]
+    expect(parseResultActionMetadata({ actions, defaultActionId: 'action-1', hasDefaultAction: true })).toEqual({ actions, defaultActionId: 'action-1' })
+    expect(parseResultActionMetadata({ actions, hasDefaultAction: false })).toEqual({ actions })
+    for (const value of [
+      { actions, hasDefaultAction: true },
+      { actions, defaultActionId: 'missing', hasDefaultAction: true },
+      { actions, defaultActionId: null, hasDefaultAction: false },
+      { actions: [...actions, ...actions], hasDefaultAction: false },
+      { actions: [{ ...actions[0], text: 'secret' }], hasDefaultAction: false },
+      { defaultActionId: 'action-1', hasDefaultAction: true },
+    ]) expect(parseResultActionMetadata(value)).toBeNull()
+  })
+
+  it('rejects unknown outcome fields/codes instead of guessing consumption', () => {
+    expect(parseResultActionOutcome({ kind: 'copied' })).toEqual({ kind: 'copied' })
+    expect(parseResultActionOutcome({ kind: 'failed', code: 'actionBusy', sourceConsumed: false })).not.toBeNull()
+    for (const value of [
+      { kind: 'copied', text: 'secret' },
+      { kind: 'failed', code: 'newError', sourceConsumed: false },
+      { kind: 'failed', code: 'actionBusy' },
+      { kind: 'failed', code: 'actionBusy', sourceConsumed: false, payload: null },
+      { kind: 'resultsUpdated', response: { requestId: 'req-2', items: [], autoExecuteResultId: 'item-1' } },
+    ]) expect(parseResultActionOutcome(value)).toBeNull()
+  })
+
+  it('validates the complete replacement before allowing an atomic install', () => {
+    const response = { requestId: 'req-2', mainResultCommand: {
+      commandId: 'transform', pluginId: 'com.uipilot.actions', commandLabel: 'actions', argument: 'hello',
+    }, items: [{ resultId: 'item-2', title: 'Fresh', activation: { kind: 'executeResult' }, hasDefaultAction: false, actions: [] }] }
+    expect(parseResultActionOutcome({ kind: 'resultsUpdated', response })).not.toBeNull()
+    for (const invalid of [
+      { ...response, mainResultCommand: { ...response.mainResultCommand, payload: null } },
+      { ...response, mainResultCommand: {} },
+      { ...response, items: [{ ...response.items[0], favorite: {} }] },
+      { ...response, items: [{ ...response.items[0], activation: { kind: 'informational' } }] },
+      { ...response, items: [{ ...response.items[0], subtitle: 42 }] },
+      { ...response, items: [response.items[0], response.items[0]] },
+    ]) expect(parseResultActionOutcome({ kind: 'resultsUpdated', response: invalid })).toBeNull()
+  })
+})
 
 describe('public plugin timer protocol', () => {
   it('accepts only exact bounded timer start input', () => {

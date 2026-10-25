@@ -55,7 +55,23 @@ export interface ResultItem {
   detail?: string
   favorite?: ResultFavorite
   hasDefaultAction?: boolean
+  actions?: readonly ResultActionDisplay[]
+  defaultActionId?: string
 }
+
+export interface ResultActionDisplay { readonly actionId: string; readonly title: string }
+export interface ResultActionMetadata {
+  readonly actions: readonly ResultActionDisplay[]
+  readonly defaultActionId?: string
+}
+export type ResultActionErrorCode =
+  | 'actionBusy' | 'actionInProgress' | 'actionAlreadyExecuted' | 'actionFailed'
+  | 'actionInvalidResponse' | 'actionTimedOut' | 'actionUnavailable' | 'actionCancelled'
+  | 'staleRequest' | 'unknownResult' | 'pluginPermissionDenied' | 'clipboardWriteFailed'
+export type ResultActionOutcome =
+  | { kind: 'copied' }
+  | { kind: 'resultsUpdated'; response: SearchResponse }
+  | { kind: 'failed'; code: ResultActionErrorCode; sourceConsumed: boolean }
 export interface SearchResponse {
   requestId: string
   items: ResultItem[]
@@ -378,6 +394,8 @@ export interface LauncherClient {
   chooseQuicklinkIcon(): Promise<QuicklinkIconCandidate | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  executeResultAction(input: { requestId: string; resultId: string; actionId: string }): Promise<unknown>
+  retireResultActions(input: { requestId: string }): Promise<void>
   openPluginPanel(input: { pluginId: string; argument: string }): Promise<PluginPanelCommandResult>
   submitPluginPanel(input: {
     sessionEpoch: U64Decimal
@@ -502,6 +520,7 @@ export interface ViewResult {
   detail?: string
   hasDefaultAction?: boolean
   favorite?: ResultFavorite
+  actions?: readonly ResultActionDisplay[]
   panelActivation?: Readonly<{ pluginId: string; initialArgument: string }>
 }
 
@@ -671,6 +690,9 @@ export interface LauncherSnapshot {
   executePending: boolean
   hidePending: boolean
   favoriteMutationPending: boolean
+  resultActionsDisabled: boolean
+  resultActionMenu?: Readonly<{ resultKey: number }>
+  resultActionRerun: boolean
   shownNotice?: string
   commandHint?: string
   status: string
@@ -723,6 +745,75 @@ function exactDenseArray(value: unknown[]): boolean {
   const keys = Object.getOwnPropertyNames(value)
   if (Object.getOwnPropertySymbols(value).length !== 0 || keys.length !== value.length + 1) return false
   return keys.every((key, index) => (index < value.length ? key === String(index) : key === 'length'))
+}
+
+const resultActionErrors = new Set<ResultActionErrorCode>([
+  'actionBusy', 'actionInProgress', 'actionAlreadyExecuted', 'actionFailed',
+  'actionInvalidResponse', 'actionTimedOut', 'actionUnavailable', 'actionCancelled',
+  'staleRequest', 'unknownResult', 'pluginPermissionDenied', 'clipboardWriteFailed',
+])
+
+function opaqueResultHandle(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\p{Cc}\s]/u.test(value)
+}
+
+/** Reads only the additive metadata from a row. Undefined means a legacy row. */
+export function parseResultActionMetadata(value: unknown): ResultActionMetadata | null | undefined {
+  const row = plainRecord(value)
+  if (!row) return null
+  if (!Object.prototype.hasOwnProperty.call(row, 'actions')) return Object.prototype.hasOwnProperty.call(row, 'defaultActionId') ? null : undefined
+  if (!Array.isArray(row.actions) || !exactDenseArray(row.actions) || row.actions.length > 8) return null
+  const actions: ResultActionDisplay[] = []
+  const handles = new Set<string>()
+  for (const value of row.actions) {
+    const action = plainRecord(value)
+    if (!action || !exactKeys(action, ['actionId', 'title']) || !opaqueResultHandle(action.actionId) ||
+        handles.has(action.actionId) || typeof action.title !== 'string' ||
+        !action.title.trim() || [...action.title].length > 80 || /\p{Cc}/u.test(action.title)) return null
+    handles.add(action.actionId)
+    actions.push(Object.freeze({ actionId: action.actionId, title: action.title }))
+  }
+  const hasDefault = Object.prototype.hasOwnProperty.call(row, 'defaultActionId')
+  if (row.hasDefaultAction !== hasDefault || (hasDefault &&
+      (!opaqueResultHandle(row.defaultActionId) || !handles.has(row.defaultActionId)))) return null
+  return Object.freeze({ actions: Object.freeze(actions), ...(hasDefault ? { defaultActionId: row.defaultActionId as string } : {}) })
+}
+
+/** Action replacements have no navigation or auto-execution instructions. */
+export function parseResultActionOutcome(value: unknown): ResultActionOutcome | null {
+  const outcome = plainRecord(value)
+  if (!outcome) return null
+  if (outcome.kind === 'copied') return exactKeys(outcome, ['kind']) ? { kind: 'copied' } : null
+  if (outcome.kind === 'failed') {
+    return exactKeys(outcome, ['code', 'kind', 'sourceConsumed']) &&
+      resultActionErrors.has(outcome.code as ResultActionErrorCode) && typeof outcome.sourceConsumed === 'boolean'
+      ? { kind: 'failed', code: outcome.code as ResultActionErrorCode, sourceConsumed: outcome.sourceConsumed } : null
+  }
+  if (outcome.kind !== 'resultsUpdated' || !exactKeys(outcome, ['kind', 'response'])) return null
+  const response = plainRecord(outcome.response)
+  if (!response || !Object.keys(response).every((key) => ['requestId', 'items', 'mainResultCommand', 'commandHint'].includes(key)) ||
+      !opaqueResultHandle(response.requestId) || !Array.isArray(response.items) ||
+      !exactDenseArray(response.items) || response.items.length > 20 || !plainRecord(response.mainResultCommand) ||
+      (Object.prototype.hasOwnProperty.call(response, 'commandHint') && typeof response.commandHint !== 'string')) return null
+  const command = plainRecord(response.mainResultCommand)
+  if (!command || !exactKeys(command, ['argument', 'commandId', 'commandLabel', 'pluginId']) ||
+      ['argument', 'commandId', 'commandLabel', 'pluginId'].some((key) => typeof command[key] !== 'string')) return null
+  const handles = new Set<string>()
+  for (const value of response.items) {
+    const row = plainRecord(value)
+    const activation = row && plainRecord(row.activation)
+    if (!row || !Object.keys(row).every((key) => [
+      'resultId', 'activation', 'title', 'subtitle', 'pluginIconUrl', 'detail',
+      'hasDefaultAction', 'actions', 'defaultActionId',
+    ].includes(key)) || !opaqueResultHandle(row.resultId) || handles.has(row.resultId) ||
+        typeof row.title !== 'string' || !activation || !exactKeys(activation, ['kind']) ||
+        activation.kind !== 'executeResult' ||
+        parseResultActionMetadata(row) == null) return null
+    if (['subtitle', 'detail', 'pluginIconUrl'].some((key) =>
+      Object.prototype.hasOwnProperty.call(row, key) && typeof row[key] !== 'string')) return null
+    handles.add(row.resultId)
+  }
+  return { kind: 'resultsUpdated', response: response as unknown as SearchResponse }
 }
 
 const installedIssues = new Set([

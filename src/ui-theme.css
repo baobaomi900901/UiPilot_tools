@@ -76,3 +76,83 @@
   --uipilot-color-border: var(--uipilot-ui-border);
   --uipilot-color-accent: var(--uipilot-ui-primary);
 }
+
+.launcher-status-region:has(.launcher-footer-actions) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.launcher-status-region:has(.launcher-footer-actions) > .status-region {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.launcher-footer-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+}
+
+.launcher-footer-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: 6px;
+  background: var(--uipilot-ui-surface-elevated);
+  color: var(--uipilot-ui-foreground);
+  font: inherit;
+  font-size: 12px;
+  line-height: 20px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.launcher-footer-actions button:hover:not(:disabled) {
+  background: var(--uipilot-ui-surface-card);
+  border-color: var(--uipilot-ui-hairline-strong);
+}
+
+.launcher-footer-actions button:focus-visible {
+  outline: 1px solid var(--uipilot-ui-hairline-strong);
+  outline-offset: 2px;
+}
+
+.launcher-footer-actions button:disabled {
+  color: var(--uipilot-ui-muted-foreground);
+  cursor: default;
+}
+
+.launcher-footer-actions kbd {
+  font: inherit;
+  color: var(--uipilot-ui-muted-foreground);
+}
+
+.launcher-status-region .status-region.is-action-success { color: var(--uipilot-ui-icon-green); }
+.launcher-status-region .status-region.is-action-error { color: var(--uipilot-ui-destructive); }
+.launcher-status-region .status-region.is-action-pending { color: var(--uipilot-ui-icon-blue); }
+
+.launcher-result-action-menu.ant-dropdown-menu {
+  border: 1px solid var(--uipilot-ui-border);
+  box-shadow: none;
+}
+
+.launcher-result-action-menu [role='menuitem']:focus-visible {
+  outline: 1px solid var(--uipilot-ui-hairline-strong);
+  outline-offset: -2px;
+}
+
+@media (forced-colors: active) {
+  .launcher-footer-actions button:focus-visible { outline: 2px solid Highlight; }
+  .launcher-footer-actions button:disabled { color: GrayText; }
+  .launcher-result-action-menu [role='menuitem']:focus-visible { outline: 2px solid Highlight; }
+}

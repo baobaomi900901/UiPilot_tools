@@ -323,6 +323,8 @@ const client: LauncherClient = {
   chooseQuicklinkIcon: async () => null,
   openFind: async () => ({ status: 'forwarded' }),
   executeResult: async () => ({ status: 'launchRequested' }),
+  executeResultAction: async () => ({ kind: 'copied' }),
+  retireResultActions: async () => undefined,
   openPluginPanel: async () => ({
     sessionEpoch: revisionOne,
     pluginId: panelPreviewPluginId,
