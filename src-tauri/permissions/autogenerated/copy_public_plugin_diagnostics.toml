@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-copy-public-plugin-diagnostics"
+description = "Enables the copy_public_plugin_diagnostics command without any pre-configured scope."
+commands.allow = ["copy_public_plugin_diagnostics"]
+
+[[permission]]
+identifier = "deny-copy-public-plugin-diagnostics"
+description = "Denies the copy_public_plugin_diagnostics command without any pre-configured scope."
+commands.deny = ["copy_public_plugin_diagnostics"]
