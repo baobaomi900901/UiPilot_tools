@@ -2723,7 +2723,7 @@ fn panel_action_host_submit_cancels_when_completion_takes_sender_before_host_sca
                 enqueued.send(()).unwrap();
                 wait_taken.recv_timeout(Duration::from_secs(5)).unwrap();
                 assert!(!service
-                    .panel_actions
+                    .content_actions
                     .lock()
                     .unwrap()
                     .contains_key(&action.context));
@@ -2993,4 +2993,506 @@ fn panel_action_poisoned_controller_hide_still_retires_registered_authority() {
             .unwrap()
             .accepted
     );
+}
+
+fn window_action_fixture(
+    name: &str,
+) -> (
+    TestRoot,
+    Arc<PublicPluginService>,
+    Arc<PublicPluginManager>,
+    Arc<crate::plugin_window::PluginWindowController>,
+    crate::plugin_window::WindowActionIdentity,
+) {
+    let root = TestRoot::new(name);
+    let source = root.package();
+    let mut value = manifest("window");
+    value["minimumHostVersion"] = json!("0.9.0");
+    value["window"]["runtimeActions"] = json!(true);
+    value["settings"] = json!([{ "key":"synthetic", "label":"Synthetic", "type":"secret" }]);
+    write_package(&source, &value);
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            PublicPluginHost::current(PublicPlatform::Windows),
+            [],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let prepared = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness(
+            "main",
+            &prepared.token,
+            BTreeSet::from([PublicPermission::UiWindow]),
+            now,
+            |_| true,
+        )
+        .unwrap();
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(manager.clone()).is_ok());
+    let route = manager.route("/demo").unwrap().unwrap();
+    let controller = Arc::new(crate::plugin_window::PluginWindowController::default());
+    let owner = crate::plugin_window::PluginWindowOwner {
+        ui_intent_epoch: 1,
+        submission_token: "initial-command".into(),
+        request_id: "initial".into(),
+        control_value: "/demo".into(),
+        plugin_id: route.plugin_id,
+        plugin_generation: route.generation,
+        activation_id: route.activation_id,
+        admission_epoch: route.admission_epoch,
+    };
+    let transaction = controller.submit(owner.clone()).unwrap();
+    assert!(controller.advance(
+        &owner,
+        crate::plugin_window::PluginWindowPhase::AwaitingReady,
+        crate::plugin_window::PluginWindowPhase::Visible
+    ));
+    assert!(controller.activate_timer_session(&owner));
+    let identity = crate::plugin_window::WindowActionIdentity {
+        owner,
+        content_label: transaction.content_label,
+        session_generation: transaction.timer_session_generation,
+        document_generation: transaction.document_generation,
+    };
+    (root, service, manager, controller, identity)
+}
+fn admit_window_action_for_test(
+    controller: &Arc<crate::plugin_window::PluginWindowController>,
+    service: &Arc<PublicPluginService>,
+    identity: &crate::plugin_window::WindowActionIdentity,
+) -> (
+    super::ScheduledPluginRequest,
+    std::sync::mpsc::Receiver<Result<Value, super::window_action::WindowActionError>>,
+) {
+    controller
+        .admit_window_action(
+            service,
+            &identity.content_label,
+            identity.session_generation,
+            identity.document_generation,
+            panel_action_input(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn window_action_admission_requires_content_exact_document_active_session_and_idle_runtime() {
+    use super::window_action::WindowActionError as E;
+    let (_root, service, manager, controller, i) = window_action_fixture("window-action-admit");
+    for (label, session, document) in [
+        ("main", i.session_generation, i.document_generation),
+        (
+            "plugin-shell-com.example.demo",
+            i.session_generation,
+            i.document_generation,
+        ),
+        (
+            "plugin-panel-content-demo",
+            i.session_generation,
+            i.document_generation,
+        ),
+        (
+            i.content_label.as_str(),
+            i.session_generation + 1,
+            i.document_generation,
+        ),
+        (
+            i.content_label.as_str(),
+            i.session_generation,
+            i.document_generation + 1,
+        ),
+    ] {
+        assert_eq!(
+            controller
+                .admit_window_action(&service, label, session, document, panel_action_input())
+                .err(),
+            Some(E::ExpiredWindowSessionError)
+        );
+    }
+    let mut wrong = i.clone();
+    wrong.owner.activation_id += 1;
+    assert_eq!(
+        manager
+            .admit_window_action(&wrong, panel_action_input(), Instant::now())
+            .err(),
+        Some(E::ExpiredWindowSessionError)
+    );
+    let command = service
+        .schedule_command(
+            manager.route("/demo running").unwrap().unwrap(),
+            2,
+            "/demo running".into(),
+            Instant::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        controller
+            .admit_window_action(
+                &service,
+                &i.content_label,
+                i.session_generation,
+                i.document_generation,
+                panel_action_input()
+            )
+            .err(),
+        Some(E::WindowRequestBusyError)
+    );
+    manager
+        .scheduler()
+        .complete(&command.dispatch.unwrap().context, Instant::now())
+        .unwrap();
+    let mut next = i.owner.clone();
+    next.request_id = "next".into();
+    let tx = controller.submit(next.clone()).unwrap();
+    assert_eq!(
+        tx.document_generation, i.document_generation,
+        "submit reuses the same document"
+    );
+    assert!(tx.timer_session_generation > i.session_generation);
+    assert_eq!(
+        controller
+            .admit_window_action(
+                &service,
+                &i.content_label,
+                tx.timer_session_generation,
+                tx.document_generation,
+                panel_action_input()
+            )
+            .err(),
+        Some(E::WindowRequestBusyError)
+    );
+}
+
+#[test]
+fn window_action_hide_retires_before_waiting_short_lease_and_keeps_physical_slot() {
+    use super::window_action::WindowActionError as E;
+    use super::{runtime::PluginApiOperation, PluginApiRequest, PluginContextStatus};
+    let (_root, service, manager, controller, i) = window_action_fixture("window-action-hide");
+    let (action, receiver) = admit_window_action_for_test(&controller, &service, &i);
+    let lease = controller
+        .begin_window_call(&i.content_label, i.session_generation, false)
+        .unwrap();
+    let closing = controller.clone();
+    let id = i.owner.plugin_id.clone();
+    let (closed, done) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        closed.send(closing.begin_timer_session_close(&id)).unwrap();
+    });
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(Err(E::ExpiredWindowSessionError))
+    );
+    assert!(
+        matches!(done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "only the short lease blocks hide"
+    );
+    assert_eq!(
+        manager.scheduler().context_status(&action.context),
+        PluginContextStatus::Expired
+    );
+    let label =
+        super::runtime_label(&action.context.plugin_id, action.context.plugin_generation).unwrap();
+    assert_eq!(
+        manager
+            .execute_api(
+                &label,
+                PluginApiRequest {
+                    context: action.context.clone(),
+                    operation: PluginApiOperation::StorageSet,
+                    key: Some("late".into()),
+                    value: Some(json!(true)),
+                    notification: None
+                }
+            )
+            .result,
+        Err(PluginRuntimeError::ExpiredRequest)
+    );
+    drop(lease);
+    assert!(done.recv_timeout(Duration::from_secs(1)).unwrap());
+    thread.join().unwrap();
+    assert!(
+        controller.finish_timer_session_hide(&i.owner.plugin_id, false),
+        "hide failure still revokes"
+    );
+    assert_eq!(
+        controller
+            .admit_window_action(
+                &service,
+                &i.content_label,
+                i.session_generation,
+                i.document_generation,
+                panel_action_input()
+            )
+            .err(),
+        Some(E::ExpiredWindowSessionError)
+    );
+    let next = service
+        .schedule_command(
+            manager.route("/demo next").unwrap().unwrap(),
+            3,
+            "/demo next".into(),
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(next.dispatch.is_none());
+    assert!(manager
+        .expire_network_timeouts(action.deadline - Duration::from_millis(1))
+        .unwrap()
+        .is_empty());
+    let outcome = manager
+        .scheduler()
+        .complete(&action.context, Instant::now())
+        .unwrap();
+    assert!(!outcome.accepted);
+    assert_eq!(
+        outcome.next.unwrap().candidate.owner.token(),
+        Some(next.token.as_str())
+    );
+    assert!(manager
+        .scheduler()
+        .complete(&action.context, Instant::now())
+        .is_err());
+}
+
+#[test]
+fn window_action_completion_ticket_observes_credential_and_host_command_retirement() {
+    use super::content_action::ContentActionError as E;
+    use super::window_action::WindowActionError as W;
+    for mode in ["credential", "command", "disable"] {
+        let (_root, service, manager, controller, i) =
+            window_action_fixture(&format!("window-action-ticket-{mode}"));
+        let (action, receiver) = admit_window_action_for_test(&controller, &service, &i);
+        assert!(
+            manager
+                .scheduler()
+                .complete(&action.context, Instant::now())
+                .unwrap()
+                .accepted
+        );
+        if mode == "credential" {
+            let mut effects = super::activation::ManagementEffects::default();
+            manager
+                .save_secret_with_effects(&i.owner.plugin_id, "synthetic", None, &mut effects)
+                .unwrap();
+            assert!(effects.retired.iter().any(|(c, _)| c == &action.context));
+        } else if mode == "command" {
+            service
+                .schedule_command(
+                    manager.route("/demo newer").unwrap().unwrap(),
+                    3,
+                    "/demo newer".into(),
+                    Instant::now(),
+                )
+                .unwrap();
+        } else {
+            manager
+                .set_enabled_with_readiness(&i.owner.plugin_id, false, |_| true)
+                .unwrap();
+        }
+        service.settle_window_action(&action.context, Ok(json!("must not publish")), true);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(if mode == "command" {
+                W::WindowRequestCancelledError
+            } else {
+                W::ExpiredWindowSessionError
+            }))
+        );
+        assert!(!service.settle_window_action(&action.context, Ok(json!("duplicate")), true));
+        assert_eq!(
+            manager.claim_window_completion(&i, &action.context),
+            Err(E::Expired)
+        );
+    }
+}
+
+#[test]
+fn window_action_document_hooks_revoke_latest_reused_session_and_ignore_old_document() {
+    use super::window_action::WindowActionError as E;
+    let (_root, service, manager, controller, i) = window_action_fixture("window-action-doc");
+    let (old, receiver) = admit_window_action_for_test(&controller, &service, &i);
+    let mut owner = i.owner.clone();
+    owner.request_id = "reused".into();
+    let tx = controller.submit(owner.clone()).unwrap();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(E::ExpiredWindowSessionError))
+    );
+    manager
+        .scheduler()
+        .complete(&old.context, Instant::now())
+        .unwrap();
+    assert!(controller.advance(
+        &owner,
+        crate::plugin_window::PluginWindowPhase::AwaitingAck,
+        crate::plugin_window::PluginWindowPhase::Visible
+    ));
+    assert!(controller.activate_timer_session(&owner));
+    let reused = crate::plugin_window::WindowActionIdentity {
+        owner: owner.clone(),
+        content_label: tx.content_label.clone(),
+        session_generation: tx.timer_session_generation,
+        document_generation: tx.document_generation,
+    };
+    let (_, receiver) = admit_window_action_for_test(&controller, &service, &reused);
+    assert!(controller.revoke_document(&owner.plugin_id, i.document_generation));
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(E::ExpiredWindowSessionError))
+    );
+    let replacement = controller.submit(owner.clone()).unwrap();
+    assert_ne!(replacement.document_generation, i.document_generation);
+    assert!(!controller.revoke_document(&owner.plugin_id, i.document_generation));
+    let mut next_owner = owner.clone();
+    next_owner.plugin_generation += 1;
+    next_owner.activation_id += 1;
+    controller.submit(next_owner.clone()).unwrap();
+    assert!(!controller.invalidate_generation(&owner.plugin_id, owner.plugin_generation));
+    assert_eq!(
+        controller.owner_for_content(&tx.content_label),
+        Some(next_owner)
+    );
+}
+
+#[test]
+fn window_action_uncertain_delivery_keeps_deadline_and_fixed_terminal_errors() {
+    use super::content_action::ContentActionError as E;
+    use super::window_action::WindowActionError as W;
+    for (error, expected) in [
+        (E::Unavailable, W::WindowRequestUnavailableError),
+        (E::Timeout, W::WindowRequestTimeoutError),
+    ] {
+        let (_root, service, manager, controller, i) =
+            window_action_fixture("window-action-terminal");
+        let (action, receiver) = admit_window_action_for_test(&controller, &service, &i);
+        manager.retire_panel_action(&action.context);
+        assert!(service.settle_window_action(&action.context, Err(error), true));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(expected))
+        );
+        assert!(manager
+            .expire_network_timeouts(action.deadline - Duration::from_millis(1))
+            .unwrap()
+            .is_empty());
+        let expired = manager.expire_network_timeouts(action.deadline).unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].expired, action.context);
+    }
+}
+
+#[test]
+fn window_action_completion_taken_before_lifecycle_scan_still_expires() {
+    use super::content_action::ContentActionError as E;
+    let (_root, service, manager, controller, i) =
+        window_action_fixture("window-action-taken-ticket");
+    let (action, receiver) = admit_window_action_for_test(&controller, &service, &i);
+    manager
+        .scheduler()
+        .complete(&action.context, Instant::now())
+        .unwrap();
+    let (taken, wait_taken) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    let completion_service = service.clone();
+    let context = action.context.clone();
+    let completing = std::thread::spawn(move || {
+        assert!(completion_service.settle_content_action_with(
+            &context,
+            Ok(json!("private")),
+            true,
+            || {
+                taken.send(()).unwrap();
+                wait_release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+        ));
+    });
+    wait_taken.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut effects = super::activation::ManagementEffects::default();
+    manager
+        .save_secret_with_effects(&i.owner.plugin_id, "synthetic", None, &mut effects)
+        .unwrap();
+    service.settle_management_effects(&effects);
+    release.send(()).unwrap();
+    completing.join().unwrap();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            super::window_action::WindowActionError::ExpiredWindowSessionError
+        ))
+    );
+    assert_eq!(
+        manager.claim_window_completion(&i, &action.context),
+        Err(E::Expired)
+    );
+}
+
+#[test]
+fn window_action_every_controller_retirement_path_settles_once() {
+    for path in [
+        "remove",
+        "uninstall",
+        "generation",
+        "session",
+        "document",
+        "submit",
+        "shutdown",
+    ] {
+        let (_root, service, manager, controller, i) =
+            window_action_fixture(&format!("window-action-removal-{path}"));
+        let (action, receiver) = admit_window_action_for_test(&controller, &service, &i);
+        match path {
+            "remove" => {
+                assert!(controller.remove_plugin(&i.owner.plugin_id));
+            }
+            "uninstall" => {
+                assert!(controller.close_for_uninstall(&i.owner.plugin_id));
+            }
+            "generation" => {
+                assert!(
+                    controller.invalidate_generation(&i.owner.plugin_id, i.owner.plugin_generation)
+                );
+            }
+            "session" => {
+                assert!(controller.revoke_timer_session(&i.owner.plugin_id, i.session_generation));
+            }
+            "document" => {
+                assert!(controller.revoke_document(&i.owner.plugin_id, i.document_generation));
+            }
+            "submit" => {
+                controller.submit(i.owner.clone()).unwrap();
+            }
+            _ => service.shutdown(),
+        }
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(
+                super::window_action::WindowActionError::ExpiredWindowSessionError
+            )),
+            "{path}"
+        );
+        assert_eq!(
+            manager.scheduler().context_status(&action.context),
+            super::PluginContextStatus::Expired
+        );
+        assert!(
+            !manager
+                .scheduler()
+                .complete(&action.context, Instant::now())
+                .unwrap()
+                .accepted
+        );
+        assert!(!service.settle_window_action(&action.context, Ok(json!("late")), true));
+        assert!(receiver.try_recv().is_err());
+    }
 }

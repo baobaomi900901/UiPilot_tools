@@ -268,6 +268,7 @@ pub(crate) struct PublicRuntimeCandidate {
     pub(crate) runtime_entry: String,
     pub(crate) network_https_declared: bool,
     pub(crate) panel_actions: bool,
+    pub(crate) window_actions: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,6 +473,11 @@ impl RuntimeSnapshot {
             runtime_recovery_needed,
             label: self.label.clone(),
             runtime_entry: self.manifest.runtime.entry.clone(),
+            window_actions: self
+                .manifest
+                .window
+                .as_ref()
+                .is_some_and(|w| w.runtime_actions),
             panel_actions: self
                 .manifest
                 .panel
@@ -4079,6 +4085,117 @@ impl PublicPluginManager {
         Ok(outcome)
     }
 
+    pub(crate) fn window_actions_enabled(
+        &self,
+        identity: &crate::plugin_window::WindowActionIdentity,
+    ) -> bool {
+        self.bundles
+            .confirmed_bundle(&identity.owner.plugin_id)
+            .ok()
+            .flatten()
+            .is_some_and(|b| {
+                b.config.installed
+                    && b.config.enabled
+                    && b.config.fault.is_none()
+                    && b.config.active_generation == identity.owner.plugin_generation
+                    && !b.runtime_recovery_needed
+                    && b.config
+                        .permission_grants
+                        .contains(&PublicPermission::UiWindow)
+                    && b.runtime
+                        .manifest
+                        .permissions
+                        .contains(&PublicPermission::UiWindow)
+                    && b.runtime.generation == identity.owner.plugin_generation
+                    && b.activation_id == identity.owner.activation_id
+                    && b.admission_epoch == identity.owner.admission_epoch
+                    && b.runtime
+                        .manifest
+                        .window
+                        .as_ref()
+                        .is_some_and(|p| p.runtime_actions)
+            })
+    }
+
+    pub(crate) fn admit_window_action(
+        &self,
+        identity: &crate::plugin_window::WindowActionIdentity,
+        request: super::window_action::WindowActionRequest,
+        now: Instant,
+    ) -> Result<ScheduledPluginRequest, super::window_action::WindowActionError> {
+        use super::window_action::WindowActionError as E;
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| E::WindowRequestUnavailableError)?;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(&identity.owner.plugin_id)
+            .map_err(|_| E::WindowRequestUnavailableError)?
+            .ok_or(E::ExpiredWindowSessionError)?;
+        let config = &bundle.config;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || config.active_generation != identity.owner.plugin_generation
+            || bundle.runtime.generation != identity.owner.plugin_generation
+            || bundle.activation_id != identity.owner.activation_id
+            || bundle.admission_epoch != identity.owner.admission_epoch
+            || !config
+                .permission_grants
+                .contains(&PublicPermission::UiWindow)
+            || !bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::UiWindow)
+            || !bundle
+                .runtime
+                .manifest
+                .window
+                .as_ref()
+                .is_some_and(|p| p.runtime_actions)
+        {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        if bundle.runtime_recovery_needed {
+            return Err(E::WindowRequestBusyError);
+        }
+        let command = bundle
+            .runtime
+            .manifest
+            .legacy_command()
+            .ok_or(E::ExpiredWindowSessionError)?;
+        if command.output_mode != PublicOutputMode::Window
+            || command.activation_mode != PublicActivationMode::Submit
+        {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        request
+            .validate()
+            .map_err(super::window_action::WindowActionError::from)?;
+        let reserved = self
+            .scheduler
+            .reserve(super::PluginRequestCandidate {
+                command_id: "default".into(),
+                plugin_id: identity.owner.plugin_id.clone(),
+                plugin_generation: identity.owner.plugin_generation,
+                activation_id: identity.owner.activation_id,
+                admission_epoch: identity.owner.admission_epoch,
+                activation_mode: PublicActivationMode::Submit,
+                input: String::new(),
+                owner: super::PluginRequestOwner::WindowAction {
+                    identity: identity.clone(),
+                    request,
+                },
+            })
+            .map_err(|_| E::WindowRequestUnavailableError)?;
+        match self.enqueue_reserved(reserved, now) {
+            Ok(PluginScheduleOutcome::Dispatched(request)) => Ok(request),
+            Err(PluginScheduleError::Busy) => Err(E::WindowRequestBusyError),
+            _ => Err(E::WindowRequestUnavailableError),
+        }
+    }
+
     pub(crate) fn panel_actions_enabled(
         &self,
         identity: &crate::plugin_panel::PanelSessionIdentity,
@@ -4211,6 +4328,23 @@ impl PublicPluginManager {
             .begin_transition()
             .map_err(|_| E::PanelRequestUnavailableError)?;
         self.scheduler.claim_panel_completion(context)
+    }
+
+    pub(crate) fn claim_window_completion(
+        &self,
+        identity: &crate::plugin_window::WindowActionIdentity,
+        context: &PluginRequestContext,
+    ) -> Result<(), super::content_action::ContentActionError> {
+        use super::content_action::ContentActionError as E;
+        let _mutation = self.lock_mutation().map_err(|_| E::Unavailable)?;
+        if !self.window_actions_enabled(identity) {
+            return Err(E::Expired);
+        }
+        let _transition = self
+            .network_authority
+            .begin_transition()
+            .map_err(|_| E::Unavailable)?;
+        self.scheduler.claim_action_completion(context)
     }
 
     pub(crate) fn retire_panel_action(&self, context: &PluginRequestContext) {

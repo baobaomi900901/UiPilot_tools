@@ -27,7 +27,7 @@ function runtimeBootstrapSource(
   )?.[1]
   if (!template) throw new Error('runtime bootstrap template is missing')
   return template
-    .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
+    .replace('__WINDOW_ACTIONS__', 'false').replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
     .replace('__PANEL_ACTIONS__', 'false')
     .replace('__RUNTIME_ACTIONS__', 'false')
     .replace('__NETWORK_HTTPS__', networkEnabled ? 'true' : 'false')

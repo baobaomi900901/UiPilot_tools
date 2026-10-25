@@ -78,11 +78,19 @@ const panelJson = (() => {
       default: return 'PanelRequestUnavailableError';
     }
   };
+  const windowErrorName = value => {
+    switch (value) {
+      case 'InvalidWindowRequestError': case 'WindowRequestBusyError': case 'ExpiredWindowSessionError':
+      case 'WindowRequestCancelledError': case 'WindowRequestTimeoutError': case 'InvalidWindowResponseError':
+      case 'WindowRequestFailedError': case 'WindowRequestUnavailableError': return value;
+      default: return 'WindowRequestUnavailableError';
+    }
+  };
   const reply = data => {
     const envelope = create(null);
     envelope.requestId = 'reply';
     envelope.data = data;
     return snapshot(envelope, ['requestId', 'data'], false).data;
   };
-  return freeze({ snapshot, reply, validAction, error, errorName });
+  return freeze({ snapshot, reply, validAction, error, errorName, windowErrorName });
 })();

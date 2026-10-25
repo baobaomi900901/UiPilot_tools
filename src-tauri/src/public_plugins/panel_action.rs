@@ -21,24 +21,6 @@ pub(crate) struct PanelActionRequest {
     pub(crate) payload: Value,
 }
 
-fn bounded(value: &Value, depth: usize, count: &mut usize) -> bool {
-    *count += 1;
-    if depth > 32 || *count > 4096 {
-        return false;
-    }
-    match value {
-        Value::Array(values) => values.iter().all(|v| bounded(v, depth + 1, count)),
-        Value::Object(values) => values.iter().all(|(k, v)| {
-            !matches!(k.as_str(), "__proto__" | "prototype" | "constructor")
-                && bounded(v, depth + 1, count)
-        }),
-        _ => true,
-    }
-}
-fn valid_json(value: &Value) -> bool {
-    bounded(value, 0, &mut 0)
-        && serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
-}
 pub(crate) fn parse_epoch(value: &str) -> Result<u64, PanelActionError> {
     value
         .parse::<u64>()
@@ -72,7 +54,9 @@ impl PanelActionRequest {
                 self.action.as_str(),
                 "__proto__" | "prototype" | "constructor"
             )
-            || !valid_json(&serde_json::json!({"action": self.action, "payload": self.payload}))
+            || !super::content_action::valid_json(
+                &serde_json::json!({"action": self.action, "payload": self.payload}),
+            )
         {
             return Err(PanelActionError::InvalidPanelRequestError);
         }
@@ -80,7 +64,7 @@ impl PanelActionRequest {
     }
 }
 pub(crate) fn response_data(request_id: &str, value: Value) -> Result<Value, PanelActionError> {
-    if !valid_json(&value) {
+    if !super::content_action::valid_json(&value) {
         return Err(PanelActionError::InvalidPanelResponseError);
     }
     let object = value

@@ -1,11 +1,13 @@
 mod activation;
 mod activation_bundle;
 mod alarm_asset;
+pub(crate) mod content_action;
 mod data_call_gate;
 mod delayed_messages;
 pub(crate) mod diagnostics;
 mod icon;
 mod manifest;
+pub(crate) mod window_action;
 // Task 4 wires the verified transport behind PluginHttpsBroker.
 #[allow(dead_code)]
 mod network;
@@ -105,19 +107,46 @@ pub(crate) fn with_settings_service_for_test(
 
 pub(crate) type PublicSubmissionResult = Result<PublicPluginResponse, PluginRuntimeError>;
 
-struct PendingPanelAction {
-    identity: crate::plugin_panel::PanelSessionIdentity,
-    controller: std::sync::Weak<crate::plugin_panel::PluginPanelController>,
-    active: Arc<AtomicBool>,
-    sender: mpsc::Sender<Result<serde_json::Value, panel_action::PanelActionError>>,
+enum ContentActionIdentity {
+    Panel(
+        crate::plugin_panel::PanelSessionIdentity,
+        std::sync::Weak<crate::plugin_panel::PluginPanelController>,
+    ),
+    Window(
+        crate::plugin_window::WindowActionIdentity,
+        std::sync::Weak<crate::plugin_window::PluginWindowController>,
+    ),
 }
+impl ContentActionIdentity {
+    fn runtime_owner(&self) -> (String, u64, u64) {
+        match self {
+            Self::Panel(i, _) => (i.plugin_id.clone(), i.generation, i.activation_id),
+            Self::Window(i, _) => (
+                i.owner.plugin_id.clone(),
+                i.owner.plugin_generation,
+                i.owner.activation_id,
+            ),
+        }
+    }
+}
+enum ContentActionSender {
+    Panel(mpsc::Sender<Result<serde_json::Value, panel_action::PanelActionError>>),
+    Window(mpsc::Sender<Result<serde_json::Value, window_action::WindowActionError>>),
+}
+struct PendingContentAction {
+    identity: ContentActionIdentity,
+    active: Arc<AtomicBool>,
+    sender: ContentActionSender,
+}
+pub(crate) type WindowActionRegistration = ContentActionRegistration;
+pub(crate) type PanelActionRegistration = ContentActionRegistration;
 
-pub(crate) struct PanelActionRegistration {
+pub(crate) struct ContentActionRegistration {
     context: PluginRequestContext,
     service: std::sync::Weak<PublicPluginService>,
     active: Arc<AtomicBool>,
 }
-impl PanelActionRegistration {
+impl ContentActionRegistration {
     pub(crate) fn active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
@@ -128,7 +157,7 @@ impl PanelActionRegistration {
         self.active.store(false, Ordering::Release);
     }
 }
-impl Drop for PanelActionRegistration {
+impl Drop for ContentActionRegistration {
     fn drop(&mut self) {
         if self.active.swap(false, Ordering::AcqRel) {
             if let Some(service) = self.service.upgrade() {
@@ -181,7 +210,7 @@ pub(crate) struct ManagementOutcome<T = PublicPluginMutation> {
 pub(crate) struct PublicPluginService {
     manager: OnceLock<Arc<PublicPluginManager>>,
     submissions: Mutex<PublicSubmissionState>,
-    panel_actions: Mutex<HashMap<PluginRequestContext, PendingPanelAction>>,
+    content_actions: Mutex<HashMap<PluginRequestContext, PendingContentAction>>,
     recoveries: Mutex<RuntimeRecoveryState>,
     recovery_changed: Condvar,
     next_submission: AtomicU64,
@@ -364,7 +393,7 @@ impl PublicPluginService {
 
     pub(crate) fn shutdown(&self) {
         let contexts = self
-            .panel_actions
+            .content_actions
             .lock()
             .ok()
             .map(|map| map.keys().cloned().collect::<Vec<_>>())
@@ -528,7 +557,7 @@ impl PublicPluginService {
         after_enqueue();
 
         let contexts = self
-            .panel_actions
+            .content_actions
             .lock()
             .ok()
             .map(|map| {
@@ -769,7 +798,7 @@ impl PublicPluginService {
     > {
         use panel_action::PanelActionError as E;
         let mut pending = self
-            .panel_actions
+            .content_actions
             .lock()
             .map_err(|_| E::PanelRequestUnavailableError)?;
         let request = self
@@ -780,11 +809,56 @@ impl PublicPluginService {
         let active = Arc::new(AtomicBool::new(true));
         pending.insert(
             request.context.clone(),
-            PendingPanelAction {
-                identity: identity.clone(),
-                controller: Arc::downgrade(controller),
+            PendingContentAction {
+                identity: ContentActionIdentity::Panel(
+                    identity.clone(),
+                    Arc::downgrade(controller),
+                ),
                 active: active.clone(),
-                sender,
+                sender: ContentActionSender::Panel(sender),
+            },
+        );
+        let registration = PanelActionRegistration {
+            context: request.context.clone(),
+            service: Arc::downgrade(self),
+            active,
+        };
+        Ok((request, registration, receiver))
+    }
+
+    pub(crate) fn prepare_window_action(
+        self: &Arc<Self>,
+        controller: &Arc<crate::plugin_window::PluginWindowController>,
+        identity: &crate::plugin_window::WindowActionIdentity,
+        request: window_action::WindowActionRequest,
+    ) -> Result<
+        (
+            ScheduledPluginRequest,
+            WindowActionRegistration,
+            mpsc::Receiver<Result<serde_json::Value, window_action::WindowActionError>>,
+        ),
+        window_action::WindowActionError,
+    > {
+        use window_action::WindowActionError as E;
+        let mut pending = self
+            .content_actions
+            .lock()
+            .map_err(|_| E::WindowRequestUnavailableError)?;
+        let request = self
+            .manager()
+            .map_err(|_| E::WindowRequestUnavailableError)?
+            .admit_window_action(identity, request, Instant::now())?;
+        let (sender, receiver) = mpsc::channel();
+        let active = Arc::new(AtomicBool::new(true));
+        pending.insert(
+            request.context.clone(),
+            PendingContentAction {
+                identity: ContentActionIdentity::Window(
+                    identity.clone(),
+                    Arc::downgrade(controller),
+                ),
+                active: active.clone(),
+                sender: ContentActionSender::Window(sender),
             },
         );
         let registration = PanelActionRegistration {
@@ -822,14 +896,31 @@ impl PublicPluginService {
         recheck: bool,
         after_take: impl FnOnce(),
     ) -> bool {
+        self.settle_content_action_with(context, result.map_err(Into::into), recheck, after_take)
+    }
+    pub(crate) fn settle_window_action(
+        &self,
+        context: &PluginRequestContext,
+        result: Result<serde_json::Value, content_action::ContentActionError>,
+        recheck: bool,
+    ) -> bool {
+        self.settle_content_action_with(context, result, recheck, || {})
+    }
+    fn settle_content_action_with(
+        &self,
+        context: &PluginRequestContext,
+        result: Result<serde_json::Value, content_action::ContentActionError>,
+        recheck: bool,
+        after_take: impl FnOnce(),
+    ) -> bool {
+        use content_action::ContentActionError as E;
+        // Never carry this lock into a controller (admission takes controller first).
         let pending = self
-            .panel_actions
+            .content_actions
             .lock()
             .ok()
             .and_then(|mut map| map.remove(context));
         let Some(pending) = pending else {
-            // Only the completion path may clean up a ticket after another path settled it.
-            // Host/lifecycle scans must leave an in-flight completion's ticket for its claim.
             if recheck {
                 if let Ok(manager) = self.manager() {
                     manager.discard_panel_completion(context);
@@ -838,37 +929,53 @@ impl PublicPluginService {
             return false;
         };
         after_take();
-        let terminal_without_completion = matches!(
-            result,
-            Err(panel_action::PanelActionError::PanelRequestTimeoutError
-                | panel_action::PanelActionError::PanelRequestUnavailableError)
-        );
-        let result = if recheck {
-            let ownership = pending
-                .controller
-                .upgrade()
-                .ok_or(panel_action::PanelActionError::ExpiredPanelSession)
-                .and_then(|controller| {
-                    controller.finish_panel_action(&pending.identity, context, || {
-                        if terminal_without_completion {
-                            return Ok(());
-                        }
-                        self.manager()
-                            .map_err(|_| {
-                                panel_action::PanelActionError::PanelRequestUnavailableError
-                            })?
-                            .claim_panel_completion(&pending.identity, context)
-                    })
-                });
-            ownership.and(result)
+        let terminal = matches!(result, Err(E::Timeout | E::Unavailable));
+        let ownership = if !recheck {
+            Ok(())
         } else {
-            result
+            match &pending.identity {
+                ContentActionIdentity::Panel(identity, controller) => {
+                    controller.upgrade().ok_or(E::Expired).and_then(|c| {
+                        c.finish_panel_action(identity, context, || {
+                            if terminal {
+                                return Ok(());
+                            }
+                            self.manager()
+                                .map_err(|_| {
+                                    panel_action::PanelActionError::PanelRequestUnavailableError
+                                })?
+                                .claim_panel_completion(identity, context)
+                        })
+                        .map_err(Into::into)
+                    })
+                }
+                ContentActionIdentity::Window(identity, controller) => {
+                    controller.upgrade().ok_or(E::Expired).and_then(|c| {
+                        c.finish_window_action(identity, context, || {
+                            if terminal {
+                                return Ok(());
+                            }
+                            self.manager()
+                                .map_err(|_| E::Unavailable)?
+                                .claim_window_completion(identity, context)
+                        })
+                    })
+                }
+            }
         };
+        let result = ownership.and(result);
         pending.active.store(false, Ordering::Release);
         if let Ok(manager) = self.manager() {
             manager.discard_panel_completion(context);
         }
-        let _ = pending.sender.send(result);
+        match pending.sender {
+            ContentActionSender::Panel(sender) => {
+                let _ = sender.send(result.map_err(Into::into));
+            }
+            ContentActionSender::Window(sender) => {
+                let _ = sender.send(result.map_err(Into::into));
+            }
+        }
         true
     }
 
@@ -902,6 +1009,13 @@ impl PublicPluginService {
                     context: environment,
                 })
                 .map_err(|_| PublicPluginManagementError::Unavailable)?,
+            ),
+            PluginRequestOwner::WindowAction {
+                request: action, ..
+            } => (
+                "windowAction",
+                serde_json::json!({"apiVersion": 1, "requestId": request.context.request_id, "action": action.action,
+                    "payload": action.payload, "context": environment}),
             ),
             PluginRequestOwner::PanelAction {
                 request: action, ..
@@ -954,40 +1068,48 @@ impl PublicPluginService {
                 .ok_or(E::InvalidPanelResponseError)
                 .and_then(|v| panel_action::response_data(&completion.context.request_id, v))
         };
-        let panel_owner = self
-            .panel_actions
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&completion.context).map(|p| p.identity.clone()));
+        let panel_owner = self.content_actions.lock().ok().and_then(|map| {
+            map.get(&completion.context)
+                .map(|p| p.identity.runtime_owner())
+        });
         let panel_success = panel_result.is_ok();
         if self.settle_panel_action(&completion.context, panel_result, true) {
-            if let Some(owner) = panel_owner.filter(|_| outcome.accepted) {
+            if let Some((plugin_id, generation, activation_id)) =
+                panel_owner.filter(|_| outcome.accepted)
+            {
                 let disabled = self
                     .manager()
                     .map_err(|_| PluginRuntimeError::Unavailable)?
                     .record_runtime_result(
-                        &owner.plugin_id,
-                        owner.generation,
-                        owner.activation_id,
+                        &plugin_id,
+                        generation,
+                        activation_id,
                         panel_success,
                         now,
                     )
                     .map_err(|_| PluginRuntimeError::Unavailable)?;
                 if disabled {
-                    self.settle_panel_generation(&owner.plugin_id, owner.generation);
-                    self.settle_plugin_submissions(&owner.plugin_id);
-                    Self::destroy_runtime(
-                        app,
-                        runtime_label(&owner.plugin_id, owner.generation).as_deref(),
-                    );
+                    self.settle_panel_generation(&plugin_id, generation);
+                    self.settle_plugin_submissions(&plugin_id);
+                    Self::destroy_runtime(app, runtime_label(&plugin_id, generation).as_deref());
                     if let Some(controller) =
                         app.try_state::<Arc<crate::plugin_panel::PluginPanelController>>()
                     {
                         if let Some(identity) =
-                            controller.teardown_generation(&owner.plugin_id, owner.generation)
+                            controller.teardown_generation(&plugin_id, generation)
                         {
                             crate::plugin_panel::destroy_content(app, &identity.content_label);
                         }
+                    }
+                    if let Some(controller) =
+                        app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
+                    {
+                        crate::plugin_window::teardown(
+                            app,
+                            controller.inner(),
+                            &plugin_id,
+                            generation,
+                        );
                     }
                     return Ok(None);
                 }
@@ -1022,10 +1144,11 @@ impl PublicPluginService {
             if let Some(controller) =
                 app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
             {
-                crate::plugin_window::teardown_current(
+                crate::plugin_window::teardown(
                     app,
                     controller.inner().as_ref(),
                     &completion.context.plugin_id,
+                    completion.context.plugin_generation,
                 );
             }
         })
@@ -1181,10 +1304,11 @@ impl PublicPluginService {
             if let Some(controller) =
                 app.try_state::<Arc<crate::plugin_window::PluginWindowController>>()
             {
-                crate::plugin_window::teardown_current(
+                crate::plugin_window::teardown(
                     app,
                     controller.inner().as_ref(),
                     &replacement.plugin_id,
+                    replacement.previous_generation,
                 );
             }
             if replacement.counts_as_fault
@@ -1282,7 +1406,7 @@ impl PublicPluginService {
 
     fn settle_panel_generation(&self, plugin_id: &str, generation: u64) {
         let contexts = self
-            .panel_actions
+            .content_actions
             .lock()
             .ok()
             .map(|map| {
@@ -1574,9 +1698,10 @@ impl PublicPluginService {
                 generation: candidate.generation,
                 activation_id: candidate.activation_id,
             },
-            runtime::public_runtime_bootstrap_with_panel(
+            runtime::public_runtime_bootstrap_with_actions(
                 candidate.network_https_declared,
                 candidate.panel_actions,
+                candidate.window_actions,
             ),
             target_url,
             on_unmuted,
@@ -1703,7 +1828,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 7, 0],
+            version: [0, 9, 0],
             api_version: 1,
         }
     }

@@ -2262,6 +2262,61 @@ pub(crate) fn plugin_panel_focus_host_input_ack(
 }
 
 #[tauri::command]
+pub(crate) async fn plugin_window_request(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    settings: State<'_, SettingsStore>,
+    session_generation: String,
+    document_generation: String,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, crate::public_plugins::window_action::WindowActionError> {
+    use crate::public_plugins::window_action::{
+        parse_request, parse_session, WindowActionError as E,
+    };
+    if plugin_window::plugin_id_from_content_label(webview.label()).is_none() {
+        return Err(E::ExpiredWindowSessionError);
+    }
+    let session = parse_session(&session_generation)?;
+    let document = parse_session(&document_generation)?;
+    let request = parse_request(request)?;
+    let (dispatch, receiver) = controller.inner().admit_window_action(
+        service.inner(),
+        webview.label(),
+        session,
+        document,
+        request,
+    )?;
+    if service
+        .dispatch(
+            &app,
+            &dispatch,
+            invocation_theme(&app, settings.snapshot().theme),
+            invoked_at_rfc3339(),
+        )
+        .is_err()
+    {
+        // The emit may have delivered; watchdog owns the physical slot until completion/deadline.
+        if let Ok(manager) = service.manager() {
+            manager.retire_panel_action(&dispatch.context);
+        }
+        service.settle_window_action(
+            &dispatch.context,
+            Err(crate::public_plugins::content_action::ContentActionError::Unavailable),
+            true,
+        );
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        receiver
+            .recv()
+            .unwrap_or(Err(E::WindowRequestUnavailableError))
+    })
+    .await
+    .map_err(|_| E::WindowRequestUnavailableError)?
+}
+
+#[tauri::command]
 pub(crate) async fn plugin_panel_request(
     webview: tauri::Webview,
     app: AppHandle,

@@ -19,13 +19,13 @@ const panel = (actions = true, result: () => Promise<unknown> = async () => ({ o
   vm.runInNewContext(source, { ...env, window, document: { addEventListener() {}, querySelector() { return null } } })
   return { window, invoke, api: window.uipilotPluginPanel }
 }
-async function runtime(module: any, optedIn = true) {
+async function runtime(module: any, optedIn = true, windowActions = false) {
   let callback: any
   const invoke = vi.fn(async () => undefined)
   const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke, transformCallback(next: any) { callback = next; return 1 } } }
   const document = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } }
   const source = template('src-tauri/src/public_plugins/runtime.rs', 'PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE')
-    .replace('__PANEL_JSON__', jsonSource).replace('__PANEL_ACTIONS__', String(optedIn)).replace('__NETWORK_HTTPS__', 'false')
+    .replace('__WINDOW_ACTIONS__', String(windowActions)).replace('__PANEL_JSON__', jsonSource).replace('__PANEL_ACTIONS__', String(optedIn)).replace('__NETWORK_HTTPS__', 'false')
     .replace('const module = entry ? await import(entry) : null;', 'const module = window.testModule;')
   vm.runInNewContext(source, { ...env, window, document })
   await vi.waitFor(() => expect(document.title).not.toBe(''))
@@ -114,4 +114,27 @@ it('never executes inherited array toJSON/getters while snapshotting and seriali
   `, { TextEncoder })
   expect(result.calls).toBe(0)
   expect(result.serialized).toBe('{"action":"save","payload":{"values":[1,2]}}')
+})
+
+
+it('requires onWindowAction at opt-in readiness and dispatches fresh frozen Window invocations on the shared slot', async () => {
+  const missing = await runtime({ onCommand: async () => ({}) }, false, true)
+  expect(missing.document.title).toBe('uipilot-public-plugin-failed')
+  const commands = vi.fn(async () => ({}))
+  let retainedApi: any
+  const windowHandler = vi.fn(async (next: any, api: any) => {
+    expect(Object.isFrozen(next.payload)).toBe(true)
+    retainedApi = api
+    return { requestId: next.requestId, data: { values: [1, 2] } }
+  })
+  const r = await runtime({ onCommand: commands, onWindowAction: windowHandler }, false, true)
+  expect(r.document.title).toBe('uipilot-public-plugin-ready')
+  await r.callback({ payload: { context, kind: 'windowAction', invocation: structuredClone(invocation) } })
+  expect(commands).not.toHaveBeenCalled()
+  expect(windowHandler).toHaveBeenCalledTimes(1)
+  expect(() => retainedApi.storage.get('late')).toThrow('ExpiredRequestError')
+  expect(r.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: { context, response: { requestId: context.requestId, data: { values: [1, 2] } } } })
+  const failed = await runtime({ onCommand: commands, onWindowAction: async () => { throw new Error('secret stack') } }, false, true)
+  await failed.callback({ payload: { context, kind: 'windowAction', invocation: structuredClone(invocation) } })
+  expect(failed.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: { context, failed: true } })
 })

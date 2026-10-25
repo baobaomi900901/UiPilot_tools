@@ -81,6 +81,7 @@ fn main() {
             "plugin_panel_request_hide_commit",
             "plugin_panel_focus_host_input",
             "plugin_panel_focus_host_input_ack",
+            "plugin_window_request",
             "plugin_panel_request",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",

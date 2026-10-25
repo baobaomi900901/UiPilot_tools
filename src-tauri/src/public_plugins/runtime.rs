@@ -27,6 +27,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   __PANEL_JSON__
   let handler = null;
   let panelHandler = null;
+  let windowHandler = null;
+  const windowActionsEnabled = __WINDOW_ACTIONS__;
   const panelActionsEnabled = __PANEL_ACTIONS__;
   let busy = false;
   const networkEnabled = __NETWORK_HTTPS__;
@@ -267,8 +269,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
       const api = deepFreeze(apiShape);
       let completion;
       try {
-        const response = await (dispatch.kind === 'panelAction' ? panelHandler : handler)(deepFreeze(dispatch.invocation), api);
-        if (dispatch.kind === 'panelAction') {
+        const response = await (dispatch.kind === 'windowAction' ? windowHandler : dispatch.kind === 'panelAction' ? panelHandler : handler)(deepFreeze(dispatch.invocation), api);
+        if (dispatch.kind === 'panelAction' || dispatch.kind === 'windowAction') {
           try {
             const snapshot = panelJson.snapshot(response, ['requestId', 'data']);
             completion = { context: requestContext, response: snapshot };
@@ -293,6 +295,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     const module = entry ? await import(entry) : null;
     if (!module || typeof module.onCommand !== 'function') throw new TypeError('onCommand export required');
     if (panelActionsEnabled && typeof module.onPanelAction !== 'function') throw new TypeError('onPanelAction export required');
+    if (windowActionsEnabled && typeof module.onWindowAction !== 'function') throw new TypeError('onWindowAction export required');
+    windowHandler = module.onWindowAction;
     panelHandler = module.onPanelAction;
     handler = module.onCommand;
     document.title = 'uipilot-public-plugin-ready';
@@ -304,11 +308,23 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
 pub(crate) fn public_runtime_bootstrap(network_https: bool) -> String {
     public_runtime_bootstrap_with_panel(network_https, false)
 }
+#[cfg(test)]
 pub(crate) fn public_runtime_bootstrap_with_panel(
     network_https: bool,
     panel_actions: bool,
 ) -> String {
+    public_runtime_bootstrap_with_actions(network_https, panel_actions, false)
+}
+pub(crate) fn public_runtime_bootstrap_with_actions(
+    network_https: bool,
+    panel_actions: bool,
+    window_actions: bool,
+) -> String {
     PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE
+        .replace(
+            "__WINDOW_ACTIONS__",
+            if window_actions { "true" } else { "false" },
+        )
         .replace("__PANEL_JSON__", super::panel_action::JSON_BOOTSTRAP)
         .replace(
             "__PANEL_ACTIONS__",

@@ -428,6 +428,10 @@
       "properties": {
         "entry": {
           "type": "string"
+        },
+        "runtimeActions": {
+          "default": false,
+          "type": "boolean"
         }
       },
       "required": [

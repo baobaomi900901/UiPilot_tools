@@ -59,12 +59,21 @@ pub(crate) enum PluginWindowCallError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WindowActionIdentity {
+    pub(crate) owner: PluginWindowOwner,
+    pub(crate) content_label: String,
+    pub(crate) session_generation: u64,
+    pub(crate) document_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginWindowTransaction {
     pub(crate) owner: PluginWindowOwner,
     pub(crate) shell_label: String,
     pub(crate) content_label: String,
     pub(crate) instance_number: u8,
     pub(crate) timer_session_generation: u64,
+    pub(crate) document_generation: u64,
 }
 
 #[derive(Default)]
@@ -77,6 +86,7 @@ pub(crate) struct PluginWindowController {
 struct ControllerCore {
     windows: HashMap<String, WindowState>,
     timer_session_generations: HashMap<String, u64>,
+    next_document: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +110,9 @@ struct WindowState {
     phase: PluginWindowPhase,
     owner: PluginWindowOwner,
     timer_session: TimerSessionState,
+    document_generation: u64,
+    document_revoked: bool,
+    runtime_request: Option<crate::public_plugins::WindowActionRegistration>,
 }
 
 pub(crate) struct PluginWindowCallLease {
@@ -127,6 +140,7 @@ impl PluginWindowController {
         let content_label = plugin_content_label(&owner.plugin_id)?;
         let mut core = self.core.lock().ok()?;
         if let Some(window) = core.windows.get_mut(&owner.plugin_id) {
+            window.runtime_request.take();
             window.timer_session.phase = TimerSessionPhase::Closing;
         }
         while core
@@ -136,10 +150,13 @@ impl PluginWindowController {
         {
             core = self.changed.wait(core).ok()?;
         }
-        let existing = core
-            .windows
-            .get(&owner.plugin_id)
-            .filter(|window| window.generation == owner.plugin_generation);
+        let existing = core.windows.get(&owner.plugin_id).filter(|window| {
+            window.generation == owner.plugin_generation && !window.document_revoked
+        });
+        // AwaitingReady is rebuilt below, so its old native Destroyed hook must own a different document.
+        let document_generation = existing
+            .filter(|window| window.phase != PluginWindowPhase::AwaitingReady)
+            .map(|window| window.document_generation);
         let pinned = existing.is_some_and(|window| window.pinned);
         let phase = existing
             .filter(|window| window.phase != PluginWindowPhase::AwaitingReady)
@@ -153,6 +170,13 @@ impl PluginWindowController {
             .checked_add(1)?;
         core.timer_session_generations
             .insert(owner.plugin_id.clone(), timer_session_generation);
+        let document_generation = match document_generation {
+            Some(document) => document,
+            None => {
+                core.next_document = core.next_document.checked_add(1)?;
+                core.next_document
+            }
+        };
         core.windows.insert(
             owner.plugin_id.clone(),
             WindowState {
@@ -161,6 +185,9 @@ impl PluginWindowController {
                 focused: false,
                 phase,
                 owner: owner.clone(),
+                document_generation,
+                document_revoked: false,
+                runtime_request: None,
                 timer_session: TimerSessionState {
                     generation: timer_session_generation,
                     phase: TimerSessionPhase::Prepared,
@@ -175,7 +202,113 @@ impl PluginWindowController {
             content_label,
             instance_number: 1,
             timer_session_generation,
+            document_generation,
         })
+    }
+
+    /// A document may be reused for many submits. Hooks bind document identity, never the first session.
+    pub(crate) fn revoke_document(&self, plugin_id: &str, document_generation: u64) -> bool {
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(window) = core
+            .windows
+            .get_mut(plugin_id)
+            .filter(|w| w.document_generation == document_generation)
+        else {
+            return false;
+        };
+        window.runtime_request.take();
+        window.document_revoked = true;
+        window.timer_session.phase = TimerSessionPhase::Revoked;
+        window.focused = false;
+        self.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn admit_window_action(
+        self: &Arc<Self>,
+        service: &Arc<PublicPluginService>,
+        label: &str,
+        session_generation: u64,
+        document_generation: u64,
+        request: crate::public_plugins::window_action::WindowActionRequest,
+    ) -> Result<
+        (
+            crate::public_plugins::ScheduledPluginRequest,
+            std::sync::mpsc::Receiver<
+                Result<Value, crate::public_plugins::window_action::WindowActionError>,
+            >,
+        ),
+        crate::public_plugins::window_action::WindowActionError,
+    > {
+        use crate::public_plugins::window_action::WindowActionError as E;
+        let plugin_id = plugin_id_from_content_label(label).ok_or(E::ExpiredWindowSessionError)?;
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| E::WindowRequestUnavailableError)?;
+        let window = core
+            .windows
+            .get_mut(&plugin_id)
+            .ok_or(E::ExpiredWindowSessionError)?;
+        if window.timer_session.generation != session_generation
+            || window.document_generation != document_generation
+            || matches!(
+                window.timer_session.phase,
+                TimerSessionPhase::Closing | TimerSessionPhase::Revoked
+            )
+        {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        if window.phase != PluginWindowPhase::Visible
+            || window.timer_session.phase != TimerSessionPhase::Active
+            || window.runtime_request.as_ref().is_some_and(|r| r.active())
+        {
+            return Err(E::WindowRequestBusyError);
+        }
+        window.runtime_request.take();
+        let identity = WindowActionIdentity {
+            owner: window.owner.clone(),
+            content_label: label.into(),
+            session_generation,
+            document_generation,
+        };
+        let (dispatch, registration, receiver) =
+            service.prepare_window_action(self, &identity, request)?;
+        window.runtime_request = Some(registration);
+        Ok((dispatch, receiver))
+    }
+
+    pub(crate) fn finish_window_action(
+        &self,
+        identity: &WindowActionIdentity,
+        context: &crate::public_plugins::PluginRequestContext,
+        claim: impl FnOnce() -> Result<(), crate::public_plugins::content_action::ContentActionError>,
+    ) -> Result<(), crate::public_plugins::content_action::ContentActionError> {
+        use crate::public_plugins::content_action::ContentActionError as E;
+        let mut core = self.core.lock().map_err(|_| E::Unavailable)?;
+        let window = core
+            .windows
+            .get_mut(&identity.owner.plugin_id)
+            .filter(|w| {
+                w.owner == identity.owner
+                    && w.timer_session.generation == identity.session_generation
+                    && w.document_generation == identity.document_generation
+                    && w.timer_session.phase == TimerSessionPhase::Active
+                    && w.phase == PluginWindowPhase::Visible
+            })
+            .ok_or(E::Expired)?;
+        if !window
+            .runtime_request
+            .as_ref()
+            .is_some_and(|r| r.matches(context) && r.active())
+        {
+            return Err(E::Expired);
+        }
+        let result = claim();
+        if let Some(registration) = window.runtime_request.take() {
+            registration.disarm();
+        }
+        result
     }
 
     fn active_timer_session(&self, key: &TimerKey) -> Option<(String, u64)> {
@@ -250,12 +383,11 @@ impl PluginWindowController {
     }
 
     pub(crate) fn begin_timer_session_close(&self, plugin_id: &str) -> bool {
-        let Ok(mut core) = self.core.lock() else {
-            return false;
-        };
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         let Some(window) = core.windows.get_mut(plugin_id) else {
             return false;
         };
+        window.runtime_request.take();
         window.timer_session.phase = TimerSessionPhase::Closing;
         while core
             .windows
@@ -271,15 +403,14 @@ impl PluginWindowController {
     }
 
     pub(crate) fn finish_timer_session_hide(&self, plugin_id: &str, hidden: bool) -> bool {
-        let Ok(mut core) = self.core.lock() else {
-            return false;
-        };
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         let Some(window) = core.windows.get_mut(plugin_id) else {
             return false;
         };
         if window.timer_session.phase != TimerSessionPhase::Closing {
             return false;
         }
+        window.runtime_request.take();
         window.timer_session.phase = TimerSessionPhase::Revoked;
         if hidden {
             window.focused = false;
@@ -289,15 +420,14 @@ impl PluginWindowController {
     }
 
     pub(crate) fn revoke_timer_session(&self, plugin_id: &str, session_generation: u64) -> bool {
-        let Ok(mut core) = self.core.lock() else {
-            return false;
-        };
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         let Some(window) = core.windows.get_mut(plugin_id) else {
             return false;
         };
         if window.timer_session.generation != session_generation {
             return false;
         }
+        window.runtime_request.take();
         window.timer_session.phase = TimerSessionPhase::Revoked;
         window.focused = false;
         self.changed.notify_all();
@@ -434,10 +564,9 @@ impl PluginWindowController {
     }
 
     pub(crate) fn remove_plugin(&self, plugin_id: &str) -> bool {
-        let Ok(mut core) = self.core.lock() else {
-            return false;
-        };
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(window) = core.windows.get_mut(plugin_id) {
+            window.runtime_request.take();
             window.timer_session.phase = TimerSessionPhase::Closing;
         }
         while core
@@ -459,12 +588,11 @@ impl PluginWindowController {
     }
 
     pub(crate) fn close_for_uninstall(&self, plugin_id: &str) -> bool {
-        let Ok(mut core) = self.core.lock() else {
-            return false;
-        };
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         let Some(window) = core.windows.get_mut(plugin_id) else {
             return true;
         };
+        window.runtime_request.take();
         window.timer_session.phase = TimerSessionPhase::Closing;
         while core
             .windows
@@ -496,9 +624,7 @@ impl PluginWindowController {
     }
 
     pub(crate) fn invalidate_generation(&self, plugin_id: &str, generation: u64) -> bool {
-        let Ok(mut core) = self.core.lock() else {
-            return false;
-        };
+        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         if core
             .windows
             .get(plugin_id)
@@ -507,6 +633,7 @@ impl PluginWindowController {
             return false;
         }
         if let Some(window) = core.windows.get_mut(plugin_id) {
+            window.runtime_request.take();
             window.timer_session.phase = TimerSessionPhase::Closing;
         }
         while core.windows.get(plugin_id).is_some_and(|window| {
@@ -644,6 +771,8 @@ pub(crate) struct PluginWindowPinState {
 pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
 (() => {
   'use strict';
+  __PANEL_JSON__
+  const windowActionsEnabled = __WINDOW_ACTIONS__;
   let handler = null;
   let invoke = null;
   let readySent = false;
@@ -705,8 +834,8 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
     set: async () => { throw new Error('ExpiredWindowSessionError'); },
     remove: async () => { throw new Error('ExpiredWindowSessionError'); },
   });
-  const createTimerSession = (sessionGeneration) => {
-    const session = { sessionGeneration, active: true, state: null, stateHandler: null, readToken: 0 };
+  const createTimerSession = (sessionGeneration, documentGeneration) => {
+    const session = { sessionGeneration, documentGeneration, updating: false, requestBusy: false, active: true, state: null, stateHandler: null, readToken: 0 };
     const call = async (command, args = {}) => {
       if (!session.active || timerSession !== session || !invoke) throw new Error('ExpiredWindowSessionError');
       return invoke(command, { sessionGeneration, ...args });
@@ -752,6 +881,26 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
         await call('plugin_window_storage_remove', { key });
       },
     });
+    if (windowActionsEnabled) session.request = async function(input) {
+      if (!session.active || timerSession !== session) throw panelJson.error('ExpiredWindowSessionError');
+      if (session.updating || session.requestBusy) throw panelJson.error('WindowRequestBusyError');
+      let request;
+      try {
+        if (arguments.length !== 1) throw new Error();
+        request = panelJson.snapshot(input, ['action', 'payload']);
+        if (!panelJson.validAction(request.action)) throw new Error();
+      } catch (_) { throw panelJson.error('InvalidWindowRequestError'); }
+      if (!invoke) throw panelJson.error('WindowRequestUnavailableError');
+      session.requestBusy = true;
+      try {
+        const response = await invoke('plugin_window_request', { sessionGeneration, documentGeneration, request });
+        if (!session.active || timerSession !== session) throw 'ExpiredWindowSessionError';
+        try { return panelJson.reply(response); }
+        catch (_) { throw 'InvalidWindowResponseError'; }
+      } catch (error) {
+        throw panelJson.error(panelJson.windowErrorName(error));
+      } finally { session.requestBusy = false; }
+    };
     return session;
   };
   const sendReady = async () => {
@@ -759,7 +908,11 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
     readySent = true;
     await invoke('plugin_window_content_ready');
   };
-  const api = deepFreeze({
+  const withRequest = (shape) => {
+    if (windowActionsEnabled) Object.defineProperty(shape, 'request', { enumerable: true, get: () => timerSession ? timerSession.request : undefined });
+    return shape;
+  };
+  const api = deepFreeze(withRequest({
     onUpdate(next) {
       if (handler || typeof next !== 'function') throw new TypeError('one onUpdate handler required');
       handler = next;
@@ -772,14 +925,14 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
       if (!invoke) throw new Error('Unavailable');
       await invoke('plugin_window_content_close');
     },
-  });
+  }));
   Object.defineProperty(window, 'uipilotPluginWindow', { value: api, configurable: false });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_TIMER_PREPARE__', {
     configurable: false,
-    value: ({ sessionGeneration }) => {
+    value: ({ sessionGeneration, documentGeneration }) => {
       if (!canonicalU64(sessionGeneration) || sessionGeneration === '0') throw new TypeError('invalid session generation');
       if (timerSession) timerSession.active = false;
-      timerSession = createTimerSession(sessionGeneration);
+      timerSession = createTimerSession(sessionGeneration, documentGeneration);
     },
   });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_TIMER_STATE__', {
@@ -801,8 +954,12 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
       const names = ['background','surface','text','text-muted','border','accent','danger'];
       names.forEach((name, index) => root.style.setProperty(`--uipilot-color-${name}`, tokens[index]));
       root.style.setProperty('--uipilot-font-family', 'Segoe UI, system-ui, sans-serif');
-      await handler(deepFreeze(update));
-      await invoke('plugin_window_content_ack', { requestId: update.requestId });
+      const session = timerSession;
+      if (session) session.updating = true;
+      try {
+        await handler(deepFreeze(update));
+        await invoke('plugin_window_content_ack', { requestId: update.requestId });
+      } finally { if (session) session.updating = false; }
     },
   });
   const wait = () => {
@@ -815,6 +972,18 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
   wait();
 })();
 "#;
+
+fn public_content_bootstrap(runtime_actions: bool) -> String {
+    PUBLIC_CONTENT_BOOTSTRAP
+        .replace(
+            "__PANEL_JSON__",
+            crate::public_plugins::panel_action::JSON_BOOTSTRAP,
+        )
+        .replace(
+            "__WINDOW_ACTIONS__",
+            if runtime_actions { "true" } else { "false" },
+        )
+}
 
 pub(crate) fn content_ready(controller: &PluginWindowController, label: &str) -> bool {
     let Some(owner) = controller.owner_for_content(label) else {
@@ -890,7 +1059,10 @@ pub(crate) fn prepare(
         "[DEBUG-plugin-window-focus] prepare-start plugin_id={} shell_exists={shell_exists}",
         owner.plugin_id
     );
-    if !shell_exists {
+    if !shell_exists || controller.is_current(&owner, PluginWindowPhase::AwaitingReady) {
+        if shell_exists {
+            destroy_current(app, &owner.plugin_id);
+        }
         let created = create_window(app, Arc::clone(&controller), &transaction, window_entry);
         eprintln!(
             "[DEBUG-plugin-window-focus] create-window-result plugin_id={} ok={}",
@@ -985,6 +1157,7 @@ pub(crate) fn prepare(
     let session_generation = transaction.timer_session_generation.to_string();
     let session_payload = serde_json::to_string(&serde_json::json!({
         "sessionGeneration": session_generation,
+        "documentGeneration": transaction.document_generation.to_string(),
     }))
     .map_err(|_| PublicPluginManagementError::Unavailable)?;
     content
@@ -1027,6 +1200,36 @@ pub(crate) fn prepare(
         transfer_token: owner.submission_token,
     })
 }
+// WebView2 maps custom protocols to an http subdomain. Compare only the exact host-owned document.
+struct WindowDocumentNavigation {
+    destination: tauri::Url,
+    started: std::sync::atomic::AtomicBool,
+}
+impl WindowDocumentNavigation {
+    fn same_document(url: &tauri::Url, expected: &tauri::Url) -> bool {
+        let origin = (url.scheme() == "uipilot-public-plugin"
+            && url.host_str() == Some("localhost"))
+            || (url.scheme() == "http"
+                && url.host_str() == Some("uipilot-public-plugin.localhost"));
+        origin
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == expected.path()
+            && url.query() == expected.query()
+            && url.fragment() == expected.fragment()
+    }
+    fn allows(&self, url: &tauri::Url) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.started.load(Ordering::Acquire)
+            && inert_url().is_ok_and(|inert| Self::same_document(url, &inert))
+        {
+            return true;
+        }
+        Self::same_document(url, &self.destination) && !self.started.swap(true, Ordering::AcqRel)
+    }
+}
+
 fn create_window(
     app: &AppHandle,
     controller: Arc<PluginWindowController>,
@@ -1056,17 +1259,26 @@ fn create_window(
     ))
     .map_err(|_| PublicPluginManagementError::Unavailable)?;
     let inert_url = inert_url().map_err(|_| PublicPluginManagementError::Unavailable)?;
+    let navigation_controller = Arc::clone(&controller);
+    let navigation_plugin = transaction.owner.plugin_id.clone();
+    let document_generation = transaction.document_generation;
+    let navigation_shell = shell.clone();
+    let navigation = WindowDocumentNavigation {
+        destination: content_url.clone(),
+        started: std::sync::atomic::AtomicBool::new(false),
+    };
     let content = WebviewBuilder::new(
         transaction.content_label.clone(),
         WebviewUrl::CustomProtocol(inert_url),
     )
-    .on_navigation(|url| {
-        matches!(url.scheme(), "uipilot-public-plugin" | "http")
-            && url.host_str().is_some_and(|host| {
-                host.eq_ignore_ascii_case("localhost")
-                    || host.eq_ignore_ascii_case("uipilot-public-plugin.localhost")
-            })
-            && url.port().is_none()
+    .on_navigation(move |url| {
+        if navigation.allows(url) {
+            return true;
+        }
+        if navigation_controller.revoke_document(&navigation_plugin, document_generation) {
+            let _ = navigation_shell.destroy();
+        }
+        false
     })
     .on_new_window(|_, _| NewWindowResponse::Deny)
     .on_download(|_, _| false);
@@ -1106,7 +1318,16 @@ fn create_window(
             plugin_id: transaction.owner.plugin_id.clone(),
             session_generation: transaction.timer_session_generation,
         },
-        PUBLIC_CONTENT_BOOTSTRAP.to_string(),
+        public_content_bootstrap(
+            app.state::<Arc<PublicPluginService>>()
+                .manager()?
+                .window_actions_enabled(&WindowActionIdentity {
+                    owner: transaction.owner.clone(),
+                    content_label: transaction.content_label.clone(),
+                    session_generation: transaction.timer_session_generation,
+                    document_generation: transaction.document_generation,
+                }),
+        ),
         content_url,
         on_unmuted,
         CONTENT_READY_TIMEOUT,
@@ -1126,6 +1347,9 @@ fn create_window(
     let event_shell = shell.clone();
     let event_app = app.clone();
     shell.on_window_event(move |event| match event {
+        tauri::WindowEvent::Destroyed => {
+            event_controller.revoke_document(&plugin_id, document_generation);
+        }
         tauri::WindowEvent::Focused(true) => {
             let observed = event_controller.observe_focus(&plugin_id, true);
             eprintln!(
@@ -1508,6 +1732,67 @@ mod tests {
     }
 
     #[test]
+    fn window_action_native_navigation_gate_allows_only_initial_exact_document() {
+        for origin in [
+            "uipilot-public-plugin://localhost",
+            "http://uipilot-public-plugin.localhost",
+        ] {
+            let navigation = WindowDocumentNavigation {
+                destination: tauri::Url::parse(
+                    "uipilot-public-plugin://localhost/dist/window.html",
+                )
+                .unwrap(),
+                started: std::sync::atomic::AtomicBool::new(false),
+            };
+            assert!(navigation
+                .allows(&tauri::Url::parse(&format!("{origin}/__uipilot_inert.html")).unwrap()));
+            assert!(navigation
+                .allows(&tauri::Url::parse(&format!("{origin}/dist/window.html")).unwrap()));
+            assert!(
+                !navigation
+                    .allows(&tauri::Url::parse(&format!("{origin}/dist/window.html")).unwrap()),
+                "reload invalidates the document"
+            );
+            for bad in [
+                "https://example.test/dist/window.html",
+                "http://localhost/dist/window.html",
+                "http://uipilot-public-plugin.localhost/dist/other.html",
+            ] {
+                assert!(!navigation.allows(&tauri::Url::parse(bad).unwrap()));
+            }
+        }
+        let source: String = include_str!("plugin_window.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(source.contains(".on_navigation(move|url|{ifnavigation.allows(url){returntrue;}"));
+        assert!(source.contains(
+            "navigation_controller.revoke_document(&navigation_plugin,document_generation)"
+        ));
+        assert!(source.contains("tauri::WindowEvent::Destroyed=>{event_controller.revoke_document(&plugin_id,document_generation)"));
+    }
+
+    #[test]
+    fn window_action_rebuilding_unready_content_rotates_document_and_ignores_old_destroy() {
+        let controller = PluginWindowController::default();
+        let first = owner("unready-a", 1, "request-a");
+        let initial = controller.submit(first.clone()).unwrap();
+        let next = owner("unready-b", 1, "request-b");
+        let replacement = controller.submit(next.clone()).unwrap();
+        assert_ne!(initial.document_generation, replacement.document_generation);
+        assert!(!controller.revoke_document(&first.plugin_id, initial.document_generation));
+        assert!(controller.advance(
+            &next,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible
+        ));
+        assert!(controller.activate_timer_session(&next));
+    }
+
+    #[test]
     fn singleton_reuse_keeps_instance_one_and_stale_ready_or_ack_cannot_advance() {
         let controller = PluginWindowController::default();
         let first = owner("a", 3, "request-a");
@@ -1749,7 +2034,7 @@ mod tests {
         }
         assert!(!PUBLIC_CONTENT_BOOTSTRAP.contains("listen("));
         assert!(PUBLIC_CONTENT_BOOTSTRAP.contains("session.storage = deepFreeze({"));
-        assert!(PUBLIC_CONTENT_BOOTSTRAP.contains("const api = deepFreeze({"));
+        assert!(PUBLIC_CONTENT_BOOTSTRAP.contains("const api = deepFreeze(withRequest({"));
         assert!(PUBLIC_CONTENT_BOOTSTRAP
             .contains("Reflect.deleteProperty(window, '__TAURI_INTERNALS__')"));
     }
@@ -1967,7 +2252,7 @@ mod tests {
             "WebviewBuilder::new(",
             "WebviewUrl::CustomProtocol(inert_url)",
             "prepare_windows_webview(",
-            "PUBLIC_CONTENT_BOOTSTRAP",
+            "public_content_bootstrap(",
             ".on_navigation(",
             ".on_new_window(|_, _| NewWindowResponse::Deny)",
             ".on_download(|_, _| false)",

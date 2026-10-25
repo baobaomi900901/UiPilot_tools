@@ -295,7 +295,7 @@ Action names match `^[a-z][a-z0-9.-]{0,63}$`. Payload is required (explicit null
 
 One unresolved call and one physical Runtime slot per plugin are enforced by Host. Busy rejects rather than queueing/retrying. Do not await requests inside `onUpdate` or `onHostKey`; wait until Ready. Host command submission cancels action ownership but waits for the running handler to finish or its original 30-second deadline before dispatching another handler. Close, reload, replacement, disable, permission/credential changes and faults revoke the exact old API context. Already-admitted effects may finish: cancellation after save does not mean “not saved”; reload before deliberate retry.
 
-Fixed Error.name values: `InvalidPanelRequestError`, `PanelRequestBusyError`, `ExpiredPanelSession`, `PanelRequestCancelledError`, `PanelRequestTimeoutError`, `InvalidPanelResponseError`, `PanelRequestFailedError`, `PanelRequestUnavailableError`. Business validation belongs in ordinary data (for example `{ok:false, code:"missing-variable"}`); unexpected handler errors expose no plugin stack or arbitrary native text. There is no Window RPC, multi-command panel, streaming, AbortSignal or new clipboard API.
+Fixed Error.name values: `InvalidPanelRequestError`, `PanelRequestBusyError`, `ExpiredPanelSession`, `PanelRequestCancelledError`, `PanelRequestTimeoutError`, `InvalidPanelResponseError`, `PanelRequestFailedError`, `PanelRequestUnavailableError`. Business validation belongs in ordinary data (for example `{ok:false, code:"missing-variable"}`); unexpected handler errors expose no plugin stack or arbitrary native text. There is no multi-command panel, streaming, AbortSignal or new clipboard API. Window requests require the separate Host 0.9.0 opt-in below.
 
 
 ## Host 0.7.0：本地开发刷新、恢复和诊断
@@ -307,3 +307,31 @@ Fixed Error.name values: `InvalidPanelRequestError`, `PanelRequestBusyError`, `E
 插件包 semver、Host 版本、SDK API v1、插件私有数据 schemaVersion 相互独立。刷新不会主动清除插件数据；包替换/降级也不会转换或恢复私有 JSON。插件作者应验证完整数据文档，遇到未知/较新数据版本时阻止写入，不能静默重置。宿主没有自动数据迁移、包历史回滚或备份恢复功能。已获准的旧请求效果仍可能完成；取消或保存失败不能证明数据/远端效果未发生，重试前先重新读取。
 
 详情中的“查看诊断”提供显式允许字段构造的 JSON 预览；“复制此诊断”仅复制当前预览快照，不自动更新、上传或读取剪贴板。报告含 Host/平台、插件 ID/版本、已确认配置状态及最新管理操作阶段/固定错误码，不含内容、路径、设置、私有数据、凭据、域名、请求 ID 或原始异常。状态 null 表示未知；enabled 不是 Runtime 健康证明。最新操作仅驻留内存，最多 64 个插件槽，重启清空。stateCommitOutcome 只描述 Host 配置持久化，不描述插件业务数据或远端效果。
+
+
+## Window Runtime actions (Windows Host 0.9.0+)
+
+Legacy `command` packages may declare `window.runtimeActions: true` with Windows-only `supportedPlatforms`, `activationMode: "submit"`, `outputMode: "window"`, a window entry, granted `ui.window`, and `minimumHostVersion: "0.9.0"` or later. Absent/false keeps the historical Window API with no `request` property; null and other values reject. Opt-in readiness requires an exported `onWindowAction` function; CLI performs static Manifest validation without executing Runtime. API v1, state schema and historical feature minima are unchanged.
+
+```js
+// Runtime: all business logic uses the existing request-bound API.
+export async function onWindowAction(invocation, api) {
+  const value = await api.storage.get('draft')
+  return { requestId: invocation.requestId, data: value }
+}
+// Content: obtain the current capability when the user performs an action.
+const request = window.uipilotPluginWindow.request
+if (request) {
+  const data = await request({ action: 'load', payload: null })
+}
+```
+
+The action invocation contains exactly `apiVersion: 1`, `requestId`, `action`, `payload` and `context` (`platform: "windows"`, `theme`, RFC 3339 `invokedAt`). The handler returns exactly `{requestId, data}` with the same ID. `request` resolves to deeply frozen JSON data; replies do not trigger `onUpdate` or launcher results. Runtime invocation/API objects are fresh and frozen, with the existing storage/settings/notification/optional HTTPS permissions and expiry rules.
+
+Window requests share Panel's bounded JSON contract: action names match `^[a-z][a-z0-9.-]{0,63}$` and reject `__proto__`, `prototype`, `constructor`; `payload` is required and may be null. Request/reply envelopes have exact fields, at most 64 KiB compact UTF-8, depth 32 and 4096 values. Only finite JSON primitives, dense arrays and plain data records are accepted. Accessors, toJSON execution, cycles, sparse arrays, symbols, functions, undefined, BigInt, nonfinite numbers and dangerous record keys reject. Host independently revalidates both directions.
+
+The optional readonly `request` getter supplies a new function before each session's first `onUpdate`. Capture it in `onUpdate` if needed, but call only after that callback has returned and Host has activated the window. Calling during update/ACK returns Busy immediately; never await a request as part of `onUpdate`. A retained old function remains bound to its old full window owner, session and document, and expires after hide, submit replacement, navigation/reload, destruction or lifecycle revocation. Read the getter again for the new session. Internal bootstrap arguments cannot grant authority.
+
+Each window permits one unresolved call and each plugin one physical Runtime handler. Busy rejects without queueing or retry. A new Host command cancels logical Window request ownership, then waits for the running physical handler to finish or its original 30-second deadline. Hide starts revocation immediately without waiting on the handler; hide failure does not revive ownership. Existing timer/storage leases and background timer completion keep their previous behavior. Disable, update, development reload, permission/settings/credential changes, faults and uninstall also revoke old contexts. Completion rechecks exact window identity and a single completion ticket before success. Already-admitted writes may finish; cancellation or failure is not proof that a save did not happen. Read current state before a deliberate retry.
+
+Fixed `Error.name` values are `InvalidWindowRequestError`, `WindowRequestBusyError`, `ExpiredWindowSessionError`, `WindowRequestCancelledError`, `WindowRequestTimeoutError`, `InvalidWindowResponseError`, `WindowRequestFailedError`, `WindowRequestUnavailableError`. Business validation belongs in normal data such as `{ok:false, code:"revision-conflict"}`. Handler/native exception text and plugin stacks are hidden. There is no streaming, AbortSignal, automatic retry, arbitrary invoke or content networking capability. The private bridge is restricted to the actual plugin-window content WebView; main, shell, panel, runtime and find surfaces have no grant.

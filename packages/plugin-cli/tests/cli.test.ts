@@ -14,7 +14,7 @@ const validReport: PluginValidationReportV1 = {
   schemaVersion: 1,
   valid: true,
   source: { kind: 'directory', path: 'plugin' },
-  target: { platform: 'windows', hostVersion: '0.8.0', apiVersion: 1 },
+  target: { platform: 'windows', hostVersion: '0.9.0', apiVersion: 1 },
   plugin: { pluginId: 'com.example.demo', version: '1.0.0', outputMode: 'window' },
   truncated: false,
   issues: [],

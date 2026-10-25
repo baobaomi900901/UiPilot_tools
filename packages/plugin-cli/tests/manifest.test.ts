@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.6.1'
+    tooNewHost.minimumHostVersion = '0.9.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -619,6 +619,29 @@ describe('panel Runtime action opt-in', () => {
     value.minimumHostVersion = '0.5.0'
     expect(validate(value).ok).toBe(false)
     value.minimumHostVersion = '0.6.0'
+    value.supportedPlatforms = ['windows', 'macos']
+    expect(validate(value).ok).toBe(false)
+  })
+})
+
+
+describe('window Runtime action opt-in', () => {
+  it('requires boolean opt-in, Windows and Host 0.9.0', () => {
+    const value: any = timerManifest()
+    value.minimumHostVersion = '0.9.0'
+    value.permissions = ['ui.window']
+    for (const opt of [false, true]) {
+      value.window.runtimeActions = opt
+      expect(validate(value).ok).toBe(true)
+    }
+    for (const opt of [null, 1, 'true']) {
+      value.window.runtimeActions = opt
+      expect(validate(value).ok).toBe(false)
+    }
+    value.window.runtimeActions = true
+    value.minimumHostVersion = '0.8.0'
+    expect(validate(value).ok).toBe(false)
+    value.minimumHostVersion = '0.9.0'
     value.supportedPlatforms = ['windows', 'macos']
     expect(validate(value).ok).toBe(false)
   })

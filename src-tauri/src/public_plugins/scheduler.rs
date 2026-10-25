@@ -43,6 +43,10 @@ pub(crate) struct PluginSubmissionOwner {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PluginRequestOwner {
     Command(PluginSubmissionOwner),
+    WindowAction {
+        identity: crate::plugin_window::WindowActionIdentity,
+        request: super::window_action::WindowActionRequest,
+    },
     PanelAction {
         content_label: String,
         session_epoch: u64,
@@ -84,6 +88,17 @@ impl PluginRequestCandidate {
             && match &self.owner {
                 PluginRequestOwner::Command(owner) => {
                     owner.ui_intent_epoch != 0 && !owner.submission_token.is_empty()
+                }
+                PluginRequestOwner::WindowAction { identity, request } => {
+                    identity.session_generation != 0
+                        && identity.document_generation != 0
+                        && identity.owner.plugin_id == self.plugin_id
+                        && identity.owner.plugin_generation == self.plugin_generation
+                        && identity.owner.activation_id == self.activation_id
+                        && identity.owner.admission_epoch == self.admission_epoch
+                        && !identity.content_label.is_empty()
+                        && request.validate().is_ok()
+                        && self.activation_mode == PublicActivationMode::Submit
                 }
                 PluginRequestOwner::PanelAction {
                     content_label,
@@ -169,7 +184,7 @@ struct RunningRequest {
     request: ScheduledPluginRequest,
     current: bool,
     // Preserve logical retirement across physical completion and controller settlement.
-    panel_retirement: Option<super::panel_action::PanelActionError>,
+    action_retirement: Option<super::content_action::ContentActionError>,
     notification_published: bool,
 }
 
@@ -209,9 +224,9 @@ struct PluginQueue {
     running: Option<RunningRequest>,
     waiting: Option<ReservedPluginRequest>,
     rebuilding: bool,
-    panel_completion: Option<(
+    action_completion: Option<(
         PluginRequestContext,
-        Option<super::panel_action::PanelActionError>,
+        Option<super::content_action::ContentActionError>,
     )>,
     issued: HashSet<PluginRequestContext>,
     issued_order: VecDeque<PluginRequestContext>,
@@ -226,7 +241,7 @@ impl PluginQueue {
             running: None,
             waiting: None,
             rebuilding: false,
-            panel_completion: None,
+            action_completion: None,
             issued: HashSet::new(),
             issued_order: VecDeque::new(),
         }
@@ -340,7 +355,7 @@ impl PluginRequestScheduler {
         }
         if matches!(
             reserved.candidate.owner,
-            PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::PanelAction { .. } | PluginRequestOwner::WindowAction { .. }
         ) && (queue.rebuilding || queue.running.is_some() || queue.waiting.is_some())
         {
             return Err(PluginScheduleError::Busy);
@@ -348,23 +363,22 @@ impl PluginRequestScheduler {
         match &reserved.candidate.owner {
             PluginRequestOwner::Command(_) => {
                 if let Some((_, reason)) = queue
-                    .panel_completion
+                    .action_completion
                     .as_mut()
                     .filter(|(_, reason)| reason.is_none())
                 {
-                    *reason =
-                        Some(super::panel_action::PanelActionError::PanelRequestCancelledError);
+                    *reason = Some(super::content_action::ContentActionError::Cancelled);
                 }
             }
-            PluginRequestOwner::PanelAction { .. } => {
+            PluginRequestOwner::PanelAction { .. } | PluginRequestOwner::WindowAction { .. } => {
                 if queue
-                    .panel_completion
+                    .action_completion
                     .as_ref()
                     .is_some_and(|(_, reason)| reason.is_none())
                 {
                     return Err(PluginScheduleError::Busy);
                 }
-                queue.panel_completion = None;
+                queue.action_completion = None;
             }
         }
         queue.remember(reserved.context.clone());
@@ -395,10 +409,11 @@ impl PluginRequestScheduler {
                 && matches!(
                     running.request.candidate.owner,
                     PluginRequestOwner::PanelAction { .. }
+                        | PluginRequestOwner::WindowAction { .. }
                 )
             {
-                running.panel_retirement =
-                    Some(super::panel_action::PanelActionError::PanelRequestCancelledError);
+                running.action_retirement =
+                    Some(super::content_action::ContentActionError::Cancelled);
             }
             running.current = false;
             let expired = running.request.context.clone();
@@ -450,9 +465,9 @@ impl PluginRequestScheduler {
         let accepted = running.current;
         if matches!(
             running.request.candidate.owner,
-            PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::PanelAction { .. } | PluginRequestOwner::WindowAction { .. }
         ) {
-            queue.panel_completion = Some((context.clone(), running.panel_retirement));
+            queue.action_completion = Some((context.clone(), running.action_retirement));
         }
         let next = if queue.rebuilding {
             None
@@ -489,40 +504,46 @@ impl PluginRequestScheduler {
 
     // The physical handler is finished, but its response still needs a live-owner claim.
     pub(crate) fn discard_panel_completion(&self, context: &PluginRequestContext) {
+        self.discard_action_completion(context);
+    }
+    pub(crate) fn claim_panel_completion(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), super::panel_action::PanelActionError> {
+        self.claim_action_completion(context).map_err(Into::into)
+    }
+    pub(crate) fn discard_action_completion(&self, context: &PluginRequestContext) {
         if let Ok(mut state) = self.lock() {
             if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
                 if queue
-                    .panel_completion
+                    .action_completion
                     .as_ref()
                     .is_some_and(|(c, _)| c == context)
                 {
-                    queue.panel_completion = None;
+                    queue.action_completion = None;
                 }
             }
         }
     }
 
-    pub(crate) fn claim_panel_completion(
+    pub(crate) fn claim_action_completion(
         &self,
         context: &PluginRequestContext,
-    ) -> Result<(), super::panel_action::PanelActionError> {
-        use super::panel_action::PanelActionError as E;
-        let mut state = self.lock().map_err(|_| E::PanelRequestUnavailableError)?;
+    ) -> Result<(), super::content_action::ContentActionError> {
+        use super::content_action::ContentActionError as E;
+        let mut state = self.lock().map_err(|_| E::Unavailable)?;
         let queue = state
             .by_plugin
             .get_mut(&context.plugin_id)
-            .ok_or(E::ExpiredPanelSession)?;
+            .ok_or(E::Expired)?;
         if !queue
-            .panel_completion
+            .action_completion
             .as_ref()
             .is_some_and(|(c, _)| c == context)
         {
-            return Err(E::ExpiredPanelSession);
+            return Err(E::Expired);
         }
-        let (_, reason) = queue
-            .panel_completion
-            .take()
-            .ok_or(E::ExpiredPanelSession)?;
+        let (_, reason) = queue.action_completion.take().ok_or(E::Expired)?;
         reason.map_or(Ok(()), Err)
     }
 
@@ -533,11 +554,11 @@ impl PluginRequestScheduler {
         let mut state = self.lock()?;
         if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
             if let Some((_, reason)) = queue
-                .panel_completion
+                .action_completion
                 .as_mut()
                 .filter(|(c, _)| c == context)
             {
-                *reason = Some(super::panel_action::PanelActionError::ExpiredPanelSession);
+                *reason = Some(super::content_action::ContentActionError::Expired);
             }
             if let Some(running) = queue
                 .running
@@ -545,8 +566,8 @@ impl PluginRequestScheduler {
                 .filter(|r| r.request.context == *context)
             {
                 running.current = false;
-                running.panel_retirement =
-                    Some(super::panel_action::PanelActionError::ExpiredPanelSession);
+                running.action_retirement =
+                    Some(super::content_action::ContentActionError::Expired);
             }
         }
         Ok(())
@@ -711,14 +732,13 @@ impl PluginRequestScheduler {
             return Ok(Vec::new());
         };
         let mut retired = Vec::new();
-        if let Some((context, reason)) = queue.panel_completion.as_mut() {
-            *reason = Some(super::panel_action::PanelActionError::ExpiredPanelSession);
+        if let Some((context, reason)) = queue.action_completion.as_mut() {
+            *reason = Some(super::content_action::ContentActionError::Expired);
             retired.push((context.clone(), None));
         }
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
-            running.panel_retirement =
-                Some(super::panel_action::PanelActionError::ExpiredPanelSession);
+            running.action_retirement = Some(super::content_action::ContentActionError::Expired);
             retired.push((
                 running.request.context.clone(),
                 running.request.candidate.owner.token().map(str::to_owned),
@@ -821,7 +841,7 @@ fn dispatch(
     queue.running = Some(RunningRequest {
         request: request.clone(),
         current: true,
-        panel_retirement: None,
+        action_retirement: None,
         notification_published: false,
     });
     Ok(request)
@@ -933,7 +953,7 @@ mod tests {
             );
             assert!(
                 scheduler.lock().unwrap().by_plugin[&action.context.plugin_id]
-                    .panel_completion
+                    .action_completion
                     .is_none()
             );
         }

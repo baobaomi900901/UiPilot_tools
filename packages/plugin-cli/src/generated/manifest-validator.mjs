@@ -1,11 +1,11 @@
 "use strict";
 export const validate = validate20;
 export default validate20;
-const schema31 = {"$defs":{"PanelHostKeyDeclaration":{"enum":["ArrowDown","ArrowUp","Primary+N","Tab","Shift+Tab","Enter"],"type":"string"},"PanelHostKeyFocus":{"enum":["content","host"],"type":"string"},"PluginNetworkCredential":{"additionalProperties":false,"properties":{"host":{"pattern":"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$","type":"string"},"id":{"pattern":"^[a-z][a-z0-9.-]{0,63}$","type":"string"},"settingKey":{"pattern":"^[a-z][a-z0-9.-]{0,63}$","type":"string"},"type":{"$ref":"#/$defs/PluginNetworkCredentialType"}},"required":["id","settingKey","host","type"],"type":"object"},"PluginNetworkCredentialType":{"enum":["bearer"],"type":"string"},"PublicActivationMode":{"enum":["live","submit"],"type":"string"},"PublicCommandV1":{"additionalProperties":false,"properties":{"activationMode":{"$ref":"#/$defs/PublicActivationMode"},"defaultName":{"type":"string"},"inputPlaceholder":{"default":null,"type":["string","null"]},"inputRequired":{"type":"boolean"},"outputMode":{"$ref":"#/$defs/PublicOutputMode"},"summary":{"default":null,"type":["string","null"]}},"required":["defaultName","activationMode","outputMode","inputRequired"],"type":"object"},"PublicNamedCommandV1":{"additionalProperties":false,"properties":{"activationMode":{"$ref":"#/$defs/PublicActivationMode"},"defaultName":{"type":"string"},"id":{"pattern":"^[a-z][a-z0-9-]{0,31}$","type":"string"},"inputPlaceholder":{"default":null,"type":["string","null"]},"inputRequired":{"type":"boolean"},"outputMode":{"const":"mainResult"},"summary":{"default":null,"type":["string","null"]}},"required":["id","defaultName","activationMode","outputMode","inputRequired"],"type":"object"},"PublicNetworkV1":{"additionalProperties":false,"properties":{"credentials":{"items":{"$ref":"#/$defs/PluginNetworkCredential"},"maxItems":8,"minItems":1,"type":"array"},"httpsHosts":{"items":{"pattern":"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$","type":"string"},"maxItems":8,"minItems":1,"type":"array","uniqueItems":true}},"required":["httpsHosts"],"type":"object"},"PublicOutputMode":{"enum":["mainResult","window","panel"],"type":"string"},"PublicPanelV1":{"additionalProperties":false,"properties":{"entry":{"type":"string"},"hostKeyFocus":{"$ref":"#/$defs/PanelHostKeyFocus"},"hostKeys":{"default":[],"items":{"enum":["ArrowDown","ArrowUp","Primary+N","Tab","Shift+Tab","Enter"],"type":"string"},"maxItems":8,"type":"array","uniqueItems":true},"runtimeActions":{"default":false,"type":"boolean"}},"required":["entry"],"type":"object"},"PublicPermission":{"enum":["ui.window","ui.panel","clipboard.write","clipboard.read","clipboard.history.read","clipboard.history.paste","network.https","files.userSelected","files.index.readAll","notifications.publish","timer.control","background.schedule"],"type":"string"},"PublicPlatform":{"enum":["windows","macos"],"type":"string"},"PublicRuntimeV1":{"additionalProperties":false,"properties":{"entry":{"type":"string"}},"required":["entry"],"type":"object"},"PublicSelectOptionV1":{"additionalProperties":false,"properties":{"label":{"type":"string"},"value":{"type":"string"}},"required":["value","label"],"type":"object"},"PublicSettingV1":{"oneOf":[{"additionalProperties":false,"properties":{"default":{"default":null,"type":["string","null"]},"key":{"type":"string"},"label":{"type":"string"},"type":{"const":"text","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"key":{"type":"string"},"label":{"type":"string"},"type":{"const":"secret","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"default":{"default":null,"type":["number","null"]},"key":{"type":"string"},"label":{"type":"string"},"max":{"default":null,"type":["number","null"]},"min":{"default":null,"type":["number","null"]},"step":{"default":null,"type":["number","null"]},"type":{"const":"number","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"default":{"default":null,"type":["boolean","null"]},"key":{"type":"string"},"label":{"type":"string"},"type":{"const":"boolean","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"default":{"default":null,"type":["string","null"]},"key":{"type":"string"},"label":{"type":"string"},"options":{"items":{"$ref":"#/$defs/PublicSelectOptionV1"},"type":"array"},"type":{"const":"select","type":"string"}},"required":["type","key","label","options"],"type":"object"}]},"PublicWindowV1":{"additionalProperties":false,"properties":{"entry":{"type":"string"}},"required":["entry"],"type":"object"}},"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"oneOf":[{"not":{"properties":{"commands":true},"required":["commands"]},"properties":{"command":true},"required":["command"]},{"not":{"anyOf":[{"properties":{"command":true},"required":["command"]},{"properties":{"window":true},"required":["window"]},{"properties":{"panel":true},"required":["panel"]}]},"properties":{"commands":true,"permissions":{"not":{"contains":{"enum":["ui.window","ui.panel","timer.control","clipboard.history.read","clipboard.history.paste"]}},"type":"array"}},"required":["commands"]}],"properties":{"apiVersion":{"minimum":0,"type":"integer","maximum":4294967295},"command":{"$ref":"#/$defs/PublicCommandV1"},"commands":{"items":{"$ref":"#/$defs/PublicNamedCommandV1"},"maxItems":16,"minItems":1,"type":"array"},"description":{"default":null,"type":["string","null"]},"minimumHostVersion":{"type":"string"},"name":{"type":"string"},"network":{"$ref":"#/$defs/PublicNetworkV1"},"panel":{"anyOf":[{"$ref":"#/$defs/PublicPanelV1"},{"type":"null"}]},"permissions":{"items":{"$ref":"#/$defs/PublicPermission"},"type":"array"},"pluginId":{"type":"string"},"runtime":{"$ref":"#/$defs/PublicRuntimeV1"},"schemaVersion":{"minimum":0,"type":"integer","maximum":4294967295},"settings":{"default":[],"items":{"$ref":"#/$defs/PublicSettingV1"},"type":"array"},"supportedPlatforms":{"items":{"$ref":"#/$defs/PublicPlatform"},"type":"array"},"version":{"type":"string"},"window":{"anyOf":[{"$ref":"#/$defs/PublicWindowV1"},{"type":"null"}]}},"required":["schemaVersion","pluginId","version","apiVersion","minimumHostVersion","name","supportedPlatforms","runtime","permissions"],"title":"PublicManifestV1","type":"object"};
+const schema31 = {"$defs":{"PanelHostKeyDeclaration":{"enum":["ArrowDown","ArrowUp","Primary+N","Tab","Shift+Tab","Enter"],"type":"string"},"PanelHostKeyFocus":{"enum":["content","host"],"type":"string"},"PluginNetworkCredential":{"additionalProperties":false,"properties":{"host":{"pattern":"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$","type":"string"},"id":{"pattern":"^[a-z][a-z0-9.-]{0,63}$","type":"string"},"settingKey":{"pattern":"^[a-z][a-z0-9.-]{0,63}$","type":"string"},"type":{"$ref":"#/$defs/PluginNetworkCredentialType"}},"required":["id","settingKey","host","type"],"type":"object"},"PluginNetworkCredentialType":{"enum":["bearer"],"type":"string"},"PublicActivationMode":{"enum":["live","submit"],"type":"string"},"PublicCommandV1":{"additionalProperties":false,"properties":{"activationMode":{"$ref":"#/$defs/PublicActivationMode"},"defaultName":{"type":"string"},"inputPlaceholder":{"default":null,"type":["string","null"]},"inputRequired":{"type":"boolean"},"outputMode":{"$ref":"#/$defs/PublicOutputMode"},"summary":{"default":null,"type":["string","null"]}},"required":["defaultName","activationMode","outputMode","inputRequired"],"type":"object"},"PublicNamedCommandV1":{"additionalProperties":false,"properties":{"activationMode":{"$ref":"#/$defs/PublicActivationMode"},"defaultName":{"type":"string"},"id":{"pattern":"^[a-z][a-z0-9-]{0,31}$","type":"string"},"inputPlaceholder":{"default":null,"type":["string","null"]},"inputRequired":{"type":"boolean"},"outputMode":{"const":"mainResult"},"summary":{"default":null,"type":["string","null"]}},"required":["id","defaultName","activationMode","outputMode","inputRequired"],"type":"object"},"PublicNetworkV1":{"additionalProperties":false,"properties":{"credentials":{"items":{"$ref":"#/$defs/PluginNetworkCredential"},"maxItems":8,"minItems":1,"type":"array"},"httpsHosts":{"items":{"pattern":"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$","type":"string"},"maxItems":8,"minItems":1,"type":"array","uniqueItems":true}},"required":["httpsHosts"],"type":"object"},"PublicOutputMode":{"enum":["mainResult","window","panel"],"type":"string"},"PublicPanelV1":{"additionalProperties":false,"properties":{"entry":{"type":"string"},"hostKeyFocus":{"$ref":"#/$defs/PanelHostKeyFocus"},"hostKeys":{"default":[],"items":{"enum":["ArrowDown","ArrowUp","Primary+N","Tab","Shift+Tab","Enter"],"type":"string"},"maxItems":8,"type":"array","uniqueItems":true},"runtimeActions":{"default":false,"type":"boolean"}},"required":["entry"],"type":"object"},"PublicPermission":{"enum":["ui.window","ui.panel","clipboard.write","clipboard.read","clipboard.history.read","clipboard.history.paste","network.https","files.userSelected","files.index.readAll","notifications.publish","timer.control","background.schedule"],"type":"string"},"PublicPlatform":{"enum":["windows","macos"],"type":"string"},"PublicRuntimeV1":{"additionalProperties":false,"properties":{"entry":{"type":"string"}},"required":["entry"],"type":"object"},"PublicSelectOptionV1":{"additionalProperties":false,"properties":{"label":{"type":"string"},"value":{"type":"string"}},"required":["value","label"],"type":"object"},"PublicSettingV1":{"oneOf":[{"additionalProperties":false,"properties":{"default":{"default":null,"type":["string","null"]},"key":{"type":"string"},"label":{"type":"string"},"type":{"const":"text","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"key":{"type":"string"},"label":{"type":"string"},"type":{"const":"secret","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"default":{"default":null,"type":["number","null"]},"key":{"type":"string"},"label":{"type":"string"},"max":{"default":null,"type":["number","null"]},"min":{"default":null,"type":["number","null"]},"step":{"default":null,"type":["number","null"]},"type":{"const":"number","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"default":{"default":null,"type":["boolean","null"]},"key":{"type":"string"},"label":{"type":"string"},"type":{"const":"boolean","type":"string"}},"required":["type","key","label"],"type":"object"},{"additionalProperties":false,"properties":{"default":{"default":null,"type":["string","null"]},"key":{"type":"string"},"label":{"type":"string"},"options":{"items":{"$ref":"#/$defs/PublicSelectOptionV1"},"type":"array"},"type":{"const":"select","type":"string"}},"required":["type","key","label","options"],"type":"object"}]},"PublicWindowV1":{"additionalProperties":false,"properties":{"entry":{"type":"string"},"runtimeActions":{"default":false,"type":"boolean"}},"required":["entry"],"type":"object"}},"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"oneOf":[{"not":{"properties":{"commands":true},"required":["commands"]},"properties":{"command":true},"required":["command"]},{"not":{"anyOf":[{"properties":{"command":true},"required":["command"]},{"properties":{"window":true},"required":["window"]},{"properties":{"panel":true},"required":["panel"]}]},"properties":{"commands":true,"permissions":{"not":{"contains":{"enum":["ui.window","ui.panel","timer.control","clipboard.history.read","clipboard.history.paste"]}},"type":"array"}},"required":["commands"]}],"properties":{"apiVersion":{"minimum":0,"type":"integer","maximum":4294967295},"command":{"$ref":"#/$defs/PublicCommandV1"},"commands":{"items":{"$ref":"#/$defs/PublicNamedCommandV1"},"maxItems":16,"minItems":1,"type":"array"},"description":{"default":null,"type":["string","null"]},"minimumHostVersion":{"type":"string"},"name":{"type":"string"},"network":{"$ref":"#/$defs/PublicNetworkV1"},"panel":{"anyOf":[{"$ref":"#/$defs/PublicPanelV1"},{"type":"null"}]},"permissions":{"items":{"$ref":"#/$defs/PublicPermission"},"type":"array"},"pluginId":{"type":"string"},"runtime":{"$ref":"#/$defs/PublicRuntimeV1"},"schemaVersion":{"minimum":0,"type":"integer","maximum":4294967295},"settings":{"default":[],"items":{"$ref":"#/$defs/PublicSettingV1"},"type":"array"},"supportedPlatforms":{"items":{"$ref":"#/$defs/PublicPlatform"},"type":"array"},"version":{"type":"string"},"window":{"anyOf":[{"$ref":"#/$defs/PublicWindowV1"},{"type":"null"}]}},"required":["schemaVersion","pluginId","version","apiVersion","minimumHostVersion","name","supportedPlatforms","runtime","permissions"],"title":"PublicManifestV1","type":"object"};
 const schema42 = {"enum":["ui.window","ui.panel","clipboard.write","clipboard.read","clipboard.history.read","clipboard.history.paste","network.https","files.userSelected","files.index.readAll","notifications.publish","timer.control","background.schedule"],"type":"string"};
 const schema43 = {"additionalProperties":false,"properties":{"entry":{"type":"string"}},"required":["entry"],"type":"object"};
 const schema46 = {"enum":["windows","macos"],"type":"string"};
-const schema47 = {"additionalProperties":false,"properties":{"entry":{"type":"string"}},"required":["entry"],"type":"object"};
+const schema47 = {"additionalProperties":false,"properties":{"entry":{"type":"string"},"runtimeActions":{"default":false,"type":"boolean"}},"required":["entry"],"type":"object"};
 const func1 = Object.prototype.hasOwnProperty;
 const schema32 = {"additionalProperties":false,"properties":{"activationMode":{"$ref":"#/$defs/PublicActivationMode"},"defaultName":{"type":"string"},"inputPlaceholder":{"default":null,"type":["string","null"]},"inputRequired":{"type":"boolean"},"outputMode":{"$ref":"#/$defs/PublicOutputMode"},"summary":{"default":null,"type":["string","null"]}},"required":["defaultName","activationMode","outputMode","inputRequired"],"type":"object"};
 const schema33 = {"enum":["live","submit"],"type":"string"};
@@ -2535,7 +2535,7 @@ vErrors.push(err51);
 errors++;
 }
 for(const key2 in data22){
-if(!(key2 === "entry")){
+if(!((key2 === "entry") || (key2 === "runtimeActions"))){
 const err52 = {instancePath:instancePath+"/window",schemaPath:"#/$defs/PublicWindowV1/additionalProperties",keyword:"additionalProperties",params:{additionalProperty: key2},message:"must NOT have additional properties"};
 if(vErrors === null){
 vErrors = [err52];
@@ -2558,9 +2558,9 @@ vErrors.push(err53);
 errors++;
 }
 }
-}
-else {
-const err54 = {instancePath:instancePath+"/window",schemaPath:"#/$defs/PublicWindowV1/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(data22.runtimeActions !== undefined){
+if(typeof data22.runtimeActions !== "boolean"){
+const err54 = {instancePath:instancePath+"/window/runtimeActions",schemaPath:"#/$defs/PublicWindowV1/properties/runtimeActions/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"};
 if(vErrors === null){
 vErrors = [err54];
 }
@@ -2569,11 +2569,10 @@ vErrors.push(err54);
 }
 errors++;
 }
-var _valid3 = _errs64 === errors;
-valid21 = valid21 || _valid3;
-const _errs70 = errors;
-if(data22 !== null){
-const err55 = {instancePath:instancePath+"/window",schemaPath:"#/properties/window/anyOf/1/type",keyword:"type",params:{type: "null"},message:"must be null"};
+}
+}
+else {
+const err55 = {instancePath:instancePath+"/window",schemaPath:"#/$defs/PublicWindowV1/type",keyword:"type",params:{type: "object"},message:"must be object"};
 if(vErrors === null){
 vErrors = [err55];
 }
@@ -2582,15 +2581,28 @@ vErrors.push(err55);
 }
 errors++;
 }
-var _valid3 = _errs70 === errors;
+var _valid3 = _errs64 === errors;
 valid21 = valid21 || _valid3;
-if(!valid21){
-const err56 = {instancePath:instancePath+"/window",schemaPath:"#/properties/window/anyOf",keyword:"anyOf",params:{},message:"must match a schema in anyOf"};
+const _errs72 = errors;
+if(data22 !== null){
+const err56 = {instancePath:instancePath+"/window",schemaPath:"#/properties/window/anyOf/1/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err56];
 }
 else {
 vErrors.push(err56);
+}
+errors++;
+}
+var _valid3 = _errs72 === errors;
+valid21 = valid21 || _valid3;
+if(!valid21){
+const err57 = {instancePath:instancePath+"/window",schemaPath:"#/properties/window/anyOf",keyword:"anyOf",params:{},message:"must match a schema in anyOf"};
+if(vErrors === null){
+vErrors = [err57];
+}
+else {
+vErrors.push(err57);
 }
 errors++;
 }
@@ -2608,12 +2620,12 @@ vErrors = null;
 }
 }
 else {
-const err57 = {instancePath,schemaPath:"#/type",keyword:"type",params:{type: "object"},message:"must be object"};
+const err58 = {instancePath,schemaPath:"#/type",keyword:"type",params:{type: "object"},message:"must be object"};
 if(vErrors === null){
-vErrors = [err57];
+vErrors = [err58];
 }
 else {
-vErrors.push(err57);
+vErrors.push(err58);
 }
 errors++;
 }

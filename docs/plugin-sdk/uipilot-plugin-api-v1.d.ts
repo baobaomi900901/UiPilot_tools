@@ -141,7 +141,23 @@ export type PluginPanelActionHandler = (
   api: Readonly<UiPilotPluginApiV1>,
 ) => Promise<PluginPanelActionResponse>
 
+export interface PluginWindowRequest { action: string; payload: JsonValue }
+export interface PluginWindowActionInvocation {
+  apiVersion: 1
+  requestId: string
+  action: string
+  payload: JsonValue
+  context: { platform: 'windows'; theme: 'dark' | 'light'; invokedAt: string }
+}
+export interface PluginWindowActionResponse { requestId: string; data: JsonValue }
+export type PluginWindowActionHandler = (
+  invocation: Readonly<PluginWindowActionInvocation>,
+  api: Readonly<UiPilotPluginApiV1>,
+) => Promise<PluginWindowActionResponse>
+
 export interface PluginRuntimeModule {
+  /** Required at readiness only when window.runtimeActions is true (Windows Host 0.9.0+). */
+  onWindowAction?: PluginWindowActionHandler
   /** Required at readiness only when panel.runtimeActions is true (Windows Host 0.6.0+). */
   onPanelAction?: PluginPanelActionHandler
   onCommand: PluginHandler
@@ -201,6 +217,8 @@ export interface UiPilotPluginWindowStorageApiV1 {
 }
 
 export interface UiPilotPluginWindowApiV1 {
+  /** Session-bound; call after onUpdate has returned and Host has activated the window. */
+  readonly request?: (input: Readonly<PluginWindowRequest>) => Promise<JsonValue>
   onUpdate(
     handler: (update: Readonly<PluginWindowUpdate>) => void | Promise<void>,
   ): () => void

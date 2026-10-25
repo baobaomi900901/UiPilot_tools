@@ -127,6 +127,8 @@ pub(crate) struct PublicRuntimeV1 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicWindowV1 {
+    #[serde(default)]
+    pub(crate) runtime_actions: bool,
     pub(crate) entry: String,
 }
 
@@ -716,6 +718,11 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.window.as_ref().is_some_and(|p| p.runtime_actions)
+        && (minimum_host < [0, 9, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.panel.as_ref().is_some_and(|p| p.runtime_actions)
         && (minimum_host < [0, 6, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
     {
@@ -958,6 +965,32 @@ mod schema_tests {
             &serde_json::to_vec(value).unwrap(),
             &PublicPluginHost::current(PublicPlatform::Windows),
         )
+    }
+
+    #[test]
+    fn window_action_opt_in_is_strict_and_requires_windows_host_0_9() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.9.0");
+        value["supportedPlatforms"] = serde_json::json!(["windows"]);
+        value["command"]["activationMode"] = serde_json::json!("submit");
+        value["command"]["outputMode"] = serde_json::json!("window");
+        value["window"] = serde_json::json!({"entry":"dist/window.html"});
+        value["permissions"] = serde_json::json!(["ui.window"]);
+        assert!(parse(&value).is_ok());
+        for opt in [serde_json::json!(false), serde_json::json!(true)] {
+            value["window"]["runtimeActions"] = opt;
+            assert!(parse(&value).is_ok());
+        }
+        for opt in [Value::Null, serde_json::json!(1), serde_json::json!("true")] {
+            value["window"]["runtimeActions"] = opt;
+            assert!(parse(&value).is_err());
+        }
+        value["window"]["runtimeActions"] = serde_json::json!(true);
+        value["minimumHostVersion"] = serde_json::json!("0.8.0");
+        assert!(parse(&value).is_err());
+        value["minimumHostVersion"] = serde_json::json!("0.9.0");
+        value["supportedPlatforms"] = serde_json::json!(["windows", "macos"]);
+        assert!(parse(&value).is_err());
     }
 
     #[test]

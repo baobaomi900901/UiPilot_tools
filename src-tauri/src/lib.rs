@@ -487,6 +487,7 @@ pub fn run() {
             commands::plugin_panel_request_hide_commit,
             commands::plugin_panel_focus_host_input,
             commands::plugin_panel_focus_host_input_ack,
+            commands::plugin_window_request,
             commands::plugin_panel_request,
             commands::plugin_panel_storage_get,
             commands::plugin_panel_storage_set,
