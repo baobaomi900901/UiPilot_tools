@@ -34,6 +34,7 @@ export function PublicPluginSettings({ client, plugin, revision, reload, detailB
   const sequence = useRef(0)
   const [review, setReview] = useState(false)
   const [unread, setUnread] = useState(false)
+  const writeOutcome = useRef<'success' | 'failure' | null>(null)
   const [feedback, setFeedback] = useState('')
   const updateDrafts = (next: Map<string, string | boolean>) => { draftsRef.current = next; setDrafts(next) }
   useEffect(() => { live.current = true; return () => { live.current = false; sequence.current++ } }, [])
@@ -61,10 +62,10 @@ export function PublicPluginSettings({ client, plugin, revision, reload, detailB
       if (live.current) setUnread(false)
       if (!owns()) return
       if (outcome === 'success') { updateDrafts(new Map()); setReview(false); setFeedback('已保存') }
-      else { setReview(true); setFeedback(outcome === 'failure' ? '保存未确认，落盘值可能已改变。已重新读取；请核对草稿并取消修改后重新编辑。' : '已重新读取；请核对草稿并取消修改后重新编辑。') }
+      else { setReview(true); setFeedback(writeOutcome.current === 'success' ? '已保存，已重新读取；请核对草稿并取消修改后重新编辑。' : '保存未确认，落盘值可能已改变。已重新读取；请核对草稿并取消修改后重新编辑。') }
     } catch {
       // External ordinary changes retire feedback ownership, never the need to reconcile a write.
-      if (live.current) { setUnread(true); setFeedback(outcome === 'success' ? '已保存，无法刷新当前状态。请重新读取普通设置后核对。' : '保存未确认，落盘值可能已改变；无法刷新当前状态。请重新读取普通设置，勿重复提交。') }
+      if (live.current) { setUnread(true); setFeedback(writeOutcome.current === 'success' ? '已保存，无法刷新当前状态。请重新读取普通设置后核对。' : '保存未确认，落盘值可能已改变；无法刷新当前状态。请重新读取普通设置，勿重复提交。') }
     } finally {
       if (live.current) { setBusy(false); release() }
     }
@@ -78,7 +79,7 @@ export function PublicPluginSettings({ client, plugin, revision, reload, detailB
     try { await client.savePublicPluginSettings({ input: { pluginId: plugin.pluginId, settings: Object.fromEntries(changed.map(field => [field.definition.key, field.value!])), secrets: {} } }) }
     catch { outcome = 'failure' }
     // An unmounted detail must never call even a newly supplied reload continuation.
-    if (live.current) await read(owns, outcome)
+    if (live.current) { writeOutcome.current = outcome; await read(owns, outcome) }
   }
   const reread = async () => {
     if (pending.current || detailBusy || !acquire()) return

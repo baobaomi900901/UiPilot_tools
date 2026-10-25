@@ -39,12 +39,22 @@ it('rejects empty and out-of-range numbers while step is only a hint', async () 
 })
 it('keeps uncertain drafts, only retries reads, and distinguishes a saved write with a failed refresh', async () => {
   const client = clientFixture(); client.savePublicPluginSettings.mockRejectedValueOnce(new Error('private'))
-  const reload = vi.fn(async (_accept?: (revision: string) => void) => { throw new Error('read') }); await render(client, reload)
+  let readFails = true
+  const reload = vi.fn(async (_accept?: (revision: string) => void) => { if (readFails) throw new Error('read') }); await render(client, reload)
   await input('文本', 'draft'); await click('保存普通设置')
   expect(host.textContent).toContain('保存未确认'); expect(host.querySelector<HTMLInputElement>('textarea[aria-label="文本"]')!.value).toBe('draft')
   expect(button('保存普通设置').disabled).toBe(true); await click('重新读取普通设置'); expect(client.savePublicPluginSettings).toHaveBeenCalledOnce(); expect(reload).toHaveBeenCalledTimes(2)
+  expect(host.textContent).toContain('保存未确认'); expect(host.textContent).not.toContain('已保存')
+  readFails = false; await click('重新读取普通设置')
+  expect(host.textContent).toContain('保存未确认'); expect(button('保存普通设置').disabled).toBe(true); expect(client.savePublicPluginSettings).toHaveBeenCalledOnce()
+  readFails = true
   await render(client, vi.fn(async () => {}), { ...base, pluginId: 'com.example.other' }); await input('文本', 'saved')
   await render(client, reload, { ...base, pluginId: 'com.example.other' }); await click('保存普通设置'); expect(host.textContent).toContain('已保存，无法刷新当前状态')
+  await click('重新读取普通设置')
+  expect(host.textContent).toContain('已保存，无法刷新当前状态'); expect(host.textContent).not.toContain('保存未确认'); expect(button('保存普通设置').disabled).toBe(true)
+  readFails = false; await click('重新读取普通设置')
+  expect(host.textContent).toContain('已保存'); expect(host.textContent).toContain('已重新读取'); expect(host.textContent).not.toContain('保存未确认'); expect(button('保存普通设置').disabled).toBe(true)
+  expect(client.savePublicPluginSettings).toHaveBeenCalledTimes(2)
 })
 it('admits one save and excludes recovery until reconciliation, then ignores a closed detail completion', async () => {
   const client = clientFixture(), save = deferred(); client.savePublicPluginSettings.mockReturnValueOnce(save.promise); const reload = await render(client)
