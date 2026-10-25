@@ -1450,12 +1450,12 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               placeholder="请输入参数"
               role="combobox"
               spellCheck={false}
-              suffix={settingsControl}
               onKeyDown={mainResultKeyDown}
               onBound={reportMainResultBound}
               onUnbound={reportMainResultUnbound}
               onBindingFailed={reportFailed}
             />
+            {settingsControl}
           </div>
         ) : (
           <>
