@@ -3091,7 +3091,10 @@ describe('shown and search ownership', () => {
     }
   })
 
-  it('syncs the panel host region bounds once per changed animation frame and cleans up observers', async () => {
+  it.each([1, 1.5, 1.8])('syncs physical panel bounds at pixel ratio %s and cleans up observers', async (pixelRatio) => {
+    const originalRatio = window.devicePixelRatio
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: pixelRatio })
+    const physical = (value: { x: number; y: number; width: number; height: number }) => Object.fromEntries(Object.entries(value).map(([key, number]) => [key, number * pixelRatio]))
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const resizeObservers: Array<{
       callback: ResizeObserverCallback
@@ -3171,7 +3174,7 @@ describe('shown and search ownership', () => {
       await flushFrames()
       expect(client.setPluginPanelBounds).toHaveBeenCalledWith({
         sessionEpoch: '1',
-        bounds: { x: 12, y: 64, width: 696, height: 320 },
+        bounds: physical({ x: 12, y: 64, width: 696, height: 320 }),
       })
 
       observer!.callback([], observer as unknown as ResizeObserver)
@@ -3187,7 +3190,7 @@ describe('shown and search ownership', () => {
       await flushFrames()
       expect(client.setPluginPanelBounds).toHaveBeenLastCalledWith({
         sessionEpoch: '1',
-        bounds,
+        bounds: physical(bounds),
       })
       expect(client.setPluginPanelBounds).toHaveBeenCalledTimes(2)
 
@@ -3203,6 +3206,7 @@ describe('shown and search ownership', () => {
       requestFrame.mockRestore()
       cancelFrame.mockRestore()
       rect.mockRestore()
+      Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: originalRatio })
     }
   })
 

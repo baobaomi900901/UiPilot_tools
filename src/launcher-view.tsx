@@ -722,11 +722,14 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
       frame = undefined
       if (disposed || !host.isConnected) return
       const rect = host.getBoundingClientRect()
+      // DOM coordinates include browser zoom; native child bounds use physical pixels.
+      const pixelRatio = window.devicePixelRatio
+      if (!Number.isFinite(pixelRatio) || pixelRatio <= 0) return
       const bounds: PluginPanelBounds = {
-        x: rect.left,
-        y: rect.top,
-        width: rect.width,
-        height: rect.height,
+        x: rect.left * pixelRatio,
+        y: rect.top * pixelRatio,
+        width: rect.width * pixelRatio,
+        height: rect.height * pixelRatio,
       }
       if (
         !Number.isFinite(bounds.x) || !Number.isFinite(bounds.y) ||

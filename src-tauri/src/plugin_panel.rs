@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{
     webview::{NewWindowResponse, WebviewBuilder},
-    AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow,
+    AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
+    WebviewWindow,
 };
 
 #[cfg(windows)]
@@ -2692,18 +2693,12 @@ pub(crate) fn teardown_plugin(
     Some(identity)
 }
 
-fn main_logical_size(main: &tauri::Window) -> Result<(f64, f64), PanelBoundsError> {
+fn main_physical_size(main: &tauri::Window) -> Result<(f64, f64), PanelBoundsError> {
     let size = main
         .inner_size()
         .map_err(|_| PanelBoundsError::Unavailable)?;
-    let scale = main
-        .scale_factor()
-        .map_err(|_| PanelBoundsError::Unavailable)?;
-    if !scale.is_finite() || scale <= 0.0 {
-        return Err(PanelBoundsError::Unavailable);
-    }
-    let width = size.width as f64 / scale;
-    let height = size.height as f64 / scale;
+    let width = size.width as f64;
+    let height = size.height as f64;
     if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
         return Err(PanelBoundsError::Unavailable);
     }
@@ -2826,15 +2821,21 @@ pub(crate) fn set_bounds(
     let main = app
         .get_window("main")
         .ok_or(PanelBoundsError::Unavailable)?;
-    let (main_width, main_height) = main_logical_size(&main)?;
+    let (main_width, main_height) = main_physical_size(&main)?;
     let bounds = clamp_panel_bounds(main_width, main_height, requested)?;
     let content = app
         .get_webview(&identity.content_label)
         .ok_or(PanelBoundsError::Unavailable)?;
     content
         .set_bounds(tauri::Rect {
-            position: tauri::Position::Logical(LogicalPosition::new(bounds.x, bounds.y)),
-            size: tauri::Size::Logical(LogicalSize::new(bounds.width, bounds.height)),
+            position: tauri::Position::Physical(PhysicalPosition::new(
+                bounds.x.round() as i32,
+                bounds.y.round() as i32,
+            )),
+            size: tauri::Size::Physical(PhysicalSize::new(
+                bounds.width.round() as u32,
+                bounds.height.round() as u32,
+            )),
         })
         .map_err(|_| PanelBoundsError::Unavailable)?;
     trace_panel_focus(app, controller, "content-bounds", || {
@@ -5844,7 +5845,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_bounds_are_clamped_to_the_main_logical_client_area() {
+    fn panel_bounds_are_clamped_to_the_main_physical_client_area() {
         let bounds = clamp_panel_bounds(
             720.0,
             420.0,

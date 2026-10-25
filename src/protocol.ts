@@ -513,6 +513,7 @@ export interface PluginPanelCommandResult {
   hostKeys: readonly PanelHostKeyDeclaration[]
 }
 
+/** Physical client pixels, converted from DOM coordinates by the main WebView. */
 export interface PluginPanelBounds {
   x: number
   y: number
