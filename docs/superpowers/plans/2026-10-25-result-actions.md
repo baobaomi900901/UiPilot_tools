@@ -34,10 +34,10 @@
 
 **Dependencies:** Task1独立review通过；设计“Private IPC and identity”“Launcher interaction and frontend ownership”及失败文案。docs/ui-guidelines.md。
 
-- [ ] 校验sanitized action metadata及typed outcomes；default/no-default选择、新结果安装保留suffix控制与caret；不调用finishSearch或自动执行返回结果。
-- [ ] 统一底栏“动作 Ctrl+K”、右键与键盘菜单；pending/consumed反馈和显式“重新运行”；收藏入口/非动作结果行为保持。
-- [ ] edit/departure立即发source-bound退休通知；捕获query/value/request/command等owner，迟到cleanup/反馈/刷新不污染新界面；主题/焦点遵循现有规范。
-- [ ] 聚焦检查、自审、提交；报告.superpowers/sdd/local-foundation/result-actions-task-2-report.md。
+- [x] 校验sanitized action metadata及typed outcomes；default/no-default选择、新结果安装保留suffix控制与caret；不调用finishSearch或自动执行返回结果。
+- [x] 统一底栏“动作 Ctrl+K”、右键与键盘菜单；pending/consumed反馈和显式“重新运行”；收藏入口/非动作结果行为保持。
+- [x] edit/departure立即发source-bound退休通知；捕获query/value/request/command等owner，迟到cleanup/反馈/刷新不污染新界面；主题/焦点遵循现有规范。
+- [x] 聚焦检查、自审、提交；报告.superpowers/sdd/local-foundation/result-actions-task-2-report.md。
 
 **Distinct test coverage:** no-default打开菜单；三入口执行同一选择且不会额外触发行默认动作；重复点击单受理；复制/受理失败禁用旧动作且rerun只走普通submit；busy可重试不消耗；staleRequest/unknownResult即使未消耗也禁用当前源并提示重新运行。编辑在debounce前退休；陈旧retire不影响新set；旧response/error/pendingcleanup不覆盖newquery/view；改变highlight不阻断合法替换；新handle原子安装且无autoexecute。原收藏、旧复制与Find不退化。键盘/双主题真实显示交用户测试，保留必要DOM事件路由/可访问名称检查。
 
@@ -62,3 +62,6 @@
 组合review解决Critical/Important；记录从本轮BASE4a3b994至最终HEAD的全diff。冻结后npm run build、前置hash、TAURI_CONFIG={"identifier":"com.uipilot.launcher.acceptance","productName":"UiPilot Acceptance"}及cargo build --manifest-path src-tauri/Cargo.toml --bin uipilot --features tauri/custom-protocol --offline --locked。新kit保留五resources、文本片段包、中文README及provenance；不覆盖0.9及更早kit。核对实际版本、全部实际发现构建输入、旧交付hash；数量按发现记录。
 
 首批人工：安装并用三个菜单入口；复制已知文本到临时编辑器；保存→latest读取→重启保留。后续重复交互/输入变更/主题键盘、旧插件短回归。只记录实际下发并获确认项；总基座仍未完成。
+## 本轮交付节奏修正
+
+用户指出本轮已运行约2.5小时。独立范围审计确认M2方向一致，但切片过大、示例后置和串行关卡推迟人工反馈。Task1/Task2已有独立Spec/Quality PASS，保留其审查证据；剩余仅完成最小文本片段插件、包验证及一次集成构建。最终组合检查集中于新增插件与跨层接缝，不全量重审已通过代码、不重复全仓测试；3项已在BASE复现的凭据测试单列待办，不阻塞本轮交付。逐命令快捷键、组件库和其他能力保持后续范围。原生人工通过前不宣称0.10完成验收。
