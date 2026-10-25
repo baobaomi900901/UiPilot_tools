@@ -54,8 +54,8 @@ label,
 .file-preview,
 .file-toolbar,
 .settings-tabs,
-.settings-tab-panel,
-.settings-detail-panel {
+.settings-detail-panel,
+.settings-tab-panel {
   app-region: no-drag;
 }
 
@@ -2037,8 +2037,8 @@ label,
   border-inline-start-color: var(--uipilot-ui-border);
 }
 
-.settings-tab-panel,
-.settings-detail-panel {
+.settings-detail-panel,
+.settings-tab-panel {
   --result-scrollbar-thumb: var(--uipilot-ui-scrollbar);
   min-width: 0;
   min-height: 0;
