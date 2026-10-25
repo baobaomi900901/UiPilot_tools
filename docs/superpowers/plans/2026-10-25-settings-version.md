@@ -11,7 +11,8 @@ Files: src/app-version.tsx, src/launcher-view.tsx, src/styles.css, src-tauri/cap
 - [x] Add metadata-backed header label, loading/error states and unmount guard.
 - [x] Grant version read only to the exact main capability; verify other capability files unchanged.
 - [x] Run npm run build and npm test -- src/launcher.test.tsx -t 'navigates between launcher and settings|routes the messages target'. No new mechanical tests.
-- [ ] Review scoped diff, commit, then build a new embedded-frontend acceptance executable with the same data identity and five resources; record source and artifact hashes.
-- [ ] Hand user manual checks: displayed 0.7.0, consistent tabs, Light/Dark, preserved old settings/plugins. These remain pending until user confirmation.
+- [x] Review scoped diff, commit, then build a new embedded-frontend acceptance executable with the same data identity and five resources; record source and artifact hashes.
+- [x] Hand user manual checks: displayed 0.7.0, consistent tabs, Light/Dark, preserved old settings/plugins. These remain pending until user confirmation.
 
 Native command: cargo build --manifest-path src-tauri/Cargo.toml --bin uipilot --features tauri/custom-protocol --offline --locked with process-local acceptance TAURI_CONFIG and shared CARGO_TARGET_DIR; restore environment afterward.
+Delivery2026-10-25: source2b2d005, independent SpecPASS/QualityPASS/no findings; navigation2/type/frontendbuild passed. Nativebuildexit0,688inputs unchanged,5resources match, old0.7kit unchanged. Newkit uipilot-0.7.0-settings-version, sameacceptanceidentity. Actualmanualchecks and recovery9cases remainpending.
