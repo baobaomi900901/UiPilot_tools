@@ -59,3 +59,13 @@ Task2提交e770d6a19a973438bf2624a6d7a80b4e4a850738，新增JSON工作台1.0.0�
 最终npm run build与离线锁定原生cargo build均exit0。717项源码/dist输入前后稳定，两包及五资源匹配，旧六个交付程序hash未变。程序实际ProductVersion/FileVersion均0.9.0，ProductName为UiPilot Acceptance，保留com.uipilot.launcher.acceptance数据标识。构建源码e770d6a19a973438bf2624a6d7a80b4e4a850738；交付.superpowers/deliveries/uipilot-0.9.0-acceptance/uipilot.exe，38829056字节，SHA256 e5424769896c3645f5686873a822559b6af748327c128239753f8217d546895d。JSON包SHA256 054eb645a6375ced9023098118b3772ed4a746d8fcd4c2e097826ef569030b40。构建记录位于该kit的delivery-evidence.json；实现与评审记录位于.superpowers/sdd/local-foundation/window-runtime-task-2-report.md及window-runtime-final-review.md。
 
 全部0.9原生人工用例仍待用户执行。首批为安装/打开、正常及错误JSON格式化、保存后关闭重开及完整退出重启；后续草稿/快速交互/主题键盘和旧插件短回归。代理未运行原生Host或操作真实数据，完整本地基座尚未完成。本次状态提交只改文档，不改变已冻结程序。
+
+## 2026-10-25 0.9.0核心人工验收收口
+
+用户逐组确认全部实际下发用例符合预期。第一组：JSON工作台安装与打开、合法格式化、非法JSON错误后可编辑、显式保存后关闭重开及完整退出重启保留。第二组：未保存编辑关闭重开恢复已保存文本；重新读取的保留/放弃确认；快速格式化与关闭重开无异常或陈旧结果覆盖；深浅主题、Tab/Shift+Tab焦点、长文本区域滚动且按钮无遮挡。第三组：settings-demo既有配置、Notes原笔记读取、templates预览、recovery inspect-v2原schema2/计数1/sentinel只读数据保留；番茄钟1.2.0本地包安装、10分钟计时关闭子窗口后继续、到期消息/响铃、打开主窗口停止响铃及重开操作。第三组用户明确回复“插件安装成功, 并且所有用例都测试过, 符合预期”。
+
+Windows文件选择框曾因粘贴正斜杠链接路径提示文件名无效，改用完整反斜杠路径后用户确认安装成功，无产品源码修改。
+
+当前已验收程序仍为.superpowers/deliveries/uipilot-0.9.0-acceptance/uipilot.exe，源码e770d6a19a973438bf2624a6d7a80b4e4a850738，版本0.9.0，SHA256 e5424769896c3645f5686873a822559b6af748327c128239753f8217d546895d。本次仅记录人工反馈，不重新构建或重跑已通过检查。独立评审与自动边界证据见前文，实际用户反馈单独记录。
+
+本轮Window→Runtime与JSON工作台核心人工验收通过。未单独下发或确认的保存期间继续编辑、不确定保存、真实超时/故障注入等扩展人工场景不因此标为已执行。完整Raycast式本地插件基座尚未完成，后续仍包括通用结果动作与逐命令快捷键、标准UI及授权系统能力、M6/M7剩余生命周期与总验收；继续保持本地包范围，不涉及在线安装/发布。
