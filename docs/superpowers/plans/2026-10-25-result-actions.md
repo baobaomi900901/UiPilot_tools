@@ -49,9 +49,9 @@
 
 **Dependencies:** Task1/2独立review通过；设计“Local example: Text Snippet”“Review and acceptance”；先读SDK教程/UI规范，参考demo-multi及json-workbench私有记录校验。
 
-- [ ] 两命令transform/latest、原文/大写行与copy/save/read动作；onCommand只读，严格记录/revision/CAS/字节限额，写一次且失败不重试；纯插件实现。
-- [ ] 业务边界和SDK合同检查，fresh CLI目录/归档验证打包，中文人工步骤；更新发现计数，自审提交并报告result-actions-task-3-report.md。
-- [ ] 父级组合review后冻结源码/dist，构建新Host0.10验收kit，保存exe/两侧hash/资源/包/人工用例。此复选项在父级完成交付前保持未勾选。
+- [x] 两命令transform/latest、原文/大写行与copy/save/read动作；onCommand只读，严格记录/revision/CAS/字节限额，写一次且失败不重试；纯插件实现。
+- [x] 业务边界和SDK合同检查，fresh CLI目录/归档验证打包，中文人工步骤；更新发现计数，自审提交并报告result-actions-task-3-report.md。
+- [x] 父级组合review后冻结源码/dist，构建新Host0.10验收kit，保存exe/两侧hash/资源/包/人工用例。此复选项在父级完成交付前保持未勾选。
 
 **Distinct test coverage:** 两command相同business ID隔离；格式转换及UTF8上限；只读command不写入；save/revision冲突/overflow/坏schema拒写/失败不重试；空值与缺失记录；fresh SDK types。Native菜单/复制/重启数据由用户确认。
 
