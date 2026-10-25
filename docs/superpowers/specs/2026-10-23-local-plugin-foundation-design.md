@@ -99,3 +99,11 @@ M2-M7 是交付路线图而非尚未设计的 wire API。实现前必须形成�
 人工发现的两项UI问题已修复并由用户复验：详情开启开关改为绿色（46da433）；Notes面板边界缩放适配，统一物理像素坐标（6ad4b66）。当前验收程序为.superpowers/deliveries/uipilot-0.8.0-panel-fit/uipilot.exe，源码6ad4b6644d3bb141a617229b98a69bd8ba99dc95，版本0.8.0，SHA256839ea9898340e2469f77479a70633256fe1eda04adfabbb9437bb2363a47a4a1。聚焦前端缩放3项、Rust边界/身份/权限4项及前端/原生构建通过，700构建输入稳定。本次仅更新文档，无重新构建。
 
 本轮普通设置核心人工验收收口。原手册初始默认值逐项核对、保存期间重复点击、真实凭据界面/服务等未获得单独人工确认，不扩大为全部扩展矩阵通过；重复提交等边界的自动检查与人工证据分别记录。完整Raycast式本地基座尚未完成：Window RPC、通用动作与逐命令快捷键、标准UI与授权系统能力及M6/M7剩余验收仍待后续。下一阶段优先评估子窗口调用Runtime的闭环，另行形成设计与实施计划；本记录不代表该功能已经实现。
+
+## 2026-10-25 0.9.0交付门槛
+
+Task2提交e770d6a19a973438bf2624a6d7a80b4e4a850738，新增JSON工作台1.0.0与示例发现断言。13项Runtime、6项窗口所有权、18项协调器检查共37项通过；SDK严格类型检查、CLI构建、目录与归档验证通过。Task2/最终组合独立评审Spec PASS、Quality PASS，无遗留发现；Task1及修复的审查证据保留，未机械重跑全仓。
+
+最终npm run build与离线锁定原生cargo build均exit0。717项源码/dist输入前后稳定，两包及五资源匹配，旧六个交付程序hash未变。程序实际ProductVersion/FileVersion均0.9.0，ProductName为UiPilot Acceptance，保留com.uipilot.launcher.acceptance数据标识。构建源码e770d6a19a973438bf2624a6d7a80b4e4a850738；交付.superpowers/deliveries/uipilot-0.9.0-acceptance/uipilot.exe，38829056字节，SHA256 e5424769896c3645f5686873a822559b6af748327c128239753f8217d546895d。JSON包SHA256 054eb645a6375ced9023098118b3772ed4a746d8fcd4c2e097826ef569030b40。构建记录位于该kit的delivery-evidence.json；实现与评审记录位于.superpowers/sdd/local-foundation/window-runtime-task-2-report.md及window-runtime-final-review.md。
+
+全部0.9原生人工用例仍待用户执行。首批为安装/打开、正常及错误JSON格式化、保存后关闭重开及完整退出重启；后续草稿/快速交互/主题键盘和旧插件短回归。代理未运行原生Host或操作真实数据，完整本地基座尚未完成。本次状态提交只改文档，不改变已冻结程序。

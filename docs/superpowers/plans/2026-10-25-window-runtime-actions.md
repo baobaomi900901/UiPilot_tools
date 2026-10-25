@@ -33,9 +33,9 @@
 
 **Dependencies:** Task1独立审查通过；设计“JSON工作台插件”“验证与人工交付”；docs/plugin-sdk/public-plugin-developer-guide.md与docs/ui-guidelines.md。插件代码实现只在新包/tests/docs，不修改Host/SDK来适配插件；发现API缺口报告主agent处理。
 
-- [ ] 实现onCommand只读初值与onWindowAction load/format/save，严格输入与存储校验、revision冲突、无自动重试或数据重置。
-- [ ] 实现紧凑双主题子窗口、草稿/请求所有权、忙碌/错误/不确定保存和显式重新读取，内容端不调用storage。
-- [ ] 插件业务边界测试、SDK签名检查、CLI验证打包，自审提交并提供人工步骤；主agent冻结源码构建Host与交付hash。
+- [x] 实现onCommand只读初值与onWindowAction load/format/save，严格输入与存储校验、revision冲突、无自动重试或数据重置。
+- [x] 实现紧凑双主题子窗口、草稿/请求所有权、忙碌/错误/不确定保存和显式重新读取，内容端不调用storage。
+- [x] 插件业务边界测试、SDK签名检查、CLI验证打包，自审提交并提供人工步骤；主agent冻结源码构建Host与交付hash。
 
 **Distinct coverage:** 格式化标准JSON、非法语法、1e400非有限、嵌套/数量/UTF-8限额；保存空/未完成JSON草稿、revision冲突、invalid-stored-data不重置、保存失败不重试。UI的重复按钮、关闭重开与陈旧结果、键盘/主题主要由用户测试。
 
@@ -51,3 +51,11 @@
 ## Task1交付门槛状态
 
 2026-10-25 Task1实现48a61c9，独立评审修复e69184d079573a477d9560007accb96048d08b50。最终Spec PASS/Quality PASS，无遗留发现，Task2已可执行。修复了原生窗口清理及focus/blur/close的document身份竞态、验证协调器版本遗漏。相关实际检查与两次未落盘审批拒绝/窄化替代见window-runtime-task-1-report.md；既有Vite体积提示保留。此为源码与自动边界验证，不代表新窗口原生人工验收通过。
+
+## 2026-10-25 0.9.0交付门槛
+
+Task2提交e770d6a19a973438bf2624a6d7a80b4e4a850738，新增JSON工作台1.0.0与示例发现断言。13项Runtime、6项窗口所有权、18项协调器检查共37项通过；SDK严格类型检查、CLI构建、目录与归档验证通过。Task2/最终组合独立评审Spec PASS、Quality PASS，无遗留发现；Task1及修复的审查证据保留，未机械重跑全仓。
+
+最终npm run build与离线锁定原生cargo build均exit0。717项源码/dist输入前后稳定，两包及五资源匹配，旧六个交付程序hash未变。程序实际ProductVersion/FileVersion均0.9.0，ProductName为UiPilot Acceptance，保留com.uipilot.launcher.acceptance数据标识。构建源码e770d6a19a973438bf2624a6d7a80b4e4a850738；交付.superpowers/deliveries/uipilot-0.9.0-acceptance/uipilot.exe，38829056字节，SHA256 e5424769896c3645f5686873a822559b6af748327c128239753f8217d546895d。JSON包SHA256 054eb645a6375ced9023098118b3772ed4a746d8fcd4c2e097826ef569030b40。构建记录位于该kit的delivery-evidence.json；实现与评审记录位于.superpowers/sdd/local-foundation/window-runtime-task-2-report.md及window-runtime-final-review.md。
+
+全部0.9原生人工用例仍待用户执行。首批为安装/打开、正常及错误JSON格式化、保存后关闭重开及完整退出重启；后续草稿/快速交互/主题键盘和旧插件短回归。代理未运行原生Host或操作真实数据，完整本地基座尚未完成。本次状态提交只改文档，不改变已冻结程序。
