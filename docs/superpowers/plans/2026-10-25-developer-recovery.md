@@ -42,13 +42,13 @@
 
 **Dependencies:** Task 1 reviewed, Host0.7 contracts fixed; design sections Plugin data/version contract and independent fixture and Acceptance and minimal automated checks. Closest example demo-multi; no new capability or panel business UI.
 
-- [ ] Implement a small submit/mainResult recovery demo using stable plugin/command identity, persisted bounded schema-1 counter snapshot, read-only status/default-setting display, explicit increment and controlled fault input.
-- [ ] Generate separate A/B same-version, readiness-broken, throwing, compatible upgraded and synthetic schema-2 writer/reader directories. Unknown/malformed schema blocks all writes; schema2 fixture is disposable and explicitly invoked.
-- [ ] Keep fixtures strictly offline and harmless, with distinct source-path/content/error/setting sentinels for diagnostic privacy checks.
-- [ ] Validate source/package artifacts and add minimal data-preservation/single-write/uncertain-save tests.
-- [ ] Build a new acceptance executable using existing acceptance identifier and embedded frontend; copy the five required resources. Preserve all previous kits; never launch it.
-- [ ] Record exact source revision/input hashes, executable/resource/archive hashes, build exit evidence and Chinese manual instructions. Use visible full paths and distinguish folder selection from archive selection.
-- [ ] Commit tracked example changes only, report artifact provenance separately; all new manual cases remain pending until user reports.
+- [x] Implement a small submit/mainResult recovery demo using stable plugin/command identity, persisted bounded schema-1 counter snapshot, read-only status/default-setting display, explicit increment and controlled fault input.
+- [x] Generate separate A/B same-version, readiness-broken, throwing, compatible upgraded and synthetic schema-2 writer/reader directories. Unknown/malformed schema blocks all writes; schema2 fixture is disposable and explicitly invoked.
+- [x] Keep fixtures strictly offline and harmless, with distinct source-path/content/error/setting sentinels for diagnostic privacy checks.
+- [x] Validate source/package artifacts and add minimal data-preservation/single-write/uncertain-save tests.
+- [x] Build a new acceptance executable using existing acceptance identifier and embedded frontend; copy the five required resources. Preserve all previous kits; never launch it.
+- [x] Record exact source revision/input hashes, executable/resource/archive hashes, build exit evidence and Chinese manual instructions. Use visible full paths and distinguish folder selection from archive selection.
+- [x] Commit tracked example changes only, report artifact provenance separately; all new manual cases remain pending until user reports.
 
 **Distinct coverage:** Missing storage read does not write; valid increment writes one complete snapshot; unknown/newer/malformed schema remains byte-for-byte unchanged; synthetic schema2 survives older reader; write failure returns uncertainty rather than claiming rollback; Runtime throw never echoed as a report field.
 
@@ -58,4 +58,4 @@
 
 Independent final review; verify artifact hashes/source provenance. Hand user short initial manual checks and full Chinese guide, with remaining cases clearly pending. This completes only the developer recovery slice, not all M6/M7 or the entire Raycast-like foundation.
 
-Status2026-10-25: Task1 implemented23bdf65, fixed728db33; independent delta SpecPASS/QualityApproved, no remaining important findings. Existing Vite chunk warning disclosed. Task2 next; all0.7 native/manual acceptance pending.
+Status2026-10-25: Task1 implemented23bdf65, fixed728db33; Task2 source d845230. Host0.7.0 kit built and independently verified: 688 unchanged inputs, six plugin archives, five resources. Final independent SpecPASS/QualityApproved; C0/I0, existing non-blocking Vite warning retained. Ready for user acceptance; all nine native/manual cases remain pending. Later commits are documentation only, not new binary source.
