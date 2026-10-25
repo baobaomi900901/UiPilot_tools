@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 
 import { formatPublicPluginDiagnostics, parsePublicPluginDiagnostics, parseU64Decimal } from './protocol'
 import { PluginIcon } from './plugin-icon'
+import { PublicPluginSettings } from './public-plugin-settings'
 import type {
   LauncherClient,
   PublicPermission,
@@ -404,8 +405,8 @@ export function publicPluginRecoveryError(error: unknown): string {
   }
 }
 
-export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload, detailBusy = false, onBusy = () => {} }: {
-  client: LauncherClient; plugin: PublicPluginInventoryItem; inventoryRevision: string; reload: () => Promise<void>; detailBusy?: boolean; onBusy?: (busy: boolean) => void
+export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload, detailBusy = false, onBusy = () => {}, acquire = () => true }: {
+  client: LauncherClient; plugin: PublicPluginInventoryItem; inventoryRevision: string; reload: () => Promise<void>; detailBusy?: boolean; onBusy?: (busy: boolean) => void; acquire?: () => boolean
 }) {
   const live = useRef(true)
   const request = useRef(0)
@@ -424,7 +425,7 @@ export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload
     if (origin.current?.isConnected && (!document.activeElement || document.activeElement === document.body || document.activeElement === origin.current)) origin.current.focus()
   }, [busy, prepared])
   const begin = () => {
-    if (pending.current || detailBusy) return false
+    if (pending.current || detailBusy || !acquire()) return false
     pending.current = true; setBusy(true); onBusy(true); setError(''); setNotice(''); return true
   }
   const end = (confirming = false) => { pending.current = false; if (live.current) { setBusy(false); onBusy(confirming) } }
@@ -508,6 +509,14 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
 }) {
   const [busy, setBusy] = useState(false)
   const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const [ordinaryBusy, setOrdinaryBusy] = useState(false)
+  const managementOwner = useRef<'ordinary' | 'detail' | 'recovery' | null>(null)
+  const acquire = (owner: 'ordinary' | 'detail' | 'recovery') => {
+    if (managementOwner.current !== null && managementOwner.current !== owner) return false
+    managementOwner.current = owner
+    return true
+  }
+  const release = (owner: 'ordinary' | 'detail' | 'recovery') => { if (managementOwner.current === owner) managementOwner.current = null }
   const operationPending = useRef(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -567,17 +576,19 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
   const cancelNetworkConsent = () => {
     if (networkConsent) rememberFocus(networkConsent.origin, null, 'network')
     setNetworkConsent(null)
+    release('detail')
   }
 
   const cancelClear = () => {
     if (clearOrigin.current) rememberFocus(clearOrigin.current, null, 'clear')
     setClearKey(null)
+    release('detail')
   }
   const networkPermission = plugin.permissions.find(({ permission }) => permission === 'network.https')
   const secretSettings = plugin.settings.filter(({ definition }) => definition.type === 'secret')
 
   const mutate = async (operation: () => Promise<void>, success: () => void, failure: string) => {
-    if (operationPending.current) return
+    if (operationPending.current || !acquire('detail')) return
     operationPending.current = true
     setBusy(true)
     setError('')
@@ -596,6 +607,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
       setError(`${committed ? '操作已完成。' : failure} 无法刷新当前状态，请返回列表刷新后核对。`)
     } finally {
       operationPending.current = false
+      release('detail')
       setBusy(false)
     }
   }
@@ -643,7 +655,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
 
   return (
     <section className="public-plugin-detail" aria-labelledby="public-plugin-detail-title" aria-busy={busy}>
-      <fieldset className="public-detail-fields" disabled={busy || recoveryBusy}>
+      <fieldset className="public-detail-fields" disabled={busy || recoveryBusy || ordinaryBusy || networkConsent !== null || clearKey !== null}>
       <dl className="public-plugin-detail-list">
         <dt className="public-detail-name-term">启动键</dt>
         <dd className="public-detail-name-value">
@@ -684,7 +696,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
             <dd>
               <div className="public-network-access-header">
                 <Switch aria-label="网络访问" checked={networkPermission.granted} disabled={busy || !networkPermission.supported}
-                  onChange={(granted, event) => granted ? setNetworkConsent({ plugin, revision: inventoryRevision, origin: event.currentTarget }) : setNetworkAccess(false, event.currentTarget)} />
+                  onChange={(granted, event) => { if (!acquire('detail')) return; if (granted) setNetworkConsent({ plugin, revision: inventoryRevision, origin: event.currentTarget }); else setNetworkAccess(false, event.currentTarget) }} />
                 <span>{networkPermission.supported ? (networkPermission.granted ? '已授权' : '未授权') : '不支持'}</span>
               </div>
               <CredentialBindings credentials={plugin.network.credentials} settings={plugin.settings} />
@@ -710,7 +722,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
                         onChange={(event) => setSecretDrafts((drafts) => ({ ...drafts, [definition.key]: event.target.value }))} />
                       <div className="public-secret-actions">
                         <Button htmlType="submit" type="primary" aria-label={`保存 ${definition.label}`} disabled={!draft.trim()} aria-disabled={busy}>保存</Button>
-                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy} onClick={(event) => { clearOrigin.current = event.currentTarget; setClearKey(definition.key) }}>清除</Button>
+                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy} onClick={(event) => { if (!acquire('detail')) return; clearOrigin.current = event.currentTarget; setClearKey(definition.key) }}>清除</Button>
                       </div>
                     </form>
                   )
@@ -723,7 +735,11 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
         <dd>暂未提供插件目录</dd>
       </dl>
       </fieldset>
-      <PublicPluginRecovery key={plugin.pluginId} client={client} plugin={plugin} inventoryRevision={inventoryRevision} reload={reload} detailBusy={busy} onBusy={setRecoveryBusy} />
+      <PublicPluginSettings key={`settings:${plugin.pluginId}`} client={client} plugin={plugin} revision={inventoryRevision} reload={reload}
+        detailBusy={busy || recoveryBusy || networkConsent !== null || clearKey !== null}
+        acquire={() => { if (!acquire('ordinary')) return false; setOrdinaryBusy(true); return true }}
+        release={() => { release('ordinary'); setOrdinaryBusy(false) }} />
+      <PublicPluginRecovery key={plugin.pluginId} client={client} plugin={plugin} inventoryRevision={inventoryRevision} reload={reload} detailBusy={busy || ordinaryBusy || networkConsent !== null || clearKey !== null} acquire={() => acquire('recovery')} onBusy={(next) => { setRecoveryBusy(next); if (!next) release('recovery') }} />
       <div className="public-detail-feedback" aria-live="polite">
         {busy ? <span role="status">正在保存…</span> : null}
         {notice ? <span role="status">{notice}</span> : null}

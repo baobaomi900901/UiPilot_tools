@@ -372,7 +372,7 @@ const client: LauncherClient = {
     }))
   },
   cancelPublicPlugin: async () => undefined,
-  getPublicPluginDiagnostics: async ({ pluginId }) => ({ schemaVersion: 1, hostVersion: '0.7.0', platform: 'windows', pluginId, state: null, lastOperation: null }),
+  getPublicPluginDiagnostics: async ({ pluginId }) => ({ schemaVersion: 1, hostVersion: '0.8.0', platform: 'windows', pluginId, state: null, lastOperation: null }),
   copyPublicPluginDiagnostics: async () => { throw { code: 'pluginUnavailable' } },
   setPublicPluginEnabled: async ({ pluginId, enabled }) => { updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, enabled })) },
   setPublicPluginNetworkAccess: async ({ pluginId, granted, expectedInventoryRevision }) => {
@@ -401,7 +401,9 @@ const client: LauncherClient = {
   savePublicPluginSettings: async ({ input }) => {
     await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
     updatePreviewPlugin(input.pluginId, (plugin) => ({ ...plugin, settings: plugin.settings.map((setting) =>
-      Object.prototype.hasOwnProperty.call(input.secrets, setting.definition.key)
+      setting.definition.type !== 'secret' && Object.prototype.hasOwnProperty.call(input.settings, setting.definition.key)
+        ? { ...setting, value: input.settings[setting.definition.key] }
+        : Object.prototype.hasOwnProperty.call(input.secrets, setting.definition.key)
         ? { ...setting, secretConfigured: input.secrets[setting.definition.key] !== null } : setting),
     }))
     if (previewScenarioPending && previewParameters.get('credentialScenario') === 'save-error') {
