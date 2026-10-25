@@ -27,6 +27,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { AppVersion } from './app-version'
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 
 import { sameFavoriteTarget, type LauncherCore } from './launcher-core'
@@ -2246,6 +2247,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             </Tooltip>
             <h1>设置</h1>
           </div>
+          <AppVersion />
         </header>
       </div>
       <div
