@@ -58,4 +58,12 @@
 
 Independent final review; verify artifact hashes/source provenance. Hand user short initial manual checks and full Chinese guide, with remaining cases clearly pending. This completes only the developer recovery slice, not all M6/M7 or the entire Raycast-like foundation.
 
-Status2026-10-25: Task1 implemented23bdf65, fixed728db33; Task2 source d845230. Host0.7.0 kit built and independently verified: 688 unchanged inputs, six plugin archives, five resources. Final independent SpecPASS/QualityApproved; C0/I0, existing non-blocking Vite warning retained. Ready for user acceptance; all nine native/manual cases remain pending. Later commits are documentation only, not new binary source.
+Status2026-10-25: Task1 implemented23bdf65, fixed728db33; Task2 source d845230. Host0.7.0 kit built and independently verified: 688 unchanged inputs, six plugin archives, five resources. Final independent SpecPASS/QualityApproved; C0/I0, existing non-blocking Vite warning retained. Initial delivery was ready for user acceptance; see the user acceptance closure below for subsequent fixes, the current executable and confirmed scope.
+
+## 2026-10-25 用户人工验收收口
+
+本轮实际下发的核心流程与收尾检查已获用户截图或明确确认：同版本开发重载、取消/身份/版本拦截、readiness失败保留旧版及重启恢复、故障停用后修复仍保持停用并手动启用、包升级保留数据、schema2经过旧读取器阻止写入后原样保留、启动键/收藏持久化、诊断读取/复制一致与V2私有数据排除、键盘双主题，以及Notes/templates/multi回归。
+
+人工发现并修复两项集成缺陷：详情内容区缺少no-drag导致无法滚动（最终源码c812e62），诊断get/copy未登记Tauri命令和主WebView权限（3646478）。均完成聚焦检查、独立评审和后续用户复验。当前验收程序为 `.superpowers/deliveries/uipilot-0.7.0-diagnostics/uipilot.exe`，源码36464787d6a8c84a7e56b841796eedb71948840b；版本0.7.0；SHA256 2614a83a2d7705deb5dd524559bd44b1fad3aed1df6fcbda04c4921be6e69cf9。691项构建输入稳定、五资源匹配；本次仅更新验收记录，不重新构建。
+
+边界：这是开发者恢复切片的核心人工验收通过，不代表原手册所有扩展细节逐项执行。仅刷新列表行为、降级提示文案、各历史状态下的诊断复制矩阵等未单独确认；真实凭据服务、安装器及整个M6/M7仍不在此结论内。完整基座仍缺普通插件设置编辑闭环，以及路线图中的Window RPC、通用动作/快捷键、标准UI与授权系统能力。下一阶段建议优先普通配置编辑，尚未形成新的实施计划或开始实现。
