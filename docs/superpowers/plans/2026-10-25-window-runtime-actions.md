@@ -18,10 +18,10 @@
 
 **Dependencies:** 设计“公开合同”“会话、线性化与生命周期”“集成边界”，既有Panel/Timer授权。独立设计审核通过后开始。
 
-- [ ] opt-in manifest/CLI/schema/SDK及onWindowAction readiness、版本同步。
-- [ ] 有类型WindowAction dispatch与共享有界JSON/单物理Runtime槽、独立pending settlement与completion ticket所有权。
-- [ ] Window controller内精确注册与全部生命周期撤销，旧函数会话绑定、bootstrap请求桥及最小ACL。
-- [ ] 完成边界/竞态回归、旧Panel与window timer重点回归、类型/构建，自审提交，写.superpowers/sdd/local-foundation/window-runtime-task-1-report.md。
+- [x] opt-in manifest/CLI/schema/SDK及onWindowAction readiness、版本同步。
+- [x] 有类型WindowAction dispatch与共享有界JSON/单物理Runtime槽、独立pending settlement与completion ticket所有权。
+- [x] Window controller内精确注册与全部生命周期撤销，旧函数会话绑定、bootstrap请求桥及最小ACL。
+- [x] 完成边界/竞态回归、旧Panel与window timer重点回归、类型/构建，自审提交，写.superpowers/sdd/local-foundation/window-runtime-task-1-report.md。
 
 **Distinct coverage:** Prepared/AwaitingAck为Busy且onUpdate不会等自身ACK；有效Visible会话可调用；main/shell/panel/runtime不可调用；旧request函数不能借新会话。Window调用期间hide/submit立即逻辑退休且不等待长RPC，旧API失权但物理槽直到completion/deadline才释放。物理完成后凭据/权限变化先于settlement则不能成功；重复回复只settle一次；新generation出现后旧timeout不能销毁新窗口。emit不确定失败仍有watchdog。小版本manifest/handler错误不能发布包；旧window timer/storage不因新增request改变。
 
@@ -46,3 +46,8 @@
 最终whole-change reviewer审查Task1与Task2范围；解决Critical/Important后交付。冻结源码及dist记录前后hash，TAURI_CONFIG使用{"identifier":"com.uipilot.launcher.acceptance","productName":"UiPilot Acceptance"}，cargo build --manifest-path src-tauri/Cargo.toml --bin uipilot --features tauri/custom-protocol --offline --locked。独立新kit包含exe、已有五资源、JSON插件包、中文README和校验记录，旧kit保持。
 
 首批用户测试安装/打开、正常与错误JSON格式化、保存/关闭重开/进程重启。之后快速交互与键盘主题、旧Notes/templates/settings/recovery短回归。实际反馈逐项记录，未完成总基座不得宣称完成。
+
+
+## Task1交付门槛状态
+
+2026-10-25 Task1实现48a61c9，独立评审修复e69184d079573a477d9560007accb96048d08b50。最终Spec PASS/Quality PASS，无遗留发现，Task2已可执行。修复了原生窗口清理及focus/blur/close的document身份竞态、验证协调器版本遗漏。相关实际检查与两次未落盘审批拒绝/窄化替代见window-runtime-task-1-report.md；既有Vite体积提示保留。此为源码与自动边界验证，不代表新窗口原生人工验收通过。
