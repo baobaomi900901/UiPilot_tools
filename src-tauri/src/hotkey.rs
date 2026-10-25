@@ -39,9 +39,26 @@ impl HotkeyKind {
     }
 }
 
+pub(crate) fn command_chord(raw: &str) -> Result<Shortcut, ()> {
+    match HotkeyKind::parse(raw)? {
+        HotkeyKind::Chord(shortcut) => Ok(shortcut),
+        HotkeyKind::DoubleTap(_) => Err(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DoubleTapModifier, HotkeyKind, DOUBLE_ALT, DOUBLE_CTRL};
+
+    #[test]
+    fn command_hotkey_requires_chord_and_canonicalizes_aliases() {
+        assert!(super::command_chord("DoubleCtrl").is_err());
+        assert!(super::command_chord("not a shortcut").is_err());
+        assert_eq!(
+            super::command_chord("Control+N").unwrap().to_string(),
+            super::command_chord("Ctrl+N").unwrap().to_string()
+        );
+    }
 
     #[test]
     fn parses_double_tap_exact_and_rejects_aliases() {

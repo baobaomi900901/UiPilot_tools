@@ -14,6 +14,7 @@ import { createPluginWindowCore } from './plugin-window-core'
 import { PluginWindowView } from './plugin-window-view'
 import {
   parseFileSearchResponse,
+  parseCommandEntryResolution,
   parseMessageCenterSnapshot,
   parseMessageSummary,
   parsePluginInventorySnapshot,
@@ -108,6 +109,12 @@ export const client: LauncherClient = {
     await invoke('plugin_panel_focus_host_input_ack', { ...input })
   },
   commitPluginWindowTransfer: (input) => invoke<void>('commit_plugin_window_transfer', input),
+  setPublicPluginCommandHotkey: (input) => invoke('set_public_plugin_command_hotkey', { input }),
+  resolvePublicPluginCommandEntry: async (input) => {
+    const resolved = parseCommandEntryResolution(await invoke('resolve_public_plugin_command_entry', input))
+    if (!resolved) throw { code: 'pluginQueryFailed' }
+    return resolved
+  },
   listPublicPlugins: async () => {
     const value = await invoke<unknown>('list_public_plugins')
     const inventory = parsePublicPluginInventory(value)
@@ -301,9 +308,13 @@ void (async () => {
     return
   }
   try {
-    const unlisten = await listen('hotkey-recording://current', () => {
-      window.dispatchEvent(new Event(HOTKEY_RECORDING_CURRENT_DOM_EVENT))
+    const recordingUnlisten = await listen('hotkey-recording://current', (event) => {
+      window.dispatchEvent(new CustomEvent(HOTKEY_RECORDING_CURRENT_DOM_EVENT, { detail: event.payload }))
     })
+    let entryUnlisten: (() => void) | undefined
+    try { entryUnlisten = await listen('command-hotkey://entry', (event) => core.commandHotkeyEntry(event.payload)) }
+    catch (error) { recordingUnlisten(); throw error }
+    const unlisten = () => { recordingUnlisten(); entryUnlisten?.() }
     if (tornDown) {
       unlisten()
       return

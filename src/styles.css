@@ -2874,3 +2874,8 @@ label,
 .public-settings-feedback { min-height: 20px; margin-top: 8px; font-size: 12px; color: var(--uipilot-ui-muted-foreground); overflow-wrap: anywhere; }
 
 .public-ordinary-setting .ant-select { width: 100%; }
+
+.public-command-hotkey { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.public-command-hotkey .settings-hotkey-recorder { flex: 1; min-width: 0; }
+.public-command-hotkey .settings-hotkey-recorder input { min-width: 0; text-overflow: ellipsis; }
+.public-command-hotkey-status { flex: 0 0 42px; font-size: 12px; color: var(--uipilot-ui-muted-foreground); }

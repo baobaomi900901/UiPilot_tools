@@ -283,6 +283,20 @@ impl PublicPluginService {
             reserved_names,
             Arc::clone(&message_center),
         )?);
+        let changed_app = app.clone();
+        manager.attach_command_hotkeys(
+            settings.inner().clone(),
+            Arc::new(move || {
+                let app = changed_app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let coordinator = Arc::clone(
+                        app.state::<Arc<crate::lifecycle::LifecycleCoordinator>>()
+                            .inner(),
+                    );
+                    let _ = coordinator.reconcile_command_hotkeys(&app);
+                });
+            }),
+        )?;
         message_center
             .start_native_attention(manager.timer_service(), attention_route)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;

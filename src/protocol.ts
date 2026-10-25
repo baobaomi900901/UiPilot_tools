@@ -42,6 +42,7 @@ export interface SearchAppsInput {
   querySequence: number
   submit?: boolean
   completionOrigin?: CompletionOrigin
+  stableCommandTarget?: CommandHotkeyEntry
 }
 
 export interface ResultItem {
@@ -252,6 +253,8 @@ export interface PublicPluginInventoryCommand {
   effectiveName: string
   nameOverride: string | null
   favorite: boolean
+  hotkey: string | null
+  hotkeyStatus: 'unset' | 'active' | 'suspended' | 'unavailable'
 }
 
 export interface PublicPluginInventoryItem {
@@ -271,6 +274,7 @@ export interface PublicPluginInventoryItem {
 }
 
 export interface PublicPluginInventory {
+  hotkeyRevision: string
   revision: string
   items: readonly PublicPluginInventoryItem[]
 }
@@ -335,10 +339,14 @@ export interface CommandError {
 export type ShowTarget = 'launcher' | 'settings' | 'messages'
 export type LifecycleNotice = 'settingsFailed'
 
+export interface CommandHotkeyEntry { pluginId: string; commandId: string; hotkey: string; bindingRevision: string }
+export interface CommandEntryResolution { pluginId: string; commandId: string; commandLabel: string; outputMode: 'mainResult' | 'window' | 'panel'; activationMode: 'live' | 'submit'; inputRequired: boolean; inputPlaceholder: string | null }
+
 export interface LauncherShown {
   invocationId: string
   target: ShowTarget
   notice: LifecycleNotice | null
+  commandEntry?: CommandHotkeyEntry
 }
 
 export interface MessageSummary {
@@ -396,7 +404,7 @@ export interface LauncherClient {
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   executeResultAction(input: { requestId: string; resultId: string; actionId: string }): Promise<unknown>
   retireResultActions(input: { requestId: string }): Promise<void>
-  openPluginPanel(input: { pluginId: string; argument: string }): Promise<PluginPanelCommandResult>
+  openPluginPanel(input: { pluginId: string; argument: string; stableCommandTarget?: CommandHotkeyEntry }): Promise<PluginPanelCommandResult>
   submitPluginPanel(input: {
     sessionEpoch: U64Decimal
     argument: string
@@ -407,6 +415,8 @@ export interface LauncherClient {
   closePluginPanel(input: { sessionEpoch: U64Decimal }): Promise<void>
   acknowledgePluginPanelFocusHostInput(input: PluginPanelFocusHostInputEvent & { focused: boolean }): Promise<void>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
+  setPublicPluginCommandHotkey(input: { pluginId: string; commandId: string; hotkey: string | null }): Promise<void>
+  resolvePublicPluginCommandEntry(input: { entry: CommandHotkeyEntry }): Promise<CommandEntryResolution>
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
   selectPublicPluginDirectory(): Promise<string | null>
@@ -713,12 +723,31 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
   const prototype = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) return null
   const candidate = value as Record<string, unknown>
-  const keys = Object.keys(candidate).sort()
+  const keys = Object.keys(candidate).filter((key) => key !== 'commandEntry').sort()
   if (keys.length !== shownKeys.length || keys.some((key, index) => key !== shownKeys[index])) return null
+  if (Object.prototype.hasOwnProperty.call(candidate, 'commandEntry') && (candidate.target !== 'launcher' || !parseCommandHotkeyEntry(candidate.commandEntry))) return null
   if (typeof candidate.invocationId !== 'string') return null
   if (candidate.target !== 'launcher' && candidate.target !== 'settings' && candidate.target !== 'messages') return null
   if (candidate.notice !== null && candidate.notice !== 'settingsFailed') return null
   return candidate as unknown as LauncherShown
+}
+
+export function parseCommandHotkeyEntry(value: unknown): CommandHotkeyEntry | null {
+  const entry = plainRecord(value)
+  if (!entry || !exactKeys(entry, ['bindingRevision', 'commandId', 'hotkey', 'pluginId']) ||
+    typeof entry.pluginId !== 'string' || !PUBLIC_PLUGIN_ID.test(entry.pluginId) ||
+    typeof entry.commandId !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(entry.commandId) ||
+    typeof entry.hotkey !== 'string' || (!/^(?:(?:Ctrl|Control|Shift|Alt|Meta|Super)\+)*[A-Za-z][A-Za-z0-9]*$/iu.test(entry.hotkey) || entry.hotkey.startsWith('Double')) ||
+    !canonicalU64(entry.bindingRevision) || entry.bindingRevision === '0') return null
+  return entry as unknown as CommandHotkeyEntry
+}
+export function parseCommandEntryResolution(value: unknown): CommandEntryResolution | null {
+  const entry = plainRecord(value)
+  if (!entry || !exactKeys(entry, ['activationMode', 'commandId', 'commandLabel', 'inputPlaceholder', 'inputRequired', 'outputMode', 'pluginId']) ||
+    typeof entry.pluginId !== 'string' || !PUBLIC_PLUGIN_ID.test(entry.pluginId) || typeof entry.commandId !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(entry.commandId) ||
+    typeof entry.commandLabel !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(entry.commandLabel) || typeof entry.inputRequired !== 'boolean' ||
+    (entry.inputPlaceholder !== null && typeof entry.inputPlaceholder !== 'string') || !['mainResult', 'window', 'panel'].includes(entry.outputMode as string) || !['live', 'submit'].includes(entry.activationMode as string)) return null
+  return entry as unknown as CommandEntryResolution
 }
 
 const U64_MAX = 18_446_744_073_709_551_615n
@@ -973,12 +1002,14 @@ function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null
   const effectiveNames = new Set<string>()
   for (const valueCommand of item.commands) {
     const command = plainRecord(valueCommand)
-    if (!command || !exactKeys(command, ['commandId', 'defaultName', 'effectiveName', 'favorite', 'nameOverride']) ||
+    if (!command || !exactKeys(command, ['commandId', 'defaultName', 'effectiveName', 'favorite', 'hotkey', 'hotkeyStatus', 'nameOverride']) ||
       typeof command.commandId !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.commandId) || commandIds.has(command.commandId) ||
       typeof command.defaultName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.defaultName) ||
       typeof command.effectiveName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.effectiveName) || effectiveNames.has(command.effectiveName) ||
       (command.nameOverride !== null && (typeof command.nameOverride !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.nameOverride))) ||
-      command.effectiveName !== (command.nameOverride ?? command.defaultName) || typeof command.favorite !== 'boolean') return null
+      command.effectiveName !== (command.nameOverride ?? command.defaultName) || typeof command.favorite !== 'boolean' ||
+      (command.hotkey !== null && (typeof command.hotkey !== 'string' || !parseCommandHotkeyEntry({ pluginId: item.pluginId, commandId: command.commandId, hotkey: command.hotkey, bindingRevision: '1' }))) ||
+      !['unset', 'active', 'suspended', 'unavailable'].includes(command.hotkeyStatus as string) || ((command.hotkey === null) !== (command.hotkeyStatus === 'unset'))) return null
     commandIds.add(command.commandId)
     effectiveNames.add(command.effectiveName)
     commands.push(command as unknown as PublicPluginInventoryCommand)
@@ -1005,7 +1036,7 @@ function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null
 
 export function parsePublicPluginInventory(value: unknown): PublicPluginInventory | null {
   const inventory = plainRecord(value)
-  if (!inventory || !exactKeys(inventory, ['items', 'revision']) || !canonicalU64(inventory.revision) || !Array.isArray(inventory.items) || !exactDenseArray(inventory.items)) return null
+  if (!inventory || !exactKeys(inventory, ['hotkeyRevision', 'items', 'revision']) || !canonicalU64(inventory.hotkeyRevision) || !canonicalU64(inventory.revision) || !Array.isArray(inventory.items) || !exactDenseArray(inventory.items)) return null
   const items: PublicPluginInventoryItem[] = []
   const ids = new Set<string>()
   for (const valueItem of inventory.items) {
@@ -1013,7 +1044,7 @@ export function parsePublicPluginInventory(value: unknown): PublicPluginInventor
     if (!item || !ids.add(item.pluginId)) return null
     items.push(item)
   }
-  return { revision: inventory.revision, items }
+  return { revision: inventory.revision, hotkeyRevision: inventory.hotkeyRevision as string, items }
 }
 
 export function parsePublicPluginPrepareSummary(value: unknown): PublicPluginPrepareSummary | null {

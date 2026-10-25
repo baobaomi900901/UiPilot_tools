@@ -101,3 +101,44 @@ it('keeps read recovery mandatory when an external definition change retires a p
   await render(client, reload, { ...base, settings: base.settings.map(s => s.definition.key === 'constructor' ? { ...s, definition: { ...s.definition, label: '已变更文本' } } : s) }, '2')
   await act(async () => save.resolve()); expect(button('重新读取普通设置')).not.toBeNull(); expect(button('取消普通设置修改').disabled).toBe(true); expect(button('保存普通设置').disabled).toBe(true)
 })
+
+
+it('command hotkey clear retries only reload and recovers keyboard focus', async () => {
+  const client = Object.assign(clientFixture(), { setPublicPluginCommandHotkey: vi.fn(async () => {}) })
+  const plugin = { ...base, commands: [{ commandId: 'default', defaultName: 'settings', effectiveName: 'settings', nameOverride: null, favorite: false, hotkey: 'control+KeyN', hotkeyStatus: 'suspended' as const }] }
+  let readFails = true
+  const reload = vi.fn(async () => { if (readFails) throw new Error('read') })
+  await render(client, reload, plugin)
+  expect(host.textContent).toContain('已暂停')
+  button('清除命令快捷键').focus()
+  await click('清除命令快捷键')
+  expect(client.setPublicPluginCommandHotkey).toHaveBeenCalledWith({ pluginId: base.pluginId, commandId: 'default', hotkey: null })
+  expect(host.textContent).toContain('无法刷新当前状态')
+  expect(button('清除命令快捷键').disabled).toBe(true)
+  readFails = false
+  await click('刷新命令状态')
+  expect(client.setPublicPluginCommandHotkey).toHaveBeenCalledOnce()
+  expect(reload).toHaveBeenCalledTimes(2)
+  expect(button('清除命令快捷键').disabled).toBe(false)
+})
+
+it('command hotkey shared recorder deduplicates DOM/native capture and disallows double tap', async () => {
+  const client = Object.assign(clientFixture(), { setPublicPluginCommandHotkey: vi.fn(async () => {}) })
+  const plugin = { ...base, commands: [{ commandId: 'default', defaultName: 'settings', effectiveName: 'settings', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }] }
+  await render(client, undefined, plugin)
+  await click('录制命令快捷键')
+  const recorder = host.querySelector<HTMLInputElement>('input[aria-label="命令快捷键"]')!
+  await act(async () => {
+    recorder.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true }))
+    recorder.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true }))
+  })
+  expect(client.setPublicPluginCommandHotkey).not.toHaveBeenCalled()
+  await act(async () => {
+    recorder.dispatchEvent(new KeyboardEvent('keydown', { key: 'n', code: 'KeyN', ctrlKey: true, bubbles: true }))
+    window.dispatchEvent(new CustomEvent('uipilot-hotkey-recording-current', { detail: 'control+KeyN' }))
+    recorder.dispatchEvent(new KeyboardEvent('keyup', { key: 'n', code: 'KeyN', ctrlKey: true, bubbles: true }))
+    window.dispatchEvent(new CustomEvent('uipilot-hotkey-recording-current', { detail: 'control+KeyN' }))
+  })
+  expect(client.setPublicPluginCommandHotkey).toHaveBeenCalledOnce()
+  expect(client.setPublicPluginCommandHotkey).toHaveBeenCalledWith({ pluginId: base.pluginId, commandId: 'default', hotkey: 'control+KeyN' })
+})

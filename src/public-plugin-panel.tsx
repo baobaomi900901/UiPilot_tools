@@ -1,3 +1,5 @@
+import { HotkeyRecorderInput } from './hotkey-recorder-input'
+import type { HotkeyRecordingPhase } from './launcher-core'
 import { Button, Input, Modal, Popconfirm, Spin, Switch, Tooltip } from 'antd'
 import { FolderOpen, RefreshCw, Star, Undo2, Upload } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
@@ -18,7 +20,7 @@ import type {
 
 interface PublicPluginPanelProps {
   client: LauncherClient
-  onOpenDetails?: (plugin: PublicPluginInventoryItem, revision: string) => void
+  onOpenDetails?: (plugin: PublicPluginInventoryItem, revision: string, hotkeyRevision: string) => void
 }
 
 const CLEANUP_PENDING_MESSAGE = '插件已卸载，数据清理将在下次启动时重试'
@@ -199,13 +201,14 @@ function CredentialBindings({ credentials, settings = [], addedIds = [] }: {
 }
 
 // Each command owns its drafts and continuations; package settings remain singular.
-function PublicPluginCommandRow({ client, pluginId, command, revision, reload, single }: {
+function PublicPluginCommandRow({ client, pluginId, command, revision, reload, single, onRecordingPhase }: {
   client: LauncherClient
   pluginId: string
   command: PublicPluginInventoryItem['commands'][number]
   revision: string
   reload: (beforePublish?: (revision: string) => void) => Promise<void>
   single: boolean
+  onRecordingPhase?: (phase: HotkeyRecordingPhase) => void
 }) {
   const [draft, setDraft] = useState(command.effectiveName)
   const [busy, setBusy] = useState(false)
@@ -261,7 +264,7 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
     if (active !== document.body && active !== focus.origin) return
     const recovery = unreconciled ? row.current?.querySelector<HTMLButtonElement>('button[data-command-refresh]') : null
     const target = focus.origin.isConnected && !focus.origin.matches(':disabled') ? focus.origin
-      : recovery ?? row.current?.querySelector<HTMLInputElement>('input')
+      : recovery ?? row.current?.querySelector<HTMLButtonElement>('.settings-hotkey-recorder button') ?? row.current?.querySelector<HTMLInputElement>('input')
     if (target?.isConnected && !target.matches(':disabled')) target.focus()
   }, [busy, unreconciled])
   const reconcile = async (owns: () => boolean) => {
@@ -319,6 +322,11 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
       '无法保存启动键，请检查名称冲突后重试。', origin,
     )
   }
+  const saveHotkey = (hotkey: string | null, origin?: HTMLElement) => mutate(
+    () => client.setPublicPluginCommandHotkey({ pluginId, commandId: command.commandId, hotkey }),
+    () => setNotice(hotkey === null ? '已清除快捷键' : '已保存快捷键'),
+    '无法保存快捷键，请检查快捷键冲突或系统占用后重试。', origin,
+  )
   const suffix = single ? '' : ` ${command.commandId}`
   return (
     <div className="public-command-row" data-command-id={command.commandId} aria-busy={busy} ref={row}>
@@ -349,6 +357,13 @@ function PublicPluginCommandRow({ client, pluginId, command, revision, reload, s
             () => setNotice(command.favorite ? '已取消常用' : '已设为常用'), '无法更改常用状态，请重试。', event.currentTarget,
           )} /></Tooltip>
       </form>
+      <div className="public-command-hotkey">
+        <HotkeyRecorderInput key={revision} value={command.hotkey ?? ''} label={`命令快捷键${suffix}`} allowDoubleTap={false}
+          disabled={busy || unreconciled} onRecordingPhase={onRecordingPhase}
+          onCommit={(chord) => saveHotkey(chord, row.current?.querySelector<HTMLButtonElement>('.settings-hotkey-recorder button') ?? undefined)} />
+        <Button aria-label={`清除命令快捷键${suffix}`} disabled={busy || unreconciled || !command.hotkey} onClick={(event) => void saveHotkey(null, event.currentTarget)}>清除</Button>
+        <span className="public-command-hotkey-status" role="status">{({ unset: '未设置', active: '已启用', suspended: '已暂停', unavailable: '不可用' })[command.hotkeyStatus ?? 'unset']}</span>
+      </div>
       <div className="public-command-feedback" aria-live="polite">
         {error ? <span role="alert" className="plugin-row-error">{error}</span> : busy ? '保存中…' : notice}
         {unreconciled ? <Button size="small" data-command-refresh aria-label={`刷新命令状态${suffix}`} disabled={busy}
@@ -501,10 +516,12 @@ export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload
   </div>
 }
 
-export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }: {
+export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRevision = '0', onRecordingPhase, reload }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
   inventoryRevision: string
+  hotkeyRevision?: string
+  onRecordingPhase?: (phase: HotkeyRecordingPhase) => void
   reload: (beforePublish?: (revision: string) => void) => Promise<void>
 }) {
   const [busy, setBusy] = useState(false)
@@ -660,7 +677,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, reload }
         <dt className="public-detail-name-term">启动键</dt>
         <dd className="public-detail-name-value">
           {plugin.commands.map((command) => <PublicPluginCommandRow key={command.commandId}
-            client={client} pluginId={plugin.pluginId} command={command} revision={inventoryRevision}
+            client={client} pluginId={plugin.pluginId} command={command} revision={`${inventoryRevision}:${hotkeyRevision}`} onRecordingPhase={onRecordingPhase}
             reload={reload} single={plugin.commands.length === 1} />)}
         </dd>
         <dt>版本号</dt>
@@ -920,7 +937,7 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
           plugin={plugin}
           reload={reload}
           onCleanupPending={handleCleanupPending}
-          onDetails={() => onOpenDetails?.(plugin, inventory!.revision)}
+          onDetails={() => onOpenDetails?.(plugin, inventory!.revision, inventory!.hotkeyRevision)}
         />
       ))}
     </section>

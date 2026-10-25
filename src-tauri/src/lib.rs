@@ -1,8 +1,9 @@
+mod command_hotkeys;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 use std::sync::Arc;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 use find_window::{FocusEffect, WindowLabel};
@@ -334,6 +335,7 @@ fn setup_production_lifecycle(
         .install_main_window_hwnd(hwnd.0 as isize)
         .map_err(|_| lifecycle_setup_error())?;
     let _ = coordinator.reconcile_runtime_settings(app.handle(), &persisted_settings);
+    let _ = coordinator.reconcile_command_hotkeys(app.handle());
     let _ = apps::start_initial_refresh(Arc::clone(app_cache))?;
     coordinator
         .mark_setup_ready(app.handle())
@@ -389,6 +391,22 @@ pub fn run() {
     let shortcut_coordinator = Arc::clone(&coordinator);
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
+    let (shortcut_sender, shortcut_receiver) =
+        std::sync::mpsc::channel::<(tauri::AppHandle, lifecycle::NativeHotkeyEvent)>();
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
+    {
+        let coordinator = Arc::clone(&coordinator);
+        std::thread::Builder::new()
+            .name("uipilot-hotkey-events".into())
+            .spawn(move || {
+                while let Ok((app, event)) = shortcut_receiver.recv() {
+                    coordinator.dispatch_queued_native_hotkey(&app, event);
+                }
+            })
+            .expect("native hotkey event worker failed");
+    }
+
+    #[cfg(any(test, not(feature = "test-instrumentation")))]
     let builder = builder
         .plugin(tauri_plugin_single_instance::init(
             move |app, _args, _cwd| {
@@ -397,14 +415,10 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, _shortcut, event| {
+                .with_handler(move |app, shortcut, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        let main_foreground = lifecycle::main_window_owns_native_foreground(app);
-                        let dispatch = lifecycle::should_dispatch_hotkey_show(main_foreground);
-                        if dispatch {
-                            let _ = shortcut_coordinator.request_show(app, ShowTarget::Launcher);
-                        } else {
-                            let _ = app.emit_to("main", HOTKEY_RECORDING_CURRENT_EVENT, ());
+                        if let Some(event) = shortcut_coordinator.capture_native_hotkey(*shortcut) {
+                            let _ = shortcut_sender.send((app.clone(), event));
                         }
                     }
                 })
@@ -450,6 +464,8 @@ pub fn run() {
             commands::hide_find_window,
             commands::select_public_plugin_directory,
             commands::list_public_plugins,
+            commands::set_public_plugin_command_hotkey,
+            commands::resolve_public_plugin_command_entry,
             commands::list_quicklinks,
             commands::save_quicklink,
             commands::delete_quicklink,
@@ -598,6 +614,7 @@ pub fn run() {
                     .shutdown();
                 run_find_controller.shutdown();
                 run_file_index.enter_terminal();
+                run_coordinator.unregister_command_hotkeys_for_exit(_app);
                 run_coordinator.uninstall_hook_for_exit();
                 run_coordinator.observe_run_exit();
             }
@@ -808,7 +825,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 82);
+        assert_eq!(production.matches("commands::").count(), 88);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -820,6 +837,8 @@ mod tests {
             "hide_find_window",
             "select_public_plugin_directory",
             "list_public_plugins",
+            "set_public_plugin_command_hotkey",
+            "resolve_public_plugin_command_entry",
             "list_quicklinks",
             "save_quicklink",
             "delete_quicklink",
@@ -975,6 +994,8 @@ mod tests {
         let find = include_str!("../capabilities/find.json");
         for command in [
             "list_public_plugins",
+            "set_public_plugin_command_hotkey",
+            "resolve_public_plugin_command_entry",
             "prepare_public_plugin_install",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
@@ -1152,7 +1173,7 @@ mod tests {
             "move |app, _args, _cwd|",
             "tauri_plugin_global_shortcut::Builder::new()",
             "tauri_plugin_global_shortcut::ShortcutState::Pressed",
-            "lifecycle::main_window_owns_native_foreground(app)",
+            "shortcut_coordinator.capture_native_hotkey(*shortcut)",
             "HOTKEY_RECORDING_CURRENT_EVENT",
             "setup_production_lifecycle(",
             "&public_plugin_service,",
@@ -1197,7 +1218,7 @@ mod tests {
             production
                 .matches("request_show(app, ShowTarget::Launcher)")
                 .count(),
-            2
+            1
         );
         assert!(production.contains("lifecycle::TRAY_OPEN_LAUNCHER"));
         assert!(production.contains("打开主界面"));

@@ -154,7 +154,7 @@ describe('plugin protocol', () => {
   it('strictly parses public inventory settings and rejects output mode or secret value leaks', () => {
     const item = {
       pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
-      source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false }], enabled: true,
+      source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
       fault: null, generation: 1,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
       network: null,
@@ -167,11 +167,11 @@ describe('plugin protocol', () => {
         { definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: false },
       ],
     }
-    expect(parsePublicPluginInventory({ revision: '1', items: [item] })).toEqual({ revision: '1', items: [item] })
-    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, iconUrl: null }] })).not.toBeNull()
-    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, iconUrl: 'https://example.com/icon.png' }] })).toBeNull()
-    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, outputMode: 'mainResult' }] })).toBeNull()
-    expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, settings: [{ definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true, value: 'leak' }] }] })).toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [item] })).toEqual({ revision: '1', hotkeyRevision: '0', items: [item] })
+    expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [{ ...item, iconUrl: null }] })).not.toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [{ ...item, iconUrl: 'https://example.com/icon.png' }] })).toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [{ ...item, outputMode: 'mainResult' }] })).toBeNull()
+    expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [{ ...item, settings: [{ definition: { type: 'secret', key: 'token', label: 'Token' }, secretConfigured: true, value: 'leak' }] }] })).toBeNull()
   })
   it('parses mutation revisions and compares the full u64 range without Number', () => {
     expect(parsePluginMutationOutcome({ revision: '18446744073709551615' })).toEqual({
@@ -355,7 +355,9 @@ function fakeClient() {
     setPluginPanelBounds: vi.fn(async () => undefined),
     closePluginPanel: vi.fn(async () => undefined),
     acknowledgePluginPanelFocusHostInput: vi.fn(async () => undefined),
-    listPublicPlugins: vi.fn(async () => ({ revision: '0', items: [] })),
+    resolvePublicPluginCommandEntry: vi.fn(async () => ({ pluginId: 'com.example.hotkey', commandId: 'default', commandLabel: 'hotkey', outputMode: 'mainResult', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })),
+    setPublicPluginCommandHotkey: vi.fn(async () => undefined),
+    listPublicPlugins: vi.fn(async () => ({ revision: '0', hotkeyRevision: '0', items: [] })),
     selectPublicPluginArchive: vi.fn(async () => null),
     selectPublicPluginDirectory: vi.fn(async () => null),
     preparePublicPlugin: vi.fn(async () => { throw new Error('not prepared') }),
@@ -7966,10 +7968,10 @@ describe('React view and accessibility', () => {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({
-      revision: '1',
+      revision: '1', hotkeyRevision: '0',
       items: [{
         pluginId: 'com.example.demo', name: 'Demo', description: 'A compact plugin description that stays on one row.', version: '1.0.0',
-        source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false }], enabled: true,
+        source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
         network: { httpsHosts: ['api.example.com'], credentials: [] },
@@ -8092,16 +8094,16 @@ describe('React view and accessibility', () => {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({
-      revision: '1',
+      revision: '1', hotkeyRevision: '0',
       items: [
         {
           pluginId: 'com.example.notes', name: 'Notes', description: null, version: '1.0.0',
-          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false }], enabled: true,
+          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
           fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
         },
         {
           pluginId: 'com.example.translate', name: 'Translate', description: null, version: '1.0.0',
-          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false }], enabled: true,
+          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
           fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
         },
       ],
@@ -8141,7 +8143,7 @@ describe('React view and accessibility', () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
-    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '1', items: [] })
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '1', hotkeyRevision: '0', items: [] })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -8169,13 +8171,13 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const item = {
       pluginId: 'com.example.cleanup', name: 'Cleanup', description: null, version: '1.0.0',
-      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'cleanup', effectiveName: 'cleanup', nameOverride: null, favorite: false }], enabled: true,
+      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'cleanup', effectiveName: 'cleanup', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
       fault: null, generation: 1, iconUrl: null, permissions: [], settings: [],
       network: null,
     }
     vi.mocked(fake.client.listPublicPlugins)
-      .mockResolvedValueOnce({ revision: '1', items: [item] })
-      .mockResolvedValueOnce({ revision: '2', items: [] })
+      .mockResolvedValueOnce({ revision: '1', hotkeyRevision: '0', items: [item] })
+      .mockResolvedValueOnce({ revision: '2', hotkeyRevision: '0', items: [] })
     vi.mocked(fake.client.uninstallPublicPlugin).mockRejectedValueOnce({
       code: 'dataCleanupPending',
       message: 'private cleanup path',
@@ -8369,14 +8371,14 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const networkItem = {
       pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
-      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false }], enabled: true,
+      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
       fault: null, generation: 1, iconUrl: null,
       network: { httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [] },
       permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
       settings: [],
     }
     vi.mocked(fake.client.listPublicPlugins)
-      .mockResolvedValueOnce({ revision: '1', items: [networkItem] })
+      .mockResolvedValueOnce({ revision: '1', hotkeyRevision: '0', items: [networkItem] })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -8515,9 +8517,10 @@ describe('real adapter and startup', () => {
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://hidden', expect.any(Function)))
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 9)).toEqual([
+    expect(order.slice(0, 10)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
       'hotkey-recording://current',
+      'command-hotkey://entry',
       'launcher://shown',
       'launcher://hidden',
       'uipilot-plugin-panel-error',
@@ -8703,6 +8706,7 @@ describe('real adapter and startup', () => {
     const panelResetUnlisten = vi.fn()
     const panelFocusUnlisten = vi.fn()
     const hotkeyRecordingUnlisten = vi.fn()
+    const commandHotkeyUnlisten = vi.fn()
     let shownHandler: ((event: { payload: unknown }) => void) | undefined
     let mountedCore: ReturnType<typeof createLauncherCore> | undefined
     let throwFatal = false
@@ -8729,6 +8733,7 @@ describe('real adapter and startup', () => {
       if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
       if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
       if (event === 'hotkey-recording://current') return hotkeyRecordingUnlisten
+      if (event === 'command-hotkey://entry') return commandHotkeyUnlisten
       return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
@@ -8764,6 +8769,7 @@ describe('real adapter and startup', () => {
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
       expect(panelFocusUnlisten).toHaveBeenCalledOnce()
       expect(hotkeyRecordingUnlisten).toHaveBeenCalledOnce()
+      expect(commandHotkeyUnlisten).toHaveBeenCalledOnce()
       await vi.waitFor(() => expect(document.querySelector('.status-region')?.textContent).toBe('操作不可用，请重试。'))
       expect(document.body.textContent).not.toContain(privateError)
       expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateError)
@@ -8790,7 +8796,7 @@ describe('real adapter and startup', () => {
 
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
-    const unlistens = Array.from({ length: 7 }, () => vi.fn())
+    const unlistens = Array.from({ length: 8 }, () => vi.fn())
     tauriCapture.listen.mockImplementation(async (_event, _handler) => unlistens[tauriCapture.listen.mock.calls.length - 1]!)
     tauriCapture.invoke.mockImplementation((command) =>
       Promise.resolve(command === 'load_settings' ? emptySettings : undefined),
@@ -9362,7 +9368,7 @@ describe('credential consent and settings', () => {
   const credential = { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' as const }
   const item = {
     pluginId: 'com.example.credentials', name: 'Credentials', description: null, version: '1.0.0',
-    source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'credentials', effectiveName: 'credentials', nameOverride: null, favorite: false }], enabled: true,
+    source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'credentials', effectiveName: 'credentials', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
     fault: null, generation: 1, iconUrl: null,
     network: { httpsHosts: ['api.example.com'], credentials: [credential] },
     permissions: [{ permission: 'network.https' as const, supported: true, granted: false }],
@@ -9377,7 +9383,7 @@ describe('credential consent and settings', () => {
     installMatchMedia(dark)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
-    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '41', items: [plugin] })
+    vi.mocked(fake.client.listPublicPlugins).mockResolvedValue({ revision: '41', hotkeyRevision: '0', items: [plugin] })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -9406,7 +9412,7 @@ describe('credential consent and settings', () => {
       await enter(secret, 'synthetic-value')
       await act(async () => button('保存 Current API token').click())
       expect(secret.readOnly).toBe(true)
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, commands: item.commands.map((command) => ({ ...command, favorite: true })) }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [{ ...item, commands: item.commands.map((command) => ({ ...command, favorite: true })) }] })
       await act(async () => button('设为常用').click())
       await vi.waitFor(() => expect(button('取消常用')).not.toBeNull())
       await act(async () => pending.resolve())
@@ -9462,7 +9468,7 @@ describe('credential consent and settings', () => {
       expect(ui.client.setPublicPluginNetworkAccess).not.toHaveBeenCalled()
       expect(document.querySelector('[role="dialog"]')?.textContent).toContain('service-token')
       vi.mocked(ui.client.setPublicPluginNetworkAccess).mockRejectedValueOnce({ code: 'staleInventory', message: 'private detail' })
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, network: { ...item.network, credentials: [{ ...credential, host: 'new.example.com' }] } }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [{ ...item, network: { ...item.network, credentials: [{ ...credential, host: 'new.example.com' }] } }] })
       await act(async () => button('确认开启网络访问').click())
       expect(ui.client.setPublicPluginNetworkAccess).toHaveBeenCalledExactlyOnceWith({ pluginId: item.pluginId, granted: true, expectedInventoryRevision: '41' })
       expect(ui.host.textContent).toContain('new.example.com')
@@ -9470,7 +9476,7 @@ describe('credential consent and settings', () => {
       expect(ui.host.textContent).not.toContain('private detail')
       expect(document.querySelector('[role="dialog"]')).toBeNull()
       await act(async () => button('网络访问').click())
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '43', items: [{ ...item, permissions: [{ permission: 'network.https', supported: true, granted: true }] }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '43', hotkeyRevision: '0', items: [{ ...item, permissions: [{ permission: 'network.https', supported: true, granted: true }] }] })
       await act(async () => button('确认开启网络访问').click())
       expect(ui.client.setPublicPluginNetworkAccess).toHaveBeenLastCalledWith({ pluginId: item.pluginId, granted: true, expectedInventoryRevision: '42' })
       await act(async () => button('网络访问').click())
@@ -9572,7 +9578,7 @@ describe('credential consent and settings', () => {
       expect(ui.client.savePublicPluginSettings).toHaveBeenCalledExactlyOnceWith({ input: { pluginId: item.pluginId, settings: {}, secrets: { 'api-token': 'synthetic-token' } } })
       expect(ui.host.querySelector('.public-plugin-detail')?.getAttribute('aria-busy')).toBe('true')
       expect(input.readOnly).toBe(true)
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: true })) }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: true })) }] })
       await act(async () => pending.resolve())
       expect(input.value).toBe('')
       expect(other.value).toBe('other-unsaved-draft')
@@ -9588,7 +9594,7 @@ describe('credential consent and settings', () => {
     try {
       await ui.open()
       vi.mocked(ui.client.savePublicPluginSettings).mockRejectedValueOnce(new Error('private token'))
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: false })) }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: false })) }] })
       await act(async () => button('清除 Other token').click())
       expect(ui.client.savePublicPluginSettings).not.toHaveBeenCalled()
       await act(async () => button('确认清除 Other token').click())
@@ -9643,7 +9649,7 @@ describe('credential consent and settings', () => {
   it('also sends the displayed global revision when enabling a network plugin without credentials', async () => {
     const ui = await setup()
     try {
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '57', items: [{ ...item, network: { ...item.network, credentials: [] } }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '57', hotkeyRevision: '0', items: [{ ...item, network: { ...item.network, credentials: [] } }] })
       await act(async () => button('刷新').click())
       await ui.open()
       await act(async () => button('网络访问').click())
@@ -9659,7 +9665,7 @@ describe('credential consent and settings', () => {
       const input = ui.host.querySelector<HTMLInputElement>('input[aria-label="Current API token"]')!
       await enter(input, 'synthetic-failed-draft')
       vi.mocked(ui.client.savePublicPluginSettings).mockRejectedValueOnce(new Error('synthetic-failed-draft'))
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: true })) }] })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [{ ...item, settings: item.settings.map((setting) => ({ ...setting, secretConfigured: true })) }] })
       await act(async () => input.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })))
       expect(ui.client.savePublicPluginSettings).toHaveBeenCalledOnce()
       expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(2)
@@ -9730,17 +9736,17 @@ describe('independent command management', () => {
     installMatchMedia(dark)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
-    let inventory = { revision: '10', items: [{
+    let inventory = { revision: '10', hotkeyRevision: '0', items: [{
       pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage' as const,
       commands: [
-        { commandId: 'upper', defaultName: 'upper', effectiveName: 'upper', nameOverride: null as string | null, favorite: false },
-        { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null as string | null, favorite: false },
-        ...Array.from({ length: Math.max(0, count - 2) }, (_, index) => ({ commandId: `command-${index + 3}`, defaultName: `long-command-name-number-${index + 3}`, effectiveName: `long-command-name-number-${index + 3}`, nameOverride: null as string | null, favorite: false })),
+        { commandId: 'upper', defaultName: 'upper', effectiveName: 'upper', nameOverride: null as string | null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const },
+        { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null as string | null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const },
+        ...Array.from({ length: Math.max(0, count - 2) }, (_, index) => ({ commandId: `command-${index + 3}`, defaultName: `long-command-name-number-${index + 3}`, effectiveName: `long-command-name-number-${index + 3}`, nameOverride: null as string | null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const })),
       ], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
     }] }
     vi.mocked(fake.client.listPublicPlugins).mockImplementation(async () => structuredClone(inventory))
     const update = (commandId: string, values: Partial<typeof inventory.items[number]['commands'][number]>) => {
-      inventory = { ...inventory, revision: String(Number(inventory.revision) + 1), items: inventory.items.map((plugin) => ({ ...plugin,
+      inventory = { ...inventory, revision: String(Number(inventory.revision) + 1), hotkeyRevision: '0', items: inventory.items.map((plugin) => ({ ...plugin,
         commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, ...values } : command),
       })) }
     }
@@ -9908,7 +9914,7 @@ describe('independent command management', () => {
       await act(async () => newer.resolve(authoritative))
       expect(input(ui.host, 'upper').readOnly).toBe(false)
       expect(input(ui.host, 'constructor').readOnly).toBe(false)
-      if (order === 'newer-first') await act(async () => older.resolve({ ...authoritative, revision: '10', items: [] }))
+      if (order === 'newer-first') await act(async () => older.resolve({ ...authoritative, revision: '10', hotkeyRevision: '0', items: [] }))
       expect(button(ui.host, '取消常用 constructor')).not.toBeNull()
       expect(kind === 'rename' ? input(ui.host, 'upper').value : button(ui.host, '取消常用 upper')?.getAttribute('aria-pressed')).toBe(kind === 'rename' ? 'custom' : 'true')
     } finally { await ui.cleanup() }
@@ -10021,7 +10027,7 @@ describe('independent command management', () => {
         await act(async () => button(ui.host, '保存启动键 upper').click())
       } else await act(async () => button(ui.host, '设为常用 upper').click())
       const inventory = ui.snapshot()
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValueOnce({ ...inventory, revision: '99', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'constructor') })) })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValueOnce({ ...inventory, revision: '99', hotkeyRevision: '0', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'constructor') })) })
       await act(async () => button(ui.host, '设为常用 constructor').click())
       expect(ui.host.querySelector('[data-command-id="upper"]')).toBeNull()
       const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
@@ -10105,7 +10111,7 @@ describe('independent command management', () => {
       await act(async () => input(ui.host, 'upper').blur())
       expect(document.activeElement).toBe(document.body)
       const inventory = await ui.client.listPublicPlugins()
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ ...inventory, revision: '99', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'upper') })) })
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ ...inventory, revision: '99', hotkeyRevision: '0', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'upper') })) })
       await act(async () => button(ui.host, '设为常用 constructor').click())
       await vi.waitFor(() => expect(input(ui.host, 'constructor')).toBeNull())
       expect(document.activeElement).toBe(document.body)
@@ -10246,4 +10252,73 @@ it.each([[false, false], [true, false], [false, true], [true, true]])('returns c
     expect(fake.client.setPublicPluginFavorite).not.toHaveBeenCalled()
     expect(fake.client.executeResult).not.toHaveBeenCalled()
   } finally { await mounted.unmount(); core.destroy() }
+})
+
+
+describe('command hotkey entry', () => {
+  const entry = { pluginId: 'com.example.hotkey', commandId: 'default', hotkey: 'Ctrl+N', bindingRevision: '1' }
+  it('commits a no-input command once with stable identity and no result action', async () => {
+    const fake = await startedCore(); const { core } = fake
+    fake.emit(shown('hotkey-invocation'))
+    await Promise.resolve(); await Promise.resolve()
+    vi.mocked(fake.client.searchApps).mockClear()
+    core.commandHotkeyEntry(entry)
+    await Promise.resolve(); await Promise.resolve()
+    expect(fake.client.resolvePublicPluginCommandEntry).toHaveBeenCalledWith({ entry })
+    expect(fake.client.searchApps).toHaveBeenCalledTimes(1)
+    expect(fake.client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ submit: true, stableCommandTarget: entry }))
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('supersedes an old search reply immediately while the newer entry resolve awaits', async () => {
+    const fake = await startedCore(); const { core } = fake
+    fake.emit(shown('hotkey-invocation'))
+    await Promise.resolve(); await Promise.resolve()
+    const oldSearch = deferred<SearchResponse | null>()
+    vi.mocked(fake.client.searchApps).mockReturnValueOnce(oldSearch.promise)
+    core.commandHotkeyEntry(entry)
+    await Promise.resolve(); await Promise.resolve()
+    const newResolve = deferred<import('./protocol').CommandEntryResolution>()
+    vi.mocked(fake.client.resolvePublicPluginCommandEntry).mockReturnValueOnce(newResolve.promise)
+    core.commandHotkeyEntry(entry)
+    oldSearch.resolve({ requestId: 'obsolete-hotkey-window', items: [], windowTransferToken: 'obsolete-transfer' })
+    await Promise.resolve(); await Promise.resolve()
+    expect(fake.client.commitPluginWindowTransfer).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('arms required-input Window without dispatch and rejects an obsolete resolve after navigation', async () => {
+    const fake = await startedCore(); const { core } = fake
+    fake.emit(shown('hotkey-invocation'))
+    await Promise.resolve(); await Promise.resolve()
+    vi.mocked(fake.client.resolvePublicPluginCommandEntry).mockResolvedValueOnce({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'renamed', outputMode: 'window', activationMode: 'submit', inputRequired: true, inputPlaceholder: '内容' })
+    vi.mocked(fake.client.searchApps).mockClear()
+    core.commandHotkeyEntry(entry)
+    await Promise.resolve(); await Promise.resolve()
+    expect(core.getSnapshot().mainResultCommand?.commandLabel).toBe('renamed')
+    expect(vi.mocked(fake.client.searchApps).mock.calls.every(([input]) => input.submit !== true)).toBe(true)
+    const pending = deferred<import('./protocol').CommandEntryResolution>()
+    vi.mocked(fake.client.resolvePublicPluginCommandEntry).mockReturnValueOnce(pending.promise)
+    core.commandHotkeyEntry(entry)
+    core.navigate('settings')
+    pending.resolve({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'late', outputMode: 'mainResult', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })
+    await Promise.resolve(); await Promise.resolve()
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(core.getSnapshot().mainResultCommand).toBeUndefined()
+    core.destroy()
+  })
+  it('offers foreground and hidden chords to recording before navigation and suppresses delayed delivery', async () => {
+    const fake = await startedSettingsCore(); const { core } = fake
+    const consume = vi.fn()
+    window.addEventListener('uipilot-hotkey-recording-current', consume)
+    core.setHotkeyRecordingPhase('recording')
+    core.commandHotkeyEntry(entry)
+    expect(consume).toHaveBeenCalledTimes(1)
+    expect(fake.client.resolvePublicPluginCommandEntry).not.toHaveBeenCalled()
+    core.setHotkeyRecordingPhase('completed')
+    fake.emit({ ...shown('recorded'), commandEntry: entry })
+    expect(core.getSnapshot().view).toBe('settings')
+    expect(fake.client.resolvePublicPluginCommandEntry).not.toHaveBeenCalled()
+    window.removeEventListener('uipilot-hotkey-recording-current', consume)
+    core.destroy()
+  })
 })

@@ -27,6 +27,7 @@ use windows::Win32::{
 };
 
 use crate::{
+    command_hotkeys::{CommandEntry, CommandHotkeys},
     commands::clear_and_hide,
     file_index::FileIndex,
     file_search::everything_runtime::EverythingRuntimeSupervisor,
@@ -86,6 +87,8 @@ struct LauncherShown {
     invocation_id: String,
     target: ShowTarget,
     notice: Option<LifecycleNotice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_entry: Option<CommandEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,39 +169,53 @@ enum ShowOutcome {
     Ignored,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShowRequest {
+    target: ShowTarget,
+    command_entry: Option<CommandEntry>,
+}
+
 #[derive(Debug, Default)]
 struct Readiness {
     setup_ready: bool,
     frontend_ready: bool,
-    pending_target: Option<ShowTarget>,
+    pending_target: Option<ShowRequest>,
 }
 
 impl Readiness {
-    fn request(&mut self, target: ShowTarget) -> Option<ShowTarget> {
+    fn request_command(
+        &mut self,
+        target: ShowTarget,
+        command_entry: Option<CommandEntry>,
+    ) -> Option<ShowRequest> {
+        let request = ShowRequest {
+            target,
+            command_entry,
+        };
         if self.setup_ready && self.frontend_ready {
-            Some(target)
+            Some(request)
         } else {
-            self.pending_target = Some(target);
+            self.pending_target = Some(request);
             None
         }
     }
-
-    fn mark_setup_ready(&mut self) -> Option<ShowTarget> {
-        self.setup_ready = true;
-        self.take_if_ready()
-    }
-
-    fn mark_frontend_ready(&mut self) -> Option<ShowTarget> {
-        self.frontend_ready = true;
-        self.take_if_ready()
-    }
-
-    fn take_if_ready(&mut self) -> Option<ShowTarget> {
+    fn take_request_if_ready(&mut self) -> Option<ShowRequest> {
         if self.setup_ready && self.frontend_ready {
             self.pending_target.take()
         } else {
             None
         }
+    }
+    fn request(&mut self, target: ShowTarget) -> Option<ShowTarget> {
+        self.request_command(target, None).map(|r| r.target)
+    }
+    fn mark_setup_ready(&mut self) -> Option<ShowTarget> {
+        self.setup_ready = true;
+        self.take_request_if_ready().map(|r| r.target)
+    }
+    fn mark_frontend_ready(&mut self) -> Option<ShowTarget> {
+        self.frontend_ready = true;
+        self.take_request_if_ready().map(|r| r.target)
     }
 }
 
@@ -480,6 +497,22 @@ pub(crate) enum ReservationError {
     Overflow,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeHotkeyEvent {
+    pub(crate) shortcut: Shortcut,
+    epoch: u64,
+}
+
+pub(crate) struct HotkeyOperationGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    epoch: &'a AtomicU64,
+}
+impl Drop for HotkeyOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LifecycleCoordinator {
     next_invocation: AtomicU64,
@@ -492,6 +525,9 @@ pub(crate) struct LifecycleCoordinator {
     critical_changed: Condvar,
     pending_notice: Mutex<Option<LifecycleNotice>>,
     runtime_settings: Mutex<RuntimeSettings>,
+    hotkey_operation: Mutex<()>,
+    hotkey_event_epoch: AtomicU64,
+    pub(crate) command_hotkeys: CommandHotkeys,
     hotkey_hook: Mutex<Option<HotkeyHook>>,
     foreground_capture: Mutex<ForegroundCaptureState>,
 }
@@ -509,6 +545,9 @@ impl Default for LifecycleCoordinator {
             critical_changed: Condvar::new(),
             pending_notice: Mutex::new(None),
             runtime_settings: Mutex::new(RuntimeSettings::default()),
+            hotkey_operation: Mutex::new(()),
+            hotkey_event_epoch: AtomicU64::new(0),
+            command_hotkeys: CommandHotkeys::default(),
             hotkey_hook: Mutex::new(None),
             foreground_capture: Mutex::new(ForegroundCaptureState::default()),
         }
@@ -983,6 +1022,48 @@ impl LifecycleCoordinator {
         self.store_file_index_phase(phase);
     }
 
+    pub(crate) fn lock_hotkey_operation(&self) -> Result<HotkeyOperationGuard<'_>, ()> {
+        let guard = self.hotkey_operation.lock().map_err(|_| ())?;
+        self.hotkey_event_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(2).map(|_| value + 1)
+            })
+            .map_err(|_| ())?;
+        Ok(HotkeyOperationGuard {
+            _guard: guard,
+            epoch: &self.hotkey_event_epoch,
+        })
+    }
+
+    // Called under the plugin's own shortcut mutex: only copy atomics, never take a host lock.
+    pub(crate) fn capture_native_hotkey(&self, shortcut: Shortcut) -> Option<NativeHotkeyEvent> {
+        let epoch = self.hotkey_event_epoch.load(Ordering::Acquire);
+        (epoch % 2 == 0).then_some(NativeHotkeyEvent { shortcut, epoch })
+    }
+
+    fn lock_native_hotkey_event(
+        &self,
+        event: &NativeHotkeyEvent,
+    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.hotkey_operation.lock().ok()?;
+        (event.epoch % 2 == 0 && self.hotkey_event_epoch.load(Ordering::Acquire) == event.epoch)
+            .then_some(guard)
+    }
+
+    pub(crate) fn dispatch_queued_native_hotkey(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        event: NativeHotkeyEvent,
+    ) {
+        let Some(_operation) = self.lock_native_hotkey_event(&event) else {
+            return;
+        };
+        if self.observe_exit() != ExitState::Running {
+            return;
+        }
+        self.dispatch_native_hotkey(app, &event.shortcut);
+    }
+
     pub(crate) fn save_settings_transaction(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -990,6 +1071,11 @@ impl LifecycleCoordinator {
         kind: HotkeyKind,
         update: SettingsUpdate,
     ) -> Result<(), ()> {
+        let _operation = self.lock_hotkey_operation()?;
+        let snapshot = settings.snapshot();
+        if crate::command_hotkeys::launcher_conflicts(&snapshot, &kind.canonical()) {
+            return Err(());
+        }
         let persisted = settings.snapshot();
         let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
         self.apply_production_hotkey_transaction(
@@ -1010,6 +1096,11 @@ impl LifecycleCoordinator {
         kind: HotkeyKind,
         hotkey: String,
     ) -> Result<(), ()> {
+        let _operation = self.lock_hotkey_operation()?;
+        let snapshot = settings.snapshot();
+        if crate::command_hotkeys::launcher_conflicts(&snapshot, &kind.canonical()) {
+            return Err(());
+        }
         let persisted = settings.snapshot();
         let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
         self.apply_production_hotkey_transaction(
@@ -1115,6 +1206,16 @@ impl LifecycleCoordinator {
         uninstall_slot_with(&self.hotkey_hook, HotkeyHook::uninstall)
     }
 
+    pub(crate) fn unregister_command_hotkeys_for_exit(&self, app: &AppHandle) {
+        // Exit must never wait behind a worker that needs the main thread.
+        let Ok(_operation) = self.hotkey_operation.try_lock() else {
+            return;
+        };
+        for binding in self.command_hotkeys.entries() {
+            let _ = app.global_shortcut().unregister(binding.shortcut);
+        }
+    }
+
     pub(crate) fn uninstall_hook_for_exit(&self) {
         let _ = self.uninstall_production_hook();
     }
@@ -1148,6 +1249,7 @@ impl LifecycleCoordinator {
         app: &AppHandle,
         settings: &Settings,
     ) -> Result<(), ()> {
+        let _operation = self.lock_hotkey_operation()?;
         let global_shortcut = app.global_shortcut();
         let autostart = app.autolaunch();
         let coordinator = Arc::clone(self);
@@ -1220,6 +1322,162 @@ impl LifecycleCoordinator {
         result
     }
 
+    pub(crate) fn command_entry_current(&self, app: &AppHandle, entry: &CommandEntry) -> bool {
+        if !self.command_hotkeys.matches(entry) {
+            return false;
+        }
+        if !crate::command_hotkeys::saved_matches(&app.state::<SettingsStore>().snapshot(), entry) {
+            return false;
+        }
+        app.state::<Arc<PublicPluginService>>()
+            .manager()
+            .ok()
+            .and_then(|m| {
+                m.route_by_id(&entry.plugin_id, &entry.command_id, "")
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    }
+
+    pub(crate) fn dispatch_native_hotkey(self: &Arc<Self>, app: &AppHandle, shortcut: &Shortcut) {
+        if let Some(entry) = self.command_hotkeys.candidate(shortcut.id()) {
+            if !self.command_entry_current(app, &entry) {
+                return;
+            }
+            if main_window_owns_native_foreground(app) {
+                let _ = app.emit_to("main", "command-hotkey://entry", entry);
+            } else {
+                let dispatcher = app.clone();
+                let show_app = app.clone();
+                let coordinator = Arc::clone(self);
+                let _ = dispatcher.run_on_main_thread(move || {
+                    if !coordinator.command_entry_current(&show_app, &entry) {
+                        return;
+                    }
+                    let request = coordinator
+                        .readiness
+                        .lock()
+                        .unwrap()
+                        .request_command(ShowTarget::Launcher, Some(entry));
+                    if let Some(request) = request {
+                        let _ = coordinator.show_main_entry(
+                            &show_app,
+                            request.target,
+                            request.command_entry,
+                        );
+                    }
+                });
+            }
+            return;
+        }
+        let launcher = self
+            .runtime_settings
+            .lock()
+            .unwrap()
+            .registered
+            .iter()
+            .any(|s| s.id() == shortcut.id());
+        if !launcher {
+            return;
+        }
+        if should_dispatch_hotkey_show(main_window_owns_native_foreground(app)) {
+            let _ = self.request_show(app, ShowTarget::Launcher);
+        } else {
+            let _ = app.emit_to(
+                "main",
+                crate::HOTKEY_RECORDING_CURRENT_EVENT,
+                shortcut.to_string(),
+            );
+        }
+    }
+
+    pub(crate) fn reconcile_command_hotkeys(self: &Arc<Self>, app: &AppHandle) -> Result<(), ()> {
+        let _critical = self.reserve_critical().map_err(|_| ())?;
+        let _operation = self.lock_hotkey_operation()?;
+        let service = app.state::<Arc<PublicPluginService>>();
+        let manager = service.manager().map_err(|_| ())?;
+        let settings = app.state::<SettingsStore>();
+        let snapshot = settings.snapshot();
+        let inventory = manager.inventory().map_err(|_| ())?;
+        let mut targets = std::collections::BTreeSet::new();
+        for b in self.command_hotkeys.entries() {
+            targets.insert((b.entry.plugin_id, b.entry.command_id));
+        }
+        for (plugin, commands) in &snapshot.public_plugin_command_hotkeys {
+            for command in commands.keys() {
+                targets.insert((plugin.clone(), command.clone()));
+            }
+        }
+        let native = app.global_shortcut();
+        let mut failed = false;
+        for (plugin, command) in targets {
+            let eligible = inventory
+                .items
+                .iter()
+                .find(|p| p.plugin_id == plugin)
+                .is_some_and(|p| {
+                    p.enabled
+                        && p.fault.is_none()
+                        && p.commands.iter().any(|c| c.command_id == command)
+                });
+            let chord = snapshot
+                .public_plugin_command_hotkeys
+                .get(&plugin)
+                .and_then(|m| m.get(&command));
+            let replacement = chord
+                .and_then(|c| crate::hotkey::command_chord(c).ok())
+                .filter(|_| eligible);
+            let tracked = self
+                .command_hotkeys
+                .entries()
+                .into_iter()
+                .filter(|b| b.entry.plugin_id == plugin && b.entry.command_id == command)
+                .collect::<Vec<_>>();
+            if (tracked.is_empty() && replacement.is_none())
+                || (tracked.len() == 1
+                    && tracked[0].confirmed
+                    && replacement == Some(tracked[0].shortcut))
+            {
+                continue;
+            }
+            let result = self.command_hotkeys.edit(
+                &plugin,
+                &command,
+                replacement,
+                eligible,
+                &mut |s| native.register(s).map_err(|_| ()),
+                &mut |s| native.unregister(s).map_err(|_| ()),
+                || {
+                    let current = settings.snapshot();
+                    if current
+                        .public_plugin_command_hotkeys
+                        .get(&plugin)
+                        .and_then(|m| m.get(&command))
+                        != chord
+                    {
+                        return Err(());
+                    }
+                    if replacement.is_some()
+                        && manager
+                            .route_by_id(&plugin, &command, "")
+                            .map_err(|_| ())?
+                            .is_none()
+                    {
+                        return Err(());
+                    }
+                    Ok(())
+                },
+            );
+            failed |= result.is_err();
+        }
+        if failed {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn request_show(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1240,14 +1498,38 @@ impl LifecycleCoordinator {
         self: &Arc<Self>,
         app: &AppHandle,
     ) -> Result<(), LifecycleError> {
-        self.mark_setup_ready_with(|target| self.show_main(app, target))
+        let request = {
+            let mut readiness = self.readiness.lock().unwrap();
+            readiness.setup_ready = true;
+            readiness.take_request_if_ready()
+        };
+        if let Some(request) = request {
+            if request.command_entry.is_none() {
+                self.show_main(app, request.target)?;
+            } else {
+                self.show_main_entry(app, request.target, request.command_entry)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn mark_frontend_ready(
         self: &Arc<Self>,
         app: &AppHandle,
     ) -> Result<(), LifecycleError> {
-        self.mark_frontend_ready_with(|target| self.show_main(app, target))
+        let request = {
+            let mut readiness = self.readiness.lock().unwrap();
+            readiness.frontend_ready = true;
+            readiness.take_request_if_ready()
+        };
+        if let Some(request) = request {
+            if request.command_entry.is_none() {
+                self.show_main(app, request.target)?;
+            } else {
+                self.show_main_entry(app, request.target, request.command_entry)?;
+            }
+        }
+        Ok(())
     }
 
     fn request_show_with<D>(
@@ -1264,10 +1546,10 @@ impl LifecycleCoordinator {
     fn handle_request_main(self: &Arc<Self>, app: &AppHandle, target: ShowTarget) {
         let target = {
             let mut readiness = self.readiness.lock().expect("readiness lock poisoned");
-            readiness.request(target)
+            readiness.request_command(target, None)
         };
-        if let Some(target) = target {
-            let _ = self.show_main(app, target);
+        if let Some(request) = target {
+            let _ = self.show_main_entry(app, request.target, request.command_entry);
         }
     }
 
@@ -1334,6 +1616,15 @@ impl LifecycleCoordinator {
         app: &AppHandle,
         target: ShowTarget,
     ) -> Result<ShowOutcome, LifecycleError> {
+        self.show_main_entry(app, target, None)
+    }
+
+    fn show_main_entry(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        target: ShowTarget,
+        command_entry: Option<CommandEntry>,
+    ) -> Result<ShowOutcome, LifecycleError> {
         let Some((window, registry)) = self.show_main_with_resolver(
             || self.observe_exit(),
             || {
@@ -1383,8 +1674,11 @@ impl LifecycleCoordinator {
                 public.cleanup_retired_result_actions(&registry);
             }
         };
-        let mut emit =
-            |payload: &LauncherShown| window.emit("launcher://shown", payload).map_err(|_| ());
+        let mut emit = |payload: &LauncherShown| {
+            let mut payload = payload.clone();
+            payload.command_entry = command_entry.clone();
+            window.emit("launcher://shown", payload).map_err(|_| ())
+        };
         let mut clear_window = || {
             let _ = clear_and_hide(&registry, &window);
         };
@@ -1449,6 +1743,7 @@ impl LifecycleCoordinator {
             invocation_id,
             target,
             notice,
+            command_entry: None,
         };
         if (operations.emit)(&payload).is_err() {
             (operations.clear_and_hide)();
@@ -1716,6 +2011,7 @@ impl LifecycleCoordinator {
             let exit_app = app.clone();
             let _ = dispatcher.run_on_main_thread(move || {
                 prepare_application_shutdown(&exit_app);
+                coordinator.unregister_command_hotkeys_for_exit(&exit_app);
                 coordinator.uninstall_hook_for_exit();
                 exit_app.exit(0);
             });
@@ -1757,6 +2053,7 @@ impl LifecycleCoordinator {
                 move || {
                     exit_index.enter_terminal();
                     prepare_application_shutdown(&exit_app);
+                    exit_coordinator.unregister_command_hotkeys_for_exit(&exit_app);
                     exit_coordinator.uninstall_hook_for_exit();
                     let app = exit_app.clone();
                     let _ = exit_dispatcher.run_on_main_thread(move || app.exit(0));
@@ -2316,6 +2613,219 @@ mod tests {
             ReadyOrder::FrontendFirst => [state.mark_frontend_ready(), state.mark_setup_ready()],
         };
         results.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn command_hotkey_native_queue_preserves_order_and_rejects_reassigned_binding_events() {
+        let coordinator = LifecycleCoordinator::default();
+        let chord = crate::hotkey::command_chord("Ctrl+K").unwrap();
+        let second = crate::hotkey::command_chord("Ctrl+M").unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(coordinator.capture_native_hotkey(chord).unwrap())
+            .unwrap();
+        sender
+            .send(coordinator.capture_native_hotkey(second).unwrap())
+            .unwrap();
+        let first = receiver.recv().unwrap();
+        let next = receiver.recv().unwrap();
+        assert_eq!(first.shortcut.id(), chord.id());
+        assert_eq!(next.shortcut.id(), second.id());
+        assert!(coordinator.lock_native_hotkey_event(&first).is_some());
+        {
+            let _edit = coordinator.lock_hotkey_operation().unwrap();
+            assert!(
+                coordinator.capture_native_hotkey(chord).is_none(),
+                "busy native presses cannot acquire a future binding"
+            );
+            coordinator
+                .command_hotkeys
+                .edit(
+                    "com.example.reassigned",
+                    "default",
+                    Some(chord),
+                    true,
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                    || Ok(()),
+                )
+                .unwrap();
+        }
+        assert!(
+            coordinator.lock_native_hotkey_event(&first).is_none(),
+            "old queued press must not activate reassigned target"
+        );
+        let fresh = coordinator.capture_native_hotkey(chord).unwrap();
+        assert!(coordinator.lock_native_hotkey_event(&fresh).is_some());
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split(".with_handler(move |app, shortcut, event|")
+            .nth(1)
+            .unwrap()
+            .split(".build()")
+            .next()
+            .unwrap();
+        assert!(handler.contains("capture_native_hotkey(*shortcut)"));
+        assert!(handler.contains("shortcut_sender.send"));
+        assert!(!handler.contains("dispatch_native_hotkey"));
+        assert!(!handler.contains(".lock("));
+    }
+
+    #[test]
+    fn command_hotkey_shared_gate_linearizes_competing_launcher_and_command_edits() {
+        use std::collections::BTreeSet;
+        fn edit(
+            coordinator: &Arc<LifecycleCoordinator>,
+            settings: &SettingsStore,
+            native: &Mutex<BTreeSet<u32>>,
+            launcher: bool,
+        ) -> Result<(), ()> {
+            let shortcut = crate::hotkey::command_chord("Ctrl+K").unwrap();
+            let snapshot = settings.snapshot();
+            let mut register = |s: Shortcut| {
+                if native.lock().unwrap().insert(s.id()) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            };
+            let mut unregister = |s: Shortcut| {
+                if native.lock().unwrap().remove(&s.id()) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            };
+            if launcher {
+                if crate::command_hotkeys::launcher_conflicts(&snapshot, &shortcut.to_string()) {
+                    return Err(());
+                }
+                coordinator.apply_hotkey_settings_transaction(
+                    HotkeyBindingChange {
+                        persisted: HotkeyKind::parse(&snapshot.hotkey)?,
+                        requested: HotkeyKind::Chord(shortcut),
+                        autostart: false,
+                    },
+                    (&mut register, &mut unregister),
+                    (|_| Ok(()), || Ok(())),
+                    (|| Ok(false), |_| Ok(())),
+                    || settings.update_hotkey(shortcut.to_string()).map_err(|_| ()),
+                )
+            } else {
+                if crate::command_hotkeys::conflicts(
+                    &snapshot,
+                    "com.example.notes",
+                    "default",
+                    &shortcut.to_string(),
+                ) {
+                    return Err(());
+                }
+                coordinator.command_hotkeys.edit(
+                    "com.example.notes",
+                    "default",
+                    Some(shortcut),
+                    true,
+                    &mut register,
+                    &mut unregister,
+                    || {
+                        settings
+                            .set_command_hotkey(
+                                "com.example.notes",
+                                "default",
+                                Some(shortcut.to_string()),
+                            )
+                            .map_err(|_| ())
+                    },
+                )
+            }
+        }
+        for launcher_first in [true, false] {
+            let directory = std::env::temp_dir().join(format!(
+                "uipilot-command-hotkey-gate-{}-{launcher_first}",
+                std::process::id()
+            ));
+            let settings = SettingsStore::load(&directory).unwrap();
+            let coordinator = Arc::new(LifecycleCoordinator::default());
+            let native = Arc::new(Mutex::new(BTreeSet::new()));
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = {
+                let coordinator = Arc::clone(&coordinator);
+                let settings = settings.clone();
+                let native = Arc::clone(&native);
+                std::thread::spawn(move || {
+                    let _gate = coordinator.lock_hotkey_operation().unwrap();
+                    acquired_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    edit(&coordinator, &settings, &native, launcher_first)
+                })
+            };
+            acquired_rx.recv().unwrap();
+            let second = {
+                let coordinator = Arc::clone(&coordinator);
+                let settings = settings.clone();
+                let native = Arc::clone(&native);
+                std::thread::spawn(move || {
+                    let _gate = coordinator.lock_hotkey_operation().unwrap();
+                    edit(&coordinator, &settings, &native, !launcher_first)
+                })
+            };
+            release_tx.send(()).unwrap();
+            assert!(first.join().unwrap().is_ok());
+            assert!(second.join().unwrap().is_err());
+            assert_eq!(native.lock().unwrap().len(), 1);
+            assert_eq!(
+                coordinator.command_hotkeys.entries().len(),
+                usize::from(!launcher_first)
+            );
+            assert_eq!(
+                coordinator
+                    .runtime_settings
+                    .lock()
+                    .unwrap()
+                    .registered
+                    .len(),
+                usize::from(launcher_first)
+            );
+            let saved = settings.snapshot();
+            assert_eq!(
+                saved.public_plugin_command_hotkeys.is_empty(),
+                launcher_first
+            );
+            assert_eq!(saved.hotkey == Settings::default().hotkey, !launcher_first);
+            assert!(directory.starts_with(std::env::temp_dir()));
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn command_hotkey_readiness_keeps_identity_in_last_request_slot() {
+        let mut state = Readiness::default();
+        let entry = |command: &str| crate::command_hotkeys::CommandEntry {
+            plugin_id: "com.example.notes".into(),
+            command_id: command.into(),
+            hotkey: "control+KeyN".into(),
+            binding_revision: "1".into(),
+        };
+        state.request_command(ShowTarget::Launcher, Some(entry("a")));
+        state.request_command(ShowTarget::Launcher, Some(entry("b")));
+        state.setup_ready = true;
+        state.frontend_ready = true;
+        assert_eq!(
+            state.take_request_if_ready().unwrap().command_entry,
+            Some(entry("b"))
+        );
+        state.frontend_ready = false;
+        state.request_command(ShowTarget::Launcher, Some(entry("a")));
+        state.request_command(ShowTarget::Settings, None);
+        state.frontend_ready = true;
+        assert_eq!(
+            state.take_request_if_ready(),
+            Some(ShowRequest {
+                target: ShowTarget::Settings,
+                command_entry: None
+            })
+        );
     }
 
     #[test]
@@ -3196,6 +3706,7 @@ mod tests {
             (ShowTarget::Messages, "messages"),
         ] {
             let value = serde_json::to_value(LauncherShown {
+                command_entry: None,
                 invocation_id: "invocation-1".into(),
                 target,
                 notice: Some(LifecycleNotice::SettingsFailed),

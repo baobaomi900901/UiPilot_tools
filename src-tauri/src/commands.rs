@@ -5,6 +5,7 @@ use std::{
     sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
@@ -608,6 +609,8 @@ pub(crate) struct PluginCommandCompletionResult {
 pub(crate) struct OpenPluginPanelInput {
     plugin_id: String,
     argument: String,
+    #[serde(default)]
+    stable_command_target: Option<crate::command_hotkeys::CommandEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1179,13 +1182,156 @@ pub(crate) async fn select_public_plugin_directory(
     )
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CommandHotkeyInput {
+    plugin_id: String,
+    command_id: String,
+    #[serde(deserialize_with = "deserialize_nullable_hotkey")]
+    hotkey: Option<String>,
+}
+fn deserialize_nullable_hotkey<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandEntryResolution {
+    plugin_id: String,
+    command_id: String,
+    command_label: String,
+    output_mode: PublicOutputMode,
+    activation_mode: PublicActivationMode,
+    input_required: bool,
+    input_placeholder: Option<String>,
+}
+
+fn command_hotkey_access<T>(label: &str, protected: impl FnOnce() -> T) -> Result<T, CommandError> {
+    require_main_label(label)?;
+    Ok(protected())
+}
+
+#[tauri::command]
+pub(crate) async fn set_public_plugin_command_hotkey(
+    window: WebviewWindow,
+    input: CommandHotkeyInput,
+) -> Result<(), CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    let replacement = input
+        .hotkey
+        .as_deref()
+        .map(crate::hotkey::command_chord)
+        .transpose()
+        .map_err(|_| CommandError::plugin_query_failed())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let coordinator = Arc::clone(app.state::<Arc<LifecycleCoordinator>>().inner());
+        let _critical = coordinator
+            .reserve_critical()
+            .map_err(|_| CommandError::plugin_query_failed())?;
+        let _operation = coordinator
+            .lock_hotkey_operation()
+            .map_err(|_| CommandError::plugin_query_failed())?;
+        let service = app.state::<Arc<PublicPluginService>>();
+        let manager = service.manager()?;
+        let authority = manager.command_hotkey_authority(&input.plugin_id, &input.command_id)?;
+        let settings = app.state::<SettingsStore>();
+        let canonical = replacement.map(|s| s.to_string());
+        if canonical.as_ref().is_some_and(|chord| {
+            crate::command_hotkeys::conflicts(
+                &settings.snapshot(),
+                &input.plugin_id,
+                &input.command_id,
+                chord,
+            )
+        }) {
+            return Err(CommandError::plugin_query_failed());
+        }
+        let native = app.global_shortcut();
+        coordinator
+            .command_hotkeys
+            .edit(
+                &input.plugin_id,
+                &input.command_id,
+                replacement,
+                authority.0,
+                &mut |s| native.register(s).map_err(|_| ()),
+                &mut |s| native.unregister(s).map_err(|_| ()),
+                || {
+                    manager
+                        .persist_command_hotkey(
+                            &settings,
+                            &input.plugin_id,
+                            &input.command_id,
+                            canonical,
+                            authority,
+                        )
+                        .map_err(|_| ())
+                },
+            )
+            .map_err(|_| CommandError::plugin_query_failed())
+    })
+    .await
+    .map_err(|_| CommandError::plugin_query_failed())?
+}
+
+#[tauri::command]
+pub(crate) fn resolve_public_plugin_command_entry(
+    window: WebviewWindow,
+    entry: crate::command_hotkeys::CommandEntry,
+) -> Result<CommandEntryResolution, CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+    if !coordinator.command_entry_current(&app, &entry) {
+        return Err(CommandError::plugin_query_failed());
+    }
+    let service = app.state::<Arc<PublicPluginService>>();
+    let route = service
+        .manager()?
+        .route_by_id(&entry.plugin_id, &entry.command_id, "")?
+        .ok_or_else(CommandError::plugin_query_failed)?;
+    if !coordinator.command_entry_current(&app, &entry) {
+        return Err(CommandError::plugin_query_failed());
+    }
+    Ok(CommandEntryResolution {
+        plugin_id: route.plugin_id,
+        command_id: route.command_id,
+        command_label: route.command_label,
+        output_mode: route.output_mode,
+        activation_mode: route.activation_mode,
+        input_required: route.input_required,
+        input_placeholder: route.input_placeholder,
+    })
+}
+
 #[tauri::command]
 pub(crate) fn list_public_plugins(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
 ) -> Result<PublicPluginInventory, CommandError> {
     require_main_window(&window)?;
-    Ok(service.manager()?.inventory()?)
+    let mut inventory = service.manager()?.inventory()?;
+    let app = window.app_handle();
+    let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+    let settings = app.state::<SettingsStore>().snapshot();
+    inventory.hotkey_revision = coordinator.command_hotkeys.revision();
+    for plugin in &mut inventory.items {
+        for command in &mut plugin.commands {
+            command.hotkey = settings
+                .public_plugin_command_hotkeys
+                .get(&plugin.plugin_id)
+                .and_then(|m| m.get(&command.command_id))
+                .cloned();
+            command.hotkey_status = coordinator.command_hotkeys.status(
+                &plugin.plugin_id,
+                &command.command_id,
+                command.hotkey.as_deref(),
+                plugin.enabled && plugin.fault.is_none(),
+            );
+        }
+    }
+    Ok(inventory)
 }
 
 #[tauri::command]
@@ -3255,10 +3401,27 @@ async fn open_plugin_panel_impl(
     controller: State<'_, Arc<PluginPanelController>>,
     input: OpenPluginPanelInput,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
-    let route = public
-        .manager()?
-        .panel_route(&input.plugin_id, &input.argument)?
-        .ok_or_else(CommandError::plugin_query_failed)?;
+    let route = if let Some(target) = &input.stable_command_target {
+        if target.plugin_id != input.plugin_id
+            || !app
+                .state::<Arc<LifecycleCoordinator>>()
+                .command_entry_current(&app, target)
+        {
+            return Err(CommandError::plugin_query_failed());
+        }
+        public
+            .manager()?
+            .route_by_id(&target.plugin_id, &target.command_id, &input.argument)?
+            .filter(|route| {
+                route.output_mode == PublicOutputMode::Panel
+                    && (!route.input_required || !route.input.is_empty())
+            })
+    } else {
+        public
+            .manager()?
+            .panel_route(&input.plugin_id, &input.argument)?
+    }
+    .ok_or_else(CommandError::plugin_query_failed)?;
     let panel_entry = route
         .panel_entry
         .clone()
@@ -3351,6 +3514,7 @@ pub(crate) async fn search_apps(
     query_sequence: u64,
     submit: Option<bool>,
     completion_origin: Option<CompletionOriginInput>,
+    stable_command_target: Option<crate::command_hotkeys::CommandEntry>,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
     let submit = submit.unwrap_or(false);
@@ -3363,7 +3527,10 @@ pub(crate) async fn search_apps(
         registry,
     };
     let normalized_query = query.trim().to_owned();
-    if completion_origin.is_none() && !normalized_query.starts_with('/') {
+    if stable_command_target.is_none()
+        && completion_origin.is_none()
+        && !normalized_query.starts_with('/')
+    {
         match resolve_currency_search(
             registry,
             &normalized_query,
@@ -3392,7 +3559,8 @@ pub(crate) async fn search_apps(
     let settings_snapshot = settings.snapshot();
     let web_search_engine = settings_snapshot.web_search_engine;
     let quicklink_items = quicklinks.list().items;
-    if completion_origin.is_none()
+    if stable_command_target.is_none()
+        && completion_origin.is_none()
         && (!normalized_query.starts_with('/') || normalized_query == "/")
     {
         return Ok(search_apps_with_catalog(
@@ -3411,7 +3579,8 @@ pub(crate) async fn search_apps(
             |applications| settings.decorate_applications(applications),
         ));
     }
-    if completion_origin.is_none()
+    if stable_command_target.is_none()
+        && completion_origin.is_none()
         && (normalized_query == "/find"
             || normalized_query.starts_with("/find ")
             || normalized_query == "/quicklinks"
@@ -3435,7 +3604,10 @@ pub(crate) async fn search_apps(
             |_| {},
         ));
     }
-    if completion_origin.is_none() && plugin_discovery_prefix(&normalized_query).is_some() {
+    if stable_command_target.is_none()
+        && completion_origin.is_none()
+        && plugin_discovery_prefix(&normalized_query).is_some()
+    {
         return Ok(search_apps_with_catalog(
             registry,
             CatalogSearchRequest {
@@ -3455,7 +3627,43 @@ pub(crate) async fn search_apps(
     let route_query = completion_origin
         .as_ref()
         .map_or(normalized_query.as_str(), |_| query.as_str());
-    if let Some(route) = public.manager()?.route(route_query)? {
+    let route = if let Some(target) = &stable_command_target {
+        if !app
+            .state::<Arc<LifecycleCoordinator>>()
+            .command_entry_current(app, target)
+        {
+            return Err(CommandError::plugin_query_failed());
+        }
+        public
+            .manager()?
+            .route_by_id(
+                &target.plugin_id,
+                &target.command_id,
+                route_query
+                    .split_once(' ')
+                    .map_or("", |(_, argument)| argument.trim()),
+            )?
+            .ok_or_else(CommandError::plugin_query_failed)
+            .map(Some)?
+    } else {
+        public.manager()?.route(route_query)?
+    };
+    if let Some(route) = route {
+        // Hotkey entry prompts before the ordinary Window completion exception.
+        if stable_command_target.is_some() && route.input_required && route.input.is_empty() {
+            return Ok(public_plugin_prompt(
+                registry,
+                &invocation_id,
+                query_sequence,
+                Some(
+                    route
+                        .input_placeholder
+                        .clone()
+                        .unwrap_or_else(|| "请输入内容".into()),
+                ),
+                submitted_main_result_command(&route, submit),
+            ));
+        }
         match public_plugin_search_decision(&route, submit, completion_origin.as_ref())
             .map_err(|_| CommandError::plugin_query_failed())?
         {
@@ -5946,6 +6154,58 @@ mod tests {
     use tauri_plugin_global_shortcut::Shortcut;
 
     #[test]
+    fn command_hotkey_ipcs_reject_non_main_before_protected_access_and_strict_input() {
+        use std::cell::Cell;
+        let accesses = Cell::new(0);
+        for label in [
+            "find",
+            "plugin-runtime-com.example.notes-1",
+            "plugin-panel",
+            "plugin-window",
+            "",
+        ] {
+            for _command in [
+                "set_public_plugin_command_hotkey",
+                "resolve_public_plugin_command_entry",
+            ] {
+                assert!(
+                    super::command_hotkey_access(label, || accesses.set(accesses.get() + 1))
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(accesses.get(), 0);
+        super::command_hotkey_access("main", || accesses.set(accesses.get() + 1)).unwrap();
+        assert_eq!(accesses.get(), 1);
+        let input = serde_json::json!({ "pluginId": "com.example.notes", "commandId": "default", "hotkey": null });
+        assert!(serde_json::from_value::<super::CommandHotkeyInput>(input.clone()).is_ok());
+        for invalid in [
+            serde_json::json!({ "pluginId": "com.example.notes", "commandId": "default" }),
+            serde_json::json!({ "pluginId": "com.example.notes", "commandId": "default", "hotkey": 1 }),
+            serde_json::json!({ "pluginId": "com.example.notes", "commandId": "default", "hotkey": null, "extra": true }),
+        ] {
+            assert!(serde_json::from_value::<super::CommandHotkeyInput>(invalid).is_err());
+        }
+        let source = include_str!("commands.rs");
+        for name in [
+            "set_public_plugin_command_hotkey",
+            "resolve_public_plugin_command_entry",
+        ] {
+            let body = source
+                .split(&format!("fn {name}("))
+                .nth(1)
+                .unwrap()
+                .split("#[tauri::command]")
+                .next()
+                .unwrap();
+            assert!(
+                body.find("command_hotkey_access(window.label()").unwrap()
+                    < body.find("app.state::<").unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn save_plugin_settings_tears_down_only_after_real_effects_including_partial_failure() {
         use std::time::Instant;
         for case in [
@@ -7277,6 +7537,7 @@ mod tests {
             window_position: None,
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
+            public_plugin_command_hotkeys: BTreeMap::new(),
         };
         fs::write(
             dir.path().join("settings.json"),

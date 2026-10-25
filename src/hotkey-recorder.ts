@@ -18,6 +18,7 @@ export type RecorderEvent =
       shift: boolean
       meta: boolean
       repeat: boolean
+      allowDoubleTap?: boolean
       nowMs: number
     }
   | { type: 'cancel' }
@@ -133,11 +134,11 @@ function handleKeydown(state: RecorderState, event: KeydownEvent): RecorderResul
     return recordingResult(state)
   }
 
-  if (isCtrlKey(event)) {
+  if (isCtrlKey(event) && event.allowDoubleTap !== false) {
     return handleDoubleTap(state, 'Ctrl', event.nowMs)
   }
 
-  if (isAltKey(event)) {
+  if (isAltKey(event) && event.allowDoubleTap !== false) {
     return handleDoubleTap(state, 'Alt', event.nowMs)
   }
 

@@ -16,6 +16,7 @@ Putting bindings in strict public-plugin state would broaden the migration contr
 
 - Persist `publicPluginCommandHotkeys: BTreeMap<pluginId, BTreeMap<commandId, canonicalChord>>`, defaulting to empty. Existing Settings updates preserve this map.
 - Add main-window-only `set_public_plugin_command_hotkey({ pluginId, commandId, hotkey: string | null })`; null explicitly clears. Reject unknown fields/identities and non-chord values before native work. Use `HotkeyKind::parse/canonical`; launcher double-tap remains supported.
+- Editing an installed disabled/faulted command persists its chord as suspended without native registration; saved suspended chords still participate in conflict checks.
 - Enrich inventory command rows with `hotkey: string | null` and `hotkeyStatus: 'unset' | 'active' | 'suspended' | 'unavailable'`. Suspended means disabled/faulted; unavailable means native registration/cleanup could not be confirmed. Expose an independent host `hotkeyRevision`; row continuation ownership includes both inventory and hotkey revisions.
 - Extract the existing recorder into a small shared component accepting value, commit callback, and allow-double-tap option. Command rows disallow double-tap and add an accessible explicit “清除” action. Reuse the row's mutation/reload/focus recovery path; failed reload retries the read only.
 - Record/edit/clear, loading, errors, and long chords fit the existing compact row in both themes using semantic tokens. Escape cancels recording; Tab order and focus return remain predictable. Keep a binding visible while suspended.

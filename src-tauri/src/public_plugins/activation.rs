@@ -140,6 +140,7 @@ pub(crate) struct PublicPluginMutation {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicPluginInventory {
     pub(crate) revision: String,
+    pub(crate) hotkey_revision: String,
     pub(crate) items: Vec<PublicPluginInventoryItem>,
 }
 
@@ -169,6 +170,8 @@ pub(crate) struct PublicPluginInventoryCommand {
     pub(crate) effective_name: String,
     pub(crate) name_override: Option<String>,
     pub(crate) favorite: bool,
+    pub(crate) hotkey: Option<String>,
+    pub(crate) hotkey_status: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -586,6 +589,8 @@ pub(crate) struct PublicPluginManager {
     owner_cleanup: Arc<PluginOwnerCleanupStore>,
     bundles: Arc<ActivationReservationBook>,
     mutation: Mutex<()>,
+    hotkey_settings: Mutex<Option<crate::settings::SettingsStore>>,
+    hotkey_changed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_uncertain_close: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -820,6 +825,8 @@ impl PublicPluginManager {
             owner_cleanup,
             bundles,
             mutation: Mutex::new(()),
+            hotkey_settings: Mutex::new(None),
+            hotkey_changed: Mutex::new(None),
             #[cfg(test)]
             after_uncertain_close: Mutex::new(None),
             #[cfg(test)]
@@ -839,16 +846,117 @@ impl PublicPluginManager {
         Ok(manager)
     }
 
+    pub(crate) fn attach_command_hotkeys(
+        &self,
+        settings: crate::settings::SettingsStore,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), PublicPluginManagementError> {
+        *self
+            .hotkey_settings
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)? = Some(settings);
+        *self
+            .hotkey_changed
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)? = Some(changed);
+        self.prune_command_hotkeys()
+    }
+    fn prune_command_hotkeys_locked(&self) -> Result<(), PublicPluginManagementError> {
+        if let Some(settings) = self
+            .hotkey_settings
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+            .as_ref()
+        {
+            let installed = self
+                .state
+                .configs()?
+                .into_iter()
+                .filter(|c| c.installed)
+                .map(|c| (c.plugin_id, c.commands.into_keys().collect()))
+                .collect();
+            settings
+                .prune_command_hotkeys(&installed)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn prune_command_hotkeys(&self) -> Result<(), PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        self.prune_command_hotkeys_locked()
+    }
+    fn publish_command_hotkeys(&self) -> Result<(), PublicPluginManagementError> {
+        let result = self.prune_command_hotkeys();
+        let changed = self
+            .hotkey_changed
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+            .clone();
+        if let Some(changed) = changed {
+            changed();
+        }
+        result
+    }
+    fn command_authority_locked(
+        &self,
+        plugin: &str,
+        command: &str,
+    ) -> Result<(bool, u64), PublicPluginManagementError> {
+        let config = self
+            .state
+            .config(plugin)?
+            .filter(|c| c.installed && c.commands.contains_key(command))
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        if self
+            .owner_cleanup
+            .is_blocked(plugin)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        Ok((
+            config.enabled && config.fault.is_none(),
+            config.active_generation,
+        ))
+    }
+    pub(crate) fn command_hotkey_authority(
+        &self,
+        plugin: &str,
+        command: &str,
+    ) -> Result<(bool, u64), PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        self.command_authority_locked(plugin, command)
+    }
+    pub(crate) fn persist_command_hotkey(
+        &self,
+        settings: &crate::settings::SettingsStore,
+        plugin: &str,
+        command: &str,
+        hotkey: Option<String>,
+        expected: (bool, u64),
+    ) -> Result<(), PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        if self.command_authority_locked(plugin, command)? != expected {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        settings
+            .set_command_hotkey(plugin, command, hotkey)
+            .map_err(|_| PublicPluginManagementError::Unavailable)
+    }
+
     fn refresh_clipboard_history_authorization(&self) -> Result<(), PublicPluginManagementError> {
+        let hotkey_cleanup = self.publish_command_hotkeys();
         let plugin_ids = self
             .state
             .configs()?
             .into_iter()
             .filter(clipboard_history_is_authorized)
             .map(|config| config.plugin_id);
-        self.clipboard_history
+        let clipboard_cleanup = self
+            .clipboard_history
             .sync_authorized_plugins(plugin_ids)
-            .map_err(PublicPluginManagementError::from)
+            .map_err(PublicPluginManagementError::from);
+        clipboard_cleanup.and(hotkey_cleanup)
     }
 
     pub(crate) fn shutdown_clipboard_history(&self) {
@@ -1351,6 +1459,7 @@ impl PublicPluginManager {
                 previous_activation_id,
             ) = {
                 let _mutation = self.lock_mutation()?;
+                self.prune_command_hotkeys_locked()?;
                 let pending = {
                     let mut data = self.lock_data()?;
                     let pending = data
@@ -2756,7 +2865,9 @@ impl PublicPluginManager {
         committed: &PublicPluginUninstallCommit,
         settings: &crate::settings::SettingsStore,
     ) -> Result<(), PublicPluginManagementError> {
-        let mut failed = false;
+        let mut failed = settings
+            .remove_command_hotkeys(&committed.plugin_id)
+            .is_err();
         failed |= self
             .clipboard_history
             .uninstall(&committed.plugin_id, committed.retain_data)
@@ -2941,6 +3052,8 @@ impl PublicPluginManager {
                         effective_name: command.effective_name.clone(),
                         name_override: command.name_override.clone(),
                         favorite: command.favorite,
+                        hotkey: None,
+                        hotkey_status: "unset",
                     })
                     .collect(),
                 enabled: config.enabled,
@@ -2973,6 +3086,7 @@ impl PublicPluginManager {
                 .then_with(|| left.plugin_id.cmp(&right.plugin_id))
         });
         Ok(PublicPluginInventory {
+            hotkey_revision: "0".into(),
             revision: revision.to_string(),
             items,
         })
@@ -3017,13 +3131,33 @@ impl PublicPluginManager {
         if effective_name.is_empty() {
             return Ok(None);
         }
+        self.route_matching(effective_name, input, None)
+    }
+
+    pub(crate) fn route_by_id(
+        &self,
+        plugin: &str,
+        command: &str,
+        input: &str,
+    ) -> Result<Option<PublicPluginRoute>, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        self.route_matching("", input, Some((plugin, command)))
+    }
+
+    fn route_matching(
+        &self,
+        effective_name: &str,
+        input: &str,
+        stable: Option<(&str, &str)>,
+    ) -> Result<Option<PublicPluginRoute>, PublicPluginManagementError> {
         for bundle in self.bundles.bundles()? {
             let config = &bundle.config;
             let snapshot = &bundle.runtime;
-            let Some((command_id, command_config)) = config
-                .commands
-                .iter()
-                .find(|(_, command)| command.effective_name == effective_name)
+            let Some((command_id, command_config)) =
+                config.commands.iter().find(|(id, command)| match stable {
+                    Some((plugin, wanted)) => config.plugin_id == plugin && id.as_str() == wanted,
+                    None => command.effective_name == effective_name,
+                })
             else {
                 continue;
             };
@@ -3038,7 +3172,7 @@ impl PublicPluginManager {
                 || !config.enabled
                 || config.fault.is_some()
                 || config.active_generation != snapshot.generation
-                || command_config.effective_name != effective_name
+                || (stable.is_none() && command_config.effective_name != effective_name)
             {
                 continue;
             }
@@ -8412,6 +8546,172 @@ mod tests {
                 |_| true,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn command_hotkey_id_route_survives_rename_label_reuse_and_closes_on_fault() {
+        let dir = TestDir::new("command-hotkey-id-route");
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        let manager = multi_manager(&dir);
+        install_multi(&manager, &dir.source());
+        let before = manager
+            .route_by_id("com.example.activation", "upper", "hello")
+            .unwrap()
+            .unwrap();
+        manager
+            .rename_command("com.example.activation", "upper", Some("renamed"))
+            .unwrap();
+        manager
+            .rename_command("com.example.activation", "constructor", Some("upper"))
+            .unwrap();
+        assert_eq!(
+            manager.route("/upper hello").unwrap().unwrap().command_id,
+            "constructor"
+        );
+        let stable = manager
+            .route_by_id("com.example.activation", "upper", "hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stable.command_id, "upper");
+        assert_eq!(stable.command_label, "renamed");
+        let settings = SettingsStore::load(dir.path()).unwrap();
+        manager
+            .attach_command_hotkeys(settings.clone(), Arc::new(|| {}))
+            .unwrap();
+        let authority = manager
+            .command_hotkey_authority("com.example.activation", "upper")
+            .unwrap();
+        manager
+            .persist_command_hotkey(
+                &settings,
+                "com.example.activation",
+                "upper",
+                Some("control+KeyN".into()),
+                authority,
+            )
+            .unwrap();
+        assert!(manager
+            .disable_plugin_for_fault_if_current(
+                "com.example.activation",
+                before.generation,
+                stable.activation_id,
+                PublicPluginFault::RuntimeUnavailable
+            )
+            .unwrap());
+        assert!(manager
+            .route_by_id("com.example.activation", "upper", "hello")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            settings.snapshot().public_plugin_command_hotkeys["com.example.activation"]["upper"],
+            "control+KeyN"
+        );
+        assert!(manager
+            .persist_command_hotkey(
+                &settings,
+                "com.example.activation",
+                "upper",
+                None,
+                authority
+            )
+            .is_err());
+        manager
+            .set_enabled_with_readiness("com.example.activation", true, |_| true)
+            .unwrap();
+        assert!(manager
+            .route_by_id("com.example.activation", "upper", "hello")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn command_hotkey_uninstall_revalidation_and_cleanup_ignore_retain_data() {
+        for retain in [true, false] {
+            let dir = TestDir::new("command-hotkey-uninstall");
+            write_package(&dir.source(), "1.0.0", "one");
+            let manager = manager(&dir);
+            install_discovery_package(&manager, &dir.source(), Instant::now());
+            let settings = SettingsStore::load(dir.path()).unwrap();
+            manager
+                .attach_command_hotkeys(settings.clone(), Arc::new(|| {}))
+                .unwrap();
+            let authority = manager
+                .command_hotkey_authority("com.example.activation", "default")
+                .unwrap();
+            manager
+                .persist_command_hotkey(
+                    &settings,
+                    "com.example.activation",
+                    "default",
+                    Some("control+KeyN".into()),
+                    authority,
+                )
+                .unwrap();
+            let mut transaction = manager
+                .begin_uninstall("com.example.activation", retain)
+                .unwrap()
+                .unwrap();
+            manager.drain_uninstall_data(&mut transaction).unwrap();
+            let committed = manager.commit_uninstall(transaction).unwrap();
+            assert!(manager
+                .persist_command_hotkey(
+                    &settings,
+                    "com.example.activation",
+                    "default",
+                    Some("control+KeyM".into()),
+                    authority
+                )
+                .is_err());
+            manager
+                .finish_uninstall_cleanup(&committed, &settings)
+                .unwrap();
+            assert!(settings.snapshot().public_plugin_command_hotkeys.is_empty());
+            install_discovery_package(&manager, &dir.source(), Instant::now());
+            assert!(settings.snapshot().public_plugin_command_hotkeys.is_empty());
+        }
+    }
+
+    #[test]
+    fn command_hotkey_update_prunes_removed_ids_and_precommit_prune_blocks_resurrection() {
+        let dir = TestDir::new("command-hotkey-prune");
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        let manager = multi_manager(&dir);
+        install_multi(&manager, &dir.source());
+        let settings = SettingsStore::load(dir.path()).unwrap();
+        manager
+            .attach_command_hotkeys(settings.clone(), Arc::new(|| {}))
+            .unwrap();
+        for id in ["upper", "constructor"] {
+            settings
+                .set_command_hotkey("com.example.activation", id, Some("control+KeyN".into()))
+                .unwrap();
+        }
+        write_multi_package(&dir.source(), "2.0.0", "lower", false);
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["commands"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["id"] == "upper");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        install_multi(&manager, &dir.source());
+        let saved = settings.snapshot().public_plugin_command_hotkeys;
+        assert!(saved["com.example.activation"].contains_key("upper"));
+        assert!(!saved["com.example.activation"].contains_key("constructor"));
+        // Simulate a prior postcommit cleanup failure/crash leaving a stale preference.
+        settings
+            .set_command_hotkey(
+                "com.example.activation",
+                "constructor",
+                Some("control+KeyM".into()),
+            )
+            .unwrap();
+        write_multi_package(&dir.source(), "3.0.0", "lower", false);
+        install_multi(&manager, &dir.source());
+        assert!(
+            !settings.snapshot().public_plugin_command_hotkeys["com.example.activation"]
+                .contains_key("constructor")
+        );
     }
 
     #[test]

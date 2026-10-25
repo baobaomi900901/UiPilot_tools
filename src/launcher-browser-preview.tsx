@@ -42,7 +42,7 @@ const previewQuicklinks: QuicklinkView[] = [
     updatedAt: '2026-08-31T00:00:00Z',
   },
 ]
-let previewPublicPlugins: PublicPluginInventory = {
+let previewPublicPlugins: PublicPluginInventory = { hotkeyRevision: '0',
   revision: '1',
   items: [
     {
@@ -51,7 +51,7 @@ let previewPublicPlugins: PublicPluginInventory = {
       description: '项目笔记、代码片段和常用链接管理。',
       version: '0.1.0',
       source: 'localPackage',
-      commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false }],
+      commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
       enabled: true,
       fault: null,
       generation: 1,
@@ -71,7 +71,7 @@ let previewPublicPlugins: PublicPluginInventory = {
       description: '选中文本翻译、方向切换和复制结果。',
       version: '0.3.0',
       source: 'localPackage',
-      commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false }],
+      commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
       enabled: false,
       fault: null,
       generation: 2,
@@ -105,7 +105,7 @@ let previewPublicPlugins: PublicPluginInventory = {
 const credentialPreviewPlugin: PublicPluginInventoryItem = {
   pluginId: 'com.uipilot.credential-demo', name: 'Credential Demo',
   description: '合成凭据设置与网络授权预览，不连接真实服务。', version: '0.1.0', source: 'localPackage',
-  commands: [{ commandId: 'default', defaultName: 'credential-demo', effectiveName: 'credential-demo', nameOverride: null, favorite: false }], enabled: true,
+  commands: [{ commandId: 'default', defaultName: 'credential-demo', effectiveName: 'credential-demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
   fault: null, generation: 1, iconUrl: null,
   network: { httpsHosts: ['api.example.com'], credentials: [
     { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' },
@@ -120,6 +120,7 @@ previewPublicPlugins = { ...previewPublicPlugins, items: [...previewPublicPlugin
 let previewScenarioPending = true
 function updatePreviewPlugin(pluginId: string, update: (plugin: PublicPluginInventoryItem) => PublicPluginInventoryItem) {
   previewPublicPlugins = {
+    hotkeyRevision: previewPublicPlugins.hotkeyRevision,
     revision: String(BigInt(previewPublicPlugins.revision) + 1n),
     items: previewPublicPlugins.items.map((plugin) => plugin.pluginId === pluginId ? update(plugin) : plugin),
   }
@@ -134,7 +135,7 @@ const commandPreviewPlugin: PublicPluginInventoryItem = {
     commandId: index === 1 ? 'constructor' : index === 0 ? 'upper' : `command-${index + 1}`,
     defaultName: commandPreviewCount === 16 ? `long-command-name-number-${String(index + 1).padStart(2, '0')}` : index === 0 ? 'upper' : 'lower',
     effectiveName: commandPreviewCount === 16 ? `long-command-name-number-${String(index + 1).padStart(2, '0')}` : index === 0 ? 'upper' : 'lower',
-    nameOverride: null, favorite: false,
+    nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const,
   })), network: null, permissions: [], settings: [],
 }
 if (commandPreview) previewPublicPlugins = { ...previewPublicPlugins, items: [commandPreviewPlugin] }
@@ -344,6 +345,8 @@ const client: LauncherClient = {
   setPluginPanelBounds: async () => undefined,
   acknowledgePluginPanelFocusHostInput: async () => undefined,
   commitPluginWindowTransfer: async () => undefined,
+  setPublicPluginCommandHotkey: async () => undefined,
+  resolvePublicPluginCommandEntry: async () => { throw new Error('native command hotkeys are unavailable in preview') },
   listPublicPlugins: async () => {
     const inventory = structuredClone(previewPublicPlugins)
     if (commandPreview && inventory.revision !== '1') {

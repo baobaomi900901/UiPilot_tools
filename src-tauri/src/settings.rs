@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,8 @@ pub(crate) struct Settings {
     pub(crate) find_window_position: Option<WindowPosition>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) plugin_window_positions: BTreeMap<String, WindowPosition>,
+    #[serde(default)]
+    pub(crate) public_plugin_command_hotkeys: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 pub(crate) struct SettingsUpdate {
@@ -92,9 +94,10 @@ pub(crate) struct FindPreferenceSnapshot {
     pub(crate) file_preview_enabled: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct SettingsStore {
-    paths: AtomicPaths,
-    state: Mutex<SettingsState>,
+    paths: Arc<AtomicPaths>,
+    state: Arc<Mutex<SettingsState>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +121,7 @@ impl Default for Settings {
             window_position: None,
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
+            public_plugin_command_hotkeys: BTreeMap::new(),
         }
     }
 }
@@ -148,39 +152,39 @@ impl From<AtomicFileError> for SettingsError {
 impl SettingsStore {
     pub(crate) fn load(app_data_dir: &Path) -> Result<Self, SettingsError> {
         fs::create_dir_all(app_data_dir).map_err(|_| SettingsError::Storage)?;
-        let paths = AtomicPaths::new(app_data_dir, "settings.json");
+        let paths = Arc::new(AtomicPaths::new(app_data_dir, "settings.json"));
 
         if let Some(value) = load_candidate(paths.current())? {
             return Ok(Self {
                 paths,
-                state: Mutex::new(SettingsState {
+                state: Arc::new(Mutex::new(SettingsState {
                     value,
                     current_is_valid: true,
                     theme_revision: 0,
                     file_preview_revision: 0,
-                }),
+                })),
             });
         }
         if let Some(value) = load_candidate(paths.backup())? {
             return Ok(Self {
                 paths,
-                state: Mutex::new(SettingsState {
+                state: Arc::new(Mutex::new(SettingsState {
                     value,
                     current_is_valid: false,
                     theme_revision: 0,
                     file_preview_revision: 0,
-                }),
+                })),
             });
         }
 
         Ok(Self {
             paths,
-            state: Mutex::new(SettingsState {
+            state: Arc::new(Mutex::new(SettingsState {
                 value: Settings::default(),
                 current_is_valid: false,
                 theme_revision: 0,
                 file_preview_revision: 0,
-            }),
+            })),
         })
     }
 
@@ -211,6 +215,61 @@ impl SettingsStore {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
         candidate.hotkey = hotkey;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_command_hotkey(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
+        hotkey: Option<String>,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        if let Some(hotkey) = hotkey {
+            candidate
+                .public_plugin_command_hotkeys
+                .entry(plugin_id.into())
+                .or_default()
+                .insert(command_id.into(), hotkey);
+        } else if let Some(commands) = candidate.public_plugin_command_hotkeys.get_mut(plugin_id) {
+            commands.remove(command_id);
+            if commands.is_empty() {
+                candidate.public_plugin_command_hotkeys.remove(plugin_id);
+            }
+        }
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn prune_command_hotkeys(
+        &self,
+        installed: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate
+            .public_plugin_command_hotkeys
+            .retain(|plugin, commands| {
+                commands.retain(|command, _| {
+                    installed
+                        .get(plugin)
+                        .is_some_and(|ids| ids.contains(command))
+                });
+                !commands.is_empty()
+            });
+        if candidate == state.value {
+            return Ok(());
+        }
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn remove_command_hotkeys(&self, plugin_id: &str) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.public_plugin_command_hotkeys.remove(plugin_id);
+        if candidate == state.value {
+            return Ok(());
+        }
         self.persist(&mut state, candidate)
     }
 
@@ -523,6 +582,25 @@ mod tests {
 
     fn read_backup(dir: &TestDir) -> Settings {
         serde_json::from_slice(&fs::read(dir.backup()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn command_hotkey_settings_default_roundtrip_preserve_and_prune() {
+        let dir = TestDir::new("command-hotkeys");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert!(store.snapshot().public_plugin_command_hotkeys.is_empty());
+        store
+            .set_command_hotkey("com.example.notes", "default", Some("Ctrl+N".into()))
+            .unwrap();
+        store.update_hotkey("Alt+Space".into()).unwrap();
+        assert_eq!(
+            store.snapshot().public_plugin_command_hotkeys["com.example.notes"]["default"],
+            "Ctrl+N"
+        );
+        let reloaded = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(reloaded.snapshot(), store.snapshot());
+        store.prune_command_hotkeys(&BTreeMap::new()).unwrap();
+        assert!(store.snapshot().public_plugin_command_hotkeys.is_empty());
     }
 
     #[test]
@@ -1160,6 +1238,7 @@ mod tests {
             window_position: None,
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
+            public_plugin_command_hotkeys: BTreeMap::new(),
         };
         write_settings(&dir.current(), &persisted);
         let store = SettingsStore::load(dir.path()).unwrap();

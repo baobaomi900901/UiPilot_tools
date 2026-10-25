@@ -44,6 +44,8 @@ fn main() {
             "hide_find_window",
             "select_public_plugin_directory",
             "list_public_plugins",
+            "set_public_plugin_command_hotkey",
+            "resolve_public_plugin_command_entry",
             "get_public_plugin_diagnostics",
             "copy_public_plugin_diagnostics",
             "list_quicklinks",

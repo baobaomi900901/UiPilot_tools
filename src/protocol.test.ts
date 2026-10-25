@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  parseLauncherShown,
   parseResultActionMetadata,
   parseResultActionOutcome,
   parsePluginTimerStartInput,
@@ -99,14 +100,14 @@ describe('public plugin timer protocol', () => {
 
   it('accepts timer.control in public plugin inventory permissions', () => {
     const inventory = {
-      revision: '1',
+      revision: '1', hotkeyRevision: '0',
       items: [{
         pluginId: 'com.example.timer',
         name: 'Timer',
         description: null,
         version: '1.0.0',
         source: 'localPackage',
-        commands: [{ commandId: 'default', defaultName: 'timer', effectiveName: 'timer', nameOverride: null, favorite: false }],
+        commands: [{ commandId: 'default', defaultName: 'timer', effectiveName: 'timer', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
         enabled: true,
         fault: null,
         generation: 1,
@@ -121,14 +122,14 @@ describe('public plugin timer protocol', () => {
 
   it('accepts ui.panel in public plugin inventory permissions', () => {
     const inventory = {
-      revision: '1',
+      revision: '1', hotkeyRevision: '0',
       items: [{
         pluginId: 'com.example.panel',
         name: 'Panel',
         description: null,
         version: '1.0.0',
         source: 'localPackage',
-        commands: [{ commandId: 'default', defaultName: 'panel', effectiveName: 'panel', nameOverride: null, favorite: false }],
+        commands: [{ commandId: 'default', defaultName: 'panel', effectiveName: 'panel', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
         enabled: true,
         fault: null,
         generation: 1,
@@ -148,7 +149,7 @@ describe('public plugin timer protocol', () => {
       description: null,
       version: '1.0.0',
       source: 'localPackage',
-      commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false }],
+      commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
       enabled: true,
       fault: null,
       generation: 1,
@@ -157,8 +158,8 @@ describe('public plugin timer protocol', () => {
       permissions: [{ permission: 'network.https', supported: true, granted: true }],
       settings: [],
     }
-    expect(parsePublicPluginInventory({ revision: '1', items: [item] })).toEqual({
-      revision: '1',
+    expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [item] })).toEqual({
+      revision: '1', hotkeyRevision: '0',
       items: [item],
     })
     for (const network of [
@@ -170,7 +171,7 @@ describe('public plugin timer protocol', () => {
       { httpsHosts: ['api.example.com'], credentials: [], extra: true },
       { httpsHosts: [], credentials: [] },
     ]) {
-      expect(parsePublicPluginInventory({ revision: '1', items: [{ ...item, network }] })).toBeNull()
+      expect(parsePublicPluginInventory({ revision: '1', hotkeyRevision: '0', items: [{ ...item, network }] })).toBeNull()
     }
 
     const prepared = {
@@ -220,9 +221,9 @@ describe('public plugin timer protocol', () => {
 
 
 it('parses the full command inventory with constructor and rejects malformed command identities', () => {
-  const command = { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null, favorite: false }
-  const item = { pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage', commands: [command, { ...command, commandId: 'upper', defaultName: 'upper', effectiveName: 'custom', nameOverride: 'custom', favorite: true }], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
-  const inventory = (commands: unknown) => ({ revision: '1', items: [{ ...item, commands }] })
+  const command = { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }
+  const item = { pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage', commands: [command, { ...command, commandId: 'upper', defaultName: 'upper', effectiveName: 'custom', nameOverride: 'custom', favorite: true, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
+  const inventory = (commands: unknown) => ({ revision: '1', hotkeyRevision: '0', items: [{ ...item, commands }] })
   expect(parsePublicPluginInventory(inventory(item.commands))).toEqual(inventory(item.commands))
   for (const commandId of [undefined, null, '', 'Upper', 'bad id']) {
     const { commandId: _id, ...rest } = command
@@ -232,4 +233,17 @@ it('parses the full command inventory with constructor and rejects malformed com
     expect(parsePublicPluginInventory(inventory(commands))).toBeNull()
   }
   expect(parsePublicPluginInventory(inventory([{ ...command, nameOverride: 'lower' }]))).toEqual(inventory([{ ...command, nameOverride: 'lower' }]))
+})
+
+
+describe('command hotkey protocol', () => {
+  it('preserves an exact stable entry on the same shown invocation', () => {
+    const commandEntry = { pluginId: 'com.example.notes', commandId: 'default', hotkey: 'Ctrl+N', bindingRevision: '1' }
+    const shown = { invocationId: 'invocation-2', target: 'launcher', notice: null, commandEntry }
+    expect(parseLauncherShown(shown)).toEqual(shown)
+    for (const entry of [null, { ...commandEntry, bindingRevision: '01' }, { ...commandEntry, commandId: '' }, { ...commandEntry, extra: true }, { ...commandEntry, hotkey: 'DoubleCtrl' }]) {
+      expect(parseLauncherShown({ ...shown, commandEntry: entry })).toBeNull()
+    }
+    expect(parseLauncherShown({ ...shown, target: 'settings' })).toBeNull()
+  })
 })

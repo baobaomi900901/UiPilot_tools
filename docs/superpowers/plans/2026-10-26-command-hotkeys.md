@@ -14,7 +14,7 @@ One parent design review, one implementer, and one combined implementation/code 
 
 ### Task 1: Ship command bindings from Settings through native entry
 
-**Files:** `src-tauri/src/settings.rs`, `hotkey.rs`, `lifecycle.rs`, `commands.rs`, `public_plugins.rs`, `public_plugins/activation.rs`, `lib.rs`; `src-tauri/build.rs`, `src-tauri/capabilities/main.json` and generated command permission files; `src/protocol.ts`, `launcher-core.ts`, `launcher-view.tsx`, `public-plugin-panel.tsx`, `main.ts`, `hotkey-recorder.ts`, extracted `hotkey-recorder-input.tsx`, `styles.css`; existing focused test files. Update root `package.json`/`package-lock.json`, `src-tauri/Cargo.toml`/`Cargo.lock`/`tauri.conf.json`, and `packages/plugin-cli/src/contracts.ts` plus its version expectations.
+**Files:** `src-tauri/src/command_hotkeys.rs`, `src-tauri/src/settings.rs`, `hotkey.rs`, `lifecycle.rs`, `commands.rs`, `public_plugins.rs`, `public_plugins/activation.rs`, `lib.rs`; `src-tauri/build.rs`, `src-tauri/capabilities/main.json` and generated command permission files; `src/protocol.ts`, `launcher-core.ts`, `launcher-view.tsx`, `public-plugin-panel.tsx`, `main.ts`, `hotkey-recorder.ts`, extracted `hotkey-recorder-input.tsx`, `styles.css`; existing focused test files. Update root `package.json`/`package-lock.json`, `src-tauri/Cargo.toml`/`Cargo.lock`/`tauri.conf.json`, and `packages/plugin-cli/src/contracts.ts` plus its version expectations.
 
 **Dependencies:** Design sections “Settings and visible behavior”, “Registration, persistence, and locks”, “Native delivery and recording”, and “Stable command entry and execution”.
 

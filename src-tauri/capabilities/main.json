@@ -9,6 +9,8 @@
     "allow-open-find-window",
     "allow-select-public-plugin-directory",
     "allow-list-public-plugins",
+    "allow-set-public-plugin-command-hotkey",
+    "allow-resolve-public-plugin-command-entry",
     "allow-get-public-plugin-diagnostics",
     "allow-copy-public-plugin-diagnostics",
     "allow-list-quicklinks",

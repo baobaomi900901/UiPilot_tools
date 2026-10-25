@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-public-plugin-command-hotkey"
+description = "Enables the set_public_plugin_command_hotkey command without any pre-configured scope."
+commands.allow = ["set_public_plugin_command_hotkey"]
+
+[[permission]]
+identifier = "deny-set-public-plugin-command-hotkey"
+description = "Denies the set_public_plugin_command_hotkey command without any pre-configured scope."
+commands.deny = ["set_public_plugin_command_hotkey"]

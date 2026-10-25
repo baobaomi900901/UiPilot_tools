@@ -49,11 +49,7 @@ import type {
   WebSearchEngine,
 } from './protocol'
 import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
-import {
-  formatHotkeyDisplay,
-  reduceHotkeyRecorder,
-  type RecorderState,
-} from './hotkey-recorder'
+import { formatHotkeyDisplay } from './hotkey-recorder'
 
 export interface LauncherViewProps {
   core: LauncherCore
@@ -69,7 +65,8 @@ interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
   onBindingFailed?: () => void
 }
 
-export const HOTKEY_RECORDING_CURRENT_DOM_EVENT = 'uipilot-hotkey-recording-current'
+export { HOTKEY_RECORDING_CURRENT_DOM_EVENT } from './hotkey-recorder-input'
+import { HotkeyRecorderInput } from './hotkey-recorder-input'
 
 const QUICKLINKS_STATUS_DURATION_MS = 2000
 const QUICKLINK_EDITOR_FOCUSABLE_SELECTOR = 'input:not(:disabled), textarea:not(:disabled), button:not(:disabled)'
@@ -297,149 +294,11 @@ function scrollFileResultIntoView(container: HTMLElement | null, selected: HTMLE
   }
 }
 
-interface HotkeyRecorderInputProps {
-  core: LauncherCore
-  value: string
-  disabled?: boolean
-  id?: string
-  name?: string
-}
-
-function HotkeyRecorderInput({ core, value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
-  const [recorderState, setRecorderState] = useState<RecorderState>(() => ({ status: 'idle', baseline: value }))
-  const recorderStateRef = useRef(recorderState)
-  const inputRef = useRef<InputRef>(null)
-  const actionRef = useRef<HTMLButtonElement>(null)
-  const returnFocusToAction = useRef(false)
-  const pendingCommit = useRef<{ canonical: string; finalState: RecorderState } | undefined>(undefined)
-  const recording = recorderState.status === 'recording'
-
-  const updateRecorderState = useCallback((next: RecorderState) => {
-    recorderStateRef.current = next
-    setRecorderState(next)
-  }, [])
-
-  useEffect(() => {
-    const current = recorderStateRef.current
-    if (current.status === 'recording') return
-    updateRecorderState({ status: 'idle', baseline: value, pendingTap: undefined })
-  }, [updateRecorderState, value])
-
-  useEffect(() => () => core.setHotkeyRecordingPhase('idle'), [core])
-
-  useEffect(() => {
-    const completeCurrentHotkeyRecording = () => {
-      if (recorderStateRef.current.status !== 'recording') return
-      pendingCommit.current = undefined
-      returnFocusToAction.current = true
-      core.setHotkeyRecordingPhase('idle')
-      updateRecorderState(
-        reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state,
-      )
-    }
-    window.addEventListener(HOTKEY_RECORDING_CURRENT_DOM_EVENT, completeCurrentHotkeyRecording)
-    return () => {
-      window.removeEventListener(HOTKEY_RECORDING_CURRENT_DOM_EVENT, completeCurrentHotkeyRecording)
-    }
-  }, [core, updateRecorderState])
-
-  const display =
-    recording ? '按下快捷键…' : formatHotkeyDisplay(value)
-
-  useLayoutEffect(() => {
-    if (recording) {
-      inputRef.current?.input?.focus()
-      return
-    }
-    if (!disabled && returnFocusToAction.current) {
-      returnFocusToAction.current = false
-      actionRef.current?.focus()
-    }
-  }, [disabled, recording])
-
-  const toggleRecording = useCallback(() => {
-    if (disabled) return
-    pendingCommit.current = undefined
-    core.setHotkeyRecordingPhase(recording ? 'idle' : 'recording')
-    updateRecorderState(reduceHotkeyRecorder(
-      recorderStateRef.current,
-      recording ? { type: 'cancel' } : { type: 'start', baseline: value },
-    ).state)
-  }, [core, disabled, recording, updateRecorderState, value])
-
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    event.preventDefault()
-    event.stopPropagation()
-    if (event.key === 'Escape') {
-      pendingCommit.current = undefined
-      returnFocusToAction.current = true
-      core.setHotkeyRecordingPhase('idle')
-      updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state)
-      return
-    }
-    if (pendingCommit.current) return
-    const result = reduceHotkeyRecorder(recorderStateRef.current, {
-      type: 'keydown',
-      key: event.key,
-      code: event.code,
-      ctrl: event.ctrlKey,
-      alt: event.altKey,
-      shift: event.shiftKey,
-      meta: event.metaKey,
-      repeat: event.repeat,
-      nowMs: Date.now(),
-    })
-    if (result.commit) {
-      if (result.commit === value) {
-        returnFocusToAction.current = true
-        core.setHotkeyRecordingPhase('completed')
-        updateRecorderState(result.state)
-        return
-      }
-      pendingCommit.current = { canonical: result.commit, finalState: result.state }
-      updateRecorderState({ ...result.state, status: 'recording' })
-      return
-    }
-    updateRecorderState(result.state)
-  }
-
-  const handleKeyUp = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    event.preventDefault()
-    event.stopPropagation()
-    const pending = pendingCommit.current
-    if (!pending) return
-    pendingCommit.current = undefined
-    returnFocusToAction.current = true
-    core.setHotkeyRecordingPhase('completed')
-    updateRecorderState(pending.finalState)
-    void core.saveHotkeyCanonical(pending.canonical)
-  }
-
-  return (
-    <div className="settings-hotkey-recorder">
-      <Input
-        ref={inputRef}
-        readOnly
-        value={display}
-        id={id}
-        name={name}
-        disabled={disabled || !recording}
-        tabIndex={recording ? 0 : -1}
-        onKeyDown={handleKeyDown}
-        onKeyUp={handleKeyUp}
-      />
-      <Button ref={actionRef} disabled={disabled} onClick={toggleRecording}>
-        {recording ? '取消录制' : '重新录制'}
-      </Button>
-    </div>
-  )
-}
-
 export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.Element {
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
-  const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string; session: number } | null>(null)
+  const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string; hotkeyRevision: string; session: number } | null>(null)
   const detailSession = useRef(0)
   const detailReload = useRef(0)
   const detailReloadPending = useRef<{
@@ -2041,7 +1900,8 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
           <Form component="div" layout="vertical" className="settings-basic-form">
             <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
               <HotkeyRecorderInput
-                core={core}
+                onCommit={core.saveHotkeyCanonical}
+                onRecordingPhase={core.setHotkeyRecordingPhase}
                 value={settings.hotkey.value}
                 id={`settings-hotkey-${settings.hotkey.key}`}
                 name={`settings-hotkey-${settings.hotkey.key}`}
@@ -2124,7 +1984,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} onOpenDetails={(plugin, revision) => setPublicPluginDetail({ plugin, revision, session: ++detailSession.current })} />
+        <PublicPluginPanel client={core.client} onOpenDetails={(plugin, revision, hotkeyRevision) => setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current })} />
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2287,6 +2147,7 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             key={`${selectedPublicPlugin.pluginId}:${publicPluginDetail!.session}`}
             plugin={selectedPublicPlugin}
             inventoryRevision={publicPluginDetail!.revision}
+            hotkeyRevision={publicPluginDetail!.hotkeyRevision} onRecordingPhase={core.setHotkeyRecordingPhase}
             reload={async (beforePublish) => {
               const session = publicPluginDetail!.session
               if (detailSession.current !== session) return
@@ -2307,11 +2168,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
                   const inventory = await core.client.listPublicPlugins()
                   if (detailSession.current !== session || detailReload.current !== entry.request) return
                   // Notify waiting rows before React can publish the accepted revision.
-                  for (const accept of entry.beforePublish.splice(0)) accept(inventory.revision)
+                  for (const accept of entry.beforePublish.splice(0)) accept(`${inventory.revision}:${inventory.hotkeyRevision}`)
                   setPublicPluginDetail((current) => {
                     if (current?.session !== session || current.plugin.pluginId !== selectedPublicPlugin.pluginId) return current
                     const plugin = inventory.items.find(({ pluginId }) => pluginId === current.plugin.pluginId)
-                    return plugin ? { plugin, revision: inventory.revision, session } : null
+                    return plugin ? { plugin, revision: inventory.revision, hotkeyRevision: inventory.hotkeyRevision, session } : null
                   })
                   entry.resolve()
                 } catch (error) {
