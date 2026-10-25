@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.json-workbench",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.9.0",
+  "name": "JSON 工作台",
+  "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "json-workbench",
+    "summary": "校验、格式化 JSON 和保存草稿",
+    "activationMode": "submit",
+    "outputMode": "window",
+    "inputRequired": false,
+    "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+  },
+  "runtime": { "entry": "dist/runtime.js" },
+  "window": { "entry": "dist/window.html", "runtimeActions": true },
+  "permissions": ["ui.window"],
+  "settings": []
+}

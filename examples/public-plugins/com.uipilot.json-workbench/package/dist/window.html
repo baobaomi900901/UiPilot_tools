@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JSON 工作台</title>
+    <link rel="stylesheet" href="./window.css" />
+  </head>
+  <body>
+    <main aria-label="JSON 工作台">
+      <div class="summary"><span id="draft-state">正在读取…</span><span id="byte-count">0 / 8192 字节</span></div>
+      <div class="actions" aria-label="草稿操作">
+        <button id="format" class="primary" type="button" disabled>校验并格式化</button>
+        <button id="save" type="button" disabled>保存草稿</button>
+        <button id="reload" type="button" disabled>重新读取</button>
+      </div>
+      <div class="editors">
+        <div class="field"><label for="input">JSON 输入</label><textarea id="input" spellcheck="false" autocomplete="off" placeholder="输入 JSON；未完成的内容也可以保存为草稿。" aria-describedby="byte-count status" disabled></textarea></div>
+        <div class="field"><label for="output">格式化结果</label><textarea id="output" spellcheck="false" placeholder="点击“校验并格式化”查看结果。" readonly aria-describedby="status"></textarea></div>
+      </div>
+      <div id="discard" class="discard" role="group" aria-labelledby="discard-message" hidden>
+        <p id="discard-message"></p>
+        <div class="confirm-actions"><button id="discard-confirm" type="button">放弃草稿并重新读取</button><button id="discard-cancel" type="button">保留草稿</button></div>
+      </div>
+      <p id="status" role="status" aria-live="polite" aria-atomic="true">正在读取已保存草稿…</p>
+    </main>
+    <script type="module" src="./window.js"></script>
+  </body>
+</html>
