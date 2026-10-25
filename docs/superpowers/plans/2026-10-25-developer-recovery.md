@@ -24,13 +24,13 @@
 
 **Dependencies:** Design sections Exact scope and interface changes, Ordering identity and failure behavior, Sanitized diagnostic contract; existing transaction, PublicPluginDetail, PublicPluginSettings, first-party clipboard backend.
 
-- [ ] Add targeted refresh input and token-bound intent without duplicating activation. Expose operation/previous version in existing confirmation.
-- [ ] Record bounded observational outcomes at real lifecycle branches, without changing transaction decisions/lock order.
-- [ ] Add main-window diagnostics lookup and exact-preview copy, strict Rust/TS shape/value/size validation.
-- [ ] Add detail refresh/re-enable and diagnosis preview/copy; reuse confirmation UI. Consume prepared UI token after every commit attempt; separate mutation success from refresh failure; guard stale async completions and duplicate mutations.
-- [ ] Add fixed safe Chinese errors and truthful persistence wording; no raw error interpolation. Preserve existing permission/network credential confirmation.
-- [ ] Synchronize release metadata/current CLI target to 0.7.0 without changing historical API capability minima. Document snapshot semantics, package versus data version and no automatic rollback/migration.
-- [ ] Self-review, commit and report code changes, focused commands/output and remaining manual checks.
+- [x] Add targeted refresh input and token-bound intent without duplicating activation. Expose operation/previous version in existing confirmation.
+- [x] Record bounded observational outcomes at real lifecycle branches, without changing transaction decisions/lock order.
+- [x] Add main-window diagnostics lookup and exact-preview copy, strict Rust/TS shape/value/size validation.
+- [x] Add detail refresh/re-enable and diagnosis preview/copy; reuse confirmation UI. Consume prepared UI token after every commit attempt; separate mutation success from refresh failure; guard stale async completions and duplicate mutations.
+- [x] Add fixed safe Chinese errors and truthful persistence wording; no raw error interpolation. Preserve existing permission/network credential confirmation.
+- [x] Synchronize release metadata/current CLI target to 0.7.0 without changing historical API capability minima. Document snapshot semantics, package versus data version and no automatic rollback/migration.
+- [x] Self-review, commit and report code changes, focused commands/output and remaining manual checks.
 
 **Distinct coverage:** Wrong main-window caller rejected before protected state access; wrong plugin/version/stale inventory rejected; caller/target token cannot be repurposed; target changes after prepare reject while unrelated later changes do not silently replace target expectations; bad readiness preserves previous package/config; verified NotCommitted versus Unknown/publication failure diagnostics; an earlier slow operation cannot overwrite a newer observation; strict diagnostic fields reject sentinels/unknown keys/noncanonical scalars and copy emits exactly preview; old UI request cannot update another detail session; commit failure clears consumed preparation; mutation success plus inventory failure is not reported as mutation failure.
 
@@ -57,3 +57,5 @@
 ## Delivery checkpoint
 
 Independent final review; verify artifact hashes/source provenance. Hand user short initial manual checks and full Chinese guide, with remaining cases clearly pending. This completes only the developer recovery slice, not all M6/M7 or the entire Raycast-like foundation.
+
+Status2026-10-25: Task1 implemented23bdf65, fixed728db33; independent delta SpecPASS/QualityApproved, no remaining important findings. Existing Vite chunk warning disclosed. Task2 next; all0.7 native/manual acceptance pending.
