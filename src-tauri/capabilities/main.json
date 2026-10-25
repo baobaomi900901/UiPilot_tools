@@ -37,6 +37,8 @@
     "allow-clear-messages",
     "allow-search-apps",
     "allow-execute-result",
+    "allow-execute-result-action",
+    "allow-retire-result-actions",
     "allow-list-plugins",
     "allow-install-plugin",
     "allow-reload-plugin",

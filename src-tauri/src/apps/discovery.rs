@@ -377,6 +377,7 @@ pub(crate) fn discover() -> Result<DiscoverySnapshot, DiscoveryError> {
 pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAction) {
     (
         ResultItem {
+            result_actions: None,
             result_id: String::new(),
             activation: LauncherResultActivation::ExecuteResult,
             title: application.display_name.clone(),

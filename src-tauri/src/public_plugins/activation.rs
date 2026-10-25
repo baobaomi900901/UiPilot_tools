@@ -197,6 +197,7 @@ pub(crate) struct PublicSettingView {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicPluginRoute {
+    pub(crate) result_publication: Option<super::result_action::ResultActionLease>,
     pub(crate) command_id: String,
     pub(crate) plugin_id: String,
     pub(crate) generation: u64,
@@ -269,6 +270,7 @@ pub(crate) struct PublicRuntimeCandidate {
     pub(crate) network_https_declared: bool,
     pub(crate) panel_actions: bool,
     pub(crate) window_actions: bool,
+    pub(crate) result_actions: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -473,6 +475,7 @@ impl RuntimeSnapshot {
             runtime_recovery_needed,
             label: self.label.clone(),
             runtime_entry: self.manifest.runtime.entry.clone(),
+            result_actions: self.manifest.runtime.result_actions,
             window_actions: self
                 .manifest
                 .window
@@ -587,6 +590,8 @@ pub(crate) struct PublicPluginManager {
     after_uncertain_close: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_state_durable: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_result_route_token: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     data: Mutex<ActivationData>,
     runtime_faults: Mutex<HashMap<(String, u64), RuntimeFaultWindow>>,
     observations: Observations,
@@ -819,6 +824,8 @@ impl PublicPluginManager {
             after_uncertain_close: Mutex::new(None),
             #[cfg(test)]
             after_state_durable: Mutex::new(None),
+            #[cfg(test)]
+            before_result_route_token: Mutex::new(None),
             data: Mutex::new(ActivationData {
                 active_by_plugin,
                 ..ActivationData::default()
@@ -3000,6 +3007,7 @@ impl PublicPluginManager {
         &self,
         query: &str,
     ) -> Result<Option<PublicPluginRoute>, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
         let Some(command) = query.strip_prefix('/') else {
             return Ok(None);
         };
@@ -3038,7 +3046,34 @@ impl PublicPluginManager {
                 .manifest
                 .command_by_id(command_id)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            // Capture publication authority from the same confirmed owner snapshot.
+            let confirmed = self.bundles.confirmed_bundle(&config.plugin_id)?;
+            if !confirmed
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &bundle))
+            {
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.before_result_route_token.lock().unwrap().clone() {
+                hook();
+            }
+            let result_publication = if snapshot.manifest.runtime.result_actions {
+                Some(
+                    self.scheduler
+                        .capture_result_publication(
+                            &config.plugin_id,
+                            snapshot.generation,
+                            bundle.activation_id,
+                            bundle.admission_epoch,
+                        )
+                        .map_err(|_| PublicPluginManagementError::Unavailable)?,
+                )
+            } else {
+                None
+            };
             return Ok(Some(PublicPluginRoute {
+                result_publication,
                 command_id: command_id.clone(),
                 plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
@@ -3118,6 +3153,7 @@ impl PublicPluginManager {
                 return Ok(None);
             }
             return Ok(Some(PublicPluginRoute {
+                result_publication: None,
                 command_id: "default".into(),
                 plugin_id: config.plugin_id.clone(),
                 generation: snapshot.generation,
@@ -3583,6 +3619,242 @@ impl PublicPluginManager {
             .then(|| request.candidate.command_id.clone()))
     }
 
+    pub(crate) fn bind_result_command_route(
+        &self,
+        saved: &PublicPluginRoute,
+        context: &PluginRequestContext,
+        submission_token: &str,
+    ) -> Result<PublicPluginRoute, PublicPluginManagementError> {
+        let _mutation = self.lock_mutation()?;
+        let invalid = || PublicPluginManagementError::Unavailable;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(&saved.plugin_id)?
+            .ok_or_else(invalid)?;
+        let c = &bundle.config;
+        let m = &bundle.runtime.manifest;
+        if context.plugin_id != saved.plugin_id
+            || context.plugin_generation < saved.generation
+            || context.plugin_generation != bundle.runtime.generation
+            || !c.installed
+            || !c.enabled
+            || c.fault.is_some()
+            || c.active_generation != context.plugin_generation
+            || bundle.runtime_recovery_needed
+            || !m.runtime.result_actions
+            || m.command_by_id(&saved.command_id)
+                .is_none_or(|cmd| cmd.output_mode != PublicOutputMode::MainResult)
+            || c.command(&saved.command_id)
+                .is_none_or(|command| command.effective_name != saved.command_label)
+        {
+            return Err(invalid());
+        }
+        // Same-generation work may never acquire post-mutation authority.
+        if context.plugin_generation == saved.generation {
+            self.checked_result_owner(saved, false)
+                .map_err(|_| invalid())?;
+        }
+        let token = self
+            .scheduler
+            .bound_command_publication(
+                context,
+                submission_token,
+                &saved.command_id,
+                &saved.input,
+                bundle.activation_id,
+                bundle.admission_epoch,
+            )
+            .map_err(|_| invalid())?;
+        if context.plugin_generation == saved.generation
+            && saved.result_publication.as_ref() != Some(&token)
+        {
+            return Err(invalid());
+        }
+        let mut route = saved.clone();
+        route.generation = context.plugin_generation;
+        route.activation_id = bundle.activation_id;
+        route.admission_epoch = bundle.admission_epoch;
+        route.runtime_label = bundle.runtime.label.clone();
+        route.runtime_recovery_needed = false;
+        route.result_publication = Some(token);
+        Ok(route)
+    }
+    pub(crate) fn result_actions_enabled(&self, route: &PublicPluginRoute) -> bool {
+        self.bundles
+            .confirmed_bundle(&route.plugin_id)
+            .ok()
+            .flatten()
+            .is_some_and(|b| b.runtime.manifest.runtime.result_actions)
+    }
+    // Caller holds the shared legacy admission read until publication/effect admission.
+    // No earlier lock is acquired by the registry callback.
+    fn checked_result_owner(
+        &self,
+        route: &PublicPluginRoute,
+        copy: bool,
+    ) -> Result<(), super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(&route.plugin_id)
+            .map_err(|_| E::ActionUnavailable)?
+            .ok_or(E::StaleRequest)?;
+        let c = &bundle.config;
+        let m = &bundle.runtime.manifest;
+        if !route.result_publication.as_ref().is_some_and(|token| {
+            self.scheduler
+                .result_publication_current(&route.plugin_id, token)
+        }) {
+            return Err(E::StaleRequest);
+        }
+        if !c.installed
+            || !c.enabled
+            || c.fault.is_some()
+            || c.active_generation != route.generation
+            || bundle.runtime.generation != route.generation
+            || bundle.activation_id != route.activation_id
+            || bundle.admission_epoch != route.admission_epoch
+            || !m.runtime.result_actions
+            || c.command(&route.command_id).is_none()
+            || m.command_by_id(&route.command_id)
+                .is_none_or(|cmd| cmd.output_mode != PublicOutputMode::MainResult)
+        {
+            return Err(E::StaleRequest);
+        }
+        if copy
+            && (!c
+                .permission_grants
+                .contains(&PublicPermission::ClipboardWrite)
+                || !m.permissions.contains(&PublicPermission::ClipboardWrite))
+        {
+            return Err(E::PluginPermissionDenied);
+        }
+        if bundle.runtime_recovery_needed {
+            return Err(E::ActionBusy);
+        }
+        Ok(())
+    }
+    pub(crate) fn publish_result_actions<T>(
+        &self,
+        route: &PublicPluginRoute,
+        copy: bool,
+        publish: impl FnOnce() -> T,
+    ) -> Result<T, super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        let _mutation = self.lock_mutation().map_err(|_| E::ActionUnavailable)?;
+        self.checked_result_owner(route, copy)?;
+        self.scheduler.with_result_publication(
+            &route.plugin_id,
+            route.result_publication.as_ref().ok_or(E::StaleRequest)?,
+            publish,
+        )
+    }
+    pub(crate) fn copy_result_action(
+        &self,
+        registry: &crate::result_registry::ResultRegistry,
+        origin: &super::result_action::ResultActionOrigin,
+        copy: impl FnOnce(&str) -> Result<(), ()>,
+    ) -> super::result_action::ResultActionOutcome {
+        use super::result_action::*;
+        let admitted = (|| {
+            let _mutation = self
+                .lock_mutation()
+                .map_err(|_| ResultActionErrorCode::ActionUnavailable)?;
+            self.checked_result_owner(&origin.route, true)?;
+            let PublicResultAction::CopyText { text, .. } = &origin.action else {
+                return Err(ResultActionErrorCode::UnknownResult);
+            };
+            self.scheduler.with_result_publication(
+                &origin.route.plugin_id,
+                origin
+                    .route
+                    .result_publication
+                    .as_ref()
+                    .ok_or(ResultActionErrorCode::StaleRequest)?,
+                || registry.claim_result_action(origin, None),
+            )??;
+            Ok(copy(text).map_err(|_| ResultActionErrorCode::ClipboardWriteFailed))
+        })();
+        match admitted {
+            Err(code) => ResultActionOutcome::failed(
+                code,
+                matches!(
+                    code,
+                    ResultActionErrorCode::ActionAlreadyExecuted
+                        | ResultActionErrorCode::ActionInProgress
+                ),
+            ),
+            Ok(Ok(())) => ResultActionOutcome::Copied,
+            Ok(Err(code)) => ResultActionOutcome::failed(code, true),
+        }
+    }
+    pub(crate) fn reserve_result_action(
+        &self,
+        origin: &super::result_action::ResultActionOrigin,
+    ) -> Result<ReservedPluginRequest, super::result_action::ResultActionErrorCode> {
+        if !origin.lease.live()
+            || origin
+                .route
+                .result_publication
+                .as_ref()
+                .is_some_and(|token| !token.live())
+        {
+            return Err(super::result_action::ResultActionErrorCode::StaleRequest);
+        }
+        self.scheduler
+            .reserve(super::PluginRequestCandidate {
+                command_id: origin.route.command_id.clone(),
+                plugin_id: origin.route.plugin_id.clone(),
+                plugin_generation: origin.route.generation,
+                activation_id: origin.route.activation_id,
+                admission_epoch: origin.route.admission_epoch,
+                activation_mode: PublicActivationMode::Submit,
+                input: origin.route.input.clone(),
+                owner: super::PluginRequestOwner::ResultAction(origin.clone()),
+            })
+            .map_err(|_| super::result_action::ResultActionErrorCode::ActionUnavailable)
+    }
+    pub(crate) fn admit_result_action(
+        &self,
+        registry: &crate::result_registry::ResultRegistry,
+        origin: &super::result_action::ResultActionOrigin,
+        reserved: ReservedPluginRequest,
+        now: Instant,
+    ) -> Result<ScheduledPluginRequest, super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        let _mutation = self.lock_mutation().map_err(|_| E::ActionUnavailable)?;
+        self.checked_result_owner(&origin.route, origin.requires_copy_grant)?;
+        let _transition = self
+            .network_authority
+            .begin_transition()
+            .map_err(|_| E::ActionUnavailable)?;
+        let context = reserved.context.clone();
+        self.scheduler.admit_result_action(reserved, now, || {
+            registry.claim_result_action(origin, Some(context))
+        })
+    }
+    pub(crate) fn finish_result_action(
+        &self,
+        registry: &crate::result_registry::ResultRegistry,
+        origin: &super::result_action::ResultActionOrigin,
+        context: &PluginRequestContext,
+        prepared: crate::result_registry::PreparedResultActionSet,
+        copy: bool,
+    ) -> Result<crate::model::SearchResponse, super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        let _mutation = self.lock_mutation().map_err(|_| E::ActionUnavailable)?;
+        self.checked_result_owner(&origin.route, copy)?;
+        let _transition = self
+            .network_authority
+            .begin_transition()
+            .map_err(|_| E::ActionUnavailable)?;
+        self.scheduler
+            .finish_result_action(context, &origin.lease, || {
+                registry
+                    .replace_result_actions(origin, prepared)
+                    .ok_or(E::StaleRequest)
+            })
+    }
     pub(crate) fn can_copy_text(&self, plugin_id: &str, command_id: &str, generation: u64) -> bool {
         self.bundles
             .confirmed_bundle(plugin_id)
@@ -4441,6 +4713,7 @@ impl PublicPluginManager {
     }
 
     pub(crate) fn shutdown_network(&self) -> usize {
+        self.scheduler.close_result_publications();
         self.network_authority.shutdown()
     }
 
@@ -8474,6 +8747,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             PublicPluginRoute {
+                result_publication: None,
                 command_id: "default".into(),
                 plugin_id: "com.example.activation".into(),
                 generation: 1,
@@ -11851,5 +12125,390 @@ mod tests {
             assert_eq!(fs::read(&current).unwrap(), source);
             drop(held);
         }
+    }
+    fn result_action_fixture(
+        manager: &PublicPluginManager,
+        route: PublicPluginRoute,
+        copy: bool,
+    ) -> (
+        crate::result_registry::ResultRegistry,
+        super::super::result_action::ResultActionOrigin,
+    ) {
+        use super::super::result_action::*;
+        let registry = crate::result_registry::ResultRegistry::default();
+        registry.on_show("result-action".into());
+        let token = registry
+            .begin_query(
+                crate::result_registry::QueryDomain::Plugin,
+                "result-action",
+                1,
+            )
+            .unwrap();
+        let rows = vec![PublicActionResult {
+            id: "same".into(),
+            title: "Row".into(),
+            subtitle: None,
+            detail: None,
+            actions: vec![if copy {
+                PublicResultAction::CopyText {
+                    id: "copy".into(),
+                    title: "Copy".into(),
+                    text: "test-only-copy".into(),
+                }
+            } else {
+                PublicResultAction::Runtime {
+                    id: "save".into(),
+                    title: "Save".into(),
+                    payload: Value::Null,
+                }
+            }],
+            default_action_id: None,
+        }];
+        let prepared = registry
+            .prepare_result_actions(route.clone(), rows)
+            .unwrap();
+        let response = manager
+            .publish_result_actions(&route, copy, || {
+                registry.publish_prepared_result_actions(token, prepared)
+            })
+            .unwrap()
+            .unwrap();
+        let row = &response.items[0];
+        let action = &row.result_actions.as_ref().unwrap().actions[0];
+        let origin = registry
+            .resolve_result_action(&ExecuteResultActionRequest {
+                request_id: response.request_id,
+                result_id: row.result_id.clone(),
+                action_id: action.action_id.clone(),
+            })
+            .unwrap();
+        (registry, origin)
+    }
+    fn opt_in_result_package(path: &Path) {
+        let file = path.join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        value["runtime"]["resultActions"] = json!(true);
+        value["minimumHostVersion"] = json!("0.10.0");
+        fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    #[test]
+    fn result_action_initial_publication_and_copy_hold_actual_owner_mutation_barrier() {
+        use super::super::result_action::*;
+        for copy in [false, true] {
+            let dir = TestDir::new("result-action-owner-barrier");
+            write_multi_package(&dir.source(), "1.0.0", "lower", false);
+            opt_in_result_package(&dir.source());
+            let manager = Arc::new(manager(&dir));
+            install_multi(&manager, &dir.source());
+            let route = manager.route("/upper saved").unwrap().unwrap();
+            let (registry, origin) = result_action_fixture(&manager, route.clone(), copy);
+            let (entered, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            let worker = {
+                let manager = manager.clone();
+                let origin = origin.clone();
+                let registry = registry.clone();
+                thread::spawn(move || {
+                    if copy {
+                        assert!(matches!(
+                            manager.copy_result_action(&registry, &origin, |text| {
+                                assert_eq!(text, "test-only-copy");
+                                entered.send(()).unwrap();
+                                wait.recv().unwrap();
+                                Ok(())
+                            }),
+                            ResultActionOutcome::Copied
+                        ));
+                    } else {
+                        manager
+                            .publish_result_actions(&origin.route, false, || {
+                                entered.send(()).unwrap();
+                                wait.recv().unwrap();
+                            })
+                            .unwrap();
+                    }
+                })
+            };
+            observed.recv().unwrap();
+            let (done, finished) = mpsc::channel();
+            let mutation = {
+                let manager = manager.clone();
+                thread::spawn(move || {
+                    let result =
+                        manager.rename_command("com.example.activation", "upper", Some("changed"));
+                    done.send(result.is_ok()).unwrap();
+                })
+            };
+            assert!(finished.recv_timeout(Duration::from_millis(30)).is_err());
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(finished.recv_timeout(Duration::from_secs(2)).unwrap());
+            mutation.join().unwrap();
+            assert!(manager
+                .publish_result_actions(&route, copy, || panic!("stale owner published"))
+                .is_err());
+        }
+    }
+    #[test]
+    fn result_action_copy_failure_consumes_and_denied_owner_never_executes_fake_effect() {
+        use super::super::result_action::*;
+        let dir = TestDir::new("result-action-copy-consume");
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        opt_in_result_package(&dir.source());
+        let manager = manager(&dir);
+        install_multi(&manager, &dir.source());
+        let route = manager.route("/upper").unwrap().unwrap();
+        let (registry, origin) = result_action_fixture(&manager, route, true);
+        assert!(matches!(
+            manager.copy_result_action(&registry, &origin, |_| Err(())),
+            ResultActionOutcome::Failed {
+                code: ResultActionErrorCode::ClipboardWriteFailed,
+                source_consumed: true
+            }
+        ));
+        assert!(matches!(
+            manager.copy_result_action(&registry, &origin, |_| panic!("copy replay")),
+            ResultActionOutcome::Failed {
+                code: ResultActionErrorCode::ActionAlreadyExecuted,
+                source_consumed: true
+            }
+        ));
+        manager
+            .set_enabled_with_readiness("com.example.activation", false, |_| true)
+            .unwrap();
+        assert!(matches!(
+            manager.copy_result_action(&registry, &origin, |_| panic!("denied effect")),
+            ResultActionOutcome::Failed {
+                source_consumed: false,
+                ..
+            }
+        ));
+    }
+    #[tokio::test]
+    async fn result_action_retired_lease_blocks_actual_apis_and_network_delivery_without_cleanup() {
+        use super::super::runtime::{PluginApiOperation, PluginApiRequest};
+        let dir = TestDir::new("result-action-api-lease");
+        write_network_package(&dir.source(), "1.0.0", &["api.example.com"]);
+        opt_in_result_package(&dir.source());
+        let (authority, barrier) = PluginNetworkAuthorityGate::paused_response_for_test(200);
+        let manager = Arc::new(manager_with_network_authority(&dir, authority.clone()));
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let route = manager.route("/network").unwrap().unwrap();
+        let (registry, origin) = result_action_fixture(&manager, route, false);
+        let reserved = manager.reserve_result_action(&origin).unwrap();
+        let request = manager
+            .admit_result_action(&registry, &origin, reserved, now)
+            .unwrap();
+        let api = |operation| PluginApiRequest {
+            context: request.context.clone(),
+            operation,
+            key: Some("draft".into()),
+            value: Some(json!("test")),
+            notification: None,
+        };
+        assert!(manager
+            .execute_api(
+                &origin.route.runtime_label,
+                api(PluginApiOperation::StorageSet)
+            )
+            .result
+            .is_ok());
+        let call = authority
+            .admit(
+                "com.example.network",
+                request.context.plugin_generation,
+                &request.context,
+                &manager.scheduler,
+                network_request(),
+            )
+            .unwrap();
+        let pending = tokio::spawn({
+            let authority = authority.clone();
+            let scheduler = manager.scheduler.clone();
+            async move {
+                authority
+                    .execute_before_delivery_for_test(call, scheduler, || {})
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), barrier.reached.notified())
+            .await
+            .unwrap();
+        // Revoke under registry only. Do not call service cleanup or scheduler retirement.
+        registry.retire_result_actions(&request_source_id(&registry, &origin));
+        assert!(!origin.lease.live());
+        for operation in [
+            PluginApiOperation::StorageGet,
+            PluginApiOperation::StorageSet,
+            PluginApiOperation::StorageRemove,
+            PluginApiOperation::SettingGet,
+            PluginApiOperation::SecretConfigured,
+            PluginApiOperation::NotificationPublish,
+            PluginApiOperation::NotificationSchedule,
+        ] {
+            assert_eq!(
+                manager
+                    .execute_api(&origin.route.runtime_label, api(operation))
+                    .result,
+                Err(PluginRuntimeError::ExpiredRequest)
+            );
+        }
+        assert_eq!(
+            authority
+                .admit(
+                    "com.example.network",
+                    request.context.plugin_generation,
+                    &request.context,
+                    &manager.scheduler,
+                    network_request()
+                )
+                .err(),
+            Some(PluginNetworkErrorCode::ExpiredRequest)
+        );
+        barrier.release.notify_one();
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(PluginNetworkErrorCode::ExpiredRequest)
+        );
+        assert!(
+            !manager
+                .scheduler
+                .complete(&request.context, now)
+                .unwrap()
+                .accepted
+        );
+    }
+    fn request_source_id(
+        _registry: &crate::result_registry::ResultRegistry,
+        origin: &super::super::result_action::ResultActionOrigin,
+    ) -> String {
+        origin.ticket.request_id().to_owned()
+    }
+
+    #[test]
+    fn result_action_publication_token_tracks_business_changes_but_preserves_favorites_and_noops() {
+        for setting in [false, true] {
+            let dir = TestDir::new("result-action-business-token");
+            write_multi_package(&dir.source(), "1.0.0", "lower", false);
+            opt_in_result_package(&dir.source());
+            let manager = manager(&dir);
+            install_multi(&manager, &dir.source());
+            let route = manager.route("/upper saved").unwrap().unwrap();
+            let (registry, origin) = result_action_fixture(&manager, route.clone(), true);
+            manager
+                .set_command_favorite("com.example.activation", "upper", true)
+                .unwrap();
+            manager
+                .rename_command("com.example.activation", "upper", None)
+                .unwrap();
+            manager
+                .save_settings(
+                    "com.example.activation",
+                    &BTreeMap::from([("compact".into(), json!(false))]),
+                )
+                .unwrap();
+            assert!(manager.publish_result_actions(&route, true, || ()).is_ok());
+            if setting {
+                manager
+                    .save_settings(
+                        "com.example.activation",
+                        &BTreeMap::from([("compact".into(), json!(true))]),
+                    )
+                    .unwrap();
+            } else {
+                manager
+                    .rename_command("com.example.activation", "upper", Some("renamed"))
+                    .unwrap();
+            }
+            assert!(manager
+                .publish_result_actions(&route, true, || panic!("stale publication"))
+                .is_err());
+            assert!(matches!(
+                manager.copy_result_action(&registry, &origin, |_| panic!("stale copy")),
+                super::super::result_action::ResultActionOutcome::Failed {
+                    source_consumed: false,
+                    ..
+                }
+            ));
+            let mut runtime = origin.clone();
+            runtime.action = super::super::result_action::PublicResultAction::Runtime {
+                id: "save".into(),
+                title: "Save".into(),
+                payload: Value::Null,
+            };
+            let reserved = manager.reserve_result_action(&runtime);
+            assert!(
+                reserved.is_err()
+                    || manager
+                        .admit_result_action(&registry, &runtime, reserved.unwrap(), Instant::now())
+                        .is_err()
+            );
+            let fresh = manager
+                .route(if setting {
+                    "/upper saved"
+                } else {
+                    "/renamed saved"
+                })
+                .unwrap()
+                .unwrap();
+            assert!(manager.publish_result_actions(&fresh, true, || ()).is_ok());
+        }
+    }
+    #[test]
+    fn result_action_route_capture_cannot_pair_old_bundle_with_post_rename_token() {
+        let dir = TestDir::new("result-action-route-capture");
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        opt_in_result_package(&dir.source());
+        let manager = Arc::new(manager(&dir));
+        install_multi(&manager, &dir.source());
+        let (entered, observed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let wait = Arc::new(std::sync::Mutex::new(wait));
+        *manager.before_result_route_token.lock().unwrap() = Some(Arc::new(move || {
+            entered.send(()).unwrap();
+            wait.lock().unwrap().recv().unwrap();
+        }));
+        let route_worker = {
+            let manager = manager.clone();
+            thread::spawn(move || manager.route("/upper saved").unwrap().unwrap())
+        };
+        observed.recv().unwrap();
+        let (done, finished) = mpsc::channel();
+        let rename = {
+            let manager = manager.clone();
+            thread::spawn(move || {
+                done.send(manager.rename_command(
+                    "com.example.activation",
+                    "upper",
+                    Some("renamed"),
+                ))
+                .unwrap();
+            })
+        };
+        assert!(finished.recv_timeout(Duration::from_millis(30)).is_err());
+        release.send(()).unwrap();
+        let captured = route_worker.join().unwrap();
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        rename.join().unwrap();
+        *manager.before_result_route_token.lock().unwrap() = None;
+        assert_eq!(captured.command_label, "upper");
+        assert!(!captured.result_publication.as_ref().unwrap().live());
+        let fresh = manager.route("/renamed saved").unwrap().unwrap();
+        assert_eq!(fresh.command_label, "renamed");
+        assert!(fresh.result_publication.as_ref().unwrap().live());
+        assert_ne!(captured.result_publication, fresh.result_publication);
     }
 }

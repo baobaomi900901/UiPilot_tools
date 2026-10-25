@@ -42,7 +42,7 @@ interface PublicManifestBase {
   name: string
   description?: string | null
   supportedPlatforms: PluginPlatform[]
-  runtime: { entry: string }
+  runtime: { entry: string; resultActions?: boolean }
   window?: { entry: string; runtimeActions?: boolean } | null
   panel?: {
     entry: string
@@ -495,6 +495,7 @@ function validateParsedManifest(
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
+    (manifest.runtime.resultActions === true && (versionGreater([0, 10, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || normalizedCommands(manifest).some(({ command }) => command.outputMode !== 'mainResult'))) ||
     (manifest.window?.runtimeActions === true && (versionGreater([0, 9, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.panel?.runtimeActions === true && (versionGreater([0, 6, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     versionGreater(minimumHost, hostVersion) ||

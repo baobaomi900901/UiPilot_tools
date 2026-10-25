@@ -512,6 +512,8 @@ pub fn run() {
             commands::publish_plugin_results,
             commands::search_files,
             commands::execute_result,
+            commands::execute_result_action,
+            commands::retire_result_actions,
             commands::list_plugins,
             commands::install_plugin,
             commands::reload_plugin,
@@ -806,7 +808,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 80);
+        assert_eq!(production.matches("commands::").count(), 82);
         for command in [
             "open_find_window",
             "prepare_find_initialization",

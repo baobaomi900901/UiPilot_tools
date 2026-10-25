@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.9.1'
+    tooNewHost.minimumHostVersion = '0.10.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -645,4 +645,15 @@ describe('window Runtime action opt-in', () => {
     value.supportedPlatforms = ['windows', 'macos']
     expect(validate(value).ok).toBe(false)
   })
+})
+
+it('matches the Rust result-action manifest parity fixtures', async () => {
+  const cases = JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/result-action-manifest-fixtures.json'), 'utf8'))
+  for (const item of cases) {
+    const value: any = multiCommandManifest()
+    value.minimumHostVersion = item.minimum
+    if (item.minimum === '0.2.0') { value.command = value.commands[0]; delete value.command.id; delete value.commands }
+    value.runtime = item.runtime; value.supportedPlatforms = item.platforms
+    expect(validate(value).ok, item.name).toBe(item.valid)
+  }
 })

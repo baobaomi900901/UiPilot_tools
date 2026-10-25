@@ -1,0 +1,111 @@
+[
+  {
+    "name": "absent",
+    "runtime": {
+      "entry": "dist/runtime.js"
+    },
+    "minimum": "0.2.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": true
+  },
+  {
+    "name": "false",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": false
+    },
+    "minimum": "0.2.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": true
+  },
+  {
+    "name": "true",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": true
+  },
+  {
+    "name": "null",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": null
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": false
+  },
+  {
+    "name": "string",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": "true"
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": false
+  },
+  {
+    "name": "number",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": 1
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": false
+  },
+  {
+    "name": "old-minimum",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.9.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": false
+  },
+  {
+    "name": "macos",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows",
+      "macos"
+    ],
+    "valid": false
+  },
+  {
+    "name": "extra",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true,
+      "other": true
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows"
+    ],
+    "valid": false
+  }
+]

@@ -28,6 +28,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   let handler = null;
   let panelHandler = null;
   let windowHandler = null;
+  let resultHandler = null;
+  const resultActionsEnabled = __RESULT_ACTIONS__;
   const windowActionsEnabled = __WINDOW_ACTIONS__;
   const panelActionsEnabled = __PANEL_ACTIONS__;
   let busy = false;
@@ -269,12 +271,15 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
       const api = deepFreeze(apiShape);
       let completion;
       try {
-        const response = await (dispatch.kind === 'windowAction' ? windowHandler : dispatch.kind === 'panelAction' ? panelHandler : handler)(deepFreeze(dispatch.invocation), api);
+        const response = await (dispatch.kind === 'resultAction' ? resultHandler : dispatch.kind === 'windowAction' ? windowHandler : dispatch.kind === 'panelAction' ? panelHandler : handler)(deepFreeze(dispatch.invocation), api);
         if (dispatch.kind === 'panelAction' || dispatch.kind === 'windowAction') {
           try {
             const snapshot = panelJson.snapshot(response, ['requestId', 'data']);
             completion = { context: requestContext, response: snapshot };
           } catch (_) { completion = { context: requestContext, response: null }; }
+        } else if (resultActionsEnabled) {
+          try { completion = { context: requestContext, response: panelJson.snapshot(response, ['requestId', 'results']) }; }
+          catch (_) { completion = { context: requestContext, response: null }; }
         } else
         completion = { context: requestContext, response };
       } catch (_) {
@@ -296,6 +301,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     if (!module || typeof module.onCommand !== 'function') throw new TypeError('onCommand export required');
     if (panelActionsEnabled && typeof module.onPanelAction !== 'function') throw new TypeError('onPanelAction export required');
     if (windowActionsEnabled && typeof module.onWindowAction !== 'function') throw new TypeError('onWindowAction export required');
+    if (resultActionsEnabled && typeof module.onAction !== 'function') throw new TypeError('onAction export required');
+    resultHandler = module.onAction;
     windowHandler = module.onWindowAction;
     panelHandler = module.onPanelAction;
     handler = module.onCommand;
@@ -315,12 +322,30 @@ pub(crate) fn public_runtime_bootstrap_with_panel(
 ) -> String {
     public_runtime_bootstrap_with_actions(network_https, panel_actions, false)
 }
+#[cfg(test)]
 pub(crate) fn public_runtime_bootstrap_with_actions(
     network_https: bool,
     panel_actions: bool,
     window_actions: bool,
 ) -> String {
+    public_runtime_bootstrap_with_result_actions(
+        network_https,
+        panel_actions,
+        window_actions,
+        false,
+    )
+}
+pub(crate) fn public_runtime_bootstrap_with_result_actions(
+    network_https: bool,
+    panel_actions: bool,
+    window_actions: bool,
+    result_actions: bool,
+) -> String {
     PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE
+        .replace(
+            "__RESULT_ACTIONS__",
+            if result_actions { "true" } else { "false" },
+        )
         .replace(
             "__WINDOW_ACTIONS__",
             if window_actions { "true" } else { "false" },

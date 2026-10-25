@@ -228,6 +228,8 @@ pub(crate) struct SearchResponse {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResultItem {
+    #[serde(flatten)]
+    pub(crate) result_actions: Option<crate::public_plugins::result_action::ResultActionMetadata>,
     pub(crate) result_id: String,
     pub(crate) activation: LauncherResultActivation,
     pub(crate) title: String,
@@ -305,6 +307,7 @@ mod tests {
     #[test]
     fn informational_result_serializes_explicit_false_default_action() {
         let value = serde_json::to_value(ResultItem {
+            result_actions: None,
             result_id: "info".into(),
             activation: LauncherResultActivation::Informational,
             title: "不支持的货币代码".into(),

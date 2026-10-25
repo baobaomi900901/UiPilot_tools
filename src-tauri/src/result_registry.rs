@@ -108,6 +108,10 @@ pub(crate) struct ExecutionTicket {
 }
 
 impl ExecutionTicket {
+    #[cfg(test)]
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
     pub(crate) const fn scope(&self) -> WindowScope {
         self.scope
     }
@@ -127,6 +131,7 @@ struct ResultSet {
     domain: QueryDomain,
     generation: u64,
     actions: HashMap<String, ResultAction>,
+    result_actions: Option<crate::public_plugins::result_action::ResultActionSnapshot>,
 }
 
 #[derive(Default)]
@@ -141,6 +146,7 @@ struct RegistryState {
     domain_exhausted: [bool; 3],
     plugin_reservation: Option<PluginDomainEpochReservation>,
     current: Option<ResultSet>,
+    retired_action: Option<crate::public_plugins::PluginRequestContext>,
 }
 
 #[derive(Default)]
@@ -244,7 +250,7 @@ impl ResultRegistry {
         state.active_invocation_id = Some(invocation_id);
         state.latest_query_sequence = 0;
         state.latest_query_domain = None;
-        state.current = None;
+        Self::retire_current(&mut state);
         Ok(())
     }
 
@@ -273,7 +279,7 @@ impl ResultRegistry {
 
         state.latest_query_sequence = query_sequence;
         state.latest_query_domain = Some(domain);
-        state.current = None;
+        Self::retire_current(&mut state);
         let domain_epoch = state.domain_epochs[domain.index()];
         Some(QueryToken {
             generation: state.generation,
@@ -315,7 +321,7 @@ impl ResultRegistry {
         let next_result_set_generation = match state.result_set_generation.checked_add(1) {
             Some(generation) => generation,
             None => {
-                state.current = None;
+                Self::retire_current(&mut state);
                 return None;
             }
         };
@@ -323,19 +329,19 @@ impl ResultRegistry {
             .ok()
             .and_then(|count| count.checked_add(1))
         else {
-            state.current = None;
+            Self::retire_current(&mut state);
             return None;
         };
         let first_id = match self.inner.allocator.allocate(id_count) {
             Some(previous) => match previous.checked_add(1) {
                 Some(first) => first,
                 None => {
-                    state.current = None;
+                    Self::retire_current(&mut state);
                     return None;
                 }
             },
             None => {
-                state.current = None;
+                Self::retire_current(&mut state);
                 return None;
             }
         };
@@ -355,11 +361,13 @@ impl ResultRegistry {
         }
 
         state.result_set_generation = next_result_set_generation;
+        Self::retire_current(&mut state);
         state.current = Some(ResultSet {
             request_id: request_id.clone(),
             domain: token.domain,
             generation: next_result_set_generation,
             actions,
+            result_actions: None,
         });
         Some(response(request_id, items))
     }
@@ -384,7 +392,7 @@ impl ResultRegistry {
             .lock()
             .expect("result registry lock poisoned");
         let current = state.current.as_ref().ok_or(RegistryError::StaleRequest)?;
-        if current.request_id != request_id {
+        if current.request_id != request_id || current.result_actions.is_some() {
             return Err(RegistryError::StaleRequest);
         }
 
@@ -427,7 +435,7 @@ impl ResultRegistry {
         if !self.ticket_matches(&state, ticket) {
             return false;
         }
-        state.current = None;
+        Self::retire_current(&mut state);
         true
     }
 
@@ -512,7 +520,7 @@ impl ResultRegistry {
             .as_ref()
             .is_some_and(|current| current.domain == QueryDomain::Application)
         {
-            state.current = None;
+            Self::retire_current(&mut state);
         }
         true
     }
@@ -540,7 +548,7 @@ impl ResultRegistry {
                 .as_ref()
                 .is_some_and(|current| current.domain == QueryDomain::Plugin)
             {
-                state.current = None;
+                Self::retire_current(&mut state);
             }
             return Err(PluginDomainReservationError::Exhausted);
         };
@@ -552,7 +560,7 @@ impl ResultRegistry {
             })
             .map_err(|_| {
                 state.domain_exhausted[index] = true;
-                state.current = None;
+                Self::retire_current(&mut state);
                 PluginDomainReservationError::Exhausted
             })?
             + 1;
@@ -561,6 +569,16 @@ impl ResultRegistry {
             next,
             nonce,
         };
+        if let Some(snapshot) = state
+            .current
+            .as_mut()
+            .and_then(|set| set.result_actions.as_mut())
+        {
+            snapshot.lease.revoke();
+            if let Some(context) = snapshot.context.take() {
+                state.retired_action = Some(context);
+            }
+        }
         state.plugin_reservation = Some(reservation);
         Ok(reservation)
     }
@@ -607,7 +625,7 @@ impl ResultRegistry {
             .as_ref()
             .is_some_and(|current| current.domain == QueryDomain::Plugin)
         {
-            state.current = None;
+            Self::retire_current(&mut state);
         }
         Ok(())
     }
@@ -624,7 +642,7 @@ impl ResultRegistry {
         if domain == QueryDomain::Plugin && state.plugin_reservation.is_some() {
             state.domain_exhausted[domain.index()] = true;
             state.plugin_reservation = None;
-            state.current = None;
+            Self::retire_current(&mut state);
             return Err(DomainEpochExhausted);
         }
         let epoch = &mut state.domain_epochs[domain.index()];
@@ -635,7 +653,7 @@ impl ResultRegistry {
                 .as_ref()
                 .is_some_and(|current| current.domain == domain)
             {
-                state.current = None;
+                Self::retire_current(&mut state);
             }
             return Err(DomainEpochExhausted);
         };
@@ -645,9 +663,326 @@ impl ResultRegistry {
             .as_ref()
             .is_some_and(|current| current.domain == domain)
         {
-            state.current = None;
+            Self::retire_current(&mut state);
         }
         Ok(())
+    }
+
+    fn retire_current(state: &mut RegistryState) {
+        if let Some(mut current) = state.current.take() {
+            if let Some(snapshot) = current.result_actions.as_mut() {
+                snapshot.lease.revoke();
+                if let Some(context) = snapshot.context.take() {
+                    state.retired_action = Some(context);
+                }
+            }
+        }
+    }
+    pub(crate) fn take_retired_result_action(
+        &self,
+    ) -> Option<crate::public_plugins::PluginRequestContext> {
+        self.inner.state.lock().ok()?.retired_action.take()
+    }
+    pub(crate) fn retire_result_actions(&self, request_id: &str) -> bool {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return false;
+        };
+        let Some(snapshot) = state
+            .current
+            .as_mut()
+            .filter(|set| set.request_id == request_id)
+            .and_then(|set| set.result_actions.as_mut())
+        else {
+            return false;
+        };
+        snapshot.lease.revoke();
+        snapshot.state = crate::public_plugins::result_action::SnapshotClaim::Consumed;
+        if let Some(context) = snapshot.context.take() {
+            state.retired_action = Some(context);
+        }
+        true
+    }
+    pub(crate) fn resolve_result_action(
+        &self,
+        request: &crate::public_plugins::result_action::ExecuteResultActionRequest,
+    ) -> Result<
+        crate::public_plugins::result_action::ResultActionOrigin,
+        crate::public_plugins::result_action::ResultActionErrorCode,
+    > {
+        use crate::public_plugins::result_action::*;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ResultActionErrorCode::ActionUnavailable)?;
+        let current = state
+            .current
+            .as_ref()
+            .filter(|set| set.request_id == request.request_id)
+            .ok_or(ResultActionErrorCode::StaleRequest)?;
+        let snapshot = current
+            .result_actions
+            .as_ref()
+            .filter(|s| s.lease.live())
+            .ok_or(ResultActionErrorCode::StaleRequest)?;
+        let (business_result_id, actions) = snapshot
+            .rows
+            .get(&request.result_id)
+            .ok_or(ResultActionErrorCode::UnknownResult)?;
+        let action = actions
+            .get(&request.action_id)
+            .ok_or(ResultActionErrorCode::UnknownResult)?
+            .clone();
+        Ok(ResultActionOrigin {
+            ticket: ExecutionTicket {
+                scope: self.inner.scope,
+                scope_generation: state.generation,
+                invocation_id: state
+                    .active_invocation_id
+                    .clone()
+                    .ok_or(ResultActionErrorCode::StaleRequest)?,
+                result_set_generation: current.generation,
+                request_id: current.request_id.clone(),
+                result_id: request.result_id.clone(),
+            },
+            route: snapshot.route.clone(),
+            query_sequence: state.latest_query_sequence,
+            lease: snapshot.lease.clone(),
+            business_result_id: business_result_id.clone(),
+            requires_copy_grant: snapshot
+                .rows
+                .values()
+                .any(|(_, actions)| actions.values().any(PublicResultAction::is_copy)),
+            action,
+        })
+    }
+    pub(crate) fn claim_result_action(
+        &self,
+        origin: &crate::public_plugins::result_action::ResultActionOrigin,
+        context: Option<crate::public_plugins::PluginRequestContext>,
+    ) -> Result<(), crate::public_plugins::result_action::ResultActionErrorCode> {
+        use crate::public_plugins::result_action::*;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ResultActionErrorCode::ActionUnavailable)?;
+        if !self.action_ticket_matches(&state, origin) {
+            return Err(ResultActionErrorCode::StaleRequest);
+        }
+        let snapshot = state
+            .current
+            .as_mut()
+            .and_then(|set| set.result_actions.as_mut())
+            .ok_or(ResultActionErrorCode::StaleRequest)?;
+        match snapshot.state {
+            SnapshotClaim::Available => {}
+            SnapshotClaim::InFlight => return Err(ResultActionErrorCode::ActionInProgress),
+            SnapshotClaim::Consumed => return Err(ResultActionErrorCode::ActionAlreadyExecuted),
+        }
+        snapshot.state = if context.is_some() {
+            SnapshotClaim::InFlight
+        } else {
+            SnapshotClaim::Consumed
+        };
+        snapshot.context = context;
+        Ok(())
+    }
+    pub(crate) fn consume_result_action(
+        &self,
+        origin: &crate::public_plugins::result_action::ResultActionOrigin,
+    ) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            if self.action_ticket_matches(&state, origin) {
+                if let Some(snapshot) = state
+                    .current
+                    .as_mut()
+                    .and_then(|s| s.result_actions.as_mut())
+                {
+                    snapshot.state = crate::public_plugins::result_action::SnapshotClaim::Consumed;
+                    snapshot.context = None;
+                }
+            }
+        }
+    }
+    fn action_ticket_matches(
+        &self,
+        state: &RegistryState,
+        origin: &crate::public_plugins::result_action::ResultActionOrigin,
+    ) -> bool {
+        let t = &origin.ticket;
+        self.inner.scope == WindowScope::Main
+            && state.active
+            && t.scope == WindowScope::Main
+            && t.scope_generation == state.generation
+            && state.active_invocation_id.as_deref() == Some(t.invocation_id.as_str())
+            && state.latest_query_sequence == origin.query_sequence
+            && state.plugin_reservation.is_none()
+            && state.current.as_ref().is_some_and(|set| {
+                set.request_id == t.request_id
+                    && set.generation == t.result_set_generation
+                    && set.result_actions.as_ref().is_some_and(|s| {
+                        s.lease == origin.lease
+                            && s.lease.live()
+                            && s.route
+                                .result_publication
+                                .as_ref()
+                                .is_none_or(|token| token.live())
+                            && s.rows.contains_key(&t.result_id)
+                    })
+            })
+    }
+    pub(crate) fn publish_prepared_result_actions(
+        &self,
+        token: QueryToken,
+        prepared: PreparedResultActionSet,
+    ) -> Option<crate::model::SearchResponse> {
+        let mut state = self.inner.state.lock().ok()?;
+        if self.inner.scope != WindowScope::Main
+            || !state.active
+            || token.generation != state.generation
+            || token.query_sequence != state.latest_query_sequence
+            || Some(token.domain) != state.latest_query_domain
+            || state.domain_exhausted[token.domain.index()]
+            || state.plugin_reservation.is_some()
+            || token.domain_epoch != state.domain_epochs[token.domain.index()]
+        {
+            return None;
+        }
+        Self::install_prepared(&mut state, prepared)
+    }
+    pub(crate) fn replace_result_actions(
+        &self,
+        origin: &crate::public_plugins::result_action::ResultActionOrigin,
+        prepared: PreparedResultActionSet,
+    ) -> Option<crate::model::SearchResponse> {
+        let mut state = self.inner.state.lock().ok()?;
+        if !self.action_ticket_matches(&state, origin)
+            || !state
+                .current
+                .as_ref()?
+                .result_actions
+                .as_ref()
+                .is_some_and(|s| {
+                    s.state == crate::public_plugins::result_action::SnapshotClaim::InFlight
+                })
+        {
+            return None;
+        }
+        Self::install_prepared(&mut state, prepared)
+    }
+    fn install_prepared(
+        state: &mut RegistryState,
+        prepared: PreparedResultActionSet,
+    ) -> Option<crate::model::SearchResponse> {
+        if prepared
+            .snapshot
+            .route
+            .result_publication
+            .as_ref()
+            .is_some_and(|token| !token.live())
+        {
+            return None;
+        }
+        let Some(generation) = state.result_set_generation.checked_add(1) else {
+            Self::retire_current(state);
+            return None;
+        };
+        Self::retire_current(state);
+        state.result_set_generation = generation;
+        state.current = Some(ResultSet {
+            request_id: prepared.response.request_id.clone(),
+            domain: QueryDomain::Plugin,
+            generation,
+            actions: HashMap::new(),
+            result_actions: Some(prepared.snapshot),
+        });
+        Some(prepared.response)
+    }
+    pub(crate) fn prepare_result_actions(
+        &self,
+        route: crate::public_plugins::PublicPluginRoute,
+        rows: Vec<crate::public_plugins::result_action::PublicActionResult>,
+    ) -> Option<PreparedResultActionSet> {
+        let count = 1 + rows.len() + rows.iter().map(|r| r.actions.len()).sum::<usize>();
+        let first = self.inner.allocator.allocate(u64::try_from(count).ok()?)?;
+        self.prepare_result_actions_reserved(route, rows, first)
+    }
+    pub(crate) fn reserve_result_action_ids(&self) -> Option<u64> {
+        self.inner.allocator.allocate(181)
+    }
+    pub(crate) fn prepare_result_actions_reserved(
+        &self,
+        route: crate::public_plugins::PublicPluginRoute,
+        rows: Vec<crate::public_plugins::result_action::PublicActionResult>,
+        first: u64,
+    ) -> Option<PreparedResultActionSet> {
+        use crate::public_plugins::result_action::*;
+        let mut id = first.checked_add(1)?;
+        let request_id = Self::format_id("req", id);
+        let mut items = Vec::with_capacity(rows.len());
+        let mut private = HashMap::with_capacity(rows.len());
+        for row in rows {
+            id += 1;
+            let result_id = Self::format_id("item", id);
+            let mut actions = Vec::with_capacity(row.actions.len());
+            let mut bundle = HashMap::with_capacity(row.actions.len());
+            let mut default_action_id = None;
+            for action in row.actions {
+                id += 1;
+                let action_id = Self::format_id("action", id);
+                if row.default_action_id.as_deref() == Some(action.id()) {
+                    default_action_id = Some(action_id.clone());
+                }
+                actions.push(ResultActionDisplay {
+                    action_id: action_id.clone(),
+                    title: action.title().into(),
+                });
+                bundle.insert(action_id, action);
+            }
+            private.insert(result_id.clone(), (row.id, bundle));
+            items.push(crate::model::ResultItem {
+                result_id,
+                activation: crate::model::LauncherResultActivation::ExecuteResult,
+                title: row.title,
+                subtitle: row.subtitle,
+                detail: row.detail,
+                icon: None,
+                plugin_icon_url: route.icon_url.clone(),
+                icon_kind: None,
+                favorite: None,
+                has_default_action: default_action_id.is_some(),
+                result_actions: Some(ResultActionMetadata {
+                    actions,
+                    default_action_id,
+                }),
+            });
+        }
+        let command = crate::model::MainResultCommandContext {
+            plugin_id: route.plugin_id.clone(),
+            command_id: route.command_id.clone(),
+            command_label: route.command_label.clone(),
+            argument: route.input.clone(),
+        };
+        Some(PreparedResultActionSet {
+            response: crate::model::SearchResponse {
+                request_id,
+                items,
+                command_hint: None,
+                main_result_command: Some(command),
+                window_transfer_token: None,
+                auto_execute_result_id: None,
+                replace_local_results: false,
+                refresh_at_utc: None,
+            },
+            snapshot: ResultActionSnapshot {
+                route,
+                lease: ResultActionLease::default(),
+                state: SnapshotClaim::Available,
+                rows: private,
+                context: None,
+            },
+        })
     }
 
     fn allows_domain(&self, domain: QueryDomain) -> bool {
@@ -671,7 +1006,11 @@ impl ResultRegistry {
             && state.current.as_ref().is_some_and(|current| {
                 current.generation == ticket.result_set_generation
                     && current.request_id == ticket.request_id
-                    && current.actions.contains_key(&ticket.result_id)
+                    && (current.actions.contains_key(&ticket.result_id)
+                        || current
+                            .result_actions
+                            .as_ref()
+                            .is_some_and(|s| s.rows.contains_key(&ticket.result_id)))
             })
     }
 
@@ -680,7 +1019,7 @@ impl ResultRegistry {
         state.active_invocation_id = None;
         state.latest_query_sequence = 0;
         state.latest_query_domain = None;
-        state.current = None;
+        Self::retire_current(state);
     }
 
     fn format_id(prefix: &str, id: u64) -> String {
@@ -725,6 +1064,7 @@ mod tests {
 
     fn item(result_id: &str, title: &str) -> ResultItem {
         ResultItem {
+            result_actions: None,
             result_id: result_id.to_owned(),
             activation: LauncherResultActivation::ExecuteResult,
             title: title.to_owned(),
@@ -1823,5 +2163,43 @@ mod tests {
         .unwrap();
         assert_eq!(next.request_id, "req-0000000000000003");
         assert_eq!(next.items[0].result_id, "item-0000000000000004");
+    }
+}
+
+pub(crate) struct PreparedResultActionSet {
+    pub(crate) response: crate::model::SearchResponse,
+    snapshot: crate::public_plugins::result_action::ResultActionSnapshot,
+}
+
+#[cfg(test)]
+mod result_action_fail_closed_tests {
+    use super::*;
+    #[test]
+    fn result_action_exhausted_or_poisoned_registry_never_admits() {
+        let registry = ResultRegistry::default();
+        registry
+            .inner
+            .allocator
+            .next_id
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(registry.reserve_result_action_ids().is_none());
+        let poisoned = registry.clone();
+        assert!(std::thread::spawn(move || {
+            let _lock = poisoned.inner.state.lock().unwrap();
+            panic!("test poison");
+        })
+        .join()
+        .is_err());
+        assert!(matches!(
+            registry.resolve_result_action(
+                &crate::public_plugins::result_action::ExecuteResultActionRequest {
+                    request_id: "r".into(),
+                    result_id: "i".into(),
+                    action_id: "a".into()
+                }
+            ),
+            Err(crate::public_plugins::result_action::ResultActionErrorCode::ActionUnavailable)
+        ));
+        assert!(!registry.retire_result_actions("r"));
     }
 }

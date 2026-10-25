@@ -121,6 +121,8 @@ fn present_commands_schema(generator: &mut SchemaGenerator) -> Schema {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicRuntimeV1 {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) result_actions: bool,
     pub(crate) entry: String,
 }
 
@@ -718,6 +720,15 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.runtime.result_actions
+        && (minimum_host < [0, 10, 0]
+            || manifest.supported_platforms != [PublicPlatform::Windows]
+            || manifest
+                .normalized_commands()
+                .any(|(_, c)| c.output_mode != PublicOutputMode::MainResult))
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.window.as_ref().is_some_and(|p| p.runtime_actions)
         && (minimum_host < [0, 9, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
     {
@@ -967,6 +978,25 @@ mod schema_tests {
         )
     }
 
+    #[test]
+    fn result_action_manifest_shared_parity() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../../../docs/plugin-sdk/tests/result-action-manifest-fixtures.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut value = manifest(None);
+            value["runtime"] = case["runtime"].clone();
+            value["minimumHostVersion"] = case["minimum"].clone();
+            value["supportedPlatforms"] = case["platforms"].clone();
+            assert_eq!(
+                parse(&value).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
     #[test]
     fn window_action_opt_in_is_strict_and_requires_windows_host_0_9() {
         let mut value = manifest(None);
@@ -1525,7 +1555,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 5, 0]
+            [0, 10, 0]
         );
     }
 

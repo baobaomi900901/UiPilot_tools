@@ -231,6 +231,9 @@
       "properties": {
         "entry": {
           "type": "string"
+        },
+        "resultActions": {
+          "type": "boolean"
         }
       },
       "required": [

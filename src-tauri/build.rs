@@ -106,6 +106,8 @@ fn main() {
             "publish_plugin_results",
             "search_files",
             "execute_result",
+            "execute_result_action",
+            "retire_result_actions",
             "list_plugins",
             "install_plugin",
             "reload_plugin",

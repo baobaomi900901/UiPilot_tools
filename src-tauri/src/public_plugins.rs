@@ -14,6 +14,7 @@ mod network;
 mod owner_cleanup;
 mod package;
 pub(crate) mod panel_action;
+pub(crate) mod result_action;
 mod runtime;
 mod scheduler;
 mod secrets;
@@ -94,6 +95,10 @@ const PUBLIC_PLUGIN_CSP: &str = "default-src 'self'; script-src 'self'; style-sr
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicPluginResponse {
     MainResults(Vec<PublicMainResult>),
+    MainActionResults {
+        route: PublicPluginRoute,
+        results: Vec<result_action::PublicActionResult>,
+    },
     Window(PublicWindowResponse),
     Panel(PublicPanelResponse),
 }
@@ -166,6 +171,14 @@ impl Drop for ContentActionRegistration {
         }
     }
 }
+struct PendingResultAction {
+    context: PluginRequestContext,
+    origin: result_action::ResultActionOrigin,
+    registry: crate::result_registry::ResultRegistry,
+    legacy: Arc<crate::plugins::PluginManager>,
+    reserved_ids: u64,
+    sender: mpsc::Sender<result_action::ResultActionOutcome>,
+}
 struct PendingPublicSubmission {
     route: PublicPluginRoute,
     sender: mpsc::Sender<Option<PublicSubmissionResult>>,
@@ -211,6 +224,7 @@ pub(crate) struct PublicPluginService {
     manager: OnceLock<Arc<PublicPluginManager>>,
     submissions: Mutex<PublicSubmissionState>,
     content_actions: Mutex<HashMap<PluginRequestContext, PendingContentAction>>,
+    result_action: Mutex<Option<PendingResultAction>>,
     recoveries: Mutex<RuntimeRecoveryState>,
     recovery_changed: Condvar,
     next_submission: AtomicU64,
@@ -379,6 +393,10 @@ impl PublicPluginService {
         // Waiting submissions may never have been bound to a request. Settle the
         // exact token as well as its context, never a plugin-wide moving target.
         for (context, token) in &effects.retired {
+            self.settle_result_action(
+                context,
+                result_action::ResultActionErrorCode::ActionCancelled,
+            );
             self.settle_panel_action(
                 context,
                 Err(panel_action::PanelActionError::ExpiredPanelSession),
@@ -392,6 +410,20 @@ impl PublicPluginService {
     }
 
     pub(crate) fn shutdown(&self) {
+        let result_context = self
+            .result_action
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|p| p.context.clone()));
+        if let Some(context) = result_context {
+            if let Ok(manager) = self.manager() {
+                manager.retire_panel_action(&context);
+            }
+            self.settle_result_action(
+                &context,
+                result_action::ResultActionErrorCode::ActionCancelled,
+            );
+        }
         let contexts = self
             .content_actions
             .lock()
@@ -555,6 +587,23 @@ impl PublicPluginService {
             }
         };
         after_enqueue();
+        let result_context = self.result_action.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .filter(|p| {
+                    p.context.plugin_id == route.plugin_id
+                        && p.context.plugin_generation == route.generation
+                })
+                .map(|p| {
+                    p.origin.lease.revoke();
+                    p.context.clone()
+                })
+        });
+        if let Some(context) = result_context {
+            self.settle_result_action(
+                &context,
+                result_action::ResultActionErrorCode::ActionCancelled,
+            );
+        }
 
         let contexts = self
             .content_actions
@@ -578,8 +627,7 @@ impl PublicPluginService {
         }
         let dispatch = match outcome {
             PluginScheduleOutcome::Dispatched(request) => {
-                self.bind_request(&token, &request.context)?;
-                Some(request)
+                self.bind_unsent_dispatch(request, now)?
             }
             PluginScheduleOutcome::Waiting {
                 expired,
@@ -765,8 +813,7 @@ impl PublicPluginService {
             self.settle_submission(&recovery.submission_token, None);
             return Ok(None);
         };
-        self.bind_request(&recovery.submission_token, &dispatch.context)?;
-        Ok(Some(dispatch))
+        self.bind_unsent_dispatch(dispatch, now)
     }
 
     pub(crate) fn recover_runtime(
@@ -781,6 +828,194 @@ impl PublicPluginService {
             false
         };
         self.complete_runtime_recovery_with(recovery, now, |_| ready)
+    }
+
+    pub(crate) fn cleanup_retired_result_actions(
+        &self,
+        registry: &crate::result_registry::ResultRegistry,
+    ) {
+        if let Some(context) = registry.take_retired_result_action() {
+            if let Ok(manager) = self.manager() {
+                manager.retire_panel_action(&context);
+            }
+            self.settle_result_action(
+                &context,
+                result_action::ResultActionErrorCode::ActionCancelled,
+            );
+        }
+    }
+    pub(crate) fn prepare_result_action(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        legacy: Arc<crate::plugins::PluginManager>,
+        registry: crate::result_registry::ResultRegistry,
+        origin: result_action::ResultActionOrigin,
+    ) -> Result<
+        (
+            ScheduledPluginRequest,
+            mpsc::Receiver<result_action::ResultActionOutcome>,
+        ),
+        result_action::ResultActionErrorCode,
+    > {
+        let service = Arc::clone(self);
+        let watchdog_app = app.clone();
+        self.prepare_result_action_with_observer(legacy, registry, origin, move || {
+            result_action::prepare_deadline_observer(move |_| {
+                let _ = service.expire_runtime_timeouts(&watchdog_app, Instant::now());
+            })
+        })
+    }
+    fn prepare_result_action_with_observer(
+        self: &Arc<Self>,
+        legacy: Arc<crate::plugins::PluginManager>,
+        registry: crate::result_registry::ResultRegistry,
+        origin: result_action::ResultActionOrigin,
+        prepare_observer: impl FnOnce() -> Result<
+            mpsc::Sender<Instant>,
+            result_action::ResultActionErrorCode,
+        >,
+    ) -> Result<
+        (
+            ScheduledPluginRequest,
+            mpsc::Receiver<result_action::ResultActionOutcome>,
+        ),
+        result_action::ResultActionErrorCode,
+    > {
+        use result_action::ResultActionErrorCode as E;
+        let mut pending = self
+            .result_action
+            .lock()
+            .map_err(|_| E::ActionUnavailable)?;
+        if let Some(active) = pending.as_ref() {
+            return Err(if active.origin.lease == origin.lease {
+                E::ActionInProgress
+            } else {
+                E::ActionBusy
+            });
+        }
+        let manager = self.manager().map_err(|_| E::ActionUnavailable)?;
+        let reserved = manager.reserve_result_action(&origin)?;
+        let reserved_ids = registry
+            .reserve_result_action_ids()
+            .ok_or(E::ActionUnavailable)?;
+        let (sender, receiver) = mpsc::channel();
+        // Fallible observer creation occurs before the source claim or physical slot.
+        let arm = prepare_observer()?;
+        let request = legacy
+            .with_public_result_admission(|| {
+                manager.admit_result_action(&registry, &origin, reserved, Instant::now())
+            })
+            .ok_or(E::ActionUnavailable)??;
+        *pending = Some(PendingResultAction {
+            context: request.context.clone(),
+            origin,
+            registry,
+            legacy,
+            reserved_ids,
+            sender,
+        });
+        let _ = arm.send(request.deadline);
+        Ok((request, receiver))
+    }
+    pub(crate) fn settle_result_action(
+        &self,
+        context: &PluginRequestContext,
+        code: result_action::ResultActionErrorCode,
+    ) -> bool {
+        let pending = self.result_action.lock().ok().and_then(|mut slot| {
+            if slot.as_ref().is_some_and(|p| p.context == *context) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        let Some(pending) = pending else {
+            return false;
+        };
+        pending.registry.consume_result_action(&pending.origin);
+        if let Ok(manager) = self.manager() {
+            manager.discard_panel_completion(context);
+        }
+        let _ = pending
+            .sender
+            .send(result_action::ResultActionOutcome::failed(code, true));
+        true
+    }
+    fn complete_result_action(
+        &self,
+        completion: &PluginCommandCompletion,
+        accepted: bool,
+    ) -> Option<(result_action::ResultActionOrigin, bool, bool)> {
+        use result_action::{ResultActionErrorCode as E, ResultActionOutcome as O};
+        let pending = self.result_action.lock().ok().and_then(|mut slot| {
+            if slot
+                .as_ref()
+                .is_some_and(|p| p.context == completion.context)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        })?;
+        let result = (|| {
+            if !accepted || !pending.origin.lease.live() {
+                return Err(E::ActionCancelled);
+            }
+            if completion.failed {
+                return Err(E::ActionFailed);
+            }
+            let rows = result_action::parse(
+                &completion.context,
+                completion
+                    .response
+                    .clone()
+                    .ok_or(E::ActionInvalidResponse)?,
+            )
+            .map_err(|_| E::ActionInvalidResponse)?;
+            let copy = rows.iter().any(|r| {
+                r.actions
+                    .iter()
+                    .any(result_action::PublicResultAction::is_copy)
+            });
+            let prepared = pending
+                .registry
+                .prepare_result_actions_reserved(
+                    pending.origin.route.clone(),
+                    rows,
+                    pending.reserved_ids,
+                )
+                .ok_or(E::ActionUnavailable)?;
+            pending
+                .legacy
+                .with_public_result_admission(|| {
+                    self.manager()
+                        .map_err(|_| E::ActionUnavailable)?
+                        .finish_result_action(
+                            &pending.registry,
+                            &pending.origin,
+                            &completion.context,
+                            prepared,
+                            copy,
+                        )
+                })
+                .ok_or(E::ActionUnavailable)?
+        })();
+        let success = result.is_ok();
+        let fault = matches!(result, Err(E::ActionFailed | E::ActionInvalidResponse));
+        let outcome = match result {
+            Ok(response) => O::ResultsUpdated { response },
+            Err(code) => {
+                pending.registry.consume_result_action(&pending.origin);
+                O::failed(code, true)
+            }
+        };
+        if let Ok(manager) = self.manager() {
+            manager.discard_panel_completion(&completion.context);
+        }
+        // Replacement retired the old lease under registry lock; no callback carries that lock.
+        self.cleanup_retired_result_actions(&pending.registry);
+        let _ = pending.sender.send(outcome);
+        Some((pending.origin, success, fault))
     }
 
     pub(crate) fn prepare_panel_action(
@@ -986,13 +1221,23 @@ impl PublicPluginService {
         theme: PluginInvocationTheme,
         invoked_at: String,
     ) -> Result<(), PublicPluginManagementError> {
-        let service = Arc::clone(self);
-        let watchdog_app = app.clone();
-        let deadline = request.deadline;
-        thread::spawn(move || {
-            thread::sleep(deadline.saturating_duration_since(Instant::now()));
-            let _ = service.expire_runtime_timeouts(&watchdog_app, Instant::now());
-        });
+        if !request.candidate.owner.live() {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        if !matches!(request.candidate.owner, PluginRequestOwner::ResultAction(_)) {
+            let service = Arc::clone(self);
+            let watchdog_app = app.clone();
+            let deadline = request.deadline;
+            thread::spawn(move || {
+                thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                let _ = service.expire_runtime_timeouts(&watchdog_app, Instant::now());
+            });
+        }
+        if self.manager()?.scheduler().context_status(&request.context)
+            != PluginContextStatus::Current
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         let environment = PluginInvocationEnvironment {
             platform: PluginInvocationPlatform::Windows,
             theme,
@@ -1010,6 +1255,16 @@ impl PublicPluginService {
                 })
                 .map_err(|_| PublicPluginManagementError::Unavailable)?,
             ),
+            PluginRequestOwner::ResultAction(origin) => {
+                let result_action::PublicResultAction::Runtime { id, payload, .. } = &origin.action
+                else {
+                    return Err(PublicPluginManagementError::Unavailable);
+                };
+                (
+                    "resultAction",
+                    serde_json::json!({"apiVersion":1,"requestId":request.context.request_id,"commandId":origin.route.command_id,"resultId":origin.business_result_id,"actionId":id,"payload":payload,"input":origin.route.input,"context":environment}),
+                )
+            }
             PluginRequestOwner::WindowAction {
                 request: action, ..
             } => (
@@ -1056,6 +1311,34 @@ impl PublicPluginService {
         outcome: PluginCompletionOutcome,
         now: Instant,
     ) -> Result<Option<ScheduledPluginRequest>, PluginRuntimeError> {
+        if let Some((origin, success, fault)) =
+            self.complete_result_action(completion, outcome.accepted)
+        {
+            if outcome.accepted && (success || fault) {
+                let disabled = self
+                    .manager()
+                    .map_err(|_| PluginRuntimeError::Unavailable)?
+                    .record_runtime_result(
+                        &origin.route.plugin_id,
+                        origin.route.generation,
+                        origin.route.activation_id,
+                        success,
+                        now,
+                    )
+                    .map_err(|_| PluginRuntimeError::Unavailable)?;
+                if disabled {
+                    self.settle_plugin_submissions(&origin.route.plugin_id);
+                    Self::destroy_runtime(app, Some(&origin.route.runtime_label));
+                    return Ok(None);
+                }
+            }
+            return outcome
+                .next
+                .map(|next| self.bind_unsent_dispatch(next, now))
+                .transpose()
+                .map(Option::flatten)
+                .map_err(|_| PluginRuntimeError::Unavailable);
+        }
         use panel_action::PanelActionError as E;
         let panel_result = if !outcome.accepted {
             Err(E::ExpiredPanelSession)
@@ -1114,13 +1397,12 @@ impl PublicPluginService {
                     return Ok(None);
                 }
             }
-            if let Some(next) = outcome.next.as_ref() {
-                if let Some(token) = next.candidate.owner.token() {
-                    self.bind_request(token, &next.context)
-                        .map_err(|_| PluginRuntimeError::Unavailable)?;
-                }
-            }
-            return Ok(outcome.next);
+            return outcome
+                .next
+                .map(|next| self.bind_unsent_dispatch(next, now))
+                .transpose()
+                .map(Option::flatten)
+                .map_err(|_| PluginRuntimeError::Unavailable);
         }
         self.complete_submission_with(completion, outcome, now, || {
             if let Some(controller) =
@@ -1189,10 +1471,13 @@ impl PublicPluginService {
                     let result = match pending.route.output_mode {
                         PublicOutputMode::MainResult => value
                             .and_then(|value| {
-                                parse_main_result_response(&completion.context, value)
+                                if self.manager().map_err(|_|PluginRuntimeError::Unavailable)?.result_actions_enabled(&pending.route){
+                                    return result_action::parse(&completion.context,value).map(|results|PublicPluginResponse::MainActionResults{route:pending.route.clone(),results});
+                                }
+                                parse_main_result_response(&completion.context, value).map(PublicPluginResponse::MainResults)
                             })
                             .and_then(|results| {
-                                if results.iter().any(|result| result.copy_text.is_some())
+                                if matches!(&results,PublicPluginResponse::MainResults(rows) if rows.iter().any(|result|result.copy_text.is_some()))
                                     && !self
                                         .manager()
                                         .map_err(|_| PluginRuntimeError::Unavailable)?
@@ -1204,7 +1489,7 @@ impl PublicPluginService {
                                 {
                                     Err(PluginRuntimeError::InvalidOperation)
                                 } else {
-                                    Ok(PublicPluginResponse::MainResults(results))
+                                    Ok(results)
                                 }
                             }),
                         PublicOutputMode::Window => value
@@ -1254,19 +1539,12 @@ impl PublicPluginService {
                 return Ok(None);
             }
         }
-        if let Some(next) = outcome.next.as_ref() {
-            self.bind_request(
-                &next
-                    .candidate
-                    .owner
-                    .command()
-                    .expect("waiting request is a command")
-                    .submission_token,
-                &next.context,
-            )
-            .map_err(|_| PluginRuntimeError::Unavailable)?;
-        }
-        Ok(outcome.next)
+        outcome
+            .next
+            .map(|next| self.bind_unsent_dispatch(next, now))
+            .transpose()
+            .map(Option::flatten)
+            .map_err(|_| PluginRuntimeError::Unavailable)
     }
 
     fn expire_runtime_timeouts(
@@ -1279,6 +1557,10 @@ impl PublicPluginService {
             .expire_network_timeouts(now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         for replacement in replacements {
+            self.settle_result_action(
+                &replacement.expired,
+                result_action::ResultActionErrorCode::ActionTimedOut,
+            );
             self.settle_panel_action(
                 &replacement.expired,
                 Err(panel_action::PanelActionError::PanelRequestTimeoutError),
@@ -1371,15 +1653,9 @@ impl PublicPluginService {
                 )
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
             if let Some(next) = next {
-                self.bind_request(
-                    &next
-                        .candidate
-                        .owner
-                        .command()
-                        .expect("waiting request is a command")
-                        .submission_token,
-                    &next.context,
-                )?;
+                let Some(next) = self.bind_unsent_dispatch(next, now)? else {
+                    continue;
+                };
                 let settings = app.state::<crate::settings::SettingsStore>();
                 let theme = crate::commands::invocation_theme(app, settings.snapshot().theme);
                 let invoked_at = crate::commands::invoked_at_rfc3339();
@@ -1405,6 +1681,19 @@ impl PublicPluginService {
     }
 
     fn settle_panel_generation(&self, plugin_id: &str, generation: u64) {
+        let result_context = self.result_action.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .filter(|p| {
+                    p.context.plugin_id == plugin_id && p.context.plugin_generation == generation
+                })
+                .map(|p| p.context.clone())
+        });
+        if let Some(context) = result_context {
+            self.settle_result_action(
+                &context,
+                result_action::ResultActionErrorCode::ActionCancelled,
+            );
+        }
         let contexts = self
             .content_actions
             .lock()
@@ -1502,14 +1791,36 @@ impl PublicPluginService {
         Ok(next)
     }
 
+    fn bind_unsent_dispatch(
+        &self,
+        request: ScheduledPluginRequest,
+        now: Instant,
+    ) -> Result<Option<ScheduledPluginRequest>, PublicPluginManagementError> {
+        let token = request
+            .candidate
+            .owner
+            .token()
+            .ok_or(PublicPluginManagementError::Unavailable)?
+            .to_owned();
+        if self.bind_request(&token, &request.context).is_ok() {
+            return Ok(Some(request));
+        }
+        self.abort_submission_request(&request.context, &token, now)
+    }
     fn bind_request(
         &self,
         token: &str,
         context: &PluginRequestContext,
     ) -> Result<(), PublicPluginManagementError> {
         let mut submissions = self.lock_submissions()?;
-        if !submissions.by_token.contains_key(token) {
-            return Err(PublicPluginManagementError::Unavailable);
+        let pending = submissions
+            .by_token
+            .get_mut(token)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        if pending.route.result_publication.is_some() {
+            pending.route =
+                self.manager()?
+                    .bind_result_command_route(&pending.route, context, token)?;
         }
         submissions
             .token_by_request
@@ -1698,10 +2009,11 @@ impl PublicPluginService {
                 generation: candidate.generation,
                 activation_id: candidate.activation_id,
             },
-            runtime::public_runtime_bootstrap_with_actions(
+            runtime::public_runtime_bootstrap_with_result_actions(
                 candidate.network_https_declared,
                 candidate.panel_actions,
                 candidate.window_actions,
+                candidate.result_actions,
             ),
             target_url,
             on_unmuted,
@@ -1828,7 +2140,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 9, 0],
+            version: [0, 10, 0],
             api_version: 1,
         }
     }

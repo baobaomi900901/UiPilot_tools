@@ -100,14 +100,14 @@ export interface CopyTextDefaultAction {
 export interface PluginResult {
   id: string
   title: string
-  subtitle?: string
-  detail?: string
-  defaultAction?: CopyTextDefaultAction
+  subtitle?: string | null
+  detail?: string | null
+  defaultAction?: CopyTextDefaultAction | null
 }
 
 export interface MainResultResponse {
   requestId: string
-  results: PluginResult[]
+  results: (PluginResult | PluginActionResult)[]
 }
 
 export interface WindowResponse {
@@ -156,6 +156,8 @@ export type PluginWindowActionHandler = (
 ) => Promise<PluginWindowActionResponse>
 
 export interface PluginRuntimeModule {
+  /** Required at readiness when runtime.resultActions is true (Windows Host 0.10.0+). */
+  onAction?: PluginActionHandler
   /** Required at readiness only when window.runtimeActions is true (Windows Host 0.9.0+). */
   onWindowAction?: PluginWindowActionHandler
   /** Required at readiness only when panel.runtimeActions is true (Windows Host 0.6.0+). */
@@ -328,3 +330,32 @@ declare global {
     readonly uipilotPluginPanel: Readonly<UiPilotPluginPanelApiV1>
   }
 }
+
+/** Windows Host 0.10.0+, runtime.resultActions: true. IDs are business strings, not Host handles. */
+export type PluginResultAction =
+  | { id: string; title: string; type: 'copyText'; text: string }
+  | { id: string; title: string; type: 'runtime'; payload: JsonValue }
+export interface PluginActionResult {
+  id: string
+  title: string
+  subtitle?: string | null
+  detail?: string | null
+  actions: PluginResultAction[]
+  /** Omit to require an explicit menu selection. Never defaults to the first action. */
+  defaultActionId?: string
+}
+export interface PluginActionInvocation {
+  apiVersion: 1
+  requestId: string
+  /** Always the normalized saved ID; opted-in legacy command uses default. */
+  commandId: string
+  resultId: string
+  actionId: string
+  payload: JsonValue
+  input: string
+  context: { platform: 'windows'; theme: 'dark' | 'light'; invokedAt: string }
+}
+/** Export onAction as well as onCommand, including copy-only packages. Fresh frozen request-bound API. */
+export type PluginActionHandler = (
+  invocation: Readonly<PluginActionInvocation>, api: Readonly<UiPilotPluginApiV1>,
+) => Promise<MainResultResponse>

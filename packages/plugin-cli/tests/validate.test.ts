@@ -63,10 +63,10 @@ function networkSnapshot() {
 }
 
 describe('validateSnapshot', () => {
-  it('reports Host 0.9.0 for a valid network Manifest', () => {
+  it('reports Host 0.10.0 for a valid network Manifest', () => {
     const report = validateSnapshot(networkSnapshot(), 'network-package', 'windows')
     expect(report.valid).toBe(true)
-    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.9.0', apiVersion: 1 })
+    expect(report.target).toEqual({ platform: 'windows', hostVersion: '0.10.0', apiVersion: 1 })
   })
 
   it('accepts the complete Timer package on Windows', () => {
@@ -114,7 +114,7 @@ it('reports declared commands in order with fixed aggregate mode on production s
     builder.addFile('dist/runtime.js', Buffer.from('export {}'))
     const report = validateSnapshot(builder.finish(), 'multi-package', 'windows')
     expect(report.valid, name).toBe(!['duplicate-name', 'empty'].includes(name))
-    expect(report.target.hostVersion).toBe('0.9.0')
+    expect(report.target.hostVersion).toBe('0.10.0')
     if (fixture.schemaValid) {
       expect(report.plugin).toEqual({ pluginId: fixture.manifest.pluginId, version: fixture.manifest.version,
         outputMode: 'mainResult', commands: fixture.manifest.commands.map((command: any) => ({
@@ -130,7 +130,7 @@ it('reports declared commands in order with fixed aggregate mode on production s
 
 it('forwards command identities while leaving shared failures unowned and preserving phase order', () => {
   const value = multiCommandManifest()
-  value.minimumHostVersion = '0.9.1'
+  value.minimumHostVersion = '0.10.1'
   value.commands[0].inputRequired = true
   value.commands[1].summary = ''
   value.permissions = ['clipboard.read']
@@ -149,7 +149,7 @@ it('forwards command identities while leaving shared failures unowned and preser
 
 it('caps mixed command/resource findings at the same smallest 100 keys with stable phases', () => {
   const value = multiCommandManifest()
-  value.minimumHostVersion = '0.9.1'
+  value.minimumHostVersion = '0.10.1'
   value.commands[0].summary = ''
   value.commands[1].inputRequired = true
   const builder = new SnapshotBuilder('directory')

@@ -1799,7 +1799,7 @@ fn repository_multi_demo_stages_real_directory_and_archive_on_current_and_reject
         version: [0, 5, 0],
         ..host()
     };
-    assert_eq!(host().version, [0, 5, 0]);
+    assert_eq!(host().version, [0, 10, 0]);
     let historical_host = PublicPluginHost {
         version: [0, 4, 0],
         ..host()
@@ -1938,7 +1938,7 @@ fn repository_credential_demo_stages_on_0_4_0_and_rejects_0_3_4_without_cli_buil
         Err(PublicPackageError::IncompatibleApi)
     ));
     let root = TestRoot::new("credential-demo-current-host");
-    assert_eq!(host().version, [0, 5, 0]);
+    assert_eq!(host().version, [0, 10, 0]);
     let credential_host = PublicPluginHost {
         version: [0, 4, 0],
         ..host()
@@ -2303,11 +2303,14 @@ fn cli_multi_command_pack_fixture_stages_on_0_5_0() {
         include_bytes!("../../../tests/fixtures/public-plugin-pack/multi-command.uipilot-plugin"),
     )
     .unwrap();
-    assert_eq!(host().version, [0, 5, 0]);
+    let minimum_host = PublicPluginHost {
+        version: [0, 5, 0],
+        ..host()
+    };
     let prepared = package::stage(
         PublicPackageSource::Archive(archive.clone()),
         &root.staging(),
-        &host(),
+        &minimum_host,
     )
     .unwrap();
     assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-multi");
@@ -3495,4 +3498,470 @@ fn window_action_every_controller_retirement_path_settles_once() {
         assert!(!service.settle_window_action(&action.context, Ok(json!("late")), true));
         assert!(receiver.try_recv().is_err());
     }
+}
+
+fn result_action_service(
+    root: &TestRoot,
+) -> (
+    Arc<PublicPluginService>,
+    Arc<PublicPluginManager>,
+    crate::result_registry::ResultRegistry,
+    super::result_action::ResultActionOrigin,
+) {
+    use super::result_action::*;
+    use crate::result_registry::{QueryDomain, ResultRegistry};
+    let source = root.package();
+    let mut value = manifest("mainResult");
+    value["minimumHostVersion"] = json!("0.10.0");
+    value["runtime"]["resultActions"] = json!(true);
+    value["permissions"] = json!([]);
+    value["settings"] = json!([{"key":"flag","label":"Flag","type":"boolean","default":false}]);
+    write_package(&source, &value);
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            PublicPluginHost::current(PublicPlatform::Windows),
+            [],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let prepared = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+        .unwrap();
+    let route = manager.route("/demo saved input").unwrap().unwrap();
+    let registry = ResultRegistry::default();
+    registry.on_show("source".into());
+    let token = registry
+        .begin_query(QueryDomain::Plugin, "source", 1)
+        .unwrap();
+    let rows=parse(&super::PluginRequestContext{plugin_id:route.plugin_id.clone(),plugin_generation:route.generation,request_id:"public-request-0000000000000001".into()},json!({"requestId":"public-request-0000000000000001","results":[{"id":"same","title":"Save","actions":[{"id":"save","title":"Save","type":"runtime","payload":null}]}]})).unwrap();
+    let response = manager
+        .publish_result_actions(&route, false, || {
+            registry.publish_prepared_result_actions(
+                token,
+                registry
+                    .prepare_result_actions(route.clone(), rows)
+                    .unwrap(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let origin = registry
+        .resolve_result_action(&ExecuteResultActionRequest {
+            request_id: response.request_id,
+            result_id: response.items[0].result_id.clone(),
+            action_id: response.items[0].result_actions.as_ref().unwrap().actions[0]
+                .action_id
+                .clone(),
+        })
+        .unwrap();
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(manager.clone()).is_ok());
+    (service, manager, registry, origin)
+}
+#[test]
+fn result_action_observer_precommit_failure_leaves_no_pending_claim_or_physical_request() {
+    use super::result_action::*;
+    let root = TestRoot::new("result-action-precommit");
+    let (service, manager, registry, origin) = result_action_service(&root);
+    let legacy = Arc::new(crate::plugins::PluginManager::new());
+    assert!(matches!(
+        service.prepare_result_action_with_observer(
+            legacy.clone(),
+            registry.clone(),
+            origin.clone(),
+            || Err(ResultActionErrorCode::ActionUnavailable)
+        ),
+        Err(ResultActionErrorCode::ActionUnavailable)
+    ));
+    assert!(service.result_action.lock().unwrap().is_none());
+    let (arm, watch) = std::sync::mpsc::channel();
+    let (request, _receiver) = service
+        .prepare_result_action_with_observer(legacy, registry.clone(), origin.clone(), || Ok(arm))
+        .unwrap();
+    assert_eq!(watch.recv().unwrap(), request.deadline);
+    assert_eq!(
+        manager.scheduler().context_status(&request.context),
+        super::PluginContextStatus::Current
+    );
+    assert!(matches!(
+        registry.claim_result_action(&origin, None),
+        Err(ResultActionErrorCode::ActionInProgress)
+    ));
+    service.settle_result_action(&request.context, ResultActionErrorCode::ActionCancelled);
+}
+#[test]
+fn result_action_authenticated_malformed_completion_settles_once_and_forgery_selects_nothing() {
+    use super::result_action::*;
+    for case in ["valid", "malformed", "throw"] {
+        let root = TestRoot::new("result-action-complete");
+        let (service, manager, registry, origin) = result_action_service(&root);
+        let (arm, _watch) = std::sync::mpsc::channel();
+        let (request, receiver) = service
+            .prepare_result_action_with_observer(
+                Arc::new(crate::plugins::PluginManager::new()),
+                registry.clone(),
+                origin,
+                || Ok(arm),
+            )
+            .unwrap();
+        let mut forged = PluginCommandCompletion {
+            context: request.context.clone(),
+            failed: false,
+            response: Some(json!({"requestId":request.context.request_id,"results":[]})),
+        };
+        forged.context.request_id = "public-request-ffffffffffffffff".into();
+        assert!(manager
+            .complete(&request.candidate.plugin_id, &forged, Instant::now())
+            .is_err());
+        assert!(service.complete_result_action(&forged, true).is_none());
+        assert!(service.result_action.lock().unwrap().is_some());
+        let completion = PluginCommandCompletion {
+            context: request.context.clone(),
+            failed: case == "throw",
+            response: Some(if case == "malformed" {
+                json!({"requestId":request.context.request_id,"data":{}})
+            } else {
+                json!({"requestId":request.context.request_id,"results":[]})
+            }),
+        };
+        let accepted = manager
+            .complete(
+                &super::runtime_label(
+                    &request.context.plugin_id,
+                    request.context.plugin_generation,
+                )
+                .unwrap(),
+                &completion,
+                Instant::now(),
+            )
+            .unwrap()
+            .accepted;
+        assert!(accepted);
+        assert_eq!(
+            manager.scheduler().context_status(&request.context),
+            super::PluginContextStatus::Expired
+        );
+        let (_, success, fault) = service
+            .complete_result_action(&completion, accepted)
+            .unwrap();
+        assert_eq!(success, case == "valid");
+        assert_eq!(fault, case != "valid");
+        let outcome = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        match (case, outcome) {
+            ("valid", ResultActionOutcome::ResultsUpdated { response }) => {
+                assert!(response.items.is_empty())
+            }
+            (
+                "malformed",
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::ActionInvalidResponse,
+                    source_consumed: true,
+                },
+            ) => {}
+            (
+                "throw",
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::ActionFailed,
+                    source_consumed: true,
+                },
+            ) => {}
+            _ => panic!("wrong result action outcome"),
+        };
+        assert!(
+            !service.settle_result_action(&request.context, ResultActionErrorCode::ActionTimedOut)
+        );
+        assert!(service.complete_result_action(&completion, true).is_none());
+    }
+}
+#[test]
+fn result_action_uncertain_transport_keeps_slot_and_original_autonomous_deadline_after_settlement()
+{
+    use super::result_action::*;
+    use std::{sync::mpsc, thread};
+    let root = TestRoot::new("result-action-transport-deadline");
+    let (service, manager, registry, origin) = result_action_service(&root);
+    let (clock, advance) = mpsc::channel();
+    let (done, observed) = mpsc::channel();
+    let (worker_done, joined) = mpsc::channel();
+    let manager_for_watch = manager.clone();
+    let (request, receiver) = service
+        .prepare_result_action_with_observer(
+            Arc::new(crate::plugins::PluginManager::new()),
+            registry,
+            origin,
+            move || {
+                let (arm, watch) = mpsc::channel();
+                thread::spawn(move || {
+                    let deadline = watch.recv().unwrap();
+                    advance.recv().unwrap();
+                    let expired = manager_for_watch.expire_network_timeouts(deadline).unwrap();
+                    done.send(expired).unwrap();
+                    worker_done.send(()).unwrap();
+                });
+                Ok(arm)
+            },
+        )
+        .unwrap();
+    manager.retire_panel_action(&request.context);
+    assert!(
+        service.settle_result_action(&request.context, ResultActionErrorCode::ActionUnavailable)
+    );
+    assert!(matches!(
+        receiver.recv().unwrap(),
+        ResultActionOutcome::Failed {
+            code: ResultActionErrorCode::ActionUnavailable,
+            source_consumed: true
+        }
+    ));
+    assert!(!service.settle_result_action(&request.context, ResultActionErrorCode::ActionTimedOut));
+    clock.send(()).unwrap();
+    let expired = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].expired, request.context);
+    assert_eq!(
+        expired[0].new_generation,
+        request.context.plugin_generation + 1
+    );
+    joined.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(manager
+        .expire_network_timeouts(request.deadline + Duration::from_secs(1))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn result_action_timeout_promotes_waiting_command_with_fresh_publication_owner() {
+    use std::sync::mpsc;
+    let root = TestRoot::new("result-action-timeout-waiter");
+    let (service, manager, registry, origin) = result_action_service(&root);
+    let (arm, _watch) = mpsc::channel();
+    let (action, _receiver) = service
+        .prepare_result_action_with_observer(
+            Arc::new(crate::plugins::PluginManager::new()),
+            registry,
+            origin,
+            || Ok(arm),
+        )
+        .unwrap();
+    let submission = service
+        .schedule_command(
+            manager.route("/demo next input").unwrap().unwrap(),
+            2,
+            "/demo next input".into(),
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(submission.dispatch.is_none());
+    let expired = manager.expire_network_timeouts(action.deadline).unwrap();
+    assert_eq!(expired.len(), 1);
+    let replacement = manager
+        .replace_runtime_generation(
+            &action.context.plugin_id,
+            action.context.plugin_generation,
+            expired[0].new_generation,
+        )
+        .unwrap();
+    let next = manager
+        .finish_runtime_replacement(
+            &replacement.plugin_id,
+            replacement.generation,
+            replacement.activation_id,
+            replacement.admission_epoch,
+            Instant::now(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.candidate.input, "next input");
+    service
+        .bind_request(&submission.token, &next.context)
+        .unwrap();
+    let pending_route = service
+        .lock_submissions()
+        .unwrap()
+        .by_token
+        .get(&submission.token)
+        .unwrap()
+        .route
+        .clone();
+    assert!(
+        manager
+            .publish_result_actions(&pending_route, false, || ())
+            .is_ok(),
+        "waiting command must use its authenticated replacement owner"
+    );
+    let completion = PluginCommandCompletion {
+        context: next.context.clone(),
+        failed: false,
+        response: Some(
+            json!({"requestId":next.context.request_id,"results":[{"id":"same","title":"Fresh","actions":[]}]}),
+        ),
+    };
+    let outcome = manager
+        .complete(
+            &super::runtime_label(&next.context.plugin_id, next.context.plugin_generation).unwrap(),
+            &completion,
+            Instant::now(),
+        )
+        .unwrap();
+    service
+        .complete_submission_with(&completion, outcome, Instant::now(), || {
+            panic!("not a fault")
+        })
+        .unwrap();
+    let Some(Ok(PublicPluginResponse::MainActionResults { route, results })) = submission
+        .receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+    else {
+        panic!("fresh result response")
+    };
+    assert_eq!(route.generation, replacement.generation);
+    assert_eq!(route.input, "next input");
+    let registry = crate::result_registry::ResultRegistry::default();
+    registry.on_show("next".into());
+    let token = registry
+        .begin_query(crate::result_registry::QueryDomain::Plugin, "next", 2)
+        .unwrap();
+    assert!(manager
+        .publish_result_actions(&route, false, || registry.publish_prepared_result_actions(
+            token,
+            registry
+                .prepare_result_actions(route.clone(), results)
+                .unwrap()
+        ))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn result_action_same_generation_stale_prepared_commands_never_rebind_or_emit() {
+    use std::collections::BTreeMap;
+    for setting in [false, true] {
+        let root = TestRoot::new("result-action-stale-prepared");
+        let (service, manager, _registry, _origin) = result_action_service(&root);
+        let prepared = service
+            .prepare_command(
+                manager.route("/demo old").unwrap().unwrap(),
+                2,
+                "/demo old".into(),
+            )
+            .unwrap();
+        let old_context = prepared.request_context().clone();
+        if setting {
+            manager
+                .save_settings(
+                    "com.uipilot.demo",
+                    &BTreeMap::from([("flag".into(), json!(true))]),
+                )
+                .unwrap();
+        } else {
+            manager.rename("com.uipilot.demo", Some("renamed")).unwrap();
+        }
+        let rejected = service
+            .admit_prepared_command(prepared, Instant::now())
+            .unwrap();
+        assert!(rejected.dispatch.is_none());
+        assert!(matches!(
+            rejected.receiver.recv().unwrap(),
+            Some(Err(PluginRuntimeError::Unavailable))
+        ));
+        assert_eq!(
+            manager.scheduler().context_status(&old_context),
+            super::PluginContextStatus::Expired
+        );
+    }
+}
+#[test]
+fn result_action_bound_route_rejects_mismatched_context_token_command_or_input() {
+    let root = TestRoot::new("result-action-bound-proof");
+    let (service, manager, _registry, _origin) = result_action_service(&root);
+    let saved = manager.route("/demo exact input").unwrap().unwrap();
+    let submission = service
+        .schedule_command(saved.clone(), 2, "/demo exact input".into(), Instant::now())
+        .unwrap();
+    let request = submission.dispatch.unwrap();
+    assert!(manager
+        .bind_result_command_route(&saved, &request.context, "wrong-token")
+        .is_err());
+    let mut forged = request.context.clone();
+    forged.request_id = "public-request-ffffffffffffffff".into();
+    assert!(manager
+        .bind_result_command_route(&saved, &forged, &submission.token)
+        .is_err());
+    let mut altered = saved.clone();
+    altered.command_id = "other".into();
+    assert!(manager
+        .bind_result_command_route(&altered, &request.context, &submission.token)
+        .is_err());
+    altered = saved.clone();
+    altered.input = "different".into();
+    assert!(manager
+        .bind_result_command_route(&altered, &request.context, &submission.token)
+        .is_err());
+    manager
+        .set_command_favorite("com.uipilot.demo", "default", true)
+        .unwrap();
+    manager.rename("com.uipilot.demo", None).unwrap();
+    assert!(manager
+        .bind_result_command_route(&saved, &request.context, &submission.token)
+        .is_ok());
+    manager.rename("com.uipilot.demo", Some("renamed")).unwrap();
+    assert!(manager
+        .bind_result_command_route(&saved, &request.context, &submission.token)
+        .is_err());
+}
+#[test]
+fn result_action_rejected_unsent_bind_preserves_and_returns_the_exact_latest_successor() {
+    let root = TestRoot::new("result-action-unsent-successor");
+    let (service, manager, _registry, _origin) = result_action_service(&root);
+    let prepared = service
+        .prepare_command(
+            manager.route("/demo old").unwrap().unwrap(),
+            2,
+            "/demo old".into(),
+        )
+        .unwrap();
+    manager.rename("com.uipilot.demo", Some("renamed")).unwrap();
+    let mut successor = None;
+    let rejected = service
+        .admit_prepared_command_with(prepared, Instant::now(), || {
+            successor = Some(
+                service
+                    .schedule_command(
+                        manager.route("/renamed new").unwrap().unwrap(),
+                        3,
+                        "/renamed new".into(),
+                        Instant::now(),
+                    )
+                    .unwrap(),
+            );
+        })
+        .unwrap();
+    let successor = successor.unwrap();
+    assert!(successor.dispatch.is_none());
+    let dispatch = rejected.dispatch.unwrap();
+    assert_eq!(
+        dispatch.candidate.owner.token(),
+        Some(successor.token.as_str())
+    );
+    assert_eq!(dispatch.candidate.input, "new");
+    assert!(matches!(
+        rejected.receiver.recv().unwrap(),
+        Some(Err(PluginRuntimeError::Unavailable))
+    ));
+    assert_eq!(
+        manager.scheduler().context_status(&dispatch.context),
+        super::PluginContextStatus::Current
+    );
 }

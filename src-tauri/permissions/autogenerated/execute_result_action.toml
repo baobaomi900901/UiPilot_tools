@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-execute-result-action"
+description = "Enables the execute_result_action command without any pre-configured scope."
+commands.allow = ["execute_result_action"]
+
+[[permission]]
+identifier = "deny-execute-result-action"
+description = "Denies the execute_result_action command without any pre-configured scope."
+commands.deny = ["execute_result_action"]

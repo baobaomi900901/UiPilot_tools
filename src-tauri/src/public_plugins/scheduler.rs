@@ -43,6 +43,7 @@ pub(crate) struct PluginSubmissionOwner {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PluginRequestOwner {
     Command(PluginSubmissionOwner),
+    ResultAction(super::result_action::ResultActionOrigin),
     WindowAction {
         identity: crate::plugin_window::WindowActionIdentity,
         request: super::window_action::WindowActionRequest,
@@ -54,6 +55,19 @@ pub(crate) enum PluginRequestOwner {
     },
 }
 impl PluginRequestOwner {
+    pub(crate) fn live(&self) -> bool {
+        match self {
+            Self::ResultAction(origin) => {
+                origin.lease.live()
+                    && origin
+                        .route
+                        .result_publication
+                        .as_ref()
+                        .is_none_or(|token| token.live())
+            }
+            _ => true,
+        }
+    }
     pub(crate) fn command(&self) -> Option<&PluginSubmissionOwner> {
         match self {
             Self::Command(owner) => Some(owner),
@@ -88,6 +102,20 @@ impl PluginRequestCandidate {
             && match &self.owner {
                 PluginRequestOwner::Command(owner) => {
                     owner.ui_intent_epoch != 0 && !owner.submission_token.is_empty()
+                }
+                PluginRequestOwner::ResultAction(origin) => {
+                    origin.lease.live()
+                        && origin
+                            .route
+                            .result_publication
+                            .as_ref()
+                            .is_none_or(|token| token.live())
+                        && origin.route.plugin_id == self.plugin_id
+                        && origin.route.command_id == self.command_id
+                        && origin.route.generation == self.plugin_generation
+                        && origin.route.activation_id == self.activation_id
+                        && origin.route.admission_epoch == self.admission_epoch
+                        && self.activation_mode == PublicActivationMode::Submit
                 }
                 PluginRequestOwner::WindowAction { identity, request } => {
                     identity.session_generation != 0
@@ -221,6 +249,7 @@ struct PluginQueue {
     generation: u64,
     activation_id: u64,
     admission_epoch: u64,
+    result_publication: super::result_action::ResultActionLease,
     running: Option<RunningRequest>,
     waiting: Option<ReservedPluginRequest>,
     rebuilding: bool,
@@ -238,6 +267,7 @@ impl PluginQueue {
             generation,
             activation_id,
             admission_epoch,
+            result_publication: super::result_action::ResultActionLease::default(),
             running: None,
             waiting: None,
             rebuilding: false,
@@ -273,6 +303,7 @@ impl PluginQueue {
 
 struct SchedulerState {
     next_request: u64,
+    result_publications_closed: bool,
     by_plugin: HashMap<String, PluginQueue>,
 }
 
@@ -280,6 +311,7 @@ impl Default for SchedulerState {
     fn default() -> Self {
         Self {
             next_request: 1,
+            result_publications_closed: false,
             by_plugin: HashMap::new(),
         }
     }
@@ -291,6 +323,114 @@ pub(crate) struct PluginRequestScheduler {
 }
 
 impl PluginRequestScheduler {
+    pub(crate) fn capture_result_publication(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation: u64,
+        admission: u64,
+    ) -> Result<super::result_action::ResultActionLease, PluginScheduleError> {
+        let state = self.lock()?;
+        if state.result_publications_closed {
+            return Err(PluginScheduleError::Unavailable);
+        }
+        let queue = state
+            .by_plugin
+            .get(plugin_id)
+            .ok_or(PluginScheduleError::GenerationMismatch)?;
+        if queue.rebuilding
+            || queue.generation != generation
+            || queue.activation_id != activation
+            || queue.admission_epoch != admission
+            || !queue.result_publication.live()
+        {
+            return Err(PluginScheduleError::GenerationMismatch);
+        }
+        Ok(queue.result_publication.clone())
+    }
+    pub(crate) fn result_publication_current(
+        &self,
+        plugin_id: &str,
+        token: &super::result_action::ResultActionLease,
+    ) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            !state.result_publications_closed
+                && token.live()
+                && state
+                    .by_plugin
+                    .get(plugin_id)
+                    .is_some_and(|q| q.result_publication == *token && !q.rebuilding)
+        })
+    }
+    pub(crate) fn bound_command_publication(
+        &self,
+        context: &PluginRequestContext,
+        submission_token: &str,
+        command_id: &str,
+        input: &str,
+        activation_id: u64,
+        admission_epoch: u64,
+    ) -> Result<super::result_action::ResultActionLease, PluginScheduleError> {
+        let state = self.lock()?;
+        let queue = state
+            .by_plugin
+            .get(&context.plugin_id)
+            .ok_or(PluginScheduleError::GenerationMismatch)?;
+        let running = queue
+            .running
+            .as_ref()
+            .ok_or(PluginScheduleError::GenerationMismatch)?;
+        if state.result_publications_closed
+            || queue.rebuilding
+            || !queue.result_publication.live()
+            || !running.current
+            || running.request.context != *context
+            || running.request.candidate.owner.token() != Some(submission_token)
+            || running.request.candidate.command_id != command_id
+            || running.request.candidate.input != input
+            || running.request.candidate.activation_id != activation_id
+            || running.request.candidate.admission_epoch != admission_epoch
+            || queue.generation != context.plugin_generation
+        {
+            return Err(PluginScheduleError::GenerationMismatch);
+        }
+        Ok(queue.result_publication.clone())
+    }
+    pub(crate) fn with_result_publication<T>(
+        &self,
+        plugin_id: &str,
+        token: &super::result_action::ResultActionLease,
+        publish: impl FnOnce() -> T,
+    ) -> Result<T, super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        let state = self.lock().map_err(|_| E::ActionUnavailable)?;
+        if state.result_publications_closed
+            || !token.live()
+            || !state
+                .by_plugin
+                .get(plugin_id)
+                .is_some_and(|q| q.result_publication == *token && !q.rebuilding)
+        {
+            return Err(E::StaleRequest);
+        }
+        Ok(publish())
+    }
+    pub(crate) fn close_result_publications(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.result_publications_closed = true;
+        for queue in state.by_plugin.values() {
+            queue.result_publication.revoke();
+            if let Some(running) = queue.running.as_ref() {
+                if let PluginRequestOwner::ResultAction(origin) = &running.request.candidate.owner {
+                    origin.lease.revoke();
+                }
+            }
+        }
+    }
+
     pub(crate) fn reserve(
         &self,
         candidate: PluginRequestCandidate,
@@ -329,7 +469,10 @@ impl PluginRequestScheduler {
         reserved: ReservedPluginRequest,
         now: Instant,
     ) -> Result<PluginScheduleOutcome, PluginScheduleError> {
-        if !reserved.candidate.valid()
+        if matches!(
+            reserved.candidate.owner,
+            PluginRequestOwner::ResultAction(_)
+        ) || !reserved.candidate.valid()
             || reserved.context.plugin_id != reserved.candidate.plugin_id
             || reserved.context.plugin_generation != reserved.candidate.plugin_generation
             || !reserved.context.valid_shape()
@@ -355,7 +498,9 @@ impl PluginRequestScheduler {
         }
         if matches!(
             reserved.candidate.owner,
-            PluginRequestOwner::PanelAction { .. } | PluginRequestOwner::WindowAction { .. }
+            PluginRequestOwner::PanelAction { .. }
+                | PluginRequestOwner::WindowAction { .. }
+                | PluginRequestOwner::ResultAction(_)
         ) && (queue.rebuilding || queue.running.is_some() || queue.waiting.is_some())
         {
             return Err(PluginScheduleError::Busy);
@@ -370,7 +515,9 @@ impl PluginRequestScheduler {
                     *reason = Some(super::content_action::ContentActionError::Cancelled);
                 }
             }
-            PluginRequestOwner::PanelAction { .. } | PluginRequestOwner::WindowAction { .. } => {
+            PluginRequestOwner::PanelAction { .. }
+            | PluginRequestOwner::WindowAction { .. }
+            | PluginRequestOwner::ResultAction(_) => {
                 if queue
                     .action_completion
                     .as_ref()
@@ -410,6 +557,7 @@ impl PluginRequestScheduler {
                     running.request.candidate.owner,
                     PluginRequestOwner::PanelAction { .. }
                         | PluginRequestOwner::WindowAction { .. }
+                        | PluginRequestOwner::ResultAction(_)
                 )
             {
                 running.action_retirement =
@@ -437,6 +585,96 @@ impl PluginRequestScheduler {
         Ok(PluginScheduleOutcome::Dispatched(request))
     }
 
+    // Pending -> admission -> mutation -> authority -> scheduler -> registry.
+    // Everything fallible is checked before claim; dispatch cannot queue this owner.
+    pub(crate) fn admit_result_action(
+        &self,
+        reserved: ReservedPluginRequest,
+        now: Instant,
+        claim: impl FnOnce() -> Result<(), super::result_action::ResultActionErrorCode>,
+    ) -> Result<ScheduledPluginRequest, super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        if !reserved.candidate.valid() {
+            return Err(E::StaleRequest);
+        }
+        let deadline = now
+            .checked_add(SUBMIT_TIMEOUT)
+            .ok_or(E::ActionUnavailable)?;
+        let mut state = self.lock().map_err(|_| E::ActionUnavailable)?;
+        let queue = state
+            .by_plugin
+            .get_mut(&reserved.context.plugin_id)
+            .ok_or(E::StaleRequest)?;
+        if queue.generation != reserved.candidate.plugin_generation
+            || queue.activation_id != reserved.candidate.activation_id
+            || queue.admission_epoch != reserved.candidate.admission_epoch
+        {
+            return Err(E::StaleRequest);
+        }
+        if let Some(running) = queue.running.as_ref() {
+            if let (
+                PluginRequestOwner::ResultAction(active),
+                PluginRequestOwner::ResultAction(next),
+            ) = (&running.request.candidate.owner, &reserved.candidate.owner)
+            {
+                if active.lease == next.lease {
+                    return Err(E::ActionInProgress);
+                }
+            }
+        }
+        if queue.rebuilding
+            || queue.running.is_some()
+            || queue.waiting.is_some()
+            || queue
+                .action_completion
+                .as_ref()
+                .is_some_and(|(_, reason)| reason.is_none())
+        {
+            return Err(E::ActionBusy);
+        }
+        claim()?;
+        let request = ScheduledPluginRequest {
+            context: reserved.context,
+            candidate: reserved.candidate,
+            dispatched_at: now,
+            deadline,
+        };
+        queue.remember(request.context.clone());
+        queue.action_completion = None;
+        queue.running = Some(RunningRequest {
+            request: request.clone(),
+            current: true,
+            action_retirement: None,
+            notification_published: false,
+        });
+        Ok(request)
+    }
+    pub(crate) fn finish_result_action<T>(
+        &self,
+        context: &PluginRequestContext,
+        lease: &super::result_action::ResultActionLease,
+        publish: impl FnOnce() -> Result<T, super::result_action::ResultActionErrorCode>,
+    ) -> Result<T, super::result_action::ResultActionErrorCode> {
+        use super::result_action::ResultActionErrorCode as E;
+        let mut state = self.lock().map_err(|_| E::ActionUnavailable)?;
+        let queue = state
+            .by_plugin
+            .get_mut(&context.plugin_id)
+            .ok_or(E::ActionCancelled)?;
+        if !queue
+            .action_completion
+            .as_ref()
+            .is_some_and(|(c, _)| c == context)
+        {
+            return Err(E::ActionCancelled);
+        }
+        let (_, reason) = queue.action_completion.take().ok_or(E::ActionCancelled)?;
+        if reason.is_some() || !lease.live() {
+            return Err(E::ActionCancelled);
+        }
+        publish()
+    }
+
     pub(crate) fn complete(
         &self,
         context: &PluginRequestContext,
@@ -462,12 +700,21 @@ impl PluginRequestScheduler {
                 PluginScheduleError::InvalidCandidate
             });
         }
-        let accepted = running.current;
+        let accepted = running.current && running.request.candidate.owner.live();
         if matches!(
             running.request.candidate.owner,
-            PluginRequestOwner::PanelAction { .. } | PluginRequestOwner::WindowAction { .. }
+            PluginRequestOwner::PanelAction { .. }
+                | PluginRequestOwner::WindowAction { .. }
+                | PluginRequestOwner::ResultAction(_)
         ) {
-            queue.action_completion = Some((context.clone(), running.action_retirement));
+            queue.action_completion = Some((
+                context.clone(),
+                if !running.request.candidate.owner.live() {
+                    Some(super::content_action::ContentActionError::Expired)
+                } else {
+                    running.action_retirement
+                },
+            ));
         }
         let next = if queue.rebuilding {
             None
@@ -491,6 +738,7 @@ impl PluginRequestScheduler {
         };
         if queue.running.as_ref().is_some_and(|running| {
             running.current
+                && running.request.candidate.owner.live()
                 && running.request.context == *context
                 && queue.generation == context.plugin_generation
         }) {
@@ -585,6 +833,17 @@ impl PluginRequestScheduler {
         let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) else {
             return Ok(None);
         };
+        if let Some(running) = queue.running.as_mut().filter(|running| {
+            running.request.context == *context
+                && matches!(
+                    running.request.candidate.owner,
+                    PluginRequestOwner::ResultAction(_)
+                )
+        }) {
+            running.current = false;
+            running.action_retirement = Some(super::content_action::ContentActionError::Cancelled);
+            return Ok(None);
+        }
         if queue
             .running
             .as_ref()
@@ -629,6 +888,7 @@ impl PluginRequestScheduler {
             .ok_or(PluginContextAccessError::Invalid)?;
         if queue.running.as_ref().is_some_and(|running| {
             running.current
+                && running.request.candidate.owner.live()
                 && running.request.context == *context
                 && queue.generation == context.plugin_generation
         }) {
@@ -671,6 +931,7 @@ impl PluginRequestScheduler {
             let new_generation = previous_generation
                 .checked_add(1)
                 .ok_or(PluginScheduleError::GenerationExhausted)?;
+            queue.result_publication.revoke();
             queue.rebind_waiting_generation(new_generation);
             queue.generation = new_generation;
             queue.rebuilding = true;
@@ -682,7 +943,7 @@ impl PluginRequestScheduler {
                 previous_generation,
                 new_generation,
                 has_waiting: queue.waiting.is_some(),
-                counts_as_fault: running.current,
+                counts_as_fault: running.current && running.request.candidate.owner.live(),
             });
         }
         Ok(replacements)
@@ -715,6 +976,8 @@ impl PluginRequestScheduler {
             waiting.candidate.activation_id = activation_id;
             waiting.candidate.admission_epoch = admission_epoch;
         }
+        queue.result_publication.revoke();
+        queue.result_publication = super::result_action::ResultActionLease::default();
         queue.rebuilding = false;
         let candidate = queue.waiting.take();
         candidate
@@ -731,6 +994,8 @@ impl PluginRequestScheduler {
         let Some(queue) = state.by_plugin.get_mut(plugin_id) else {
             return Ok(Vec::new());
         };
+        queue.result_publication.revoke();
+        queue.result_publication = super::result_action::ResultActionLease::default();
         let mut retired = Vec::new();
         if let Some((context, reason)) = queue.action_completion.as_mut() {
             *reason = Some(super::content_action::ContentActionError::Expired);
@@ -785,6 +1050,8 @@ impl PluginRequestScheduler {
             queue.activation_id = activation_id;
             queue.admission_epoch = admission_epoch;
         }
+        queue.result_publication.revoke();
+        queue.result_publication = super::result_action::ResultActionLease::default();
         let expired = queue.running.take().map(|running| running.request.context);
         queue.waiting = None;
         queue.rebuilding = false;
@@ -796,10 +1063,10 @@ impl PluginRequestScheduler {
         plugin_id: &str,
     ) -> Result<Option<PluginRequestContext>, PluginScheduleError> {
         let mut state = self.lock()?;
-        Ok(state
-            .by_plugin
-            .remove(plugin_id)
-            .and_then(|queue| queue.running.map(|running| running.request.context)))
+        Ok(state.by_plugin.remove(plugin_id).and_then(|queue| {
+            queue.result_publication.revoke();
+            queue.running.map(|running| running.request.context)
+        }))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, SchedulerState>, PluginScheduleError> {
@@ -1455,5 +1722,118 @@ mod tests {
             scheduler.enqueue(candidate("stale", 1, PublicActivationMode::Submit), now),
             Err(PluginScheduleError::GenerationMismatch)
         );
+    }
+    #[test]
+    fn result_action_publication_token_never_revives_after_queue_aba_rebuild_or_shutdown() {
+        for case in 0..4 {
+            let scheduler = PluginRequestScheduler::default();
+            let now = Instant::now();
+            let PluginScheduleOutcome::Dispatched(request) = scheduler
+                .enqueue(candidate("first", 1, PublicActivationMode::Submit), now)
+                .unwrap()
+            else {
+                panic!()
+            };
+            let old = scheduler
+                .capture_result_publication(&request.context.plugin_id, 1, 17, 23)
+                .unwrap();
+            match case {
+                0 => {
+                    scheduler.forget_plugin(&request.context.plugin_id).unwrap();
+                    scheduler
+                        .enqueue(candidate("new", 1, PublicActivationMode::Submit), now)
+                        .unwrap();
+                }
+                1 => {
+                    let replacements = scheduler.expire_timeouts(request.deadline).unwrap();
+                    assert_eq!(replacements.len(), 1);
+                    assert!(scheduler
+                        .capture_result_publication(&request.context.plugin_id, 2, 17, 23)
+                        .is_err());
+                    scheduler
+                        .runtime_replaced(&request.context.plugin_id, 2, 12, 24, now)
+                        .unwrap();
+                }
+                2 => {
+                    scheduler
+                        .invalidate_plugin(&request.context.plugin_id, Some((2, 12, 24)))
+                        .unwrap();
+                }
+                _ => scheduler.close_result_publications(),
+            }
+            assert!(!old.live());
+            assert!(scheduler
+                .with_result_publication(&request.context.plugin_id, &old, || panic!(
+                    "old token published"
+                ))
+                .is_err());
+            if case < 3 {
+                let generation = if case == 0 { 1 } else { 2 };
+                let activation = if case == 0 { 17 } else { 12 };
+                let admission = if case == 0 { 23 } else { 24 };
+                let fresh = scheduler
+                    .capture_result_publication(
+                        &request.context.plugin_id,
+                        generation,
+                        activation,
+                        admission,
+                    )
+                    .unwrap();
+                assert_ne!(old, fresh);
+                assert!(fresh.live());
+            }
+        }
+    }
+    #[test]
+    fn result_action_publication_callback_excludes_timeout_until_atomic_registry_work_finishes() {
+        use std::{
+            sync::{mpsc, Arc},
+            thread,
+        };
+        let scheduler = Arc::new(PluginRequestScheduler::default());
+        let now = Instant::now();
+        let PluginScheduleOutcome::Dispatched(request) = scheduler
+            .enqueue(candidate("first", 1, PublicActivationMode::Submit), now)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let token = scheduler
+            .capture_result_publication(&request.context.plugin_id, 1, 17, 23)
+            .unwrap();
+        let (entered, observed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let worker = {
+            let scheduler = scheduler.clone();
+            let token = token.clone();
+            let plugin = request.context.plugin_id.clone();
+            thread::spawn(move || {
+                scheduler
+                    .with_result_publication(&plugin, &token, || {
+                        entered.send(()).unwrap();
+                        wait.recv().unwrap();
+                        assert!(token.live());
+                    })
+                    .unwrap()
+            })
+        };
+        observed.recv().unwrap();
+        let (done, finished) = mpsc::channel();
+        let timeout = {
+            let scheduler = scheduler.clone();
+            thread::spawn(move || {
+                done.send(scheduler.expire_timeouts(request.deadline).unwrap())
+                    .unwrap()
+            })
+        };
+        assert!(finished.recv_timeout(Duration::from_millis(30)).is_err());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(2)).unwrap().len(),
+            1
+        );
+        timeout.join().unwrap();
+        assert!(!token.live());
     }
 }

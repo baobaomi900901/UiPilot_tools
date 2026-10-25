@@ -25,7 +25,7 @@ async function runtime(module: any, optedIn = true, windowActions = false) {
   const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke, transformCallback(next: any) { callback = next; return 1 } } }
   const document = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } }
   const source = template('src-tauri/src/public_plugins/runtime.rs', 'PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE')
-    .replace('__WINDOW_ACTIONS__', String(windowActions)).replace('__PANEL_JSON__', jsonSource).replace('__PANEL_ACTIONS__', String(optedIn)).replace('__NETWORK_HTTPS__', 'false')
+    .replace('__RESULT_ACTIONS__', 'false').replace('__WINDOW_ACTIONS__', String(windowActions)).replace('__PANEL_JSON__', jsonSource).replace('__PANEL_ACTIONS__', String(optedIn)).replace('__NETWORK_HTTPS__', 'false')
     .replace('const module = entry ? await import(entry) : null;', 'const module = window.testModule;')
   vm.runInNewContext(source, { ...env, window, document })
   await vi.waitFor(() => expect(document.title).not.toBe(''))

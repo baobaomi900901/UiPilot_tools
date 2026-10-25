@@ -3119,7 +3119,12 @@ async fn run_panel_submission(
     };
     let response = match response {
         Ok(PublicPluginResponse::Panel(response)) => response,
-        Ok(PublicPluginResponse::MainResults(_) | PublicPluginResponse::Window(_)) | Err(_) => {
+        Ok(
+            PublicPluginResponse::MainResults(_)
+            | PublicPluginResponse::MainActionResults { .. }
+            | PublicPluginResponse::Window(_),
+        )
+        | Err(_) => {
             if !rollback_panel_submission(
                 &app,
                 &public,
@@ -3332,6 +3337,11 @@ pub(crate) async fn search_apps(
     let app = window.app_handle();
     let registries = app.state::<ResultRegistries>();
     let registry = registries.main();
+    let public_cleanup = app.state::<Arc<PublicPluginService>>();
+    let _result_action_cleanup = ResultActionCleanup {
+        service: public_cleanup.inner(),
+        registry,
+    };
     let normalized_query = query.trim().to_owned();
     if completion_origin.is_none() && !normalized_query.starts_with('/') {
         match resolve_currency_search(
@@ -3449,6 +3459,7 @@ pub(crate) async fn search_apps(
         else {
             return Ok(None);
         };
+        public.cleanup_retired_result_actions(registry);
         let theme = invocation_theme(app, settings.snapshot().theme);
         let invoked_at = invoked_at_rfc3339();
         let submission = public.schedule_command(
@@ -3484,6 +3495,30 @@ pub(crate) async fn search_apps(
             return Ok(None);
         };
         return match response.map_err(CommandError::from)? {
+            PublicPluginResponse::MainActionResults { route, results } => {
+                let copy = results.iter().any(|r| {
+                    r.actions
+                        .iter()
+                        .any(crate::public_plugins::result_action::PublicResultAction::is_copy)
+                });
+                let prepared = registry
+                    .prepare_result_actions(route.clone(), results)
+                    .ok_or_else(CommandError::plugin_query_failed)?;
+                let plugins = app.state::<Arc<PluginManager>>();
+                let published = plugins
+                    .with_public_result_admission(|| {
+                        public
+                            .manager()
+                            .map_err(|_| CommandError::plugin_query_failed())?
+                            .publish_result_actions(&route, copy, || {
+                                registry.publish_prepared_result_actions(registry_token, prepared)
+                            })
+                            .map_err(|_| CommandError::plugin_query_failed())
+                    })
+                    .ok_or_else(CommandError::plugin_query_failed)??;
+                public.cleanup_retired_result_actions(registry);
+                Ok(published)
+            }
             PublicPluginResponse::MainResults(results) => {
                 if route.output_mode != PublicOutputMode::MainResult {
                     return Err(CommandError::plugin_query_failed());
@@ -3757,6 +3792,7 @@ fn publish_public_main_results(
             });
             (
                 crate::model::ResultItem {
+                    result_actions: None,
                     result_id: String::new(),
                     activation: LauncherResultActivation::ExecuteResult,
                     title: result.title,
@@ -3942,6 +3978,7 @@ fn completion_result(
         argument.map_or_else(|| format!("{title} "), |value| format!("{title} {value}"));
     Some((
         crate::model::ResultItem {
+            result_actions: None,
             result_id: String::new(),
             activation: LauncherResultActivation::completion(completion_text)?,
             title,
@@ -3976,6 +4013,7 @@ fn find_result(
 ) -> (crate::model::ResultItem, Option<ResultAction>) {
     (
         crate::model::ResultItem {
+            result_actions: None,
             result_id: String::new(),
             activation: LauncherResultActivation::OpenFind { query },
             title: "/find".into(),
@@ -3998,6 +4036,7 @@ fn web_search_result(
 ) -> (crate::model::ResultItem, Option<ResultAction>) {
     (
         crate::model::ResultItem {
+            result_actions: None,
             result_id: String::new(),
             activation: LauncherResultActivation::ExecuteResult,
             title: crate::web_search::search_result_title(engine).into(),
@@ -4016,6 +4055,7 @@ fn web_search_result(
 fn quicklinks_result(favorite: bool) -> (crate::model::ResultItem, Option<ResultAction>) {
     (
         crate::model::ResultItem {
+            result_actions: None,
             result_id: String::new(),
             activation: LauncherResultActivation::OpenQuicklinks,
             title: "/quicklinks".into(),
@@ -4068,6 +4108,7 @@ fn quicklink_result(
     let Some(argument) = argument else {
         return (
             crate::model::ResultItem {
+                result_actions: None,
                 result_id: String::new(),
                 activation: LauncherResultActivation::completion(format!("{title} "))
                     .unwrap_or(LauncherResultActivation::ExecuteResult),
@@ -4086,6 +4127,7 @@ fn quicklink_result(
     match expand_template(&quicklink.template, argument) {
         Ok(url) => (
             crate::model::ResultItem {
+                result_actions: None,
                 result_id: String::new(),
                 activation: LauncherResultActivation::ExecuteResult,
                 title,
@@ -4104,6 +4146,7 @@ fn quicklink_result(
         ),
         Err(_) => (
             crate::model::ResultItem {
+                result_actions: None,
                 result_id: String::new(),
                 activation: LauncherResultActivation::ExecuteResult,
                 title,
@@ -4178,6 +4221,7 @@ fn public_plugin_completion_result(
     )?;
     Some((
         crate::model::ResultItem {
+            result_actions: None,
             result_id: String::new(),
             activation,
             title,
@@ -4285,6 +4329,7 @@ fn publish_quick_evaluation_result(
             };
             (
                 crate::model::ResultItem {
+                    result_actions: None,
                     result_id: String::new(),
                     activation: LauncherResultActivation::ExecuteResult,
                     title,
@@ -4310,6 +4355,7 @@ fn publish_quick_evaluation_result(
             };
             (
                 crate::model::ResultItem {
+                    result_actions: None,
                     result_id: String::new(),
                     activation: LauncherResultActivation::Informational,
                     title: failure.title,
@@ -5231,6 +5277,94 @@ fn save_settings_core(
         .map_err(|_| CommandError::settings_failed())
 }
 
+struct ResultActionCleanup<'a> {
+    service: &'a PublicPluginService,
+    registry: &'a ResultRegistry,
+}
+impl Drop for ResultActionCleanup<'_> {
+    fn drop(&mut self) {
+        self.service.cleanup_retired_result_actions(self.registry);
+    }
+}
+#[tauri::command]
+pub(crate) async fn execute_result_action(
+    window: WebviewWindow,
+    request: serde_json::Value,
+) -> Result<crate::public_plugins::result_action::ResultActionOutcome, CommandError> {
+    require_main_label(window.label())?;
+    use crate::public_plugins::result_action::{
+        ExecuteResultActionRequest, PublicResultAction, ResultActionErrorCode as E,
+        ResultActionOutcome as O,
+    };
+    let request: ExecuteResultActionRequest =
+        serde_json::from_value(request).map_err(|_| CommandError::unknown_result())?;
+    let app = window.app_handle().clone();
+    let registry = app.state::<ResultRegistries>().main().clone();
+    let public = Arc::clone(app.state::<Arc<PublicPluginService>>().inner());
+    public.cleanup_retired_result_actions(&registry);
+    let origin = match registry.resolve_result_action(&request) {
+        Ok(origin) => origin,
+        Err(code) => return Ok(O::failed(code, false)),
+    };
+    let legacy = Arc::clone(app.state::<Arc<PluginManager>>().inner());
+    if matches!(origin.action, PublicResultAction::CopyText { .. }) {
+        let result = legacy
+            .with_public_result_admission(|| {
+                public.manager().map(|m| {
+                    m.copy_result_action(&registry, &origin, |text| {
+                        app.clipboard().write_text(text.to_owned()).map_err(|_| ())
+                    })
+                })
+            })
+            .and_then(Result::ok)
+            .unwrap_or_else(|| O::failed(E::ActionUnavailable, false));
+        return Ok(result);
+    }
+    let (dispatch, receiver) =
+        match public.prepare_result_action(&app, legacy, registry.clone(), origin) {
+            Ok(prepared) => prepared,
+            Err(code) => {
+                return Ok(O::failed(
+                    code,
+                    matches!(code, E::ActionInProgress | E::ActionAlreadyExecuted),
+                ))
+            }
+        };
+    let theme = invocation_theme(&app, app.state::<SettingsStore>().snapshot().theme);
+    if public
+        .dispatch(&app, &dispatch, theme, invoked_at_rfc3339())
+        .is_err()
+    {
+        // Uncertain transport consumes ownership but never frees possibly executing JS.
+        if let Ok(manager) = public.manager() {
+            manager.retire_panel_action(&dispatch.context);
+        }
+        public.settle_result_action(&dispatch.context, E::ActionUnavailable);
+    }
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || receiver.recv())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| O::failed(E::ActionUnavailable, true)),
+    )
+}
+#[tauri::command]
+pub(crate) fn retire_result_actions(
+    window: WebviewWindow,
+    request: serde_json::Value,
+) -> Result<(), CommandError> {
+    require_main_label(window.label())?;
+    let request: crate::public_plugins::result_action::RetireResultActionsRequest =
+        serde_json::from_value(request).map_err(|_| CommandError::unknown_result())?;
+    let app = window.app_handle();
+    let registries = app.state::<ResultRegistries>();
+    registries.main().retire_result_actions(&request.request_id);
+    app.state::<Arc<PublicPluginService>>()
+        .cleanup_retired_result_actions(registries.main());
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn execute_result(
     window: WebviewWindow,
@@ -5671,7 +5805,12 @@ pub(crate) fn clear_and_hide_window(
                 })
                 .map_err(|_| ())
         },
-        || registry.hide_and_clear(),
+        || {
+            registry.hide_and_clear();
+            if let Some(public) = app.try_state::<Arc<PublicPluginService>>() {
+                public.cleanup_retired_result_actions(registry);
+            }
+        },
         || {
             window.hide().map_err(|error| {
                 eprintln!(
@@ -6204,6 +6343,7 @@ mod tests {
     #[test]
     fn public_plugin_prompt_and_dispatch_decisions_preserve_activation_modes() {
         let mut route = PublicPluginRoute {
+            result_publication: None,
             command_id: "default".into(),
             plugin_id: "com.example.demo".into(),
             generation: 1,
@@ -6281,6 +6421,7 @@ mod tests {
     #[test]
     fn favorite_completion_origin_preview_commit_and_rejection_matrix() {
         let mut route = PublicPluginRoute {
+            result_publication: None,
             command_id: "default".into(),
             plugin_id: "com.example.demo".into(),
             generation: 1,
@@ -7266,6 +7407,7 @@ mod tests {
             host_key_focus: crate::public_plugins::PanelHostKeyFocus::Content,
         };
         let mut route = PublicPluginRoute {
+            result_publication: None,
             command_id: "default".into(),
             plugin_id: identity.plugin_id.clone(),
             generation: identity.generation,

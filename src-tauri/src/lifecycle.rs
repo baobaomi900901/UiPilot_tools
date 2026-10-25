@@ -1376,7 +1376,13 @@ impl LifecycleCoordinator {
             );
             Ok(())
         };
-        let mut registry_on_show = |invocation_id| registry.on_show(invocation_id);
+        let mut registry_on_show = |invocation_id| {
+            registry.on_show(invocation_id);
+            if let Some(public) = app.try_state::<Arc<crate::public_plugins::PublicPluginService>>()
+            {
+                public.cleanup_retired_result_actions(&registry);
+            }
+        };
         let mut emit =
             |payload: &LauncherShown| window.emit("launcher://shown", payload).map_err(|_| ());
         let mut clear_window = || {

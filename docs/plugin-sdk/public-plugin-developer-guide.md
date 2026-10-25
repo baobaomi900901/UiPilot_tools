@@ -924,7 +924,7 @@ const hasToken = await api.settings.isSecretConfigured('token')
 
 ### 结果出现但不能复制
 
-Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果还必须包含唯一的 `copyText` 默认动作。
+Manifest 必须声明 `clipboard.write`，安装时用户必须授权。未声明 resultActions 的结果使用唯一的 `copyText` 默认动作；Host 0.10.0+ 的显式 opt-in 可使用下文的命名复制动作。
 
 ### 子窗口没有内容
 
@@ -950,7 +950,7 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权，结果�
 - 插件代码长期后台运行、插件自建计时器或任意后台回调；单轮窗口计时必须交给宿主的 `timer.control`，延迟纯文本消息交给 `notifications.schedule()`。
 - 浏览器/WebView 网络、原始套接字、任意文件、原生二进制和 Shell；外部访问仅限 Runtime 请求期内的 Host 托管 HTTPS。
 - 输入模拟或控制鼠标键盘。
-- 多动作结果（actions 数组）、onAction / 自定义动作回调、HTML/Markdown 结果。
+- HTML/Markdown 结果、未经声明的动作回调。
 - 插件间通信、远程资源、依赖安装、市场发布和自动更新。
 
 遇到未覆盖的需求时，不要通过 WebView 或 Tauri 私有对象绕过限制；应等待宿主公开相应版本化 API。
@@ -1034,3 +1034,38 @@ The optional readonly `request` getter supplies a new function before each sessi
 Each window permits one unresolved call and each plugin one physical Runtime handler. Busy rejects without queueing or retry. A new Host command cancels logical Window request ownership, then waits for the running physical handler to finish or its original 30-second deadline. Hide starts revocation immediately without waiting on the handler; hide failure does not revive ownership. Existing timer/storage leases and background timer completion keep their previous behavior. Disable, update, development reload, permission/settings/credential changes, faults and uninstall also revoke old contexts. Completion rechecks exact window identity and a single completion ticket before success. Already-admitted writes may finish; cancellation or failure is not proof that a save did not happen. Read current state before a deliberate retry.
 
 Fixed `Error.name` values are `InvalidWindowRequestError`, `WindowRequestBusyError`, `ExpiredWindowSessionError`, `WindowRequestCancelledError`, `WindowRequestTimeoutError`, `InvalidWindowResponseError`, `WindowRequestFailedError`, `WindowRequestUnavailableError`. Business validation belongs in normal data such as `{ok:false, code:"revision-conflict"}`. Handler/native exception text and plugin stacks are hidden. There is no streaming, AbortSignal, automatic retry, arbitrary invoke or content networking capability. The private bridge is restricted to the actual plugin-window content WebView; main, shell, panel, runtime and find surfaces have no grant.
+
+
+## Main-result actions (Windows Host 0.10.0+)
+
+Declare `runtime.resultActions: true`, `minimumHostVersion: "0.10.0"` or later, exactly `["windows"]`, and only `mainResult` commands. Both `command` and `commands` support this opt-in. Absent/false preserves historical copy/hide behavior; null, unknown Runtime fields and incompatible declarations reject. Export callable `onCommand` and `onAction` even for a copy-only package. CLI validates statically and never evaluates JavaScript. API/schema v1, state schema 2 and historical feature minima remain unchanged.
+
+Return `{requestId, results}`. An opted-in result is `{id, title, subtitle?, detail?, actions, defaultActionId?}`. `actions` has 0–8 entries: `{id,title,type:"copyText",text}` or `{id,title,type:"runtime",payload}`. Empty actions means informational. Omit `defaultActionId` to require menu selection; present values must identify one action. Null is invalid. `actions` cannot coexist with `defaultAction`, including null. Legacy rows may be mixed in an opted-in response; their copy action follows the same snapshot consumption policy. Undeclared packages keep the legacy parser.
+
+Action IDs match `^[a-z][a-z0-9-]{0,31}$` and are unique per row. Business IDs such as `constructor` are valid string values. Action titles contain 1–80 Unicode scalars, at least one non-whitespace scalar, and no C0/C1 controls. Result IDs are unique across the complete response, nonempty, at most 128 UTF-8 bytes, and free of C0/C1 controls. Row title/subtitle/detail retain their current limits (256 scalars/512 scalars/16 KiB). Copy text allows empty strings, at most 16 KiB UTF-8, no NUL; publication and copying both require current declared/granted `clipboard.write`. Runtime payload is required and may be null. Storage adds no permission.
+
+The exact-key response has at most 20 rows, 64 KiB compact UTF-8, depth 32 and 4096 total values (root depth zero and root counted). Only finite JSON primitives, dense arrays and plain data records are supported. Cycles, accessors, symbols, undefined/functions/BigInt, nonplain objects and record keys `__proto__`, `prototype`, `constructor` reject without invoking getters or toJSON. Unknown fields, malformed variants/defaults, duplicates or overflow reject the whole response; no truncation or stringification fallback. Host independently validates after IPC conversion; duplicate raw JSON keys cannot be recovered at that stage.
+
+`onAction(invocation, api)` receives exactly `apiVersion:1`, a fresh scheduler `requestId`, saved normalized `commandId` (including `default` for legacy command), business `resultId`/`actionId`, immutable saved `payload` and original `input`, and `context:{platform:"windows",theme,invokedAt}` sampled at dispatch. Invocation and API are fresh and deeply frozen. Retained APIs from completed commands are expired. Return only a bounded `{requestId,results}` matching the new ID. Success replaces the complete source snapshot, including an empty result list, with fresh Host handles; there is no patch, retained-old mode, command retargeting, hide/open request or content `data` reply.
+
+One source snapshot permits one admitted copy or Runtime action across all rows. Busy/pre-admission denial leaves it available; accepted success, failure, cancellation and uncertain transport consume it. Duplicate pending execution reports in-progress; replay reports already-executed. This is not durable exactly-once delivery. A fresh ordinary command or Host restart is new intent, so plugins own domain idempotency. Never automatically retry mutations. After an uncertain save, read current data before deliberate retry.
+
+Runtime actions share the plugin's existing physical handler slot and 30-second deadline. They do not queue or interrupt JavaScript. A newer command retires old API authority and waits for the old handler's physical completion or deadline. Input edits, query/view replacement, hide/show and lifecycle/settings/permission changes revoke the source lease and block late publication and new API effects. Already-admitted effects may finish. Handler completion expires its API before parsing and uses one terminal ticket; malformed replies and handler throws have distinct fixed failures. Transport loss is settled once and the original autonomous deadline remains armed.
+
+The main launcher exposes footer **动作 Ctrl+K**, right-click and a keyboard menu. Enter runs the explicit default, or opens the menu when there is no default. New copy actions keep the launcher open, show **已复制**, and disable the consumed source's actions. Admitted failure shows **操作未完成，请重新读取核对后再运行**. Stale source shows **结果已过期，请重新运行**. **重新运行** explicitly submits the ordinary command; it is never an automatic action retry. Selection, scrolling and theme changes alone do not cancel a source. Public result rows remain non-favoritable.
+
+```js
+export async function onCommand(invocation) {
+  return { requestId: invocation.requestId, results: [{ id: 'text', title: invocation.input,
+    actions: [{ id: 'copy', title: '复制', type: 'copyText', text: invocation.input },
+      { id: 'save', title: '保存', type: 'runtime', payload: { text: invocation.input } }], defaultActionId: 'copy' }] }
+}
+export async function onAction(invocation, api) {
+  if (invocation.commandId !== 'default' || invocation.resultId !== 'text' || invocation.actionId !== 'save') throw new Error('invalid action')
+  // Validate domain payload and stored schema/revision before writing; never retry an uncertain write.
+  await api.storage.set('latest', invocation.payload)
+  return { requestId: invocation.requestId, results: [{ id: 'saved', title: '已保存', actions: [] }] }
+}
+```
+
+Use **选择开发目录** with the `package` directory, or **选择插件包** with a produced `.uipilot-plugin` file. The project root is not an installable directory. Validate both forms with the fresh CLI target before manual installation.

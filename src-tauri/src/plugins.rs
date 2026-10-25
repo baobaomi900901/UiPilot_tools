@@ -251,6 +251,14 @@ impl PluginManager {
         }
     }
 
+    pub(crate) fn with_public_result_admission<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _admission = self.admission.read().ok()?;
+        Some(operation())
+    }
+
     /// Invalidate shared plugin results after public management has released its locks.
     pub(crate) fn invalidate_plugin_results(&self, registry: &ResultRegistry) {
         // Legacy durable publication owns admission across reserve -> commit/cancel.
@@ -1656,6 +1664,7 @@ impl PluginManager {
             };
             items.push((
                 ResultItem {
+                    result_actions: None,
                     result_id: String::new(),
                     activation: LauncherResultActivation::ExecuteResult,
                     title: item.title,
@@ -7715,6 +7724,7 @@ mod tests {
                     &route,
                     vec![(
                         ResultItem {
+                            result_actions: None,
                             result_id: String::new(),
                             activation: crate::model::LauncherResultActivation::ExecuteResult,
                             title: "late".into(),
@@ -7800,6 +7810,7 @@ mod tests {
                     &route,
                     vec![(
                         ResultItem {
+                            result_actions: None,
                             result_id: String::new(),
                             activation: crate::model::LauncherResultActivation::ExecuteResult,
                             title: "2".into(),
