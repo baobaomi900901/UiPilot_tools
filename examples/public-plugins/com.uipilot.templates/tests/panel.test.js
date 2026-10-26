@@ -170,3 +170,16 @@ test('sync check returns nonzero on drift without repairing the copy', async (t)
   assert.equal(await readFile(join(target, 'ui.js'), 'utf8'), 'drift')
   assert.equal(await readFile(join(target, 'ui.css'), 'utf8'), 'drift')
 })
+
+test('replacement session abandons old disabled-row focus ownership', async (t) => {
+  const pending = deferred()
+  const app = await setup(t, () => pending.promise)
+  app.document.hasFocus = () => true
+  app.host('ArrowDown')
+  app.document.activeElement.click()
+  app.document.body.tabIndex = -1
+  app.document.body.focus()
+  app.update({ sessionEpoch: '2', requestId: 'r2' })
+  assert.equal(app.document.activeElement, app.document.body)
+  assert.equal(app.node('editor').hidden, true)
+})

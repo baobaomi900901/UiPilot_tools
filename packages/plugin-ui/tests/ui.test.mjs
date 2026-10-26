@@ -110,3 +110,67 @@ test('detail preserves input and focus while busy; actions and dispose stay inst
   assert.deepEqual(calls, [2, 1, 2])
   two.dispose()
 })
+
+function disabledFocusFixture(t, createList) {
+  const { document, window } = setup(t)
+  let documentFocused = true
+  // JSDOM keeps disabled buttons focused. Emulate native focus fixup explicitly,
+  // and expose whether this WebView owns focus independently from activeElement.
+  document.hasFocus = () => documentFocused
+  const container = document.querySelector('#a')
+  const list = createList(container, { onActivate() {} })
+  list.update({ items })
+  list.move(1)
+  const row = document.activeElement
+  list.update({ items, disabled: true })
+  document.body.tabIndex = -1
+  document.body.focus()
+  assert.equal(document.activeElement, document.body)
+  return { document, window, list, row, setDocumentFocus: (value) => { documentFocused = value } }
+}
+test('temporarily disabled row regains focus after native body fixup and accepts arrows', async (t) => {
+  const { createList } = await components()
+  const { document, window, list, row } = disabledFocusFixture(t, createList)
+  list.update({ items, disabled: true })
+  list.update({ items, disabled: false })
+  assert.equal(document.activeElement, row)
+  row.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+  assert.equal(document.activeElement.textContent, 'b')
+})
+test('reenabling a list never steals focus from editor or another list', async (t) => {
+  const { createList } = await components()
+  const { document, list } = disabledFocusFixture(t, createList)
+  const input = document.querySelector('input')
+  input.focus()
+  list.update({ items, disabled: false })
+  assert.equal(document.activeElement, input)
+  list.move(1)
+  list.update({ items, disabled: true })
+  const second = createList(document.querySelector('#b'), { onActivate() {} })
+  second.update({ items }); second.move(1)
+  const otherRow = document.activeElement
+  list.update({ items, disabled: false })
+  assert.equal(document.activeElement, otherRow)
+})
+test('reenabling after WebView loses focus cannot reclaim Host input focus or defer a reclaim', async (t) => {
+  const { createList } = await components()
+  const { document, list, setDocumentFocus } = disabledFocusFixture(t, createList)
+  setDocumentFocus(false)
+  list.update({ items, disabled: false })
+  assert.equal(document.activeElement, document.body)
+  setDocumentFocus(true)
+  list.update({ items })
+  assert.equal(document.activeElement, document.body)
+})
+test('removed rows and disposed instances abandon pending disabled focus', async (t) => {
+  const { createList } = await components()
+  const { document, list } = disabledFocusFixture(t, createList)
+  list.update({ items: items.slice(1), disabled: true })
+  list.update({ items, disabled: false })
+  assert.equal(document.activeElement, document.body)
+  list.move(1); list.update({ items, disabled: true })
+  document.body.focus()
+  list.dispose()
+  list.update({ items, disabled: false })
+  assert.equal(document.activeElement, document.body)
+})

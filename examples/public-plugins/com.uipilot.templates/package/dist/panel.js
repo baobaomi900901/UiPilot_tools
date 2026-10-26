@@ -257,6 +257,7 @@ panel.onHostKey((event) => {
 panel.onUpdate((update) => {
   document.documentElement.dataset.theme = update.theme
   if (session !== update.sessionEpoch) {
+    list.update({ items: [], disabled: true })
     session = update.sessionEpoch
     draft = null
     recovery = null
