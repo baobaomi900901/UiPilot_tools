@@ -141,7 +141,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 这是字段片段；完整离线包见 [demo-multi](../../examples/public-plugins/com.uipilot.demo-multi/README.md)。数组限 1–16 项，每项必填唯一 id，匹配 `^[a-z][a-z0-9-]{0,31}$`；defaultName 也须包内唯一。合法 ID 包含 constructor，勿用继承属性进行分派。每项只支持 mainResult，不能声明 window/panel 及 ui.window、ui.panel、timer.control、clipboard.history.* 权限。任一项无效则整包拒绝，不能忽略或退回第一项。
 
-Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.8.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
+Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.12.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
 
 ### 分支 B：子窗口型 Manifest
 
@@ -1069,3 +1069,18 @@ export async function onAction(invocation, api) {
 ```
 
 Use **选择开发目录** with the `package` directory, or **选择插件包** with a produced `.uipilot-plugin` file. The project root is not an installable directory. Validate both forms with the fresh CLI target before manual installation.
+
+## Host 0.12.0：显式打开浏览器链接
+
+Windows 主结果插件可声明 `url.open`，同时使用 `minimumHostVersion: "0.12.0"`、`supportedPlatforms: ["windows"]`、`runtime.resultActions: true` 和 `mainResult` 命令。安装或更新必须确认完整权限；取消新增授权会保留旧插件和数据。即使只返回静态动作，也要导出 `onAction`。
+
+```js
+// 添加到 actions；默认仍设为 copy，只有用户选择 open 时才打开。
+{ id: 'open', title: '在浏览器打开', type: 'openUrl', url: 'https://example.com/Case' }
+```
+
+Host 在发布和执行前严格校验：原文与规范化 URL 各限 4096 UTF-8 字节，必须显式以 HTTP(S):// 开始且紧接非空 authority，不允许凭据或 authority 中的 @、字面空白、C0/C1/DEL 控制字符及反斜杠。不会 trim 或修复非法输入；转义后的空白和控制字节仍可作为 URL 数据。Unicode 域名、正常转义、查询和片段受支持。具体规则见 [URL 动作合同](./public-plugin-v1.md#browser-url-result-actions-windows-host-0120)。
+
+URL 只保存在 Host 私有快照，界面只接收动作标题与不透明句柄。整个快照使用的复制/URL 权限均须声明并授权；任何一项动作获准后，无论打开成功还是失败，所有兄弟动作都会消耗。成功显示“已请求打开链接”，表示 Windows 已接受请求；失败请显式重新运行，绝不自动重试。没有 Runtime 直接打开 API，也不会因为查询或返回结果而自动打开。浏览器自己的重定向、登录和网络策略由浏览器负责，`network.https` 不授权此动作。
+
+参考 [文本片段 1.1](../../examples/public-plugins/com.uipilot.text-snippet/README.md)：只给合法 URL 的原文和最新片段加“在浏览器打开”，大写行保留复制/保存。先确认新权限，再输入 `https://example.com`，用 Ctrl+K 选择打开并核对一次浏览器请求；普通文本仍按原流程复制、保存和读取。

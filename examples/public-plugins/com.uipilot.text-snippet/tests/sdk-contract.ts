@@ -3,7 +3,8 @@ import type { MainResultResponse, PluginActionHandler, PluginActionResult, Plugi
 const copy: PluginResultAction = { id: 'copy', title: '复制', type: 'copyText', text: '' }
 const save: PluginResultAction = { id: 'save', title: '保存为最新片段', type: 'runtime', payload: { text: '', expectedRevision: 0 } }
 const read: PluginResultAction = { id: 'read', title: '重新读取', type: 'runtime', payload: null }
-const row: PluginActionResult = { id: 'text', title: '原文', actions: [copy, save, read], defaultActionId: 'copy' }
+const open: PluginResultAction = { id: 'open', title: '在浏览器打开', type: 'openUrl', url: 'https://example.com' }
+const row: PluginActionResult = { id: 'text', title: '原文', actions: [copy, save, read, open], defaultActionId: 'copy' }
 const onCommand: PluginHandler = async invocation => ({ requestId: invocation.requestId, results: [row] })
 const onAction: PluginActionHandler = async (invocation, api) => {
   const commandId: string = invocation.commandId

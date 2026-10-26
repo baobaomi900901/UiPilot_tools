@@ -3568,6 +3568,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const outcome = parseResultActionOutcome(value)
       if (!outcome) { failResultAction(owner, actionUncertain, true); return }
       if (outcome.kind === 'copied') { failResultAction(owner, '已复制', true); return }
+      if (outcome.kind === 'urlOpened') { failResultAction(owner, '已请求打开链接', true); return }
       if (outcome.kind === 'failed') {
         const stale = outcome.code === 'staleRequest' || outcome.code === 'unknownResult'
         const status = stale ? '结果已过期，请重新运行'

@@ -3732,11 +3732,8 @@ pub(crate) async fn search_apps(
         };
         return match response.map_err(CommandError::from)? {
             PublicPluginResponse::MainActionResults { route, results } => {
-                let copy = results.iter().any(|r| {
-                    r.actions
-                        .iter()
-                        .any(crate::public_plugins::result_action::PublicResultAction::is_copy)
-                });
+                let requirements =
+                    crate::public_plugins::result_action::ResultActionRequirements::rows(&results);
                 let prepared = registry
                     .prepare_result_actions(route.clone(), results)
                     .ok_or_else(CommandError::plugin_query_failed)?;
@@ -3746,7 +3743,7 @@ pub(crate) async fn search_apps(
                         public
                             .manager()
                             .map_err(|_| CommandError::plugin_query_failed())?
-                            .publish_result_actions(&route, copy, || {
+                            .publish_result_actions(&route, requirements, || {
                                 registry.publish_prepared_result_actions(registry_token, prepared)
                             })
                             .map_err(|_| CommandError::plugin_query_failed())
@@ -5550,13 +5547,19 @@ pub(crate) async fn execute_result_action(
         Err(code) => return Ok(O::failed(code, false)),
     };
     let legacy = Arc::clone(app.state::<Arc<PluginManager>>().inner());
-    if matches!(origin.action, PublicResultAction::CopyText { .. }) {
+    if matches!(
+        origin.action,
+        PublicResultAction::CopyText { .. } | PublicResultAction::OpenUrl { .. }
+    ) {
         let result = legacy
             .with_public_result_admission(|| {
-                public.manager().map(|m| {
-                    m.copy_result_action(&registry, &origin, |text| {
+                public.manager().map(|m| match &origin.action {
+                    PublicResultAction::OpenUrl { .. } => {
+                        m.open_url_result_action(&registry, &origin, crate::browser_open::open_url)
+                    }
+                    _ => m.copy_result_action(&registry, &origin, |text| {
                         app.clipboard().write_text(text.to_owned()).map_err(|_| ())
-                    })
+                    }),
                 })
             })
             .and_then(Result::ok)

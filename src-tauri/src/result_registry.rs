@@ -749,10 +749,12 @@ impl ResultRegistry {
             query_sequence: state.latest_query_sequence,
             lease: snapshot.lease.clone(),
             business_result_id: business_result_id.clone(),
-            requires_copy_grant: snapshot
-                .rows
-                .values()
-                .any(|(_, actions)| actions.values().any(PublicResultAction::is_copy)),
+            requirements: ResultActionRequirements::actions(
+                snapshot
+                    .rows
+                    .values()
+                    .flat_map(|(_, actions)| actions.values()),
+            ),
             action,
         })
     }

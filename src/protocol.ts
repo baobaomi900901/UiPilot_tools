@@ -68,9 +68,10 @@ export interface ResultActionMetadata {
 export type ResultActionErrorCode =
   | 'actionBusy' | 'actionInProgress' | 'actionAlreadyExecuted' | 'actionFailed'
   | 'actionInvalidResponse' | 'actionTimedOut' | 'actionUnavailable' | 'actionCancelled'
-  | 'staleRequest' | 'unknownResult' | 'pluginPermissionDenied' | 'clipboardWriteFailed'
+  | 'staleRequest' | 'unknownResult' | 'pluginPermissionDenied' | 'clipboardWriteFailed' | 'urlOpenFailed'
 export type ResultActionOutcome =
   | { kind: 'copied' }
+  | { kind: 'urlOpened' }
   | { kind: 'resultsUpdated'; response: SearchResponse }
   | { kind: 'failed'; code: ResultActionErrorCode; sourceConsumed: boolean }
 export interface SearchResponse {
@@ -200,6 +201,7 @@ export type PublicPermission =
   | 'ui.window'
   | 'ui.panel'
   | 'clipboard.write'
+  | 'url.open'
   | 'clipboard.read'
   | 'clipboard.history.read'
   | 'clipboard.history.paste'
@@ -780,7 +782,7 @@ function exactDenseArray(value: unknown[]): boolean {
 const resultActionErrors = new Set<ResultActionErrorCode>([
   'actionBusy', 'actionInProgress', 'actionAlreadyExecuted', 'actionFailed',
   'actionInvalidResponse', 'actionTimedOut', 'actionUnavailable', 'actionCancelled',
-  'staleRequest', 'unknownResult', 'pluginPermissionDenied', 'clipboardWriteFailed',
+  'staleRequest', 'unknownResult', 'pluginPermissionDenied', 'clipboardWriteFailed', 'urlOpenFailed',
 ])
 
 function opaqueResultHandle(value: unknown): value is string {
@@ -813,7 +815,7 @@ export function parseResultActionMetadata(value: unknown): ResultActionMetadata 
 export function parseResultActionOutcome(value: unknown): ResultActionOutcome | null {
   const outcome = plainRecord(value)
   if (!outcome) return null
-  if (outcome.kind === 'copied') return exactKeys(outcome, ['kind']) ? { kind: 'copied' } : null
+  if (outcome.kind === 'copied' || outcome.kind === 'urlOpened') return exactKeys(outcome, ['kind']) ? { kind: outcome.kind } : null
   if (outcome.kind === 'failed') {
     return exactKeys(outcome, ['code', 'kind', 'sourceConsumed']) &&
       resultActionErrors.has(outcome.code as ResultActionErrorCode) && typeof outcome.sourceConsumed === 'boolean'
@@ -945,7 +947,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 }
 
 const publicPermissions = new Set<PublicPermission>([
-  'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
+  'ui.window', 'ui.panel', 'clipboard.write', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])

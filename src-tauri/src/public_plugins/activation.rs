@@ -3785,8 +3785,11 @@ impl PublicPluginManager {
         }
         // Same-generation work may never acquire post-mutation authority.
         if context.plugin_generation == saved.generation {
-            self.checked_result_owner(saved, false)
-                .map_err(|_| invalid())?;
+            self.checked_result_owner(
+                saved,
+                super::result_action::ResultActionRequirements::default(),
+            )
+            .map_err(|_| invalid())?;
         }
         let token = self
             .scheduler
@@ -3825,7 +3828,7 @@ impl PublicPluginManager {
     fn checked_result_owner(
         &self,
         route: &PublicPluginRoute,
-        copy: bool,
+        requirements: super::result_action::ResultActionRequirements,
     ) -> Result<(), super::result_action::ResultActionErrorCode> {
         use super::result_action::ResultActionErrorCode as E;
         let bundle = self
@@ -3855,11 +3858,17 @@ impl PublicPluginManager {
         {
             return Err(E::StaleRequest);
         }
-        if copy
+        if requirements.copy
             && (!c
                 .permission_grants
                 .contains(&PublicPermission::ClipboardWrite)
                 || !m.permissions.contains(&PublicPermission::ClipboardWrite))
+        {
+            return Err(E::PluginPermissionDenied);
+        }
+        if requirements.url
+            && (!c.permission_grants.contains(&PublicPermission::UrlOpen)
+                || !m.permissions.contains(&PublicPermission::UrlOpen))
         {
             return Err(E::PluginPermissionDenied);
         }
@@ -3871,12 +3880,12 @@ impl PublicPluginManager {
     pub(crate) fn publish_result_actions<T>(
         &self,
         route: &PublicPluginRoute,
-        copy: bool,
+        requirements: super::result_action::ResultActionRequirements,
         publish: impl FnOnce() -> T,
     ) -> Result<T, super::result_action::ResultActionErrorCode> {
         use super::result_action::ResultActionErrorCode as E;
         let _mutation = self.lock_mutation().map_err(|_| E::ActionUnavailable)?;
-        self.checked_result_owner(route, copy)?;
+        self.checked_result_owner(route, requirements)?;
         self.scheduler.with_result_publication(
             &route.plugin_id,
             route.result_publication.as_ref().ok_or(E::StaleRequest)?,
@@ -3894,7 +3903,7 @@ impl PublicPluginManager {
             let _mutation = self
                 .lock_mutation()
                 .map_err(|_| ResultActionErrorCode::ActionUnavailable)?;
-            self.checked_result_owner(&origin.route, true)?;
+            self.checked_result_owner(&origin.route, origin.requirements)?;
             let PublicResultAction::CopyText { text, .. } = &origin.action else {
                 return Err(ResultActionErrorCode::UnknownResult);
             };
@@ -3919,6 +3928,47 @@ impl PublicPluginManager {
                 ),
             ),
             Ok(Ok(())) => ResultActionOutcome::Copied,
+            Ok(Err(code)) => ResultActionOutcome::failed(code, true),
+        }
+    }
+    pub(crate) fn open_url_result_action(
+        &self,
+        registry: &crate::result_registry::ResultRegistry,
+        origin: &super::result_action::ResultActionOrigin,
+        open: impl FnOnce(url::Url) -> Result<(), ()>,
+    ) -> super::result_action::ResultActionOutcome {
+        use super::result_action::*;
+        let admitted = (|| {
+            let _mutation = self
+                .lock_mutation()
+                .map_err(|_| ResultActionErrorCode::ActionUnavailable)?;
+            self.checked_result_owner(&origin.route, origin.requirements)?;
+            let PublicResultAction::OpenUrl { url, .. } = &origin.action else {
+                return Err(ResultActionErrorCode::UnknownResult);
+            };
+            let url =
+                validate_open_url(url).map_err(|_| ResultActionErrorCode::ActionInvalidResponse)?;
+            self.scheduler.with_result_publication(
+                &origin.route.plugin_id,
+                origin
+                    .route
+                    .result_publication
+                    .as_ref()
+                    .ok_or(ResultActionErrorCode::StaleRequest)?,
+                || registry.claim_result_action(origin, None),
+            )??;
+            Ok(open(url).map_err(|_| ResultActionErrorCode::UrlOpenFailed))
+        })();
+        match admitted {
+            Err(code) => ResultActionOutcome::failed(
+                code,
+                matches!(
+                    code,
+                    ResultActionErrorCode::ActionAlreadyExecuted
+                        | ResultActionErrorCode::ActionInProgress
+                ),
+            ),
+            Ok(Ok(())) => ResultActionOutcome::UrlOpened,
             Ok(Err(code)) => ResultActionOutcome::failed(code, true),
         }
     }
@@ -3957,7 +4007,7 @@ impl PublicPluginManager {
     ) -> Result<ScheduledPluginRequest, super::result_action::ResultActionErrorCode> {
         use super::result_action::ResultActionErrorCode as E;
         let _mutation = self.lock_mutation().map_err(|_| E::ActionUnavailable)?;
-        self.checked_result_owner(&origin.route, origin.requires_copy_grant)?;
+        self.checked_result_owner(&origin.route, origin.requirements)?;
         let _transition = self
             .network_authority
             .begin_transition()
@@ -3973,11 +4023,11 @@ impl PublicPluginManager {
         origin: &super::result_action::ResultActionOrigin,
         context: &PluginRequestContext,
         prepared: crate::result_registry::PreparedResultActionSet,
-        copy: bool,
+        requirements: super::result_action::ResultActionRequirements,
     ) -> Result<crate::model::SearchResponse, super::result_action::ResultActionErrorCode> {
         use super::result_action::ResultActionErrorCode as E;
         let _mutation = self.lock_mutation().map_err(|_| E::ActionUnavailable)?;
-        self.checked_result_owner(&origin.route, copy)?;
+        self.checked_result_owner(&origin.route, requirements)?;
         let _transition = self
             .network_authority
             .begin_transition()
@@ -12468,7 +12518,7 @@ mod tests {
             .prepare_result_actions(route.clone(), rows)
             .unwrap();
         let response = manager
-            .publish_result_actions(&route, copy, || {
+            .publish_result_actions(&route, copy.into(), || {
                 registry.publish_prepared_result_actions(token, prepared)
             })
             .unwrap()
@@ -12490,6 +12540,419 @@ mod tests {
         value["runtime"]["resultActions"] = json!(true);
         value["minimumHostVersion"] = json!("0.10.0");
         fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    fn url_result_rows() -> Vec<super::super::result_action::PublicActionResult> {
+        use super::super::result_action::*;
+        vec![PublicActionResult {
+            id: "url".into(),
+            title: "Link".into(),
+            subtitle: None,
+            detail: None,
+            actions: vec![
+                PublicResultAction::OpenUrl {
+                    id: "open".into(),
+                    title: "Open".into(),
+                    url: "https://example.com/Case?private=1".into(),
+                },
+                PublicResultAction::CopyText {
+                    id: "copy".into(),
+                    title: "Copy".into(),
+                    text: "private-copy".into(),
+                },
+                PublicResultAction::Runtime {
+                    id: "save".into(),
+                    title: "Save".into(),
+                    payload: Value::Null,
+                },
+            ],
+            default_action_id: Some("copy".into()),
+        }]
+    }
+    fn install_url_result_package(manager: &PublicPluginManager, path: &Path) {
+        write_multi_package(path, "1.1.0", "lower", false);
+        opt_in_result_package(path);
+        let file = path.join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        value["minimumHostVersion"] = json!("0.12.0");
+        value["permissions"] = json!(["clipboard.write", "url.open"]);
+        fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(path), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::ClipboardWrite, PublicPermission::UrlOpen]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+    }
+    // This publishes through the real registry, optionally bypassing owner validation
+    // so denial tests can present an otherwise valid private source to admission.
+    fn url_result_source(
+        manager: &PublicPluginManager,
+        checked: bool,
+    ) -> (
+        crate::result_registry::ResultRegistry,
+        Vec<super::super::result_action::ResultActionOrigin>,
+    ) {
+        use super::super::result_action::*;
+        let registry = crate::result_registry::ResultRegistry::default();
+        registry.on_show("url-action".into());
+        let token = registry
+            .begin_query(crate::result_registry::QueryDomain::Plugin, "url-action", 1)
+            .unwrap();
+        let route = manager.route("/upper").unwrap().unwrap();
+        let rows = url_result_rows();
+        let requirements = ResultActionRequirements::rows(&rows);
+        let prepared = registry
+            .prepare_result_actions(route.clone(), rows)
+            .unwrap();
+        let publish = || registry.publish_prepared_result_actions(token, prepared);
+        let response = if checked {
+            manager
+                .publish_result_actions(&route, requirements, publish)
+                .unwrap()
+        } else {
+            publish()
+        }
+        .unwrap();
+        let wire = serde_json::to_string(&response).unwrap();
+        for private in ["example.com", "private=1", "openUrl", "private-copy"] {
+            assert!(!wire.contains(private));
+        }
+        let row = &response.items[0];
+        let origins = row
+            .result_actions
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .map(|action| {
+                registry
+                    .resolve_result_action(&ExecuteResultActionRequest {
+                        request_id: response.request_id.clone(),
+                        result_id: row.result_id.clone(),
+                        action_id: action.action_id.clone(),
+                    })
+                    .unwrap()
+            })
+            .collect();
+        (registry, origins)
+    }
+    fn revoke_result_grant(manager: &PublicPluginManager, permission: PublicPermission) {
+        let bundle = manager
+            .bundles
+            .confirmed_bundle("com.example.activation")
+            .unwrap()
+            .unwrap();
+        let mut config = bundle.config.clone();
+        config.permission_grants.remove(&permission);
+        let reservation = manager.bundles.reserve("com.example.activation").unwrap();
+        reservation.begin_committing().unwrap();
+        reservation.mark_durable().unwrap();
+        reservation
+            .publish(Some(bundle.with_config(config)))
+            .unwrap();
+    }
+    #[test]
+    fn result_action_url_opens_once_and_failure_consumes_every_sibling() {
+        use super::super::result_action::*;
+        for fail in [false, true] {
+            let dir = TestDir::new("url-single-claim");
+            let manager = manager(&dir);
+            install_url_result_package(&manager, &dir.source());
+            let (registry, origins) = url_result_source(&manager, true);
+            assert_eq!(
+                origins[0].requirements,
+                ResultActionRequirements {
+                    copy: true,
+                    url: true
+                }
+            );
+            let mut calls = 0;
+            let outcome = manager.open_url_result_action(&registry, &origins[0], |url| {
+                calls += 1;
+                assert_eq!(url.as_str(), "https://example.com/Case?private=1");
+                assert!(manager.mutation.try_lock().is_err());
+                // The registry and scheduler locks are released before external effect.
+                assert!(registry
+                    .resolve_result_action(&ExecuteResultActionRequest {
+                        request_id: origins[0].ticket.request_id().into(),
+                        result_id: "absent".into(),
+                        action_id: "absent".into()
+                    })
+                    .is_err());
+                assert!(manager.scheduler.result_publication_current(
+                    &origins[0].route.plugin_id,
+                    origins[0].route.result_publication.as_ref().unwrap()
+                ));
+                if fail {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls, 1);
+            if fail {
+                assert!(matches!(
+                    outcome,
+                    ResultActionOutcome::Failed {
+                        code: ResultActionErrorCode::UrlOpenFailed,
+                        source_consumed: true
+                    }
+                ));
+            } else {
+                assert!(matches!(outcome, ResultActionOutcome::UrlOpened));
+            }
+            assert!(matches!(
+                manager.open_url_result_action(&registry, &origins[0], |_| panic!("URL replay")),
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::ActionAlreadyExecuted,
+                    source_consumed: true
+                }
+            ));
+            assert!(matches!(
+                manager.copy_result_action(&registry, &origins[1], |_| panic!("copy sibling")),
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::ActionAlreadyExecuted,
+                    source_consumed: true
+                }
+            ));
+            let reserved = manager.reserve_result_action(&origins[2]).unwrap();
+            assert!(manager
+                .admit_result_action(&registry, &origins[2], reserved, Instant::now())
+                .is_err());
+        }
+    }
+    #[test]
+    fn result_action_url_denied_stale_disabled_and_invalid_sources_have_zero_effects() {
+        use super::super::result_action::*;
+        for case in 0..8 {
+            let dir = TestDir::new("url-denials");
+            let manager = manager(&dir);
+            if case == 0 {
+                write_multi_package(&dir.source(), "1.0.0", "lower", false);
+                opt_in_result_package(&dir.source());
+                install_multi(&manager, &dir.source());
+            } else {
+                install_url_result_package(&manager, &dir.source());
+            }
+            let (registry, mut origins) = url_result_source(&manager, case != 0);
+            match case {
+                0 => {} // undeclared
+                1 => revoke_result_grant(&manager, PublicPermission::UrlOpen),
+                2 => revoke_result_grant(&manager, PublicPermission::ClipboardWrite),
+                3 => {
+                    manager
+                        .set_enabled_with_readiness("com.example.activation", false, |_| true)
+                        .unwrap();
+                }
+                4 => {
+                    origins[0].route.generation += 1;
+                }
+                5 => {
+                    registry
+                        .begin_query(crate::result_registry::QueryDomain::Plugin, "url-action", 2)
+                        .unwrap();
+                }
+                6 => registry.hide_and_clear(),
+                _ => {
+                    let PublicResultAction::OpenUrl { url, .. } = &mut origins[0].action else {
+                        panic!()
+                    };
+                    *url = "https://@example.com".into();
+                }
+            }
+            assert!(
+                matches!(
+                    manager.open_url_result_action(&registry, &origins[0], |_| panic!(
+                        "denied URL effect"
+                    )),
+                    ResultActionOutcome::Failed {
+                        source_consumed: false,
+                        ..
+                    }
+                ),
+                "case {case}"
+            );
+            if case <= 2 {
+                assert!(manager
+                    .publish_result_actions(&origins[0].route, origins[0].requirements, || panic!(
+                        "ungranted publication"
+                    ))
+                    .is_err());
+                assert!(matches!(
+                    manager.copy_result_action(&registry, &origins[1], |_| panic!(
+                        "mixed snapshot copy"
+                    )),
+                    ResultActionOutcome::Failed {
+                        code: ResultActionErrorCode::PluginPermissionDenied,
+                        source_consumed: false
+                    }
+                ));
+                let reserved = manager.reserve_result_action(&origins[2]).unwrap();
+                assert!(matches!(
+                    manager.admit_result_action(&registry, &origins[2], reserved, Instant::now()),
+                    Err(ResultActionErrorCode::PluginPermissionDenied)
+                ));
+            }
+        }
+    }
+    #[test]
+    fn result_action_url_admitted_effect_can_retire_source_without_holding_registry_lock() {
+        use super::super::result_action::*;
+        let dir = TestDir::new("url-retire-effect");
+        let manager = manager(&dir);
+        install_url_result_package(&manager, &dir.source());
+        let (registry, origins) = url_result_source(&manager, true);
+        assert!(matches!(
+            manager.open_url_result_action(&registry, &origins[0], |_| {
+                registry
+                    .begin_query(crate::result_registry::QueryDomain::Plugin, "url-action", 2)
+                    .unwrap();
+                Ok(())
+            }),
+            ResultActionOutcome::UrlOpened
+        ));
+        assert!(!origins[0].lease.live());
+        assert!(matches!(
+            manager.open_url_result_action(&registry, &origins[0], |_| panic!("retired replay")),
+            ResultActionOutcome::Failed {
+                code: ResultActionErrorCode::StaleRequest,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn result_action_runtime_replacement_preserves_full_url_and_copy_requirements() {
+        use super::super::result_action::*;
+        for declared in [false, true] {
+            let dir = TestDir::new("url-replacement");
+            let manager = manager(&dir);
+            if declared {
+                install_url_result_package(&manager, &dir.source());
+            } else {
+                write_multi_package(&dir.source(), "1.0.0", "lower", false);
+                opt_in_result_package(&dir.source());
+                install_multi(&manager, &dir.source());
+            }
+            let route = manager.route("/upper").unwrap().unwrap();
+            let (registry, origin) = result_action_fixture(&manager, route.clone(), false);
+            let now = Instant::now();
+            let reserved = manager.reserve_result_action(&origin).unwrap();
+            let dispatch = manager
+                .admit_result_action(&registry, &origin, reserved, now)
+                .unwrap();
+            assert!(
+                manager
+                    .scheduler
+                    .complete(&dispatch.context, now)
+                    .unwrap()
+                    .accepted
+            );
+            let rows = url_result_rows();
+            let requirements = ResultActionRequirements::rows(&rows);
+            let prepared = registry.prepare_result_actions(route, rows).unwrap();
+            let result = manager.finish_result_action(
+                &registry,
+                &origin,
+                &dispatch.context,
+                prepared,
+                requirements,
+            );
+            if !declared {
+                assert!(matches!(
+                    result,
+                    Err(ResultActionErrorCode::PluginPermissionDenied)
+                ));
+                continue;
+            }
+            let response = result.unwrap();
+            let row = &response.items[0];
+            let copy = registry
+                .resolve_result_action(&ExecuteResultActionRequest {
+                    request_id: response.request_id.clone(),
+                    result_id: row.result_id.clone(),
+                    action_id: row.result_actions.as_ref().unwrap().actions[1]
+                        .action_id
+                        .clone(),
+                })
+                .unwrap();
+            assert_eq!(copy.requirements, requirements);
+            revoke_result_grant(&manager, PublicPermission::UrlOpen);
+            assert!(matches!(
+                manager.copy_result_action(&registry, &copy, |_| panic!("replacement weakened")),
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::PluginPermissionDenied,
+                    ..
+                }
+            ));
+        }
+    }
+    #[test]
+    fn result_action_url_update_denied_consent_preserves_installed_config_and_data() {
+        let dir = TestDir::new("url-update-consent");
+        let manager = manager(&dir);
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        opt_in_result_package(&dir.source());
+        install_multi(&manager, &dir.source());
+        manager
+            .rename_command("com.example.activation", "upper", Some("retained"))
+            .unwrap();
+        let scope = PluginDataScope::new("com.example.activation").unwrap();
+        manager
+            .storage
+            .set(
+                &scope,
+                "com.example.activation",
+                "snippet.latest",
+                json!({"schemaVersion":1,"revision":3,"text":"saved"}),
+            )
+            .unwrap();
+        let before = manager
+            .state
+            .config("com.example.activation")
+            .unwrap()
+            .unwrap();
+        write_multi_package(&dir.source(), "1.1.0", "lower", false);
+        opt_in_result_package(&dir.source());
+        let file = dir.source().join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        value["minimumHostVersion"] = json!("0.12.0");
+        value["permissions"] = json!(["clipboard.write", "url.open"]);
+        fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert!(prepared.is_update);
+        assert!(prepared.permissions.contains(&PublicPermission::UrlOpen));
+        assert_eq!(
+            manager.commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::ClipboardWrite]),
+                now,
+                |_| panic!("denied readiness")
+            ),
+            Err(PublicPluginManagementError::PermissionDenied)
+        );
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.activation")
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            manager
+                .storage
+                .get(&scope, "com.example.activation", "snippet.latest")
+                .unwrap(),
+            Some(json!({"schemaVersion":1,"revision":3,"text":"saved"}))
+        );
+        assert!(manager.route("/retained").unwrap().is_some());
     }
     #[test]
     fn result_action_initial_publication_and_copy_hold_actual_owner_mutation_barrier() {
@@ -12521,7 +12984,7 @@ mod tests {
                         ));
                     } else {
                         manager
-                            .publish_result_actions(&origin.route, false, || {
+                            .publish_result_actions(&origin.route, false.into(), || {
                                 entered.send(()).unwrap();
                                 wait.recv().unwrap();
                             })
@@ -12545,7 +13008,7 @@ mod tests {
             assert!(finished.recv_timeout(Duration::from_secs(2)).unwrap());
             mutation.join().unwrap();
             assert!(manager
-                .publish_result_actions(&route, copy, || panic!("stale owner published"))
+                .publish_result_actions(&route, copy.into(), || panic!("stale owner published"))
                 .is_err());
         }
     }
@@ -12717,7 +13180,9 @@ mod tests {
                     &BTreeMap::from([("compact".into(), json!(false))]),
                 )
                 .unwrap();
-            assert!(manager.publish_result_actions(&route, true, || ()).is_ok());
+            assert!(manager
+                .publish_result_actions(&route, true.into(), || ())
+                .is_ok());
             if setting {
                 manager
                     .save_settings(
@@ -12731,7 +13196,7 @@ mod tests {
                     .unwrap();
             }
             assert!(manager
-                .publish_result_actions(&route, true, || panic!("stale publication"))
+                .publish_result_actions(&route, true.into(), || panic!("stale publication"))
                 .is_err());
             assert!(matches!(
                 manager.copy_result_action(&registry, &origin, |_| panic!("stale copy")),
@@ -12761,7 +13226,9 @@ mod tests {
                 })
                 .unwrap()
                 .unwrap();
-            assert!(manager.publish_result_actions(&fresh, true, || ()).is_ok());
+            assert!(manager
+                .publish_result_actions(&fresh, true.into(), || ())
+                .is_ok());
         }
     }
     #[test]

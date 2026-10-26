@@ -337,6 +337,8 @@ declare global {
 export type PluginResultAction =
   | { id: string; title: string; type: 'copyText'; text: string }
   | { id: string; title: string; type: 'runtime'; payload: JsonValue }
+  /** Windows Host 0.12.0+, declared and granted url.open. Explicit user action only. */
+  | { id: string; title: string; type: 'openUrl'; url: string }
 export interface PluginActionResult {
   defaultAction?: never
   id: string

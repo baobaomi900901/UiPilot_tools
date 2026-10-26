@@ -30,6 +30,8 @@ const CLIPBOARD_HISTORY_NOTICE = '授权后，UiPilot 运行、插件启用且�
 
 function permissionLabel(permission: PublicPermission): string {
   switch (permission) {
+    case 'url.open':
+      return '在默认浏览器打开 HTTP(S) 链接'
     case 'clipboard.write':
       return '写入剪贴板'
     case 'clipboard.read':

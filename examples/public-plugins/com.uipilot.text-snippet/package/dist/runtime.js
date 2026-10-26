@@ -44,9 +44,22 @@ const information = title => ({ id: 'status', title, actions: [] })
 const readAction = () => ({ id: 'read', title: '重新读取', type: 'runtime', payload: null })
 const readRow = () => ({ id: 'read', title: '重新读取最新片段', actions: [readAction()] })
 const copyAction = text => ({ id: 'copy', title: '复制', type: 'copyText', text })
+// Eligibility only; the Host independently validates and owns the browser effect.
+function urlActions(text) {
+  if (bytes(text) > 4096 || /[\s\x00-\x1f\x7f-\x9f\\]/u.test(text)) return []
+  const prefix = /^https?:\/\//iu.exec(text)
+  if (!prefix) return []
+  const authority = text.slice(prefix[0].length).split(/[/?#]/u)[0]
+  if (!authority || authority.includes('@')) return []
+  try {
+    const url = new URL(text)
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password || bytes(url.href) > 4096) return []
+    return [{ id: 'open', title: '在浏览器打开', type: 'openUrl', url: text }]
+  } catch { return [] }
+}
 function latestRows(current) {
   if (!current.hasSaved) return [information('尚未保存片段'), readRow()]
-  return [{ id: 'text', title: '最新片段', detail: current.text, actions: [copyAction(current.text), readAction()], defaultActionId: 'copy' }]
+  return [{ id: 'text', title: '最新片段', detail: current.text, actions: [copyAction(current.text), readAction(), ...urlActions(current.text)], defaultActionId: 'copy' }]
 }
 function response(requestId, results) {
   const reply = { requestId, results }
@@ -68,7 +81,7 @@ export async function onCommand(invocation, api) {
     const current = await load(api)
     return response(invocation.requestId, [[text, 'text', '原文'], [upper, 'uppercase', '大写']].map(([value, id, title]) => ({
       id, title, detail: value, defaultActionId: 'copy', actions: [copyAction(value),
-        { id: 'save', title: '保存为最新片段', type: 'runtime', payload: { text: value, expectedRevision: current.revision } }],
+        { id: 'save', title: '保存为最新片段', type: 'runtime', payload: { text: value, expectedRevision: current.revision } }, ...(id === 'text' ? urlActions(value) : [])],
     })))
   } catch (error) { return failure(invocation.requestId, error) }
 }

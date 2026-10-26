@@ -1000,11 +1000,7 @@ impl PublicPluginService {
                     .ok_or(E::ActionInvalidResponse)?,
             )
             .map_err(|_| E::ActionInvalidResponse)?;
-            let copy = rows.iter().any(|r| {
-                r.actions
-                    .iter()
-                    .any(result_action::PublicResultAction::is_copy)
-            });
+            let requirements = result_action::ResultActionRequirements::rows(&rows);
             let prepared = pending
                 .registry
                 .prepare_result_actions_reserved(
@@ -1023,7 +1019,7 @@ impl PublicPluginService {
                             &pending.origin,
                             &completion.context,
                             prepared,
-                            copy,
+                            requirements,
                         )
                 })
                 .ok_or(E::ActionUnavailable)?
@@ -2168,7 +2164,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 10, 0],
+            version: [0, 12, 0],
             api_version: 1,
         }
     }

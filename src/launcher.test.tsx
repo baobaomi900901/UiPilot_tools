@@ -460,7 +460,7 @@ describe('main result actions', () => {
     core.destroy()
   })
 
-  it.each(['staleRequest', 'unknownResult', 'actionFailed', 'actionInvalidResponse', 'actionTimedOut', 'actionUnavailable', 'clipboardWriteFailed', 'actionBusy'] as const)('handles %s with the reported source consumption policy', async (code) => {
+  it.each(['staleRequest', 'unknownResult', 'urlOpenFailed', 'actionFailed', 'actionInvalidResponse', 'actionTimedOut', 'actionUnavailable', 'clipboardWriteFailed', 'actionBusy'] as const)('handles %s with the reported source consumption policy', async (code) => {
     const { core, client } = await setup()
     const consumed = !['staleRequest', 'unknownResult', 'actionBusy'].includes(code)
     vi.mocked(client.executeResultAction).mockResolvedValue({ kind: 'failed', code, sourceConsumed: consumed })
@@ -474,6 +474,20 @@ describe('main result actions', () => {
       core.keyDown('Enter', false)
       expect(client.executeResultAction).toHaveBeenCalledTimes(2)
     }
+    core.destroy()
+  })
+
+  it('consumes the owned source after a URL request without hiding or executing siblings', async () => {
+    const { core, client } = await setup()
+    vi.mocked(client.executeResultAction).mockResolvedValue({ kind: 'urlOpened' })
+    core.executeResultAction(0, 'save-req-actions-0')
+    await vi.waitFor(() => expect(core.getSnapshot().status).toBe('已请求打开链接'))
+    expect(core.getSnapshot().resultActionMenu).toBeUndefined()
+    expect(core.getSnapshot().resultActionsDisabled).toBe(true)
+    expect(core.getSnapshot().resultActionRerun).toBe(true)
+    core.executeResultAction(1, 'save-req-actions-1')
+    expect(client.executeResultAction).toHaveBeenCalledOnce()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
     core.destroy()
   })
 
@@ -496,7 +510,7 @@ describe('main result actions', () => {
     core.destroy()
   })
 
-  it.each(['success', 'failure', 'reject'] as const)('retires before debounce and ignores old %s while a new action is pending', async (kind) => {
+  it.each(['success', 'url-opened', 'failure', 'reject'] as const)('retires before debounce and ignores old %s while a new action is pending', async (kind) => {
     const { core, client } = await setup()
     const old = deferred<ResultActionOutcome>()
     const next = deferred<ResultActionOutcome>()
@@ -513,6 +527,7 @@ describe('main result actions', () => {
     expect(core.getSnapshot().executePending).toBe(true)
     expect(core.getSnapshot().status).toBe('正在执行动作…')
     if (kind === 'success') old.resolve({ kind: 'resultsUpdated', response: response('req-too-late') })
+    else if (kind === 'url-opened') old.resolve({ kind: 'urlOpened' })
     else if (kind === 'failure') old.resolve({ kind: 'failed', code: 'actionTimedOut', sourceConsumed: true })
     else old.reject(new Error('private failure'))
     await Promise.resolve(); await Promise.resolve()
@@ -8279,7 +8294,7 @@ describe('React view and accessibility', () => {
       pluginId: 'com.uipilot.demo-win',
       name: 'Public Plugin Demo Window',
       version: '1.0.2',
-      permissions: ['ui.window', 'clipboard.history.read', 'clipboard.history.paste'],
+      permissions: ['ui.window', 'clipboard.history.read', 'clipboard.history.paste', 'url.open'],
       isUpdate: false, operation: 'install', previousVersion: null,
       sourceVerified: false,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
@@ -8299,6 +8314,7 @@ describe('React view and accessibility', () => {
       .toBe('uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png')
     const prepare = mounted.host.querySelector<HTMLElement>('.public-prepare')!
     expect(prepare.textContent).toContain('独立窗口 · ui.window')
+    expect(prepare.textContent).toContain('在默认浏览器打开 HTTP(S) 链接 · url.open')
     expect(prepare.textContent).toContain('剪贴板历史读取 · clipboard.history.read')
     expect(prepare.textContent).toContain('剪贴板历史粘贴 · clipboard.history.paste')
     expect(prepare.textContent).toContain('会在本机记录该插件可用的剪贴板历史摘要')

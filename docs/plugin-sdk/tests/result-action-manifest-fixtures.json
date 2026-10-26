@@ -107,5 +107,70 @@
       "windows"
     ],
     "valid": false
+  },
+  {
+    "name": "url-valid",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.12.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "url.open"
+    ],
+    "valid": true
+  },
+  {
+    "name": "url-old-minimum",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.10.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "url.open"
+    ],
+    "valid": false
+  },
+  {
+    "name": "url-missing-opt-in",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": false
+    },
+    "minimum": "0.12.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "url.open"
+    ],
+    "valid": false
+  },
+  {
+    "name": "url-mixed-platforms",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.12.0",
+    "platforms": [
+      "windows",
+      "macos"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "url.open"
+    ],
+    "valid": false
   }
 ]

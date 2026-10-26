@@ -3546,7 +3546,7 @@ fn result_action_service(
         .unwrap();
     let rows=parse(&super::PluginRequestContext{plugin_id:route.plugin_id.clone(),plugin_generation:route.generation,request_id:"public-request-0000000000000001".into()},json!({"requestId":"public-request-0000000000000001","results":[{"id":"same","title":"Save","actions":[{"id":"save","title":"Save","type":"runtime","payload":null}]}]})).unwrap();
     let response = manager
-        .publish_result_actions(&route, false, || {
+        .publish_result_actions(&route, false.into(), || {
             registry.publish_prepared_result_actions(
                 token,
                 registry
@@ -3796,7 +3796,7 @@ fn result_action_timeout_promotes_waiting_command_with_fresh_publication_owner()
         .clone();
     assert!(
         manager
-            .publish_result_actions(&pending_route, false, || ())
+            .publish_result_actions(&pending_route, false.into(), || ())
             .is_ok(),
         "waiting command must use its authenticated replacement owner"
     );
@@ -3834,7 +3834,7 @@ fn result_action_timeout_promotes_waiting_command_with_fresh_publication_owner()
         .begin_query(crate::result_registry::QueryDomain::Plugin, "next", 2)
         .unwrap();
     assert!(manager
-        .publish_result_actions(&route, false, || registry.publish_prepared_result_actions(
+        .publish_result_actions(&route, false.into(), || registry.publish_prepared_result_actions(
             token,
             registry
                 .prepare_result_actions(route.clone(), results)

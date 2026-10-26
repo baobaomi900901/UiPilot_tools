@@ -8,6 +8,7 @@ export type PublicPermission =
   | 'ui.window'
   | 'ui.panel'
   | 'clipboard.write'
+  | 'url.open'
   | 'clipboard.read'
   | 'clipboard.history.read'
   | 'clipboard.history.paste'
@@ -436,7 +437,7 @@ function permissionAvailable(permission: PublicPermission, platform: PluginPlatf
     permission === 'ui.panel' ||
     permission === 'clipboard.write' ||
     ((permission === 'clipboard.history.read' || permission === 'clipboard.history.paste') && platform === 'windows') ||
-    (permission === 'network.https' && platform === 'windows') ||
+    ((permission === 'network.https' || permission === 'url.open') && platform === 'windows') ||
     ((permission === 'notifications.publish' || permission === 'timer.control') && platform === 'windows')
   )
 }
@@ -495,6 +496,7 @@ function validateParsedManifest(
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
+    (manifest.permissions.includes('url.open') && (versionGreater([0, 12, 0], minimumHost) || !manifest.runtime.resultActions || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.runtime.resultActions === true && (versionGreater([0, 10, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || normalizedCommands(manifest).some(({ command }) => command.outputMode !== 'mainResult'))) ||
     (manifest.window?.runtimeActions === true && (versionGreater([0, 9, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.panel?.runtimeActions === true && (versionGreater([0, 6, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||

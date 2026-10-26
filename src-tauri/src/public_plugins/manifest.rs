@@ -24,6 +24,8 @@ pub(crate) enum PublicPermission {
     UiPanel,
     #[serde(rename = "clipboard.write")]
     ClipboardWrite,
+    #[serde(rename = "url.open")]
+    UrlOpen,
     #[serde(rename = "clipboard.read")]
     ClipboardRead,
     #[serde(rename = "clipboard.history.read")]
@@ -49,7 +51,8 @@ impl PublicPermission {
         matches!(self, Self::UiWindow | Self::UiPanel | Self::ClipboardWrite)
             || (matches!(
                 self,
-                Self::ClipboardHistoryRead
+                Self::UrlOpen
+                    | Self::ClipboardHistoryRead
                     | Self::ClipboardHistoryPaste
                     | Self::NetworkHttps
                     | Self::NotificationsPublish
@@ -720,6 +723,13 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest.permissions.contains(&PublicPermission::UrlOpen)
+        && (minimum_host < [0, 12, 0]
+            || manifest.supported_platforms != [PublicPlatform::Windows]
+            || !manifest.runtime.result_actions)
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.runtime.result_actions
         && (minimum_host < [0, 10, 0]
             || manifest.supported_platforms != [PublicPlatform::Windows]
@@ -989,6 +999,9 @@ mod schema_tests {
             value["runtime"] = case["runtime"].clone();
             value["minimumHostVersion"] = case["minimum"].clone();
             value["supportedPlatforms"] = case["platforms"].clone();
+            if let Some(permissions) = case.get("permissions") {
+                value["permissions"] = permissions.clone();
+            }
             assert_eq!(
                 parse(&value).is_ok(),
                 case["valid"].as_bool().unwrap(),
@@ -1555,7 +1568,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 10, 0]
+            [0, 12, 0]
         );
     }
 

@@ -39,6 +39,11 @@ pub(crate) enum PublicResultAction {
         title: String,
         text: String,
     },
+    OpenUrl {
+        id: String,
+        title: String,
+        url: String,
+    },
     Runtime {
         id: String,
         title: String,
@@ -48,17 +53,81 @@ pub(crate) enum PublicResultAction {
 impl PublicResultAction {
     pub(crate) fn id(&self) -> &str {
         match self {
-            Self::CopyText { id, .. } | Self::Runtime { id, .. } => id,
+            Self::CopyText { id, .. } | Self::OpenUrl { id, .. } | Self::Runtime { id, .. } => id,
         }
     }
     pub(crate) fn title(&self) -> &str {
         match self {
-            Self::CopyText { title, .. } | Self::Runtime { title, .. } => title,
+            Self::CopyText { title, .. }
+            | Self::OpenUrl { title, .. }
+            | Self::Runtime { title, .. } => title,
         }
     }
     pub(crate) fn is_copy(&self) -> bool {
         matches!(self, Self::CopyText { .. })
     }
+}
+/// Complete capability requirements of one immutable source snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResultActionRequirements {
+    pub(crate) copy: bool,
+    pub(crate) url: bool,
+}
+#[cfg(test)]
+impl From<bool> for ResultActionRequirements {
+    fn from(copy: bool) -> Self {
+        Self { copy, url: false }
+    }
+}
+impl ResultActionRequirements {
+    pub(crate) fn actions<'a>(actions: impl Iterator<Item = &'a PublicResultAction>) -> Self {
+        let mut requirements = Self::default();
+        for action in actions {
+            requirements.copy |= action.is_copy();
+            requirements.url |= matches!(action, PublicResultAction::OpenUrl { .. });
+        }
+        requirements
+    }
+    pub(crate) fn rows(rows: &[PublicActionResult]) -> Self {
+        Self::actions(rows.iter().flat_map(|r| r.actions.iter()))
+    }
+}
+/// Strict initial browser destination validation. Do not trim or repair authority.
+pub(crate) fn validate_open_url(raw: &str) -> Result<url::Url, ()> {
+    if raw.len() > 4096
+        || raw
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c as u32, 0..=31 | 127..=159) || c == '\\')
+    {
+        return Err(());
+    }
+    let prefix = if raw
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        7
+    } else if raw
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        8
+    } else {
+        return Err(());
+    };
+    let authority = raw[prefix..].split(['/', '?', '#']).next().ok_or(())?;
+    if authority.is_empty() || authority.contains('@') {
+        return Err(());
+    }
+    let url = url::Url::parse(raw).map_err(|_| ())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none_or(str::is_empty)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.as_str().len() > 4096
+    {
+        return Err(());
+    }
+    Ok(url)
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicActionResult {
@@ -76,7 +145,7 @@ pub(crate) struct ResultActionOrigin {
     pub(crate) query_sequence: u64,
     pub(crate) lease: ResultActionLease,
     pub(crate) business_result_id: String,
-    pub(crate) requires_copy_grant: bool,
+    pub(crate) requirements: ResultActionRequirements,
     pub(crate) action: PublicResultAction,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,11 +188,13 @@ pub(crate) enum ResultActionErrorCode {
     UnknownResult,
     PluginPermissionDenied,
     ClipboardWriteFailed,
+    UrlOpenFailed,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum ResultActionOutcome {
     Copied,
+    UrlOpened,
     ResultsUpdated {
         response: crate::model::SearchResponse,
     },
@@ -256,12 +327,13 @@ pub(crate) fn parse(
                 let required = match obj.get("type").and_then(Value::as_str) {
                     Some("copyText") => &["id", "title", "type", "text"][..],
                     Some("runtime") => &["id", "title", "type", "payload"][..],
+                    Some("openUrl") => &["id", "title", "type", "url"][..],
                     _ => return Err(invalid()),
                 };
                 if !exact(obj, required, &[]) {
                     return Err(invalid());
                 }
-                let action: PublicResultAction =
+                let mut action: PublicResultAction =
                     serde_json::from_value(action.clone()).map_err(|_| invalid())?;
                 let aid = action.id();
                 let atitle = action.title();
@@ -281,6 +353,9 @@ pub(crate) fn parse(
                     if text.len() > 16 * 1024 || text.contains('\0') {
                         return Err(invalid());
                     }
+                }
+                if let PublicResultAction::OpenUrl { url, .. } = &mut action {
+                    *url = validate_open_url(url).map_err(|_| invalid())?.to_string();
                 }
                 actions.push(action);
             }
@@ -340,6 +415,57 @@ mod tests {
     }
     fn row() -> Value {
         json!({"id":"constructor","title":"Text","actions":[{"id":"copy","title":"Copy","type":"copyText","text":""}],"defaultActionId":"copy"})
+    }
+    #[test]
+    fn result_action_open_url_validates_and_canonicalizes_private_destinations() {
+        for (raw, canonical) in [
+            ("HTTPS://EXAMPLE.COM", "https://example.com/"),
+            (
+                "https://例子.测试/路径?q=%20#x",
+                "https://xn--fsqu00a.xn--0zwm56d/%E8%B7%AF%E5%BE%84?q=%20#x",
+            ),
+            (
+                "http://localhost:80/%00%0A%7F%80",
+                "http://localhost/%00%0A%7F%80",
+            ),
+        ] {
+            let rows = parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"open","title":"Open","type":"openUrl","url":raw}],"defaultActionId":"open"}))).unwrap();
+            assert!(
+                matches!(&rows[0].actions[0], PublicResultAction::OpenUrl { url, .. } if url == canonical)
+            );
+        }
+        for raw in [
+            "https://@example.com",
+            "https:///example.com",
+            "https:example.com",
+            "//example.com",
+            "file:///tmp/x",
+            "javascript:alert(1)",
+            "https://user:pass@example.com",
+            "https://example.com:bad",
+            "https://example.com/ a",
+            "https://example.com/\\x",
+            "https://example.com/\u{80}",
+            "https://example.com/\n",
+            "https://",
+            "https://?x",
+            "https://#x",
+            " https://example.com",
+        ] {
+            assert!(parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"open","title":"Open","type":"openUrl","url":raw}]}))).is_err(), "{raw:?}");
+        }
+        let exact_limit = format!(
+            "https://example.com/{}",
+            "x".repeat(4096 - "https://example.com/".len())
+        );
+        assert!(parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"open","title":"Open","type":"openUrl","url":exact_limit}]}))).is_ok());
+        for raw in [
+            format!("https://example.com/{}", "x".repeat(4096)),
+            format!("https://example.com/{}", "汉".repeat(500)),
+        ] {
+            assert!(parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"open","title":"Open","type":"openUrl","url":raw}]}))).is_err());
+        }
+        assert!(parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"open","title":"Open","type":"openUrl","url":"https://example.com","payload":null}]}))).is_err());
     }
     #[test]
     fn result_action_accepts_bounded_actions_and_constructor_business_id() {

@@ -27,6 +27,9 @@ describe('main result action protocol', () => {
 
   it('rejects unknown outcome fields/codes instead of guessing consumption', () => {
     expect(parseResultActionOutcome({ kind: 'copied' })).toEqual({ kind: 'copied' })
+    expect(parseResultActionOutcome({ kind: 'urlOpened' })).toEqual({ kind: 'urlOpened' })
+    expect(parseResultActionOutcome({ kind: 'failed', code: 'urlOpenFailed', sourceConsumed: true })).not.toBeNull()
+    expect(parseResultActionOutcome({ kind: 'urlOpened', url: 'https://private.example' })).toBeNull()
     expect(parseResultActionOutcome({ kind: 'failed', code: 'actionBusy', sourceConsumed: false })).not.toBeNull()
     for (const value of [
       { kind: 'copied', text: 'secret' },

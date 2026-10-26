@@ -14,7 +14,7 @@ const validReport: PluginValidationReportV1 = {
   schemaVersion: 1,
   valid: true,
   source: { kind: 'directory', path: 'plugin' },
-  target: { platform: 'windows', hostVersion: '0.11.0', apiVersion: 1 },
+  target: { platform: 'windows', hostVersion: '0.12.0', apiVersion: 1 },
   plugin: { pluginId: 'com.example.demo', version: '1.0.0', outputMode: 'window' },
   truncated: false,
   issues: [],
@@ -234,7 +234,7 @@ it('shares command-local findings across real directory/archive validation and h
   const root = await mkdtemp(join(tmpdir(), 'uipilot-command-diagnostics-'))
   try {
     const value = multiCommandManifest()
-    value.minimumHostVersion = '0.11.1'
+    value.minimumHostVersion = '0.12.1'
     value.commands[0].summary = ''
     value.commands[1].inputRequired = true
     const manifest = Buffer.from(JSON.stringify(value))

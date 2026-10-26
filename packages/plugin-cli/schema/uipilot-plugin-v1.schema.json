@@ -207,6 +207,7 @@
         "ui.window",
         "ui.panel",
         "clipboard.write",
+        "url.open",
         "clipboard.read",
         "clipboard.history.read",
         "clipboard.history.paste",

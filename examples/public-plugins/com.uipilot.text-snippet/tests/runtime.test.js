@@ -32,9 +32,9 @@ const allActions = reply => reply.results.flatMap(row => row.actions)
 test('manifest declares only the two Windows submit commands and clipboard-write capability', async () => {
   await runtime()
   const manifest = JSON.parse(readFileSync(new URL('../package/plugin.json', import.meta.url)))
-  assert.equal(manifest.pluginId, 'com.uipilot.text-snippet'); assert.equal(manifest.version, '1.0.0')
-  assert.equal(manifest.minimumHostVersion, '0.10.0'); assert.deepEqual(manifest.supportedPlatforms, ['windows'])
-  assert.deepEqual(manifest.permissions, ['clipboard.write']); assert.equal(manifest.runtime.resultActions, true)
+  assert.equal(manifest.pluginId, 'com.uipilot.text-snippet'); assert.equal(manifest.version, '1.1.0')
+  assert.equal(manifest.minimumHostVersion, '0.12.0'); assert.deepEqual(manifest.supportedPlatforms, ['windows'])
+  assert.deepEqual(manifest.permissions, ['clipboard.write', 'url.open']); assert.equal(manifest.runtime.resultActions, true)
   assert.deepEqual(manifest.commands.map(row => [row.id, row.defaultName, row.activationMode, row.outputMode, row.inputRequired]), [
     ['transform', 'text-snippet', 'submit', 'mainResult', true], ['latest', 'latest-snippet', 'submit', 'mainResult', false],
   ])
@@ -114,4 +114,21 @@ test('save rejects and lost acknowledgements stay uncertain with exactly one wri
     assert.equal(mode === 'lost-ack' ? loaded.results[0].actions[0].text : info(loaded), mode === 'lost-ack' ? 'HELLO' : '尚未保存片段')
   }
   const failed = store(null, 'read-failure'); assert.equal(info(await action(failed)), '读取失败，请重新读取'); assert.equal(failed.writes, 0)
+})
+
+test('URL actions appear only on exact valid original/latest text and preserve copy defaults without effects', async () => {
+  for (const text of ['https://example.com/Case?q=%20#x', 'HTTPS://例子.测试/路径', 'http://localhost:80/%00']) {
+    const state = store(record(text)); const reply = await command(state, 'transform', text)
+    assert.deepEqual(reply.results[0].actions.at(-1), { id: 'open', title: '在浏览器打开', type: 'openUrl', url: text })
+    assert.equal(reply.results[1].actions.some(a => a.type === 'openUrl'), false)
+    const latest = await command(state, 'latest', '')
+    assert.equal(latest.results[0].actions.at(-1).url, text)
+    assert.equal(latest.results[0].defaultActionId, 'copy'); assert.equal(reply.results[0].defaultActionId, 'copy')
+    assert.equal(state.writes, 0)
+  }
+  for (const text of ['ordinary text', 'https://@example.com', 'https:///example.com', 'https:example.com', 'javascript:alert(1)', 'file:///tmp/a', 'https://u:p@example.com', 'https://example.com/ a', 'https://example.com/\\x', 'https://example.com/\u0080', 'https://example.com/' + '汉'.repeat(500), 'https://example.com/' + 'x'.repeat(4096)]) {
+    const state = store(record(text))
+    for (const reply of [await command(state, 'transform', text), await command(state, 'latest', '')]) assert.equal(allActions(reply).some(a => a.type === 'openUrl'), false, text)
+    assert.equal(state.writes, 0)
+  }
 })
