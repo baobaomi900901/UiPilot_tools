@@ -145,3 +145,11 @@ Windows文件选择框曾因粘贴正斜杠链接路径提示文件名无效，�
 验收程序.superpowers/deliveries/uipilot-0.11.0-acceptance/uipilot.exe；实际FileVersion/ProductVersion0.11.0、UiPilot Acceptance，39,950,848字节，SHA256 c00d796e41b2f4df4d513cab4dfa16a15dbabd00b35517bb8e6273507d86ac07。738项源码/dist输入前后稳定，五资源/两既有归档匹配，九个旧验收程序保持原hash；沿用acceptance数据标识，已有插件无需重装。
 
 下一步只等用户首组人工验收：latest-snippet录制并从外部触发；text-snippet进入必填参数提示；托盘退出/重启后保留绑定。后续冲突、改名、停用、Notes面板退出和深浅主题等用例另分组确认。当前整体阶段估计约72%保持不变，不把待测0.11或整个M2/M6/M7标为人工完成。完整基座、标准UI/系统能力、真实凭据和其他总验收仍有后续工作。
+
+## 2026-10-26 0.11.0首组通过及Notes首次进入修正
+
+用户确认：latest-snippet从外部快捷键触发、text-snippet必填参数提示、完整退出重启保留；录制已有命令键的冲突处理、停用/重新启用后的快捷键恢复。Notes发现每次从其他程序切回来均需两次按键，面板退出后的搜索尚未人工确认。
+
+可控顺序测试定位到原生shown安排的默认搜索，在命令解析等待期间启动，回复覆盖合成Panel结果，导致合法面板身份返回后被当作过期关闭。源码fd83558f63bf08189dc64f0f05a23afd9af5c2dd仅增加延迟搜索的commandEntryToken归属捕获与校验；3项RED复现，22项定向GREEN、前端构建和独立复核通过，无延时/重试/新功能。
+
+修正版.superpowers/deliveries/uipilot-0.11.0-panel-hotkey/uipilot.exe，仍0.11.0及原数据身份；39,950,848字节，SHA256 522ca3a54f2a2bbfc665998c09ecb63c4939543a85cd756008fae49a621df70f。原生离线构建通过，738输入/五资源/两归档核对，十个旧程序hash保持。下一步只复验Notes外部一次按键进入（重复切换3次）及关闭后默认/普通搜索；已有通过项保留，整体约72%阶段估计暂不增加。
