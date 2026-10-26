@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "pluginId": "com.uipilot.json-workbench",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "apiVersion": 1,
   "minimumHostVersion": "0.13.0",
   "name": "JSON 工作台",

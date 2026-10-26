@@ -17,6 +17,16 @@ function page(t) {
   t.after(() => dom.window.close())
   const { window } = dom
   const document = window.document
+  // JSDOM has no top layer, inert background or native focus traversal. Keep the
+  // native dialog API here; real WebView keyboard/layout acceptance is manual.
+  const proto = window.HTMLDialogElement.prototype
+  proto.showModal = function () { this.open = true; this.modalOpens = (this.modalOpens ?? 0) + 1 }
+  proto.close = function () {
+    if (!this.open) return
+    this.open = false
+    // Native close is queued. Tests deliberately allow reopening before delivery.
+    setImmediate(() => this.dispatchEvent(new window.Event('close')))
+  }
   const calls = []
   let update
   const imports = []
@@ -24,14 +34,14 @@ function page(t) {
   Object.defineProperty(window, 'uipilotPluginWindow', { value: {
     onUpdate(handler) { update = handler; return () => {} },
     get request() { return currentRequest },
-    get files() { return { openText() { const pending=deferred(); imports.push(pending); return pending.promise } } },
+    get files() { return { openText() { const pending=deferred(); pending.modalWasOpen = document.getElementById('discard').open; imports.push(pending); return pending.promise } } },
     get storage() { throw new Error('content must not access storage') },
   } })
   window.TextEncoder = TextEncoder
   window.eval(source)
-  const ui = Object.fromEntries(['input', 'output', 'import', 'format', 'save', 'reload', 'status', 'draft-state', 'discard', 'discard-confirm', 'discard-cancel'].map(id => [id, document.getElementById(id)]))
+  const ui = Object.fromEntries(['input', 'output', 'import', 'format', 'save', 'reload', 'status', 'draft-state', 'discard', 'discard-confirm', 'discard-cancel', 'discard-close', 'discard-title', 'discard-message'].map(id => [id, document.getElementById(id)]))
   function session(data = loaded(), requestId = 'open-1') {
-    currentRequest = input => { const pending = deferred(); calls.push({ input, pending, requestId }); return pending.promise }
+    currentRequest = input => { const pending = deferred(); calls.push({ input, pending, requestId, modalWasOpen: document.getElementById('discard').open }); return pending.promise }
     update({ requestId, data, theme: 'light', input: '', platform: 'windows', instanceNumber: 1, invokedAt: '' })
   }
   function edit(text) { ui.input.value = text; ui.input.dispatchEvent(new window.Event('input', { bubbles: true })) }
@@ -87,7 +97,7 @@ test('save acknowledgement advances the persisted revision while retaining later
   assert.equal(p.calls[1].input.payload.text, 'later')
 })
 
-test('uncertain save retains draft, prevents retry and requires inline confirmation before reload', async t => {
+test('uncertain save retains draft, prevents retry and requires modal confirmation before reload', async t => {
   const p = page(t)
   p.session()
   p.edit('{draft')
@@ -99,10 +109,10 @@ test('uncertain save retains draft, prevents retry and requires inline confirmat
   assert.equal(p.ui.save.disabled, true)
   assert.doesNotMatch(p.ui.status.textContent, /hidden details/)
   p.ui.reload.click()
-  assert.equal(p.ui.discard.hidden, false)
+  assert.equal(p.ui.discard.open, true)
   assert.equal(p.calls.length, 1)
   p.ui['discard-cancel'].click()
-  assert.equal(p.ui.discard.hidden, true)
+  assert.equal(p.ui.discard.open, false)
   assert.equal(p.ui.input.value, '{draft')
   p.ui.reload.click()
   p.ui['discard-confirm'].click()
@@ -154,7 +164,7 @@ test('file import is explicit, unsaved, preserves saved revision and accepts inv
 })
 test('dirty import confirmation cancels without picker, retains output on cancel/errors and restores reload action',async t=>{
  const p=page(t);p.session(loaded('saved',1));p.edit('draft');p.ui.output.value='formatted'
- p.ui.import.click();assert.equal(p.ui.discard.hidden,false);assert.equal(p.imports.length,0)
+ p.ui.import.click();assert.equal(p.ui.discard.open,true);assert.equal(p.imports.length,0)
  p.ui['discard-cancel'].click();assert.equal(p.imports.length,0);assert.equal(p.ui.input.value,'draft')
  p.ui.import.click();p.ui['discard-confirm'].click();assert.equal(p.imports.length,1)
  p.imports[0].resolve(null);await tick();assert.equal(p.ui.input.value,'draft');assert.equal(p.ui.output.value,'formatted')
@@ -189,6 +199,109 @@ test('new update ignores late cancellation and failure from old picker',async t=
 test('importing identical saved text still requires explicit save and preserves revision',async t=>{
  const p=page(t);p.session(loaded('same',4));p.ui.import.click();p.imports[0].resolve({name:'same.txt',text:'same',byteLength:4});await tick()
  assert.match(p.ui['draft-state'].textContent,/未保存/)
- p.ui.import.click();assert.equal(p.ui.discard.hidden,false);p.ui['discard-cancel'].click()
+ p.ui.import.click();assert.equal(p.ui.discard.open,true);p.ui['discard-cancel'].click()
  p.ui.save.click();assert.equal(p.calls[0].input.payload.expectedRevision,4);p.calls[0].pending.resolve({ok:true,text:'same',revision:5});await tick();assert.match(p.ui['draft-state'].textContent,/已保存/)
+})
+
+
+for (const origin of ['import', 'reload']) {
+  for (const dismissal of ['discard-cancel', 'discard-close', 'escape', 'native-cancel']) {
+    test(origin + ' modal ' + dismissal + ' preserves draft/output/status/revision and restores origin', async t => {
+      const p = page(t)
+      p.session(loaded('saved', 3))
+      p.edit('draft')
+      p.ui.format.click()
+      p.calls[0].pending.resolve({ ok: true, formatted: 'formatted draft' })
+      await tick()
+      const status = p.ui.status.textContent
+      p.ui[origin].focus()
+      p.ui[origin].click()
+      assert.equal(p.ui.discard.tagName, 'DIALOG')
+      assert.equal(p.ui.discard.open, true)
+      assert.equal(p.ui.discard.modalOpens, 1)
+      assert.equal(p.ui.discard.getAttribute('aria-labelledby'), 'discard-title')
+      assert.equal(p.ui.discard.getAttribute('aria-describedby'), 'discard-message')
+      assert.equal(p.ui['discard-cancel'].textContent, '取消')
+      assert.equal(p.ui['discard-close'].getAttribute('aria-label'), '关闭')
+      assert.equal(p.window.document.activeElement, p.ui['discard-cancel'])
+      if (dismissal === 'escape') {
+        let escaped = false
+        p.window.addEventListener('keydown', () => { escaped = true })
+        const event = new p.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+        p.ui['discard-cancel'].dispatchEvent(event)
+        assert.equal(event.defaultPrevented, true)
+        assert.equal(escaped, false)
+      } else if (dismissal === 'native-cancel') {
+        const event = new p.window.Event('cancel', { cancelable: true })
+        p.ui.discard.dispatchEvent(event)
+        assert.equal(event.defaultPrevented, true)
+      } else p.ui[dismissal].click()
+      assert.equal(p.ui.discard.open, false)
+      assert.equal(p.window.document.activeElement, p.ui[origin])
+      assert.equal(p.ui.input.value, 'draft')
+      assert.equal(p.ui.output.value, 'formatted draft')
+      assert.equal(p.ui.status.textContent, status)
+      assert.equal(p.imports.length, 0)
+      assert.equal(p.calls.length, 1)
+      p.ui.save.click()
+      assert.equal(p.calls[1].input.payload.expectedRevision, 3)
+      assert.equal(p.calls[1].input.payload.text, 'draft')
+    })
+  }
+}
+
+test('confirm closes before exactly one correct operation and shared modal resets labels', async t => {
+  const p = page(t)
+  p.session(loaded('saved', 1))
+  p.edit('draft')
+  p.ui.import.click()
+  assert.equal(p.ui.discard.open, true)
+  assert.match(p.ui['discard-title'].textContent, /导入/)
+  assert.match(p.ui['discard-confirm'].textContent, /选择文件/)
+  p.ui['discard-confirm'].click()
+  assert.equal(p.ui.discard.open, false)
+  p.ui['discard-confirm'].click()
+  assert.equal(p.imports.length, 1)
+  assert.equal(p.imports[0].modalWasOpen, false)
+  assert.equal(p.calls.length, 0)
+  p.imports[0].resolve(null)
+  await tick()
+  p.ui.reload.click()
+  assert.match(p.ui['discard-title'].textContent, /重新读取/)
+  assert.match(p.ui['discard-confirm'].textContent, /重新读取/)
+  assert.doesNotMatch(p.ui['discard-message'].textContent, /导入/)
+  p.ui['discard-confirm'].click()
+  assert.equal(p.ui.discard.open, false)
+  p.ui['discard-confirm'].click()
+  assert.equal(p.calls.length, 1)
+  assert.equal(p.calls[0].input.action, 'load')
+  assert.equal(p.calls[0].modalWasOpen, false)
+  assert.equal(p.imports.length, 1)
+})
+
+test('old queued close cannot cancel a newer modal, including across onUpdate', async t => {
+  const p = page(t)
+  p.session(loaded('saved', 1))
+  p.edit('draft')
+  p.ui.import.focus()
+  p.ui.import.click()
+  p.ui['discard-cancel'].click()
+  p.ui.reload.click()
+  await tick()
+  assert.equal(p.ui.discard.open, true)
+  assert.match(p.ui['discard-confirm'].textContent, /重新读取/)
+  let oldOriginFocused = false
+  p.ui.reload.addEventListener('focus', () => { oldOriginFocused = true })
+  p.session(loaded('replacement', 2), 'new')
+  assert.equal(p.ui.discard.open, false)
+  assert.equal(oldOriginFocused, false)
+  p.edit('new draft')
+  p.ui.import.click()
+  await tick()
+  assert.equal(p.ui.discard.open, true)
+  assert.equal(p.window.document.activeElement, p.ui['discard-cancel'])
+  p.ui['discard-confirm'].click()
+  assert.equal(p.imports.length, 1)
+  assert.equal(p.calls.length, 0)
+  assert.equal(p.ui.input.value, 'new draft')
 })

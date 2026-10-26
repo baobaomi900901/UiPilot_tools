@@ -45,8 +45,13 @@ textarea::placeholder { color: var(--muted); opacity: 1; }
 textarea:disabled { color: var(--muted); }
 #status { flex: 0 0 44px; margin: 0; padding: 6px 8px; overflow: auto; overflow-wrap: anywhere; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; line-height: 1.4; }
 #status[data-tone='error'], #byte-count[data-over-limit='true'] { color: var(--uipilot-color-danger); }
-.discard { flex-shrink: 0; padding: 8px; border: 1px solid var(--uipilot-color-danger); border-radius: 6px; background: var(--surface); }
-.discard p { margin: 0 0 6px; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.discard { width: min(420px, calc(100% - 24px)); max-height: calc(100% - 24px); margin: auto; padding: 16px; overflow: auto; color: var(--text); border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: none; }
+.discard::backdrop { background: rgba(0, 0, 0, .42); }
+.dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.dialog-heading h2 { margin: 0; font-size: 14px; font-weight: 500; }
+#discard-close { display: grid; place-items: center; flex-shrink: 0; width: 30px; padding: 4px; background: transparent; }
+.discard p { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.confirm-actions { justify-content: flex-end; flex-wrap: wrap; }
 #discard-confirm { color: var(--uipilot-color-danger); border-color: var(--uipilot-color-danger); background: transparent; }
 @media (forced-colors: active) {
   button.primary { background: ButtonFace; color: ButtonText; border-color: ButtonText; }

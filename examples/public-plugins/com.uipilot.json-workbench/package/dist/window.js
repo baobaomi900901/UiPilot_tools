@@ -1,5 +1,5 @@
 const windowApi = window.uipilotPluginWindow
-const ui = Object.fromEntries(['input', 'output', 'import', 'format', 'save', 'reload', 'status', 'draft-state', 'byte-count', 'discard', 'discard-message', 'discard-confirm', 'discard-cancel'].map(id => [id, document.getElementById(id)]))
+const ui = Object.fromEntries(['input', 'output', 'import', 'format', 'save', 'reload', 'status', 'draft-state', 'byte-count', 'discard', 'discard-message', 'discard-title', 'discard-confirm', 'discard-cancel', 'discard-close'].map(id => [id, document.getElementById(id)]))
 const encoder = new TextEncoder()
 const bytes = text => encoder.encode(text).length
 const messages = {
@@ -60,6 +60,31 @@ function controls() {
     : dirty() ? '未保存的更改' : draft.hasSaved ? '已保存 · 版本 ' + draft.revision : '新草稿 · 尚未保存'
   document.querySelector('main').setAttribute('aria-busy', String(busy))
 }
+function closeConfirmation(restoreFocus = true) {
+  const previous = confirmation
+  confirming = false
+  confirmation = null
+  // Native close may restore its previous focus synchronously. Disable the old
+  // origin during session replacement (or programmatic editing) to avoid that.
+  if (!restoreFocus && previous) previous.origin.disabled = true
+  if (ui.discard.open) ui.discard.close()
+  controls()
+  if (restoreFocus && previous?.session === session && !previous.origin.disabled) previous.origin.focus()
+  return previous
+}
+function openConfirmation(action) {
+  confirmation = { action, session, editRevision: draft.editRevision, origin: action === 'import' ? ui.import : ui.reload }
+  confirming = true
+  ui['discard-title'].textContent = action === 'import' ? '导入文件？' : '重新读取草稿？'
+  ui['discard-confirm'].textContent = action === 'import' ? '选择文件并替换草稿' : '放弃草稿并重新读取'
+  ui['discard-message'].textContent = action === 'import'
+    ? '导入成功后将替换当前输入；取消或错误会保留草稿和格式化结果。'
+    : (recovery === 'save-uncertain' ? '此前保存可能已写入。' : '') + '重新读取成功后将以已保存内容替换当前草稿，未保存编辑会丢失。'
+  controls()
+  ui.discard.showModal()
+  ui['discard-cancel'].focus()
+}
+
 function isLoaded(data) {
   return data?.ok === true && Number.isSafeInteger(data.revision) && data.revision >= 0
     && typeof data.text === 'string' && bytes(data.text) <= 8192
@@ -128,7 +153,7 @@ ui.input.addEventListener('input', () => {
   draft.text = ui.input.value
   draft.editRevision += 1
   ui.output.value = ''
-  if (confirming) { confirming = false; confirmation = null }
+  if (confirming) closeConfirmation(false)
   controls()
   if (!activeRequest) status(bytes(draft.text) > 8192 ? messages['text-limit'] : recovery ? messages[recovery] ?? messages['action-failed'] : '草稿已更改。格式化不会保存；关闭或隐藏后，未保存内容不会恢复。', bytes(draft.text) > 8192 || recovery ? 'error' : '')
 })
@@ -140,34 +165,35 @@ ui.save.addEventListener('click', () => {
 ui.reload.addEventListener('click', () => {
   if (activeRequest || confirming || !available()) return
   if (dirty() || recovery === 'save-uncertain') {
-    confirming = true
-    confirmation = { action: 'load', editRevision: draft.editRevision }
-    ui['discard-confirm'].textContent = '放弃草稿并重新读取'
-    ui['discard-message'].textContent = recovery === 'save-uncertain'
-      ? '此前保存可能已写入。重新读取成功后将以已保存内容替换当前草稿，未保存编辑会丢失。'
-      : '重新读取成功后将以已保存内容替换当前草稿，未保存编辑会丢失。'
-    controls()
-    ui['discard-confirm'].focus()
+    openConfirmation('load')
     return
   }
   void request('load', null)
 })
 ui['discard-confirm'].addEventListener('click', () => {
   if (!confirming || activeRequest) return
-  const allowed = confirmation
-  confirming = false
-  confirmation = null
-  if (!allowed || allowed.editRevision !== draft.editRevision) { controls(); return }
+  const allowed = closeConfirmation()
+  if (!allowed || allowed.session !== session || allowed.editRevision !== draft.editRevision) { controls(); return }
   if (allowed.action === 'import') void importFile()
   else void request('load', null)
 })
-ui['discard-cancel'].addEventListener('click', () => {
-  const origin = confirmation?.action
-  confirming = false
-  confirmation = null
-  controls()
-  ;(origin === 'import' ? ui.import : ui.reload).focus()
+ui['discard-cancel'].addEventListener('click', () => closeConfirmation())
+ui['discard-close'].addEventListener('click', () => closeConfirmation())
+ui.discard.addEventListener('cancel', event => {
+  event.preventDefault()
+  event.stopPropagation()
+  closeConfirmation()
 })
+// Consume Escape inside the dialog so it cannot also close the workbench.
+ui.discard.addEventListener('keydown', event => {
+  if (confirming && event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    closeConfirmation()
+  }
+})
+// No close listener: native close events are queued and may belong to an older
+// confirmation after this dialog has already reopened.
 
 const fileMessages = {
   FileOpenBusyError: '文件选择器正忙，请稍后重试。',
@@ -202,16 +228,12 @@ async function importFile() {
 ui.import.addEventListener('click', () => {
   if (activeRequest || confirming || recovery || typeof session?.files?.openText !== 'function') return
   if (dirty()) {
-    confirming = true
-    confirmation = { action: 'import', editRevision: draft.editRevision }
-    ui['discard-message'].textContent = '导入成功后将替换当前输入；取消或错误会保留草稿和格式化结果。'
-    ui['discard-confirm'].textContent = '选择文件并替换草稿'
-    controls()
-    ui['discard-confirm'].focus()
+    openConfirmation('import')
   } else void importFile()
 })
 windowApi.onUpdate(update => {
   // Capture after PREPARE, return synchronously, and invoke only on a later user action.
+  closeConfirmation(false)
   session = { files: windowApi.files, request: windowApi.request, requestId: update.requestId }
   activeRequest = null
   confirming = false

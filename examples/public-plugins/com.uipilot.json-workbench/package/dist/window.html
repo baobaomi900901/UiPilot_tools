@@ -19,12 +19,16 @@
         <div class="field"><label for="input">JSON 输入</label><textarea id="input" spellcheck="false" autocomplete="off" placeholder="输入 JSON；未完成的内容也可以保存为草稿。" aria-describedby="byte-count status" disabled></textarea></div>
         <div class="field"><label for="output">格式化结果</label><textarea id="output" spellcheck="false" placeholder="点击“校验并格式化”查看结果。" readonly aria-describedby="status"></textarea></div>
       </div>
-      <div id="discard" class="discard" role="group" aria-labelledby="discard-message" hidden>
-        <p id="discard-message"></p>
-        <div class="confirm-actions"><button id="discard-confirm" type="button">放弃草稿并重新读取</button><button id="discard-cancel" type="button">保留草稿</button></div>
-      </div>
       <p id="status" role="status" aria-live="polite" aria-atomic="true">正在读取已保存草稿…</p>
     </main>
+    <dialog id="discard" class="discard" aria-labelledby="discard-title" aria-describedby="discard-message">
+      <div class="dialog-heading">
+        <h2 id="discard-title">未保存的更改</h2>
+        <button id="discard-close" type="button" aria-label="关闭" title="关闭"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg></button>
+      </div>
+      <p id="discard-message"></p>
+      <div class="confirm-actions"><button id="discard-cancel" type="button" autofocus>取消</button><button id="discard-confirm" type="button">放弃草稿并重新读取</button></div>
+    </dialog>
     <script type="module" src="./window.js"></script>
   </body>
 </html>
