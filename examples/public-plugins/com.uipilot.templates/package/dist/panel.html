@@ -5,21 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>文本模板</title>
     <link rel="stylesheet" href="./panel.css" />
+    <link rel="stylesheet" href="./ui/ui.css" />
   </head>
   <body>
-    <main class="app">
-      <aside class="sidebar" aria-label="已保存模板">
-        <header class="toolbar">
+    <main class="uipilot-ui-layout">
+      <aside class="uipilot-ui-sidebar" aria-label="已保存模板">
+        <header class="uipilot-ui-toolbar">
           <h1>模板</h1>
           <button id="new" type="button" title="新建模板 (Ctrl+N)">新建模板</button>
         </header>
         <p id="filter" class="filter"></p>
-        <nav id="list" class="list" aria-label="模板列表"></nav>
+        <nav id="list" class="uipilot-ui-list" aria-label="模板列表"></nav>
       </aside>
-      <section class="detail" aria-label="模板编辑区">
-        <header class="toolbar detail-toolbar">
-          <span id="draft-state">未选择模板</span>
-          <div class="actions">
+      <section class="uipilot-ui-detail" aria-label="模板编辑区">
+        <header class="uipilot-ui-toolbar">
+          <span id="draft-state" class="uipilot-ui-detail-label">未选择模板</span>
+          <div class="uipilot-ui-actions">
             <button id="preview" type="button" disabled>预览</button>
             <button id="save" class="primary" type="button" disabled>保存</button>
           </div>

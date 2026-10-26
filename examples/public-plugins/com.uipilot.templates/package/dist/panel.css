@@ -44,18 +44,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 button.primary { background: var(--uipilot-color-accent); color: var(--canvas); border-color: var(--uipilot-color-accent); }
 button.primary:not(:disabled):hover { background: var(--uipilot-color-accent); border-color: var(--strong); }
-.app { display: grid; grid-template-columns: 220px minmax(0, 1fr); height: 100%; border-top: 1px solid var(--border); }
-.sidebar { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface); border-right: 1px solid var(--border); }
-.toolbar { height: 48px; flex: 0 0 48px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); }
 h1, h2 { margin: 0; font-size: 14px; font-weight: 500; }
 .filter { margin: 0; padding: 8px 12px 4px; min-height: 28px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-.list { flex: 1; min-height: 0; overflow: auto; padding: 4px 14px 8px 6px; scrollbar-gutter: stable; }
-.list button { display: block; width: 100%; margin: 2px 0; padding: 8px 10px; min-height: 42px; text-align: left; background: transparent; border-color: transparent; overflow: hidden; text-overflow: ellipsis; }
-.list button[aria-current='true'] { background: var(--selected); border-color: var(--strong); }
-.list-empty { padding: 20px 10px; color: var(--muted); font-size: 12px; line-height: 1.6; }
-.detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-.detail-toolbar > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
-.actions { display: flex; gap: 8px; flex-shrink: 0; }
 .empty { margin: auto; padding: 24px; max-width: 320px; text-align: center; }
 .empty svg { display: block; width: 32px; height: 32px; margin: 0 auto 12px; color: var(--muted); }
 .empty strong { font-size: 14px; font-weight: 500; }
@@ -85,6 +75,5 @@ dialog p { color: var(--muted); line-height: 1.6; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 @media (forced-colors: active) {
   button.primary { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
-  .list button[aria-current='true'] { border-color: Highlight; }
   button:focus-visible, input:focus-visible, textarea:focus-visible { outline-color: Highlight; }
 }

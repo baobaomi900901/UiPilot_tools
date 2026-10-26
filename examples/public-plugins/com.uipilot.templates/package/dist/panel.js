@@ -1,3 +1,5 @@
+import { createList, createDetail, createActions } from './ui/ui.js'
+
 const panel = window.uipilotPluginPanel
 const element = (id) => document.getElementById(id)
 const ui = Object.fromEntries(['new', 'list', 'filter', 'draft-state', 'preview', 'save', 'empty', 'editor', 'title', 'body', 'variables', 'variable-hint', 'output', 'status', 'reload', 'discard-dialog', 'discard-message'].map((id) => [id, element(id)]))
@@ -29,6 +31,15 @@ let filter = ''
 let activeRequest = null
 let recovery = null
 let pendingDiscard = null
+let discardedCloseEvents = 0
+const list = createList(ui.list, { onActivate: (id) => choose(() => load(id)) })
+const detail = createDetail({ empty: ui.empty, content: ui.editor, label: ui['draft-state'] })
+const actions = createActions({
+  new: { button: ui.new, onInvoke: newDraft },
+  preview: { button: ui.preview, onInvoke: preview },
+  save: { button: ui.save, onInvoke: save },
+  reload: { button: ui.reload, onInvoke: reload },
+})
 
 function status(text, tone = '') {
   ui.status.textContent = text
@@ -40,36 +51,27 @@ function available() { return typeof panel.request === 'function' && session !==
 
 function controls() {
   const busy = activeRequest !== null
-  ui.new.disabled = busy || !available()
-  ui.preview.disabled = busy || !draft || !available()
-  ui.save.disabled = busy || !draft || Boolean(recovery) || !available()
+  actions.update({
+    new: { disabled: busy || !available() },
+    preview: { disabled: busy || !draft || !available() },
+    save: { disabled: busy || !draft || Boolean(recovery) || !available() },
+    reload: { disabled: busy || !available() },
+  })
   ui.reload.hidden = !recovery
-  ui.reload.disabled = busy || !available()
-  ui['draft-state'].textContent = !draft ? '未选择模板' : busy ? '处理中…' : recovery ? '保存状态待确认 · 草稿保留' : dirty() ? '未保存的更改' : `已保存 · 版本 ${draft.revision}`
-  ui.editor.hidden = !draft
-  ui.empty.hidden = Boolean(draft)
+  detail.update({
+    hasContent: Boolean(draft), busy,
+    text: !draft ? '未选择模板' : busy ? '处理中…' : recovery ? '保存状态待确认 · 草稿保留' : dirty() ? '未保存的更改' : '已保存 · 版本 ' + draft.revision,
+  })
 }
 
 function renderList() {
-  ui.filter.textContent = filter.trim() ? `筛选：${filter}` : '全部已保存模板'
-  ui.list.replaceChildren()
-  const visible = templates.filter((item) => item.title.toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase()))
-  if (!visible.length) {
-    const empty = document.createElement('p')
-    empty.className = 'list-empty'
-    empty.textContent = filter.trim() ? '没有匹配模板。可清空主输入框后按 Enter。' : '暂无模板，点击“新建模板”开始。'
-    ui.list.append(empty)
-  }
-  for (const item of visible) {
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.textContent = item.title
-    button.title = item.title
-    button.setAttribute('aria-current', String(draft?.id === item.id))
-    button.disabled = activeRequest !== null
-    button.addEventListener('click', () => choose(() => load(item.id)))
-    ui.list.append(button)
-  }
+  ui.filter.textContent = filter.trim() ? '筛选：' + filter : '全部已保存模板'
+  list.update({
+    items: templates.filter((item) => item.title.toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase())),
+    selectedId: draft?.id ?? null,
+    disabled: activeRequest !== null,
+    emptyText: filter.trim() ? '没有匹配模板。可清空主输入框后按 Enter。' : '暂无模板，点击“新建模板”开始。',
+  })
 }
 
 function renderVariables() {
@@ -141,6 +143,7 @@ function choose(action) {
 }
 
 ui['discard-dialog'].addEventListener('close', () => {
+  if (discardedCloseEvents) { discardedCloseEvents -= 1; return }
   const action = pendingDiscard
   pendingDiscard = null
   if (ui['discard-dialog'].returnValue === 'discard') action?.()
@@ -196,7 +199,7 @@ async function load(id) {
 
 function values() { return [...draft.values].map(([name, value]) => ({ name, value })) }
 
-ui.preview.addEventListener('click', () => {
+function preview() {
   if (!draft) return
   void request('preview', { body: draft.body, values: values() }, (data, owner) => {
     if (!current(owner, true)) { status('预览期间已有新编辑，请再次预览。'); return }
@@ -206,7 +209,7 @@ ui.preview.addEventListener('click', () => {
     ui.output.value = data.ok ? data.text : ''
     status(data.ok ? '预览已更新，尚未执行保存。' : `缺少变量样例：${data.missing.join('、')}。请填写后再次预览。`, data.ok ? '' : 'error')
   })
-})
+}
 
 function save() {
   if (!draft || recovery) return
@@ -225,24 +228,25 @@ function save() {
   })
 }
 
-ui.save.addEventListener('click', save)
-ui.new.addEventListener('click', newDraft)
 ui.title.addEventListener('input', () => { if (draft) { draft.title = ui.title.value; edited() } })
 ui.body.addEventListener('input', () => { if (draft) { draft.body = ui.body.value; edited() } })
-ui.reload.addEventListener('click', () => {
+function reload() {
   if (!recovery || activeRequest) return
   if (draft.id !== null) { choose(() => load(draft.id)); return }
   recovery.refreshRequested = true
   recovery.afterRequestId = lastUpdateRequestId
   status('请在主输入框清空筛选并按 Enter 刷新列表，然后选择已保存模板；确认未保存后也可主动新建草稿。当前草稿仍保留。')
   void panel.focusHostInput().catch(() => status('无法聚焦主输入框。请手动点击，清空筛选并按 Enter 刷新。', 'error'))
-})
+}
 
 function focusable() {
   return [...document.querySelectorAll('button, input, textarea')].filter((node) => !node.disabled && node.getClientRects().length && !node.closest('dialog'))
 }
 
 panel.onHostKey((event) => {
+  if (ui['discard-dialog'].open) return
+  if (event.key === 'ArrowDown') list.move(1)
+  if (event.key === 'ArrowUp') list.move(-1)
   if (event.key === 'n') newDraft()
   if (event.key === 'Tab') {
     const entries = focusable()
@@ -257,6 +261,10 @@ panel.onUpdate((update) => {
     draft = null
     recovery = null
     activeRequest = null
+    // Native close events are queued. Ignore the old event even if a new
+    // choice already belongs to the replacement session.
+    if (pendingDiscard) discardedCloseEvents += 1
+    pendingDiscard = null
     if (ui['discard-dialog'].open) ui['discard-dialog'].close('cancel')
   }
   filter = update.input

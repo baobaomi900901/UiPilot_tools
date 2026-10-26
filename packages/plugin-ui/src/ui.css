@@ -1,0 +1,41 @@
+.uipilot-ui-layout {
+  display: grid; grid-template-columns: minmax(140px, 220px) minmax(0, 1fr); height: 100%;
+  border-top: 1px solid var(--uipilot-color-border); color: var(--uipilot-color-text); background: var(--uipilot-color-background);
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03'; letter-spacing: 0;
+}
+.uipilot-ui-sidebar { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--uipilot-color-surface); border-right: 1px solid var(--uipilot-color-border); }
+.uipilot-ui-toolbar { height: 48px; flex: 0 0 48px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--uipilot-color-border); }
+.uipilot-ui-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.uipilot-ui-detail-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--uipilot-color-text-muted); }
+.uipilot-ui-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.uipilot-ui-list {
+  flex: 1; min-height: 0; overflow: auto; padding: 4px 14px 8px 6px; scrollbar-gutter: stable;
+  --uipilot-ui-list-hover: var(--uipilot-color-surface); --uipilot-ui-list-selected: var(--uipilot-color-surface);
+}
+.uipilot-ui-list > .uipilot-ui-list-item {
+  display: block; width: 100%; margin: 2px 0; padding: 8px 10px; min-height: 42px;
+  text-align: left; background: transparent; border: 1px solid transparent; border-radius: 6px;
+  color: var(--uipilot-color-text); font: inherit; font-size: 14px; font-weight: 500;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: pointer;
+}
+.uipilot-ui-list > .uipilot-ui-list-item:not(:disabled):not([aria-current='true']):hover { background: var(--uipilot-ui-list-hover); }
+.uipilot-ui-list > .uipilot-ui-list-item[aria-current='true'] { background: var(--uipilot-ui-list-selected); border-color: var(--uipilot-color-border); }
+.uipilot-ui-list > .uipilot-ui-list-item:focus-visible { outline: 2px solid var(--uipilot-color-text); outline-offset: -2px; }
+.uipilot-ui-list > .uipilot-ui-list-item:disabled { opacity: .5; cursor: default; }
+.uipilot-ui-list-empty { padding: 20px 10px; color: var(--uipilot-color-text-muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+@supports (color: color-mix(in srgb, black, white)) {
+  .uipilot-ui-list {
+    --uipilot-ui-list-hover: color-mix(in srgb, var(--uipilot-color-text) 5%, var(--uipilot-color-surface));
+    --uipilot-ui-list-selected: color-mix(in srgb, var(--uipilot-color-text) 12%, var(--uipilot-color-surface));
+  }
+}
+@media (max-width: 560px) {
+  .uipilot-ui-layout { grid-template-columns: minmax(120px, 32%) minmax(0, 1fr); }
+  .uipilot-ui-toolbar { padding-inline: 8px; gap: 4px; }
+  .uipilot-ui-actions { gap: 4px; }
+}
+@media (forced-colors: active) {
+  .uipilot-ui-list > .uipilot-ui-list-item[aria-current='true'] { border-color: Highlight; }
+  .uipilot-ui-list > .uipilot-ui-list-item:focus-visible { outline-color: Highlight; }
+}
