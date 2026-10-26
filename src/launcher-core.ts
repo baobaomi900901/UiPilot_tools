@@ -1998,6 +1998,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
   function deferCurrentSearch(showPending = true): void {
     const owner = {
+      commandEntryToken,
       epoch: model.viewEpoch,
       invocationId: model.invocationId,
       sequence: model.querySequence,
@@ -2006,6 +2007,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setTimeout(() => {
       if (
         destroyed || model.view !== 'launcher' || owner.epoch !== model.viewEpoch ||
+        owner.commandEntryToken !== commandEntryToken ||
         owner.invocationId !== model.invocationId || owner.sequence !== model.querySequence ||
         owner.query !== model.query || owner.query !== model.queryControlValue
       ) return

@@ -10257,6 +10257,90 @@ it.each([[false, false], [true, false], [false, true], [true, true]])('returns c
 
 describe('command hotkey entry', () => {
   const entry = { pluginId: 'com.example.hotkey', commandId: 'default', hotkey: 'Ctrl+N', bindingRevision: '1' }
+  it.each(['before resolve', 'during open', 'after open'] as const)('opens the first hidden Panel hotkey when a default reply arrives %s', async (replyAt) => {
+    vi.useFakeTimers()
+    const fake = await startedCore()
+    const { core, client } = fake
+    try {
+      const resolved = deferred<import('./protocol').CommandEntryResolution>()
+      const defaultSearch = deferred<SearchResponse | null>()
+      const opened = deferred<PluginPanelCommandResult>()
+      const identity = { pluginId: entry.pluginId, commandLabel: 'notes', sessionEpoch: u64('71'), hostKeys: [] }
+      vi.mocked(client.resolvePublicPluginCommandEntry).mockReturnValueOnce(resolved.promise)
+      vi.mocked(client.searchApps).mockReturnValueOnce(defaultSearch.promise)
+      vi.mocked(client.openPluginPanel).mockReturnValueOnce(opened.promise)
+      vi.mocked(client.submitPluginPanel).mockResolvedValue(identity)
+
+      fake.emit({ ...shown('hidden-panel-hotkey'), commandEntry: entry })
+      // Native show and command entry happen in one event, before the default-search timer fires.
+      await vi.advanceTimersByTimeAsync(0)
+      const reply = async () => {
+        defaultSearch.resolve({ requestId: 'default-reply', items: [] })
+        await defaultSearch.promise
+      }
+      if (replyAt === 'before resolve') await reply()
+      resolved.resolve({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'notes', outputMode: 'panel', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })
+      await resolved.promise
+      expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: entry.pluginId, argument: '', stableCommandTarget: entry })
+      if (replyAt === 'during open') await reply()
+      opened.resolve(identity)
+      await opened.promise
+      if (replyAt === 'after open') await reply()
+      await Promise.resolve()
+
+      expect(core.getSnapshot().panel?.sessionEpoch).toBe('71')
+      expect(client.submitPluginPanel).toHaveBeenCalledOnce()
+      expect(client.closePluginPanel).not.toHaveBeenCalled()
+      expect(client.searchApps).not.toHaveBeenCalled()
+    } finally { core.destroy(); vi.useRealTimers() }
+  })
+
+  it('still defers default search for an ordinary native show', async () => {
+    vi.useFakeTimers()
+    const fake = await startedCore()
+    try {
+      vi.mocked(fake.client.searchApps).mockResolvedValueOnce({ requestId: 'ordinary-default', items: [panelItem('')] } as unknown as SearchResponse)
+      fake.emit(shown('ordinary-native-show'))
+      expect(fake.client.searchApps).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fake.client.searchApps).toHaveBeenCalledExactlyOnceWith({ query: '', invocationId: 'ordinary-native-show', querySequence: 1 })
+      expect(fake.core.getSnapshot().results).toHaveLength(1)
+      expect(fake.client.resolvePublicPluginCommandEntry).not.toHaveBeenCalled()
+    } finally { fake.core.destroy(); vi.useRealTimers() }
+  })
+
+  it.each(['newer entry', 'navigation'] as const)('ignores a hidden command resolve superseded by %s', async (supersededBy) => {
+    vi.useFakeTimers()
+    const fake = await startedCore()
+    const { core, client } = fake
+    try {
+      const old = deferred<import('./protocol').CommandEntryResolution>()
+      vi.mocked(client.resolvePublicPluginCommandEntry).mockReturnValueOnce(old.promise)
+      fake.emit({ ...shown('hidden-stale-hotkey'), commandEntry: entry })
+      const newer = { ...entry, commandId: 'newer' }
+      const next = deferred<import('./protocol').CommandEntryResolution>()
+      if (supersededBy === 'newer entry') {
+        vi.mocked(client.resolvePublicPluginCommandEntry).mockReturnValueOnce(next.promise)
+        core.commandHotkeyEntry(newer)
+      } else core.navigate('settings')
+      await vi.advanceTimersByTimeAsync(0)
+      old.resolve({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'notes', outputMode: 'panel', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })
+      await old.promise
+      expect(client.openPluginPanel).not.toHaveBeenCalled()
+      expect(client.searchApps).not.toHaveBeenCalled()
+      if (supersededBy === 'newer entry') {
+        const identity = { pluginId: newer.pluginId, commandLabel: 'newer', sessionEpoch: u64('72'), hostKeys: [] }
+        vi.mocked(client.openPluginPanel).mockResolvedValueOnce(identity)
+        vi.mocked(client.submitPluginPanel).mockResolvedValue(identity)
+        next.resolve({ pluginId: newer.pluginId, commandId: newer.commandId, commandLabel: 'newer', outputMode: 'panel', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })
+        await next.promise
+        await Promise.resolve()
+        expect(core.getSnapshot().panel?.sessionEpoch).toBe('72')
+        expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: newer.pluginId, argument: '', stableCommandTarget: newer })
+      } else expect(core.getSnapshot().view).toBe('settings')
+    } finally { core.destroy(); vi.useRealTimers() }
+  })
+
   it('commits a no-input command once with stable identity and no result action', async () => {
     const fake = await startedCore(); const { core } = fake
     fake.emit(shown('hotkey-invocation'))
