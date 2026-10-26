@@ -1284,6 +1284,32 @@ fn public_content_bootstrap(runtime_actions: bool, files_open: bool) -> String {
         )
 }
 
+// Completion is coordinated with the blocking worker; dispatch itself may only queue work.
+fn complete_file_focus(
+    controller: Arc<PluginWindowController>,
+    identity: WindowActionIdentity,
+    dispatch: impl FnOnce(
+        Box<dyn FnOnce() + Send>,
+    ) -> Result<(), crate::public_plugins::file_open::FileOpenError>,
+    authorize: impl FnOnce() -> Result<(), crate::public_plugins::file_open::FileOpenError>
+        + Send
+        + 'static,
+    focus: impl FnOnce() -> Result<(), crate::public_plugins::file_open::FileOpenError> + Send + 'static,
+) -> Result<(), crate::public_plugins::file_open::FileOpenError> {
+    use crate::public_plugins::file_open::FileOpenError as E;
+    let (completed, completion) = std::sync::mpsc::channel();
+    dispatch(Box::new(move || {
+        // This executes on the UI thread, where Wry applies set_focus synchronously.
+        // Admission occurs here, after any earlier queued lifecycle events, not on the worker.
+        let result = controller
+            .begin_file_focus(&identity, authorize)
+            .and_then(|_native_effect| focus());
+        let _ = completed.send(result);
+    }))?;
+    // Only the blocking picker worker waits. Its physical guard remains alive through execution.
+    completion.recv().unwrap_or(Err(E::FileOpenFailedError))
+}
+
 /// Admission captures the original shell. The permit moves into the blocking closure, so
 /// dropping the async waiter cannot admit another native dialog while this worker still runs.
 pub(crate) async fn open_text(
@@ -1312,7 +1338,7 @@ pub(crate) async fn open_text(
     })?;
     tauri::async_runtime::spawn_blocking(move || {
         let identity = guard.identity.clone();
-        let focus_failed = std::cell::Cell::new(false);
+        let focus_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = file_open::select_and_read(
             || {
                 controller
@@ -1335,18 +1361,30 @@ pub(crate) async fn open_text(
             },
             file_open::read_selected,
             || {
-                let _focus = controller
-                    .begin_file_focus(&identity, || manager.authorize_file_open(&identity.owner))?;
-                if shell.set_focus().is_err() {
-                    focus_failed.set(true);
-                    return Err(E::FileOpenFailedError);
-                }
-                Ok(())
+                let focus_manager = manager.clone();
+                let focus_owner = identity.owner.clone();
+                let focus_shell = shell.clone();
+                let failed = focus_failed.clone();
+                complete_file_focus(
+                    controller.clone(),
+                    identity.clone(),
+                    |job| {
+                        app.run_on_main_thread(job)
+                            .map_err(|_| E::FileOpenFailedError)
+                    },
+                    move || focus_manager.authorize_file_open(&focus_owner),
+                    move || {
+                        focus_shell.set_focus().map_err(|_| {
+                            failed.store(true, std::sync::atomic::Ordering::Release);
+                            E::FileOpenFailedError
+                        })
+                    },
+                )
             },
         );
         // Guard remains through focus. Cleanup never looks up a newer shell by its label.
         drop(guard);
-        if focus_failed.get() {
+        if focus_failed.load(std::sync::atomic::Ordering::Acquire) {
             if let Some(_hide) = controller.begin_document_hide_checked(
                 &identity.owner.plugin_id,
                 identity.document_generation,
@@ -2113,6 +2151,7 @@ mod tests {
     use std::{sync::mpsc, thread};
 
     use super::*;
+    static FILE_PICKER_TEST: Mutex<()> = Mutex::new(());
     fn owner(token: &str, generation: u64, request: &str) -> PluginWindowOwner {
         PluginWindowOwner {
             ui_intent_epoch: generation,
@@ -2127,7 +2166,141 @@ mod tests {
     }
 
     #[test]
+    fn file_open_queued_focus_rechecks_at_execution_and_retains_physical_guard_until_completion() {
+        use crate::public_plugins::file_open::FileOpenError as E;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _serial = FILE_PICKER_TEST.lock().unwrap();
+        for mode in ["replace", "close", "revoke", "grant", "valid", "failure"] {
+            let c = Arc::new(PluginWindowController::default());
+            let a = owner(mode, 1, "old");
+            let t = c.submit(a.clone()).unwrap();
+            c.advance(
+                &a,
+                PluginWindowPhase::AwaitingReady,
+                PluginWindowPhase::Visible,
+            );
+            c.activate_timer_session(&a);
+            let (guard, ()) = c
+                .admit_file_open(
+                    &t.content_label,
+                    t.timer_session_generation,
+                    t.document_generation,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let identity = guard.identity.clone();
+            let grant = Arc::new(AtomicBool::new(true));
+            let focused = Arc::new(AtomicUsize::new(0));
+            let guarded = Arc::new(AtomicBool::new(false));
+            let (queue_tx, queue_rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let worker_controller = c.clone();
+            let effect_controller = c.clone();
+            let effect_identity = identity.clone();
+            let worker_grant = grant.clone();
+            let effect_focused = focused.clone();
+            let effect_guarded = guarded.clone();
+            let worker = thread::spawn(move || {
+                let result = complete_file_focus(
+                    worker_controller,
+                    identity,
+                    move |job| {
+                        queue_tx.send(job).unwrap();
+                        resume_rx.recv().unwrap();
+                        Ok(())
+                    },
+                    move || {
+                        if worker_grant.load(Ordering::Acquire) {
+                            Ok(())
+                        } else {
+                            Err(E::FileOpenPermissionError)
+                        }
+                    },
+                    move || {
+                        effect_focused.fetch_add(1, Ordering::AcqRel);
+                        effect_guarded.store(
+                            !effect_controller
+                                .should_hide_on_blur(&effect_identity.owner.plugin_id),
+                            Ordering::Release,
+                        );
+                        assert!(
+                            effect_controller.core.try_lock().is_ok(),
+                            "native focus runs outside controller mutex"
+                        );
+                        assert_eq!(
+                            effect_controller.core.lock().unwrap().windows
+                                [&effect_identity.owner.plugin_id]
+                                .timer_session
+                                .in_flight,
+                            1
+                        );
+                        if mode == "failure" {
+                            Err(E::FileOpenFailedError)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                drop(guard);
+                result
+            });
+            let job = queue_rx.recv().unwrap();
+            match mode {
+                "replace" => {
+                    let b = owner("new", 1, "new");
+                    let next = c.submit(b.clone()).unwrap();
+                    c.advance(
+                        &b,
+                        PluginWindowPhase::AwaitingAck,
+                        PluginWindowPhase::Visible,
+                    );
+                    c.activate_timer_session(&b);
+                    assert_eq!(next.document_generation, t.document_generation);
+                }
+                "close" => {
+                    c.begin_timer_session_close(&a.plugin_id);
+                    c.finish_timer_session_hide(&a.plugin_id, true);
+                }
+                "revoke" => {
+                    c.revoke_document(&a.plugin_id, t.document_generation);
+                }
+                "grant" => grant.store(false, Ordering::Release),
+                _ => {}
+            }
+            resume_tx.send(()).unwrap();
+            job();
+            let result = worker.join().unwrap();
+            let valid = mode == "valid" || mode == "failure";
+            assert_eq!(
+                focused.load(Ordering::Acquire),
+                usize::from(valid),
+                "queued stale focus must not execute: {mode}"
+            );
+            if valid {
+                assert!(
+                    guarded.load(Ordering::Acquire),
+                    "physical blur marker survives actual focus completion"
+                );
+            }
+            assert_eq!(
+                result,
+                if mode == "valid" {
+                    Ok(())
+                } else {
+                    Err(match mode {
+                        "grant" => E::FileOpenPermissionError,
+                        "failure" => E::FileOpenFailedError,
+                        _ => E::ExpiredWindowSessionError,
+                    })
+                }
+            );
+            assert!(c.core.lock().unwrap().file_picker.is_none());
+        }
+    }
+
+    #[test]
     fn file_open_physical_guard_survives_submit_and_close_without_leasing_runtime() {
+        let _serial = FILE_PICKER_TEST.lock().unwrap();
         use crate::public_plugins::file_open::FileOpenError as E;
         let c = Arc::new(PluginWindowController::default());
         let a = owner("file-open", 1, "a");
