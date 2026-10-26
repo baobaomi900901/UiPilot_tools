@@ -279,3 +279,13 @@ Host0.13.0与JSON工作台1.1.1保持不变，本轮无代码修改、构建或�
 交付.superpowers/deliveries/templates-1.1.0-acceptance/plugins/com.uipilot.templates-1.1.0.uipilot-plugin，39,354字节，SHA2567ff17845f7ed06343d72c92d2f249c365921db08a1eec13d41e9503617dded25。现有CLI打包/归档校验通过，7项插件源码输入前后稳定。继续使用Host0.13.0，原exe SHA25619560eb7c5367f5fd50cc5a5c6a152145b9bf24ec43bf33f5b8ddcea86f8bb42未改变；无需更新exe，无宿主/前端重建或agent原生操作。
 
 下一人工节点为升级保留旧模板、新建预览保存、列表方向键/Enter与未保存切换取消。后续筛选/重启/双主题等分组下发。所有本轮人工结果仍待用户确认；只完成标准UI第一个子集，不代表完整Form/ActionPanel、M5或整体基座完成。既有0.13文件导入人工通过记录保留，普通Enter次数仍搁置。
+
+## 2026-10-27 文本模板取消入口修正版1.1.1，待复测
+
+用户在修改test(A)并选择问候(B)时反馈确认框找不到取消；截图中仅有“保留草稿”和“放弃并继续”。源码确认原value=cancel逻辑存在，本次修正文案及关闭入口，不声称原取消处理失效，也不将本组人工标为通过。
+
+源码533c5be8a208ceb438b6acdac3979e33d686bf5f仅改模板六个文件：明确“取消”、右上角可访问“关闭”，两个type=button入口显式close(cancel)，保留原放弃表单、Escape、autofocus、会话和延迟close保护。补充描述关联及有限视口布局，版本1.1.1；Runtime、共享UI库、权限、存储及最低Host0.6.0保持。12项面板聚焦检查和目录校验通过，独立Spec/Quality PASS，无新增发现。
+
+新包仍在.superpowers/deliveries/templates-1.1.0-acceptance/plugins/com.uipilot.templates-1.1.1.uipilot-plugin，40,630字节，SHA2565785e41271c5fdef44da2a1fc4281b1869582b5218a69bbff3136fa32c89d64e。归档校验通过，7个插件输入稳定；旧1.1.0包与Host0.13.0 hash保持，无宿主重建或agent原生操作。最新证据modal-1.1.1-evidence.json。
+
+下一步仅用户先保存希望保留的当前编辑，再升级插件；分别测试取消/关闭/Esc保留A草稿、预览和当前选择，以及明确放弃后载入B。本修正版实际表现和原首组其他未明确反馈项目仍待人工确认。
