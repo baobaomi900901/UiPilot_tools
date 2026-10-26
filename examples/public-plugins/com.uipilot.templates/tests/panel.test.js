@@ -20,6 +20,11 @@ async function setup(t, request = async ({ payload }) => ({ ok: true, template: 
   const dialog = document.querySelector('dialog'), closeEvents = []
   dialog.showModal = () => { dialog.open = true }
   dialog.close = (value) => { dialog.returnValue = value; dialog.open = false; closeEvents.push(() => dialog.dispatchEvent(new dom.window.Event('close'))) }
+  // JSDOM has no native method=dialog submission; model only its close result.
+  dialog.querySelector('form').addEventListener('submit', (event) => {
+    event.preventDefault()
+    dialog.close(event.submitter.value)
+  })
   dom.window.uipilotPluginPanel = {
     onHostKey(handler) { hostKey = handler },
     onUpdate(handler) { update = handler },
@@ -45,7 +50,7 @@ async function setup(t, request = async ({ payload }) => ({ ok: true, template: 
 }
 test('manifest declares arrows with content focus and keeps Host Enter as submit', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '1.1.0')
+  assert.equal(manifest.version, '1.1.1')
   assert.equal(manifest.minimumHostVersion, '0.6.0')
   assert.deepEqual(manifest.permissions, ['ui.panel'])
   assert.deepEqual(manifest.panel.hostKeys, ['ArrowDown', 'ArrowUp', 'Primary+N', 'Tab', 'Shift+Tab'])
@@ -84,6 +89,54 @@ test('dirty switch cancel preserves draft, preview and loaded identity; filterin
   assert.equal(app.node('body').value, 'unsaved body')
   assert.equal(app.node('list').querySelector('[aria-current="true"]'), null)
 })
+for (const control of ['取消', '关闭']) {
+  test(`visible ${control} closes dirty-switch confirmation and preserves draft before explicit discard`, async (t) => {
+    const app = await setup(t)
+    app.node('list').children[0].click(); await flush()
+    app.input('body', 'unsaved body'); app.node('output').value = 'existing preview'
+    app.node('list').children[1].click()
+    assert.equal(app.dialog.open, true)
+    const cancel = [...app.dialog.querySelectorAll('button')].find((button) =>
+      (button.getAttribute('aria-label') ?? button.textContent).trim() === control)
+    assert.ok(cancel, `dialog must expose an explicit ${control} button`)
+    assert.equal(cancel.type, 'button', 'cancellation must not submit the discard form')
+    assert.equal(app.dialog.getAttribute('aria-describedby'), 'discard-message')
+    if (control === '取消') assert.equal(cancel.autofocus, true)
+    else {
+      assert.equal(cancel.title, '关闭')
+      assert.ok(cancel.querySelector('svg[aria-hidden="true"]'), 'close icon is visible but decorative')
+    }
+    let submits = 0
+    app.dialog.querySelector('form').addEventListener('submit', () => { submits += 1 })
+    cancel.click()
+    assert.equal(app.dialog.open, false)
+    assert.equal(app.dialog.returnValue, 'cancel')
+    app.dispatchClose(); await flush()
+    assert.equal(submits, 0)
+    assert.equal(app.node('title').value, 'Alpha')
+    assert.equal(app.node('body').value, 'unsaved body')
+    assert.equal(app.node('output').value, 'existing preview')
+    assert.equal(app.node('list').children[0].getAttribute('aria-current'), 'true')
+    assert.equal(app.calls.length, 1, 'cancel does not send another Runtime request')
+    app.node('list').children[1].click()
+    assert.equal(app.dialog.open, true)
+    const discard = app.dialog.querySelector('button[value="discard"]')
+    assert.equal(discard.textContent, '放弃并继续')
+    discard.click()
+    assert.equal(app.dialog.open, false)
+    assert.equal(app.dialog.returnValue, 'discard')
+    app.dispatchClose(); await flush()
+    assert.equal(submits, 1, 'explicit discard uses native form submission exactly once')
+    assert.deepEqual(app.calls, [
+      { action: 'load', payload: { id: 'template-1' } },
+      { action: 'load', payload: { id: 'template-2' } },
+    ])
+    assert.equal(app.node('title').value, 'Beta')
+    assert.equal(app.node('body').value, 'saved body')
+    assert.equal(app.node('list').children[1].getAttribute('aria-current'), 'true')
+  })
+}
+
 test('busy save retains inputs, prevents duplicate calls and marks later typing dirty', async (t) => {
   const pending = deferred()
   const app = await setup(t, () => pending.promise)

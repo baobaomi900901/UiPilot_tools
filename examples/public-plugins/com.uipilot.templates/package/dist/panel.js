@@ -142,6 +142,10 @@ function choose(action) {
   ui['discard-dialog'].showModal()
 }
 
+for (const id of ['discard-cancel', 'discard-close']) {
+  element(id).addEventListener('click', () => ui['discard-dialog'].close('cancel'))
+}
+
 ui['discard-dialog'].addEventListener('close', () => {
   if (discardedCloseEvents) { discardedCloseEvents -= 1; return }
   const action = pendingDiscard

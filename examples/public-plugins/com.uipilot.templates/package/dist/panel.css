@@ -69,10 +69,13 @@ legend { padding: 0; font-weight: 500; }
 #status { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
 #status[data-tone='error'] { color: var(--uipilot-color-danger); }
 #reload { margin-top: 6px; }
-dialog { max-width: min(400px, calc(100% - 32px)); padding: 18px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+dialog { max-width: min(400px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; padding: 18px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
 dialog::backdrop { background: rgb(0 0 0 / .4); }
-dialog p { color: var(--muted); line-height: 1.6; }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+dialog p { color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
+.dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dialog-heading h2 { min-width: 0; overflow-wrap: anywhere; }
+#discard-close { display: grid; place-items: center; flex-shrink: 0; width: 30px; padding: 4px; background: transparent; }
+.dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 @media (forced-colors: active) {
   button.primary { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
   button:focus-visible, input:focus-visible, textarea:focus-visible { outline-color: Highlight; }

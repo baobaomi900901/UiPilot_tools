@@ -49,12 +49,15 @@
         </footer>
       </section>
     </main>
-    <dialog id="discard-dialog" aria-labelledby="discard-title">
+    <dialog id="discard-dialog" aria-labelledby="discard-title" aria-describedby="discard-message">
       <form method="dialog">
-        <h2 id="discard-title">放弃当前草稿？</h2>
+        <div class="dialog-heading">
+          <h2 id="discard-title">放弃当前草稿？</h2>
+          <button id="discard-close" type="button" aria-label="关闭" title="关闭"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg></button>
+        </div>
         <p id="discard-message"></p>
         <div class="dialog-actions">
-          <button value="cancel" autofocus>保留草稿</button>
+          <button id="discard-cancel" type="button" autofocus>取消</button>
           <button value="discard">放弃并继续</button>
         </div>
       </form>
