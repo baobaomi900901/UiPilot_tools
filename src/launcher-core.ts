@@ -3228,6 +3228,18 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const ownsQuery = () => ownsAction() && owner.control === model.queryControl &&
       owner.querySequence === model.querySequence && owner.query === model.query &&
       owner.query === model.queryControlValue && model.results.some(({ key }) => key === owner.resultKey)
+    const releaseFailedHotkeyOpen = () => {
+      if (!ownsQuery() || !owner.commandHotkeyTarget || stableCommandTarget !== owner.commandHotkeyTarget) return
+      stableCommandTarget = undefined
+      stableCommandOutputMode = undefined
+      if (composition?.control === model.mainResultCommand?.suffix.key) composition = undefined
+      model.mainResultCommand = undefined
+      completionOrigin = undefined
+      cancelSlashSearch()
+      model.query = ''
+      model.queryControlValue = ''
+      clearResults()
+    }
     void pending.then(
       (identity) => {
         if (!ownsQuery()) {
@@ -3239,6 +3251,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           return
         }
         if (identity.pluginId !== owner.pluginId) {
+          releaseFailedHotkeyOpen()
           model.executePending = false
           model.status = FALLBACK_ERROR
           publish(true)
@@ -3281,7 +3294,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       () => {
         if (!ownsAction()) return
         model.executePending = false
-        if (ownsQuery()) model.status = FALLBACK_ERROR
+        if (ownsQuery()) {
+          releaseFailedHotkeyOpen()
+          model.status = FALLBACK_ERROR
+        }
         publish(true)
       },
     )
