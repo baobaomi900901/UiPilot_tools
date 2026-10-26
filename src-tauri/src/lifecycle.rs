@@ -225,6 +225,18 @@ struct RuntimeSettings {
     installed_hook: Option<DoubleTapModifier>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsSaveError {
+    HotkeyConflict,
+    Failed,
+}
+
+impl From<()> for SettingsSaveError {
+    fn from(_: ()) -> Self {
+        Self::Failed
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HotkeyBindingChange {
     persisted: HotkeyKind,
@@ -1064,28 +1076,46 @@ impl LifecycleCoordinator {
         self.dispatch_native_hotkey(app, &event.shortcut);
     }
 
+    pub(crate) fn with_launcher_hotkey_save<S, P>(
+        &self,
+        kind: HotkeyKind,
+        snapshot: S,
+        apply: P,
+    ) -> Result<(), SettingsSaveError>
+    where
+        S: FnOnce() -> Settings,
+        P: FnOnce(Settings, HotkeyKind) -> Result<(), ()>,
+    {
+        let _operation = self.lock_hotkey_operation()?;
+        let persisted = snapshot();
+        if crate::command_hotkeys::launcher_conflicts(&persisted, &kind.canonical()) {
+            return Err(SettingsSaveError::HotkeyConflict);
+        }
+        apply(persisted, kind).map_err(SettingsSaveError::from)
+    }
+
     pub(crate) fn save_settings_transaction(
         self: &Arc<Self>,
         app: &AppHandle,
         settings: &SettingsStore,
         kind: HotkeyKind,
         update: SettingsUpdate,
-    ) -> Result<(), ()> {
-        let _operation = self.lock_hotkey_operation()?;
-        let snapshot = settings.snapshot();
-        if crate::command_hotkeys::launcher_conflicts(&snapshot, &kind.canonical()) {
-            return Err(());
-        }
-        let persisted = settings.snapshot();
-        let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
-        self.apply_production_hotkey_transaction(
-            app,
-            HotkeyBindingChange {
-                persisted: persisted_kind,
-                requested: kind,
-                autostart: update.autostart,
+    ) -> Result<(), SettingsSaveError> {
+        self.with_launcher_hotkey_save(
+            kind,
+            || settings.snapshot(),
+            |persisted, kind| {
+                let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
+                self.apply_production_hotkey_transaction(
+                    app,
+                    HotkeyBindingChange {
+                        persisted: persisted_kind,
+                        requested: kind,
+                        autostart: update.autostart,
+                    },
+                    || settings.update_user_settings(update).map_err(|_| ()),
+                )
             },
-            || settings.update_user_settings(update).map_err(|_| ()),
         )
     }
 
@@ -1095,22 +1125,22 @@ impl LifecycleCoordinator {
         settings: &SettingsStore,
         kind: HotkeyKind,
         hotkey: String,
-    ) -> Result<(), ()> {
-        let _operation = self.lock_hotkey_operation()?;
-        let snapshot = settings.snapshot();
-        if crate::command_hotkeys::launcher_conflicts(&snapshot, &kind.canonical()) {
-            return Err(());
-        }
-        let persisted = settings.snapshot();
-        let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
-        self.apply_production_hotkey_transaction(
-            app,
-            HotkeyBindingChange {
-                persisted: persisted_kind,
-                requested: kind,
-                autostart: persisted.autostart,
+    ) -> Result<(), SettingsSaveError> {
+        self.with_launcher_hotkey_save(
+            kind,
+            || settings.snapshot(),
+            |persisted, kind| {
+                let persisted_kind = HotkeyKind::parse(&persisted.hotkey).map_err(|_| ())?;
+                self.apply_production_hotkey_transaction(
+                    app,
+                    HotkeyBindingChange {
+                        persisted: persisted_kind,
+                        requested: kind,
+                        autostart: persisted.autostart,
+                    },
+                    || settings.update_hotkey(hotkey).map_err(|_| ()),
+                )
             },
-            || settings.update_hotkey(hotkey).map_err(|_| ()),
         )
     }
 
@@ -2613,6 +2643,43 @@ mod tests {
             ReadyOrder::FrontendFirst => [state.mark_frontend_ready(), state.mark_setup_ready()],
         };
         results.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn launcher_hotkey_save_classifies_conflict_under_gate_before_effects() {
+        for conflict in [true, false] {
+            let coordinator = LifecycleCoordinator::default();
+            let effects = Cell::new(0);
+            let result = coordinator.with_launcher_hotkey_save(
+                HotkeyKind::parse("Control+N").unwrap(),
+                || {
+                    assert!(coordinator.hotkey_operation.try_lock().is_err());
+                    let mut settings = Settings::default();
+                    if conflict {
+                        settings.public_plugin_command_hotkeys.insert(
+                            "com.example.notes".into(),
+                            [("default".into(), "Ctrl+N".into())].into(),
+                        );
+                    }
+                    settings
+                },
+                |_, _| {
+                    assert!(coordinator.hotkey_operation.try_lock().is_err());
+                    effects.set(effects.get() + 1);
+                    Err(())
+                },
+            );
+            assert_eq!(
+                result,
+                Err(if conflict {
+                    SettingsSaveError::HotkeyConflict
+                } else {
+                    SettingsSaveError::Failed
+                })
+            );
+            assert_eq!(effects.get(), usize::from(!conflict));
+            assert!(coordinator.hotkey_operation.try_lock().is_ok());
+        }
     }
 
     #[test]
@@ -4477,7 +4544,7 @@ mod tests {
                 move || reserve_coordinator.reserve_critical().map_err(|_| ()),
                 move |reservation| {
                     let _reservation = reservation;
-                    state.apply_hotkey_binding(
+                    let result = state.apply_hotkey_binding(
                         HotkeyBindingChange {
                             persisted: HotkeyKind::Chord(old),
                             requested: HotkeyKind::Chord(requested),
@@ -4527,7 +4594,8 @@ mod tests {
                                 Ok(())
                             }
                         },
-                    )
+                    );
+                    result.map_err(SettingsSaveError::from)
                 },
             ));
             assert_eq!(result.is_err(), persist_fails);

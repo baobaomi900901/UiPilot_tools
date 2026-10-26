@@ -279,6 +279,7 @@ interface PreviewPreferenceOwner {
 type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
 
 interface SettingsOperation {
+  previous?: UserSettingsUpdate
   token: number
   kind: SettingsOperationKind
   owner:
@@ -310,6 +311,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   unknownResult: '搜索结果已过期，请重新搜索。',
   applicationEntryUnavailable: '应用入口不可用，请重新扫描。',
   settingsFailed: '设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。',
+  hotkeyConflict: '快捷键已被命令占用，请选择其他快捷键。',
   windowFailed: '窗口操作失败。',
   invalidFileQuery: '查询无效。',
   fileSearchWorkerFailed: '搜索暂不可用。',
@@ -2756,7 +2758,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     owner: SettingsOperation['owner'] = { scope: 'view', viewEpoch: model.viewEpoch, view: model.view },
   ): SettingsOperation | undefined {
     if (destroyed || settingsOperation || (kind !== 'load' && !model.settings)) return undefined
-    const operation = { token: ++token, kind, owner }
+    const operation: SettingsOperation = {
+      token: ++token, kind, owner,
+      ...((kind === 'save' || kind === 'hotkey') ? { previous: settingsUpdate() } : {}),
+    }
     settingsOperation = operation
     model.settingsOperation = kind
     model.shownNotice = undefined
@@ -2863,12 +2868,28 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     await requestSettingsLoad()
   }
 
-  function finishSettingsMutation(operation: SettingsOperation, failed: boolean): void {
+  function finishSettingsMutation(operation: SettingsOperation, failed: boolean, error?: unknown): void {
     if (!ownsSettingsOperation(operation)) return
-    if (failed) model.settingsUncertain = true
+    const conflict = failed && typeof error === 'object' && error !== null &&
+      Object.prototype.hasOwnProperty.call(error, 'code') && (error as { code?: unknown }).code === 'hotkeyConflict'
+    const current = ownsSettingsView(operation)
+    if (failed && !conflict) model.settingsUncertain = true
+    if (conflict && current && operation.previous && model.settings) {
+      const previous = operation.previous
+      setControlDraft(model.settings.hotkey.key, previous.hotkey)
+      model.settings.hotkey.value = previous.hotkey
+      model.settings.autostart = previous.autostart
+      model.settings.webSearchEngine = previous.webSearchEngine
+      model.theme = previous.theme
+    }
+    const viewEpoch = model.viewEpoch
     releaseSettingsOperation(operation)
     if (model.view === 'settings') {
       void requestSettingsLoad()
+      if (conflict && current && model.viewEpoch === viewEpoch) {
+        model.status = ERROR_TEXT.hotkeyConflict
+        publish(true)
+      }
     } else {
       publish(true)
     }
@@ -2929,8 +2950,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   async function persistSettings(operation: SettingsOperation, update: UserSettingsUpdate): Promise<void> {
     try {
       await client.saveSettings({ settings: update })
-    } catch {
-      finishSettingsMutation(operation, true)
+    } catch (error) {
+      finishSettingsMutation(operation, true, error)
       return
     }
     finishSettingsMutation(operation, false)
@@ -2965,8 +2986,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     try {
       await client.saveHotkey({ hotkey: { hotkey: value } })
-    } catch {
-      finishSettingsMutation(operation, true)
+    } catch (error) {
+      finishSettingsMutation(operation, true, error)
       return
     }
     finishSettingsMutation(operation, false)

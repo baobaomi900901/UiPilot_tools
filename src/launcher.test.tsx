@@ -5591,6 +5591,66 @@ describe('settings ownership', () => {
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private backend')
   })
 
+  it('recovers a known hotkey conflict and permits recording and general settings again', async () => {
+    const { core, client } = await settingsCore()
+    vi.mocked(client.saveHotkey).mockRejectedValueOnce({ code: 'hotkeyConflict', message: 'private conflict detail' })
+
+    await core.saveHotkeyCanonical('Control+N')
+
+    await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({ readOnly: false, needsReload: false, loadStatus: 'ready' }))
+    expect(core.getSnapshot().settings!.hotkey.value).toBe('Alt+Space')
+    expect(core.getSnapshot().status).toBe('快捷键已被命令占用，请选择其他快捷键。')
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private conflict')
+    vi.mocked(client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, hotkey: 'DoubleCtrl' })
+    await core.saveHotkeyCanonical('DoubleCtrl')
+    await vi.waitFor(() => expect(core.getSnapshot().settings!.hotkey.value).toBe('DoubleCtrl'))
+    core.setAutostart(true)
+    expect(client.saveSettings).toHaveBeenCalledOnce()
+  })
+
+  it('restores confirmed preferences after reset conflict even if recovery load fails', async () => {
+    const original: SettingsView = { ...settingsFixture, autostart: true, theme: 'dark', webSearchEngine: 'google' }
+    const { core, client } = await settingsCore(original)
+    vi.mocked(client.saveSettings).mockRejectedValueOnce({ code: 'hotkeyConflict', message: 'private reset conflict' })
+    vi.mocked(client.loadSettings).mockRejectedValueOnce({ code: 'settingsFailed', message: 'private reload failure' })
+
+    await core.resetSettings()
+
+    await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'error', readOnly: true, needsReload: false }))
+    expect(core.getSnapshot()).toMatchObject({ theme: 'dark', settings: { autostart: true, webSearchEngine: 'google', hotkey: { value: 'Alt+Space' } } })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private')
+    await core.reloadSettings()
+    expect(core.getSnapshot().settings).toMatchObject({ loadStatus: 'ready', readOnly: false, needsReload: false })
+    core.setAutostart(false)
+    expect(client.saveSettings).toHaveBeenLastCalledWith({ settings: { hotkey: 'Alt+Space', autostart: false, theme: 'dark', webSearchEngine: 'google' } })
+  })
+
+  it('recovers a reset conflict through an authoritative reload', async () => {
+    const original: SettingsView = { ...settingsFixture, autostart: true, theme: 'dark', webSearchEngine: 'google' }
+    const { core, client } = await settingsCore(original)
+    vi.mocked(client.saveSettings).mockRejectedValueOnce({ code: 'hotkeyConflict' })
+    await core.resetSettings()
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    expect(core.getSnapshot()).toMatchObject({ theme: 'dark', settings: { needsReload: false, autostart: true, webSearchEngine: 'google', hotkey: { value: 'Alt+Space' } } })
+    expect(core.getSnapshot().status).toBe('快捷键已被命令占用，请选择其他快捷键。')
+  })
+
+  it('does not publish a stale conflict over a newer launcher status', async () => {
+    const { core, client, emit } = await settingsCore()
+    const save = deferred<{ hotkey: string }>()
+    vi.mocked(client.saveHotkey).mockReturnValueOnce(save.promise)
+    const pending = core.saveHotkeyCanonical('Control+N')
+    emit(shown('conflict-new-launcher', 'launcher'))
+    core.failInitialization()
+    save.reject({ code: 'hotkeyConflict', message: 'private stale conflict' })
+    await pending
+    expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
+    emit(shown('conflict-new-settings', 'settings'))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.readOnly).toBe(false))
+    expect(core.getSnapshot().settings).toMatchObject({ needsReload: false, hotkey: { value: 'Alt+Space' } })
+    expect(core.getSnapshot().status).not.toContain('已被命令占用')
+  })
+
   it('keeps one settings operation while dedicated hotkey save is pending', async () => {
     const { core, client } = await settingsCore()
     const pendingHotkey = deferred<{ hotkey: string }>()

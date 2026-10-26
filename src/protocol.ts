@@ -315,6 +315,7 @@ export type CommandErrorCode =
   | 'unknownResult'
   | 'applicationEntryUnavailable'
   | 'settingsFailed'
+  | 'hotkeyConflict'
   | 'windowFailed'
   | 'invalidFileQuery'
   | 'fileSearchWorkerFailed'

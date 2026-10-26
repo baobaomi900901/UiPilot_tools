@@ -34,6 +34,7 @@ use crate::{
     hotkey::HotkeyKind,
     lifecycle::{
         self, ClipboardPasteTarget, CriticalReservation, LifecycleCoordinator, ReservationError,
+        SettingsSaveError,
     },
     message_center::{
         MessageCenterError, MessageCenterService, MessageCenterSnapshot, MessageSummary,
@@ -302,6 +303,13 @@ impl CommandError {
         Self {
             code: "settingsFailed",
             message: "settings operation failed",
+        }
+    }
+
+    fn hotkey_conflict() -> Self {
+        Self {
+            code: "hotkeyConflict",
+            message: "launcher hotkey conflicts with a command binding",
         }
     }
 
@@ -5146,7 +5154,9 @@ async fn save_settings_with<R, E, W>(
 ) -> Result<(), CommandError>
 where
     R: FnOnce() -> Result<CriticalReservation, E>,
-    W: FnOnce(CriticalReservation, HotkeyKind, SettingsUpdate) -> Result<(), ()> + Send + 'static,
+    W: FnOnce(CriticalReservation, HotkeyKind, SettingsUpdate) -> Result<(), SettingsSaveError>
+        + Send
+        + 'static,
 {
     let (kind, update) = prepare_settings_save(settings)?;
     save_settings_worker_with(reserve, move |reservation| {
@@ -5162,7 +5172,9 @@ async fn save_hotkey_with<R, E, W>(
 ) -> Result<HotkeySettingsView, CommandError>
 where
     R: FnOnce() -> Result<CriticalReservation, E>,
-    W: FnOnce(CriticalReservation, HotkeyKind, String) -> Result<(), ()> + Send + 'static,
+    W: FnOnce(CriticalReservation, HotkeyKind, String) -> Result<(), SettingsSaveError>
+        + Send
+        + 'static,
 {
     let (kind, view) = prepare_hotkey_save(hotkey)?;
     let persisted = view.hotkey.clone();
@@ -5179,7 +5191,7 @@ pub(crate) async fn save_settings_worker_with<R, E, W>(
 ) -> Result<(), CommandError>
 where
     R: FnOnce() -> Result<CriticalReservation, E>,
-    W: FnOnce(CriticalReservation) -> Result<(), ()> + Send + 'static,
+    W: FnOnce(CriticalReservation) -> Result<(), SettingsSaveError> + Send + 'static,
 {
     let reservation = reserve().map_err(|_| CommandError::settings_failed())?;
     let result = tauri::async_runtime::spawn_blocking(move || worker(reservation))
@@ -5188,10 +5200,13 @@ where
     map_save_worker_result(result)
 }
 
-fn map_save_worker_result(result: Result<Result<(), ()>, ()>) -> Result<(), CommandError> {
+fn map_save_worker_result(
+    result: Result<Result<(), SettingsSaveError>, ()>,
+) -> Result<(), CommandError> {
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(())) | Err(()) => Err(CommandError::settings_failed()),
+        Ok(Err(SettingsSaveError::HotkeyConflict)) => Err(CommandError::hotkey_conflict()),
+        Ok(Err(SettingsSaveError::Failed)) | Err(()) => Err(CommandError::settings_failed()),
     }
 }
 
@@ -6116,8 +6131,8 @@ mod tests {
         prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
         public_plugin_search_decision, publish_everything_search,
         publish_public_command_suggestions, publish_quick_evaluation, require_find_label,
-        require_main_label, resolve_invocation_theme, save_settings_core, save_settings_with,
-        save_settings_worker_with, search_apps_with, search_apps_with_catalog,
+        require_main_label, resolve_invocation_theme, save_hotkey_with, save_settings_core,
+        save_settings_with, save_settings_worker_with, search_apps_with, search_apps_with_catalog,
         search_apps_with_catalog_and_currency, search_apps_with_clocks,
         search_apps_with_local_date, search_files_with, select_public_plugin_source_with,
         set_file_preview_preference_with, start_host_input_focus, submitted_main_result_command,
@@ -10725,10 +10740,57 @@ mod tests",
     }
 
     #[test]
+    fn save_settings_known_launcher_conflict_is_recoverable() {
+        for hotkey_only in [false, true] {
+            let coordinator = Arc::new(LifecycleCoordinator::default());
+            let reserve_coordinator = Arc::clone(&coordinator);
+            let worker_coordinator = Arc::clone(&coordinator);
+            let reserve = move || reserve_coordinator.reserve_critical().map_err(|_| ());
+            let reject = move |kind| {
+                worker_coordinator.with_launcher_hotkey_save(
+                    kind,
+                    || {
+                        let mut settings = crate::settings::Settings::default();
+                        settings.public_plugin_command_hotkeys.insert(
+                            "com.example.notes".into(),
+                            [("default".into(), "Control+N".into())].into(),
+                        );
+                        settings
+                    },
+                    |_, _| panic!("conflict must not run native or persistence effects"),
+                )
+            };
+            let result = if hotkey_only {
+                tauri::async_runtime::block_on(save_hotkey_with(
+                    HotkeySettingsUpdate {
+                        hotkey: "Control+N".into(),
+                    },
+                    reserve,
+                    move |_reservation, kind, _| reject(kind),
+                ))
+                .map(|_| ())
+            } else {
+                tauri::async_runtime::block_on(save_settings_with(
+                    user_settings("Control+N"),
+                    reserve,
+                    move |_reservation, kind, _| reject(kind),
+                ))
+            };
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "hotkeyConflict");
+            assert_eq!(
+                serde_json::to_value(&error).unwrap()["code"],
+                "hotkeyConflict"
+            );
+            assert!(coordinator.reserve_critical().is_ok());
+        }
+    }
+
+    #[test]
     fn save_settings_maps_worker_and_join_failures_to_fixed_error() {
         assert_eq!(map_save_worker_result(Ok(Ok(()))), Ok(()));
         assert_eq!(
-            map_save_worker_result(Ok(Err(()))),
+            map_save_worker_result(Ok(Err(crate::lifecycle::SettingsSaveError::Failed))),
             Err(CommandError::settings_failed())
         );
         assert_eq!(
