@@ -39,3 +39,15 @@
   .uipilot-ui-list > .uipilot-ui-list-item[aria-current='true'] { border-color: Highlight; }
   .uipilot-ui-list > .uipilot-ui-list-item:focus-visible { outline-color: Highlight; }
 }
+.uipilot-ui-field-error { margin: 0; color: var(--uipilot-color-danger); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.uipilot-ui-field-error:empty { display: none; }
+.uipilot-ui-layout [aria-invalid='true'] { border-color: var(--uipilot-color-danger); }
+.uipilot-ui-action-panel { width: min(360px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; }
+.uipilot-ui-action-panel-list { display: grid; gap: 4px; margin: 12px 0; }
+.uipilot-ui-action-panel-item { width: 100%; min-width: 0; text-align: left; white-space: normal; overflow-wrap: anywhere; color: var(--uipilot-color-text); background: var(--uipilot-color-surface); border: 1px solid var(--uipilot-color-border); border-radius: 6px; padding: 8px 10px; font: inherit; }
+.uipilot-ui-action-panel-item:focus-visible { outline: 2px solid var(--uipilot-color-text); outline-offset: -2px; }
+.uipilot-ui-action-panel-item:disabled { opacity: .5; cursor: default; }
+@media (forced-colors: active) {
+  .uipilot-ui-layout [aria-invalid='true'] { border-style: dashed; }
+  .uipilot-ui-action-panel-item:focus-visible { outline-color: Highlight; }
+}

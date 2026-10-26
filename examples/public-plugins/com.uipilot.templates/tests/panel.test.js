@@ -20,6 +20,10 @@ async function setup(t, request = async ({ payload }) => ({ ok: true, template: 
   const dialog = document.querySelector('dialog'), closeEvents = []
   dialog.showModal = () => { dialog.open = true }
   dialog.close = (value) => { dialog.returnValue = value; dialog.open = false; closeEvents.push(() => dialog.dispatchEvent(new dom.window.Event('close'))) }
+  for (const extra of document.querySelectorAll('dialog:not(#discard-dialog)')) {
+    extra.showModal = () => { assert.equal(document.querySelectorAll('dialog[open]').length, 0); extra.open = true }
+    extra.close = () => { extra.open = false; closeEvents.push(() => extra.dispatchEvent(new dom.window.Event('close'))) }
+  }
   // JSDOM has no native method=dialog submission; model only its close result.
   dialog.querySelector('form').addEventListener('submit', (event) => {
     event.preventDefault()
@@ -36,6 +40,7 @@ async function setup(t, request = async ({ payload }) => ({ ok: true, template: 
   t.after(() => { dom.window.close(); delete globalThis.window; delete globalThis.document })
   const api = {
     document, dialog, calls,
+    key: (key, options = {}) => document.activeElement.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, ctrlKey: true, bubbles: true, cancelable: true, ...options })),
     node: (id) => document.getElementById(id),
     update: (overrides = {}) => update({ sessionEpoch: '1', requestId: 'r1', input: '', theme: 'dark', data: { ok: true, templates: summaries }, ...overrides }),
     host: (key) => { inHostKey = true; try { return hostKey({ key, sessionEpoch: '1' }) } finally { inHostKey = false } },
@@ -50,7 +55,7 @@ async function setup(t, request = async ({ payload }) => ({ ok: true, template: 
 }
 test('manifest declares arrows with content focus and keeps Host Enter as submit', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '1.1.1')
+  assert.equal(manifest.version, '1.2.0')
   assert.equal(manifest.minimumHostVersion, '0.6.0')
   assert.deepEqual(manifest.permissions, ['ui.panel'])
   assert.deepEqual(manifest.panel.hostKeys, ['ArrowDown', 'ArrowUp', 'Primary+N', 'Tab', 'Shift+Tab'])
@@ -153,6 +158,10 @@ test('busy save retains inputs, prevents duplicate calls and marks later typing 
   assert.equal(body.value, 'later')
   assert.match(app.node('draft-state').textContent, /未保存/)
   assert.equal(app.node('editor').getAttribute('aria-busy'), 'false')
+  app.click('save')
+  assert.equal(app.calls[1].payload.id, 'template-3')
+  assert.equal(app.calls[1].payload.expectedRevision, 1)
+  await flush()
 })
 test('new session rejects late request reply', async (t) => {
   const pending = deferred()
@@ -194,7 +203,7 @@ test('uncertain new save needs a new Host submission before deliberate new draft
   assert.equal(app.node('title').value, 'Uncertain')
 })
 test('vendored files equal source and read-only sync check passes', async () => {
-  for (const file of ['ui.js', 'ui.css']) {
+  for (const file of ['ui.js', 'ui.css', 'form.js', 'action-panel.js']) {
     assert.equal(await readFile(new URL('ui/' + file, dist), 'utf8'), await readFile(new URL('packages/plugin-ui/src/' + file, root), 'utf8'))
   }
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('packages/plugin-ui/scripts/sync-templates.mjs', root)), '--check'], { encoding: 'utf8' })
@@ -213,7 +222,7 @@ test('sync check returns nonzero on drift without repairing the copy', async (t)
   await mkdir(join(fixture, 'packages/plugin-ui/scripts'), { recursive: true })
   await mkdir(source, { recursive: true }); await mkdir(target, { recursive: true })
   await writeFile(script, await readFile(new URL('packages/plugin-ui/scripts/sync-templates.mjs', root)))
-  for (const file of ['ui.js', 'ui.css']) {
+  for (const file of ['ui.js', 'ui.css', 'form.js', 'action-panel.js']) {
     await writeFile(join(source, file), 'source')
     await writeFile(join(target, file), 'drift')
   }
@@ -235,4 +244,86 @@ test('replacement session abandons old disabled-row focus ownership', async (t) 
   app.update({ sessionEpoch: '2', requestId: 'r2' })
   assert.equal(app.document.activeElement, app.document.body)
   assert.equal(app.node('editor').hidden, true)
+})
+
+test('local Form validation distinguishes preview/save and preserves codepoint and UTF-8 boundaries', async (t) => {
+  const app = await setup(t, async ({ payload }) => ({ ok: false, code: 'invalid-syntax' }))
+  app.click('new'); app.click('save')
+  assert.equal(app.calls.length, 0)
+  assert.equal(app.node('title').getAttribute('aria-invalid'), 'true')
+  app.click('preview'); await flush()
+  assert.equal(app.calls.length, 1, 'preview does not require title')
+  assert.equal(app.node('body').getAttribute('aria-invalid'), 'true')
+  app.input('title', '😀'.repeat(80)); app.input('body', '😀'.repeat(2048)); app.click('save'); await flush()
+  assert.equal(app.calls.length, 2)
+  assert.equal(app.calls[1].payload.title, '😀'.repeat(80))
+  assert.equal(app.node('title').hasAttribute('maxlength'), false)
+  app.input('title', '😀'.repeat(81)); app.click('save'); assert.equal(app.calls.length, 2)
+  app.input('title', 'Valid'); app.input('body', '😀'.repeat(2048) + 'a'); app.click('preview'); assert.equal(app.calls.length, 2)
+  app.input('body', ''); app.click('save'); await flush(); assert.equal(app.calls.length, 3, 'empty body may save')
+})
+test('sample binding preserves missing versus explicit empty and validates provided values before Runtime', async (t) => {
+  const app = await setup(t, async ({ payload }) => ({ ok: false, code: 'missing-variable', variables: ['name'], values: payload.values, missing: ['name'] }))
+  app.click('new'); app.input('title', 'Valid'); app.input('body', '{{name}}'); app.click('preview'); await flush()
+  const sample = app.node('variables').querySelector('input')
+  assert.equal(sample.getAttribute('aria-invalid'), 'true')
+  assert.equal(app.document.activeElement, app.node('title'), 'server errors do not focus')
+  app.click('save'); await flush()
+  assert.deepEqual(app.calls[1].payload.values, [], 'binding never invents an empty sample')
+  app.input(sample.id, ''); app.click('save'); await flush()
+  assert.deepEqual(app.calls[2].payload.values, [{ name: 'name', value: '' }])
+  app.input(sample.id, '😀'.repeat(256)); app.click('save'); await flush(); assert.equal(app.calls.length, 4)
+  app.input(sample.id, '😀'.repeat(257)); app.click('save'); assert.equal(app.calls.length, 4)
+  assert.equal(sample.getAttribute('aria-invalid'), 'true')
+  app.input('body', 'no variables now'); app.click('preview'); assert.equal(app.calls.length, 4, 'old visible provided sample remains in payload and must be checked')
+})
+test('late Runtime field errors cannot mark new edits; unchanged errors map without focusing', async (t) => {
+  let pending = deferred()
+  const app = await setup(t, () => pending.promise)
+  app.click('new'); app.input('title', 'Valid'); app.click('save'); app.input('title', 'Later')
+  app.node('body').focus(); pending.resolve({ ok: false, code: 'invalid-title' }); await flush()
+  assert.equal(app.node('title').getAttribute('aria-invalid'), null)
+  assert.equal(app.document.activeElement, app.node('body'))
+  pending = deferred(); app.click('save'); pending.resolve({ ok: false, code: 'invalid-title' }); await flush()
+  assert.equal(app.node('title').getAttribute('aria-invalid'), 'true')
+  assert.equal(app.document.activeElement, app.node('body'))
+  app.update({ theme: 'light', input: 'filter' }); assert.equal(app.node('title').getAttribute('aria-invalid'), 'true')
+  app.update({ sessionEpoch: '2' }); assert.equal(app.node('title').getAttribute('aria-invalid'), null)
+})
+test('action dialog guards shortcuts and closes synchronously before the existing discard confirmation', async (t) => {
+  const app = await setup(t)
+  app.click('new'); app.input('title', 'Draft'); app.key('k')
+  const actionsDialog = app.node('actions-dialog')
+  assert.ok(actionsDialog, 'action dialog must exist')
+  assert.equal(actionsDialog.open, true)
+  const selected = app.document.activeElement
+  app.host('n'); app.host('ArrowDown'); app.host('Tab'); app.key('s'); app.key('n'); app.key('f')
+  assert.equal(app.document.activeElement, selected); assert.equal(app.dialog.open, false); assert.equal(app.calls.length, 0)
+  const action = app.node('actions-list').querySelector('[data-action-id="new"]')
+  action.click(); action.click()
+  assert.equal(actionsDialog.open, false); assert.equal(app.dialog.open, true)
+  app.dispatchClose(); assert.equal(app.dialog.open, true, 'old action close cannot affect discard modal')
+  app.close('cancel'); app.dispatchClose()
+  app.key('k', { repeat: true }); assert.equal(actionsDialog.open, false)
+  app.key('k', { altKey: true }); assert.equal(actionsDialog.open, false)
+  app.key('k', { shiftKey: true }); assert.equal(actionsDialog.open, false)
+  app.key('k'); assert.equal(actionsDialog.open, true)
+  app.update({ sessionEpoch: '2' }); assert.equal(actionsDialog.open, false)
+  app.click('new'); app.input('title', 'New session'); app.key('k'); app.dispatchClose()
+  assert.equal(actionsDialog.open, true); assert.equal(app.node('title').value, 'New session')
+})
+test('action entries share busy and recovery restrictions with direct actions', async (t) => {
+  const pending = deferred()
+  const app = await setup(t, () => pending.promise)
+  app.click('actions')
+  const action = (id) => app.node('actions-list').querySelector(`[data-action-id="${id}"]`)
+  assert.equal(action('save').disabled, true); assert.equal(action('preview').disabled, true); assert.equal(action('reload').hidden, true)
+  app.click('actions-cancel'); app.click('new'); app.input('title', 'Draft')
+  app.click('actions'); action('save').click(); action('save').click()
+  assert.equal(app.calls.length, 1); assert.equal(app.node('actions').disabled, true)
+  app.key('k'); assert.equal(app.node('actions-dialog').open, false)
+  pending.resolve({ ok: false, code: 'save-uncertain' }); await flush()
+  app.click('actions'); assert.equal(action('save').disabled, true); assert.equal(action('reload').hidden, false)
+  action('save').click(); assert.equal(app.calls.length, 1)
+  action('new').click(); assert.equal(app.dialog.open, false, 'unknown-save recovery cannot be bypassed')
 })

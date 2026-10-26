@@ -74,7 +74,7 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
 dialog p { color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .dialog-heading h2 { min-width: 0; overflow-wrap: anywhere; }
-#discard-close { display: grid; place-items: center; flex-shrink: 0; width: 30px; padding: 4px; background: transparent; }
+#discard-close, #actions-close { display: grid; place-items: center; flex-shrink: 0; width: 30px; padding: 4px; background: transparent; }
 .dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 @media (forced-colors: active) {
   button.primary { color: ButtonText; background: ButtonFace; border-color: ButtonText; }

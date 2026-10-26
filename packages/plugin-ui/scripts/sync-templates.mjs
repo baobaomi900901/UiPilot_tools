@@ -6,7 +6,7 @@ if (check.some((arg) => arg !== '--check') || check.length > 1) {
 } else {
   const source = new URL('../src/', import.meta.url)
   const target = new URL('../../../examples/public-plugins/com.uipilot.templates/package/dist/ui/', import.meta.url)
-  for (const file of ['ui.js', 'ui.css']) {
+  for (const file of ['ui.js', 'ui.css', 'form.js', 'action-panel.js']) {
     const bytes = await readFile(new URL(file, source))
     if (check.length) {
       const copy = await readFile(new URL(file, target)).catch((error) => {

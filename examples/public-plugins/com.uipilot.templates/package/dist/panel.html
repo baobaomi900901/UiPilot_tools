@@ -21,6 +21,7 @@
         <header class="uipilot-ui-toolbar">
           <span id="draft-state" class="uipilot-ui-detail-label">未选择模板</span>
           <div class="uipilot-ui-actions">
+            <button id="actions" type="button" title="模板动作 (Ctrl+K)">动作</button>
             <button id="preview" type="button" disabled>预览</button>
             <button id="save" class="primary" type="button" disabled>保存</button>
           </div>
@@ -33,11 +34,14 @@
         <div id="editor" class="editor" hidden>
           <label for="title">模板名称 <span>最多 80 个字符</span></label>
           <input id="title" type="text" placeholder="例如：问候语、周报开头" autocomplete="off" />
+          <p id="title-error" class="uipilot-ui-field-error"></p>
           <label for="body">正文 <span>使用 {{name}} 插入变量</span></label>
           <textarea id="body" rows="4" placeholder="你好，{{name}}！" spellcheck="false"></textarea>
+          <p id="body-error" class="uipilot-ui-field-error"></p>
           <fieldset id="samples">
             <legend>变量样例</legend>
             <p id="variable-hint" class="hint">编辑正文后点击“预览”发现变量。</p>
+            <p id="samples-error" class="uipilot-ui-field-error"></p>
             <div id="variables" class="variables"></div>
           </fieldset>
           <label for="output">预览结果 <span>可选择并复制文本</span></label>
@@ -61,6 +65,14 @@
           <button value="discard">放弃并继续</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="actions-dialog" class="uipilot-ui-action-panel" aria-labelledby="actions-title">
+      <div class="dialog-heading">
+        <h2 id="actions-title">模板动作</h2>
+        <button id="actions-close" type="button" aria-label="关闭" title="关闭"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg></button>
+      </div>
+      <div id="actions-list" class="uipilot-ui-action-panel-list"></div>
+      <div class="dialog-actions"><button id="actions-cancel" type="button">取消</button></div>
     </dialog>
     <script type="module" src="./panel.js"></script>
   </body>

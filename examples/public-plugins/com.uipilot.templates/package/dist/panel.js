@@ -1,8 +1,8 @@
-import { createList, createDetail, createActions } from './ui/ui.js'
+import { createList, createDetail, createActions, createForm, createActionPanel } from './ui/ui.js'
 
 const panel = window.uipilotPluginPanel
 const element = (id) => document.getElementById(id)
-const ui = Object.fromEntries(['new', 'list', 'filter', 'draft-state', 'preview', 'save', 'empty', 'editor', 'title', 'body', 'variables', 'variable-hint', 'output', 'status', 'reload', 'discard-dialog', 'discard-message'].map((id) => [id, element(id)]))
+const ui = Object.fromEntries(['actions', 'actions-dialog', 'actions-list', 'actions-close', 'actions-cancel', 'title-error', 'body-error', 'samples-error', 'new', 'list', 'filter', 'draft-state', 'preview', 'save', 'empty', 'editor', 'title', 'body', 'variables', 'variable-hint', 'output', 'status', 'reload', 'discard-dialog', 'discard-message'].map((id) => [id, element(id)]))
 const messages = {
   'invalid-payload': '请求内容不正确，草稿已保留。',
   'invalid-title': '请输入模板名称，最多 80 个字符。',
@@ -41,6 +41,23 @@ const actions = createActions({
   reload: { button: ui.reload, onInvoke: reload },
 })
 
+const baseFields = [
+  { id: 'title', control: ui.title, error: ui['title-error'], validate: (control) => !control.value.trim() || [...control.value].length > 80 ? messages['invalid-title'] : null },
+  { id: 'body', control: ui.body, error: ui['body-error'], validate: (control) => new TextEncoder().encode(control.value).byteLength > 8192 ? messages['body-limit'] : null },
+]
+let sampleFields = []
+const form = createForm({ fields: baseFields })
+const actionPanel = createActionPanel({
+  dialog: ui['actions-dialog'], trigger: ui.actions, list: ui['actions-list'],
+  closeButton: ui['actions-close'], cancelButton: ui['actions-cancel'],
+  actions: [
+    { id: 'preview', label: '预览', onInvoke: preview },
+    { id: 'save', label: '保存', onInvoke: save },
+    { id: 'new', label: '新建模板', onInvoke: newDraft },
+    { id: 'reload', label: '重新载入已保存', onInvoke: reload },
+  ],
+})
+
 function status(text, tone = '') {
   ui.status.textContent = text
   ui.status.dataset.tone = tone
@@ -51,12 +68,15 @@ function available() { return typeof panel.request === 'function' && session !==
 
 function controls() {
   const busy = activeRequest !== null
-  actions.update({
+  const actionState = {
     new: { disabled: busy || !available() },
     preview: { disabled: busy || !draft || !available() },
     save: { disabled: busy || !draft || Boolean(recovery) || !available() },
-    reload: { disabled: busy || !available() },
-  })
+    reload: { disabled: busy || !available(), hidden: !recovery },
+  }
+  actions.update(actionState)
+  actionPanel.update(actionState)
+  ui.actions.disabled = busy || !available()
   ui.reload.hidden = !recovery
   detail.update({
     hasContent: Boolean(draft), busy,
@@ -75,13 +95,14 @@ function renderList() {
 }
 
 function renderVariables() {
+  sampleFields = []
   ui.variables.replaceChildren()
   ui['variable-hint'].textContent = draft.variables.length ? '未填写表示缺值；主动填写后清空表示明确的空字符串。' : '没有已发现变量。修改正文后点击“预览”重新发现。'
-  draft.variables.forEach((name, index) => {
+  draft.variables.forEach((name) => {
     const wrapper = document.createElement('div')
     wrapper.className = 'variable'
     const label = document.createElement('label')
-    label.htmlFor = `sample-${index}`
+    label.htmlFor = `sample-${name}`
     label.textContent = name
     const input = document.createElement('input')
     input.id = label.htmlFor
@@ -93,12 +114,20 @@ function renderVariables() {
       draft.values.set(name, input.value)
       edited()
     })
-    wrapper.append(label, input)
+    const error = document.createElement('p')
+    error.id = input.id + '-error'
+    error.className = 'uipilot-ui-field-error'
+    sampleFields.push({ id: 'sample:' + name, control: input, error,
+      validate: () => draft.values.has(name) && [...draft.values.get(name)].length > 256 ? messages['invalid-values'] : null })
+    wrapper.append(label, input, error)
     ui.variables.append(wrapper)
   })
+  form.setFields([...baseFields, ...sampleFields])
 }
 
 function renderDraft() {
+  form.clear()
+  ui['samples-error'].textContent = ''
   if (draft) {
     ui.title.value = draft.title
     ui.body.value = draft.body
@@ -110,6 +139,7 @@ function renderDraft() {
 }
 
 function edited() {
+  ui['samples-error'].textContent = ''
   draft.editRevision += 1
   ui.output.value = ''
   controls()
@@ -174,6 +204,7 @@ async function request(action, payload, apply) {
       if (action === 'save' && (data.code === 'save-uncertain' || data.code === 'conflict' || data.code === 'response-limit')) {
         recovery = { kind: draft.id === null ? 'new' : 'known', refreshRequested: false, refreshed: false }
       }
+      if (current(owner, true)) runtimeErrors(data.code)
       status(data.code === 'save-uncertain' ? '保存结果待确认，可能已写入。请重新载入已保存内容，勿直接重试。' : messages[data.code] ?? '操作未完成，草稿仍保留。', 'error')
     }
   } catch (error) {
@@ -203,20 +234,37 @@ async function load(id) {
 
 function values() { return [...draft.values].map(([name, value]) => ({ name, value })) }
 
+function runtimeErrors(code) {
+  if (code === 'invalid-title') form.setErrors(new Map([['title', messages[code]]]))
+  else if (['body-limit', 'invalid-syntax', 'variable-limit'].includes(code)) form.setErrors(new Map([['body', messages[code]]]))
+  else if (code === 'invalid-values') ui['samples-error'].textContent = messages[code]
+}
+
+function validateDraft(includeTitle) {
+  ui['samples-error'].textContent = ''
+  const valid = form.validate([...(includeTitle ? ['title'] : []), 'body', ...sampleFields.map(({ id }) => id)])
+  // Validate every provided payload sample, even if no corresponding field remains.
+  const unboundInvalid = [...draft.values].some(([name, value]) => [...value].length > 256 && !sampleFields.some(({ id }) => id === 'sample:' + name))
+  if (unboundInvalid) ui['samples-error'].textContent = messages['invalid-values']
+  if (!valid || unboundInvalid) status('请修正字段错误后重试。', 'error')
+  return valid && !unboundInvalid
+}
+
 function preview() {
-  if (!draft) return
+  if (!draft || activeRequest || !available() || !validateDraft(false)) return
   void request('preview', { body: draft.body, values: values() }, (data, owner) => {
     if (!current(owner, true)) { status('预览期间已有新编辑，请再次预览。'); return }
     draft.variables = data.variables
     draft.values = new Map(data.values.map(({ name, value }) => [name, value]))
     renderVariables()
+    if (!data.ok) form.setErrors(new Map(data.missing.map((name) => ['sample:' + name, '请填写变量样例；空字符串需主动填写后清空。'])))
     ui.output.value = data.ok ? data.text : ''
     status(data.ok ? '预览已更新，尚未执行保存。' : `缺少变量样例：${data.missing.join('、')}。请填写后再次预览。`, data.ok ? '' : 'error')
   })
 }
 
 function save() {
-  if (!draft || recovery) return
+  if (!draft || recovery || activeRequest || !available() || !validateDraft(true)) return
   void request('save', { id: draft.id, expectedRevision: draft.revision, title: draft.title, body: draft.body, values: values() }, (data, owner) => {
     // Identity survives later typing in this SAME draft. Only unchanged text receives normalized samples.
     draft.id = data.id
@@ -248,7 +296,7 @@ function focusable() {
 }
 
 panel.onHostKey((event) => {
-  if (ui['discard-dialog'].open) return
+  if (document.querySelector('dialog[open]')) return
   if (event.key === 'ArrowDown') list.move(1)
   if (event.key === 'ArrowUp') list.move(-1)
   if (event.key === 'n') newDraft()
@@ -261,6 +309,12 @@ panel.onHostKey((event) => {
 panel.onUpdate((update) => {
   document.documentElement.dataset.theme = update.theme
   if (session !== update.sessionEpoch) {
+    actionPanel.close({ restoreFocus: false })
+    form.clear()
+    form.setFields(baseFields)
+    sampleFields = []
+    ui.variables.replaceChildren()
+    ui['samples-error'].textContent = ''
     list.update({ items: [], disabled: true })
     session = update.sessionEpoch
     draft = null
@@ -287,7 +341,12 @@ panel.onUpdate((update) => {
 })
 
 document.addEventListener('keydown', (event) => {
-  if (event.isComposing || ui['discard-dialog'].open) return
+  if (event.isComposing || document.querySelector('dialog[open]')) return
+  if (event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.repeat && event.key.toLowerCase() === 'k') {
+    event.preventDefault()
+    actionPanel.open()
+    return
+  }
   if (event.ctrlKey || event.metaKey) {
     const key = event.key.toLowerCase()
     if (key === 'f') { event.preventDefault(); void panel.focusHostInput().catch(() => status('无法聚焦主输入框。', 'error')) }
