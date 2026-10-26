@@ -18,11 +18,11 @@ One parent design review, one implementer, and one combined implementation/code 
 
 **Dependencies:** Design sections “Settings and visible behavior”, “Registration, persistence, and locks”, “Native delivery and recording”, and “Stable command entry and execution”.
 
-- [ ] Implement host map, separate native registration table, shared serialization, main-only IPC, inventory enrichment, rollback/status, and both-way launcher conflict checks.
-- [ ] Connect startup and actual lifecycle publications, including runtime faults; implement prune/reinstall ordering and retainData-independent uninstall cleanup.
-- [ ] Carry stable identity through readiness/shown and foreground recording events, resolve current entry, and retain identity through asynchronous command routing. Preserve ordinary Enter and existing completion semantics.
-- [ ] Reuse recorder and command-row mutation/reload ownership for edit/clear, accessible status/focus, Light/Dark layout, and double-tap restriction.
-- [ ] Synchronize host 0.11.0 and CLI current host target without changing SDK/API contracts or old example floors.
+- [x] Implement host map, separate native registration table, shared serialization, main-only IPC, inventory enrichment, rollback/status, and both-way launcher conflict checks.
+- [x] Connect startup and actual lifecycle publications, including runtime faults; implement prune/reinstall ordering and retainData-independent uninstall cleanup.
+- [x] Carry stable identity through readiness/shown and foreground recording events, resolve current entry, and retain identity through asynchronous command routing. Preserve ordinary Enter and existing completion semantics.
+- [x] Reuse recorder and command-row mutation/reload ownership for edit/clear, accessible status/focus, Light/Dark layout, and double-tap restriction.
+- [x] Synchronize host 0.11.0 and CLI current host target without changing SDK/API contracts or old example floors.
 
 **Distinct test coverage:** Own all automated cases in the design “Focused evidence and manual acceptance” section, especially gate linearization, non-main rejection before state access, persistence/native rollback, save/uninstall ordering, stale readiness/resolve replies, rename-and-label-reuse routing, and recording DOM/native deduplication. Use existing activation fixtures and fake registration operations.
 
@@ -34,13 +34,21 @@ One parent design review, one implementer, and one combined implementation/code 
 
 **Dependencies:** Task 1; design “Scope and outcome” and “Focused evidence and manual acceptance”.
 
-- [ ] Run one integrated verification and production build after focused tests/review fixes pass; record exact command results and executable path.
-- [ ] Provide a short manual sequence using existing Text Snippet and Notes: record/edit/clear; hidden/visible trigger; required-input prompt; panel entry; conflicts in both directions and OS rejection; rename; disable/re-enable; restart; update/uninstall including retainData.
-- [ ] Record two-theme/keyboard checks and distinguish automated evidence from unperformed human global-trigger/restart/system interaction. Do not claim manual success without results.
-- [ ] Commit delivery notes, then report build location, commit IDs, remaining manual checks, and any concrete limitation.
+- [x] Run one integrated verification and production build after focused tests/review fixes pass; record exact command results and executable path.
+- [x] Provide a short manual sequence using existing Text Snippet and Notes: record/edit/clear; hidden/visible trigger; required-input prompt; panel entry; conflicts in both directions and OS rejection; rename; disable/re-enable; restart; update/uninstall including retainData.
+- [x] Record two-theme/keyboard checks and distinguish automated evidence from unperformed human global-trigger/restart/system interaction. Do not claim manual success without results.
+- [x] Commit delivery notes, then report build location, commit IDs, remaining manual checks, and any concrete limitation.
 
 **Distinct test coverage:** End-to-end interaction belongs to the human checklist; existing packages supply the acceptance fixture. No new plugin, browser demo, native smoke automation, or additional review cycle.
 
 **Verify:** Reuse completed focused test evidence; run `npm run build` and the existing acceptance build: `cargo build --manifest-path src-tauri/Cargo.toml --bin uipilot --features tauri/custom-protocol --offline --locked`, with process-only `CARGO_TARGET_DIR=D:/code/UiPilot_tools/src-tauri/target` and `TAURI_CONFIG` identifying `com.uipilot.launcher.acceptance` / `UiPilot Acceptance`. Freeze clean source/dist input hashes before the native build and compare afterward. Do not repeat the broad verifier or unchanged suites. Preserve all previous delivery binaries; do not run the resulting app.
 
 
+
+## 2026-10-26 Delivery status
+
+Implementation and delivery tasks complete; native human acceptance is pending. Frozen executable source is `2b99e9e3c00341860f87062fc2fa8a693ac4fd75`; independent full review plus the accepted-Panel and failed-open cleanup deltas pass. Final covering frontend checks: 53 passed; the prior Rust/protocol/CLI evidence remains valid. Final frontend build and offline native build passed. Non-blocking Vite size and Rust test-helper dead-code warnings are recorded in the delivery notes.
+
+Kit: `.superpowers/deliveries/uipilot-0.11.0-acceptance/`. Actual Windows version0.11.0; 39,950,848bytes; SHA256 `c00d796e41b2f4df4d513cab4dfa16a15dbabd00b35517bb8e6273507d86ac07`. 738 source/dist inputs unchanged, five resources/two existing archives matched, nine prior executables unchanged. No native app/global hotkey/clipboard/user-data operation was performed by the agent.
+
+`README.zh-CN.md`, `manual-cases.zh-CN.md`, and `manual-acceptance.json` provide the initial three checks and later conflict/Panel/lifecycle/theme cases. All user outcomes are still pending; these checkboxes record implementation and handoff, not a blanket manual PASS. Continue with the user's feedback, not another feature or repeated whole-suite run. Ordinary Enter count and unrelated baseline credential issues remain deferred.
