@@ -21,10 +21,10 @@
 
 **Dependencies:** Design Manifest and version / Result and URL validation / Admission / Frontend / Existing example sections; old result action contract remains in force.
 
-- [ ] Add url.open Windows permission with minimumHost0.12/resultActions/mainResult constraints and consent label; maintain Host/CLI/schema parity and update actual Host current + release version sources.
-- [ ] Add exact openUrl action with strict shared host validator; private canonical URL, complete snapshot {copy,url} requirements across initial publication, resolve, Runtime admission/replacement and static execution.
-- [ ] Reuse checked static admission and native adapter; implement urlOpened/urlOpenFailed, single source claim, grant/generation/lease enforcement, owned frontend feedback and explicit rerun behavior.
-- [ ] Update text-snippet1.1.0 without changing storage/IDs/default copy; secondary action only on valid original/latest URL text, never uppercase row. Update concise SDK/tutorial/example docs.
+- [x] Add url.open Windows permission with minimumHost0.12/resultActions/mainResult constraints and consent label; maintain Host/CLI/schema parity and update actual Host current + release version sources.
+- [x] Add exact openUrl action with strict shared host validator; private canonical URL, complete snapshot {copy,url} requirements across initial publication, resolve, Runtime admission/replacement and static execution.
+- [x] Reuse checked static admission and native adapter; implement urlOpened/urlOpenFailed, single source claim, grant/generation/lease enforcement, owned frontend feedback and explicit rerun behavior.
+- [x] Update text-snippet1.1.0 without changing storage/IDs/default copy; secondary action only on valid original/latest URL text, never uppercase row. Update concise SDK/tutorial/example docs.
 
 **Distinct test coverage:** Invalid/oversized URL and empty-userinfo/repair forms reject before any opener; undeclared/revoked source permissions or stale/disabled/replaced identity yield zero effect; first valid admission opens once and consumes siblings, replay/open failure cannot open again; Runtime replacement retains required grants. A query/source change during an admitted effect suppresses old UI completion. Confirm both legacy copy and Runtime actions remain valid. Manifest cases cover missing opt-in, wrong platform, low/current minimum and valid old package. Example proves plain text/data/copy/save unchanged and original/latest action eligibility.
 
@@ -36,10 +36,17 @@
 
 **Dependencies:** Task1 independent Spec/Quality pass. No implementation pending.
 
-- [ ] Build CLI once and pack text-snippet1.1.0 to fresh archive (no execution or overwrite), validate artifact; copy existing resources into new acceptance kit.
-- [ ] Freeze clean source/dist. Build native offline with existing acceptance identifier/product name. Confirm actual Windows version, hashes/resources/package and preserved prior executables; no App launch.
-- [ ] Record source-vs-doc commit provenance and short manual cases; core manual results pending until user reports them.
+- [x] Build CLI once and pack text-snippet1.1.0 to fresh archive (no execution or overwrite), validate artifact; copy existing resources into new acceptance kit.
+- [x] Freeze clean source/dist. Build native offline with existing acceptance identifier/product name. Confirm actual Windows version, hashes/resources/package and preserved prior executables; no App launch.
+- [x] Record source-vs-doc commit provenance and short manual cases; core manual results pending until user reports them.
 
 **Distinct test coverage:** Directory and archive static validation, version/build input identity, old binaries unchanged. Manual consent denial/acceptance, Ctrl+K opening, no automatic open, consumed state/rerun and existing data/shortcut preservation. No repetitive broad matrix.
 
 **Verify:** existing CLI pack/validate commands and acceptance verifier adapted to0.12; `cargo build --manifest-path src-tauri/Cargo.toml --bin uipilot --features tauri/custom-protocol --offline --locked` with process-only CARGO_TARGET_DIR and TAURI_CONFIG for com.uipilot.launcher.acceptance / UiPilot Acceptance. Build once after review; preserve source and output hashes.
+## Delivery status — 2026-10-26
+
+Task 1 source: 2ba9e6eccc920c48c0c58afa0afeb08965d09bba. Independent Spec and Quality review passed with no blockers. Focused native result-action (39), manifest (13), protocol/bootstrap (14), launcher (28), CLI (82), and example (10) checks passed, together with CLI/SDK type checks, schema freshness and final frontend build. Existing non-blocking Vite size/native dead-code warnings remain.
+
+Task 2 delivered .superpowers/deliveries/uipilot-0.12.0-acceptance. CLI build, archive pack/validation and offline native build passed. Actual PE version is 0.12.0 with UiPilot Acceptance identity; 740 source/dist inputs were unchanged, five resources matched, and thirteen previous executable hashes were preserved. Host SHA256: 2217e9a64164a67cc78ad0c9c03b789421b71c0b91e363eda36c29fe8381c309. Text-snippet1.1 archive SHA256: 6de15da7b062cc112a5cf2df200e7d6615673a4c8a1d6a10ca332aef7f1cb7e7.
+
+Manual acceptance remains pending. First handoff: host version, permission-update cancel/confirm, no automatic opening and explicit Ctrl+K browser action. No real browser/app/native-input actions were performed by agents. Further manual groups are in the kit; prior accepted0.11 cases are retained. No claim that M5 or the overall foundation is complete.
