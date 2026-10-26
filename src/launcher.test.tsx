@@ -10295,6 +10295,68 @@ describe('command hotkey entry', () => {
     } finally { core.destroy(); vi.useRealTimers() }
   })
 
+  it.each(['opened', 'rejected', 'exit', 'edit', 'newer entry'] as const)('shows a command header without a launcher row during a deferred Panel open: %s', async (outcome) => {
+    installMatchMedia(false)
+    const fake = await startedCore()
+    const { core, client } = fake
+    const mounted = await mountLauncherView(core)
+    try {
+      const opened = deferred<PluginPanelCommandResult>()
+      const identity = { pluginId: entry.pluginId, commandLabel: 'notes', sessionEpoch: u64('71'), hostKeys: [] }
+      vi.mocked(client.resolvePublicPluginCommandEntry).mockResolvedValueOnce({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'notes', outputMode: 'panel', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })
+      vi.mocked(client.openPluginPanel).mockReturnValueOnce(opened.promise)
+      vi.mocked(client.submitPluginPanel).mockResolvedValue(identity)
+      await act(async () => fake.emit({ ...shown('pending-panel-presentation'), commandEntry: entry }))
+      expect(client.openPluginPanel).toHaveBeenCalledOnce()
+      expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(0)
+      expect(core.getSnapshot().results).toEqual([])
+      expect(core.getSnapshot().selectedIndex).toBe(-1)
+      expect(mounted.host.querySelector('.panel-command-tag')?.textContent).toContain('/notes')
+      expect(mounted.host.querySelector('[role="status"][aria-label="正在打开 notes 命令"]')).not.toBeNull()
+      const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="notes argument"]')!
+      expect(input.disabled).toBe(false)
+      expect(document.activeElement).toBe(input)
+      // Enter during an open must neither dispatch again nor replace its private owner.
+      await act(async () => core.keyDown('Enter', false))
+      expect(client.openPluginPanel).toHaveBeenCalledOnce()
+      if (outcome === 'exit') {
+        await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="退出 notes 命令"]')!.click())
+        expect(core.getSnapshot().executePending).toBe(false)
+        expect(core.getSnapshot().mainResultCommand).toBeUndefined()
+      } else if (outcome === 'edit') {
+        await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().mainResultCommand!.suffixControl, value: 'changed', inputType: 'insertText' }))
+        expect(core.getSnapshot().executePending).toBe(false)
+        expect(core.getSnapshot().mainResultCommand?.suffix).toBe('changed')
+      } else if (outcome === 'newer entry') {
+        vi.mocked(client.resolvePublicPluginCommandEntry).mockResolvedValueOnce({ pluginId: entry.pluginId, commandId: 'newer', commandLabel: 'newer', outputMode: 'mainResult', activationMode: 'submit', inputRequired: true, inputPlaceholder: '内容' })
+        await act(async () => core.commandHotkeyEntry({ ...entry, commandId: 'newer' }))
+      }
+      await act(async () => {
+        if (outcome === 'rejected') opened.reject(new Error('open failed'))
+        else opened.resolve(identity)
+      })
+      expect(mounted.host.querySelector('[role="status"][aria-label="正在打开 notes 命令"]')).toBeNull()
+      if (outcome === 'opened') {
+        expect(core.getSnapshot().panel?.sessionEpoch).toBe('71')
+        expect(client.submitPluginPanel).toHaveBeenCalledOnce()
+        expect(client.closePluginPanel).not.toHaveBeenCalled()
+      } else {
+        expect(core.getSnapshot().panel).toBeUndefined()
+        expect(client.submitPluginPanel).not.toHaveBeenCalled()
+        if (outcome === 'rejected') {
+          expect(core.getSnapshot().status).toBe('操作不可用，请重试。')
+          expect(core.getSnapshot().mainResultCommand).toBeUndefined()
+        } else expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: '71' })
+        if (outcome === 'newer entry') expect(core.getSnapshot().mainResultCommand?.commandId).toBe('newer')
+        if (outcome === 'edit') {
+          expect(core.getSnapshot().mainResultCommand?.suffix).toBe('changed')
+          vi.mocked(client.openPluginPanel).mockResolvedValueOnce({ ...identity, sessionEpoch: u64('72') })
+          await act(async () => core.keyDown('Enter', false))
+          expect(client.openPluginPanel).toHaveBeenLastCalledWith({ pluginId: entry.pluginId, argument: 'changed', stableCommandTarget: entry })
+        }
+      }
+    } finally { await mounted.unmount(); core.destroy() }
+  })
   it('still defers default search for an ordinary native show', async () => {
     vi.useFakeTimers()
     const fake = await startedCore()

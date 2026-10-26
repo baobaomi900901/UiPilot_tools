@@ -1314,6 +1314,11 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               onUnbound={reportMainResultUnbound}
               onBindingFailed={reportFailed}
             />
+            {snapshot.executePending && snapshot.results.length === 0 ? (
+              <span role="status" aria-label={`正在打开 ${mainResultCommand.commandLabel} 命令`}>
+                <Spin size="small" />
+              </span>
+            ) : null}
             {settingsControl}
           </div>
         ) : (

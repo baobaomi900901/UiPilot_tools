@@ -204,21 +204,16 @@ label,
   padding-inline: 8px 2px;
   overflow: hidden;
   color: var(--uipilot-ui-foreground);
-  background: var(--uipilot-ui-muted);
-  border: 0;
+  background: color-mix(in srgb, var(--uipilot-ui-foreground) 8%, var(--uipilot-ui-surface));
+  border: 1px solid var(--uipilot-ui-hairline-strong);
   border-radius: var(--uipilot-ui-radius-sm);
+  font-weight: 500;
 }
 
 .panel-command-tag > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.panel-launcher .panel-command-tag {
-  background: color-mix(in srgb, var(--uipilot-ui-foreground) 8%, var(--uipilot-ui-surface));
-  border: 1px solid var(--uipilot-ui-hairline-strong);
-  font-weight: 500;
 }
 
 .panel-host-region {

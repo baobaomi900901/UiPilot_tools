@@ -124,6 +124,8 @@ interface PrivateApplicationResult extends ViewResult {
   resultId: string
   activation: LauncherResultActivation
   refreshDisabled?: true
+  // Private ownership anchor for a hotkey Panel open, never a launcher row.
+  transientPanelEntry?: true
 }
 
 type PrivateResult = PrivateApplicationResult
@@ -714,7 +716,7 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation, actions }) =>
+    model.results.filter((result) => !result.transientPanelEntry).map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation, actions }) =>
       Object.freeze({
         key,
         title,
@@ -851,7 +853,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
     queryControlValue: model.queryControlValue,
     querySequence: model.querySequence,
     results,
-    selectedIndex: model.selectedIndex,
+    selectedIndex: results.findIndex(({ key }) => key === model.results[model.selectedIndex]?.key),
     searchPending: model.searchPending,
     executePending: model.executePending,
     hidePending: model.hidePending,
@@ -1123,6 +1125,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function clearResults(): void {
+    if (model.executePending && model.results.some((result) => result.transientPanelEntry)) {
+      panelActionToken++
+      model.executePending = false
+    }
     retireResultActionSource()
     model.resultActionsDisabled = false
     model.resultActionRerun = false
@@ -2552,7 +2558,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const key = resultKey++
       const base = { key, resultId: `command-hotkey-${key}`, kind: 'application' as const, title: `/${resolved.commandLabel}`, hasDefaultAction: false }
       if (resolved.outputMode === 'panel' && !resolved.inputRequired) {
-        const result: PrivateApplicationResult = { ...base, activation: { kind: 'panelActivation', pluginId: entry.pluginId, initialArgument: '', favorite: false } }
+        clearResults()
+        activateMainResultCommand({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, argument: '' })
+        const result: PrivateApplicationResult = { ...base, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: entry.pluginId, initialArgument: '', favorite: false } }
         model.results = [result]
         openPanel(result)
       } else if (resolved.outputMode === 'window' && !resolved.inputRequired) {
@@ -3894,10 +3902,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (key === 'Enter') {
       if (sequenceExhausted) return
       if (model.view === 'launcher' && model.launcherMode === 'applications' && stableCommandTarget && stableCommandOutputMode === 'panel' && model.mainResultCommand) {
+        if (model.executePending) return
         const argument = model.mainResultCommand.suffix.value.trim()
         if (!argument) return
         const key = resultKey++
-        const result: PrivateApplicationResult = { key, resultId: `command-hotkey-${key}`, kind: 'application', title: model.mainResultCommand.commandLabel, hasDefaultAction: false, activation: { kind: 'panelActivation', pluginId: stableCommandTarget.pluginId, initialArgument: argument, favorite: false } }
+        const result: PrivateApplicationResult = { key, resultId: `command-hotkey-${key}`, kind: 'application', title: model.mainResultCommand.commandLabel, hasDefaultAction: false, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: stableCommandTarget.pluginId, initialArgument: argument, favorite: false } }
+        clearResults()
         model.results = [result]
         openPanel(result)
         return
