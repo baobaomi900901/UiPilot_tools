@@ -1,4 +1,5 @@
 mod activation;
+pub(crate) mod file_open;
 mod activation_bundle;
 mod alarm_asset;
 pub(crate) mod content_action;
@@ -2164,7 +2165,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 12, 0],
+            version: [0, 13, 0],
             api_version: 1,
         }
     }

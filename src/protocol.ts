@@ -202,6 +202,7 @@ export type PublicPermission =
   | 'ui.panel'
   | 'clipboard.write'
   | 'url.open'
+  | 'files.openText'
   | 'clipboard.read'
   | 'clipboard.history.read'
   | 'clipboard.history.paste'
@@ -947,7 +948,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 }
 
 const publicPermissions = new Set<PublicPermission>([
-  'ui.window', 'ui.panel', 'clipboard.write', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
+  'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])

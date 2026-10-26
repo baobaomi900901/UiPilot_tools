@@ -220,7 +220,12 @@ export interface UiPilotPluginWindowStorageApiV1 {
   remove(key: string): Promise<void>
 }
 
+/** Windows Host 0.13.0+, declared and granted files.openText. Maximum 8192 original UTF-8 bytes; null means cancellation. */
+export interface UiPilotPluginWindowFilesApiV1 {
+  openText(): Promise<Readonly<{ name: string; text: string; byteLength: number }> | null>
+}
 export interface UiPilotPluginWindowApiV1 {
+  readonly files?: Readonly<UiPilotPluginWindowFilesApiV1>
   /** Session-bound; call after onUpdate has returned and Host has activated the window. */
   readonly request?: (input: Readonly<PluginWindowRequest>) => Promise<JsonValue>
   onUpdate(

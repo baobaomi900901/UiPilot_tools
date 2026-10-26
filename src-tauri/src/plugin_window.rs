@@ -87,6 +87,8 @@ struct ControllerCore {
     windows: HashMap<String, WindowState>,
     timer_session_generations: HashMap<String, u64>,
     next_document: u64,
+    next_file_picker: u64,
+    file_picker: Option<(u64, String, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +133,153 @@ impl Drop for PluginWindowCallLease {
     fn drop(&mut self) {
         self.controller
             .finish_window_call(&self.owner.plugin_id, self.session_generation);
+    }
+}
+
+// Global physical exclusion is independent of replaceable session state and async task lifetime.
+static FILE_PICKER_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct PhysicalPickerPermit;
+impl PhysicalPickerPermit {
+    fn acquire() -> Result<Self, crate::public_plugins::file_open::FileOpenError> {
+        FILE_PICKER_BUSY
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map(|_| Self)
+            .map_err(|_| crate::public_plugins::file_open::FileOpenError::FileOpenBusyError)
+    }
+}
+impl Drop for PhysicalPickerPermit {
+    fn drop(&mut self) {
+        FILE_PICKER_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+pub(crate) struct FileOpenGuard {
+    pub(crate) identity: WindowActionIdentity,
+    controller: Arc<PluginWindowController>,
+    token: u64,
+    _physical: PhysicalPickerPermit,
+}
+impl Drop for FileOpenGuard {
+    fn drop(&mut self) {
+        let mut core = self
+            .controller
+            .core
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if core
+            .file_picker
+            .as_ref()
+            .is_some_and(|(token, _, _)| *token == self.token)
+        {
+            core.file_picker = None;
+        }
+    }
+}
+impl PluginWindowController {
+    fn file_identity_current(core: &ControllerCore, identity: &WindowActionIdentity) -> bool {
+        plugin_content_label(&identity.owner.plugin_id).as_deref()
+            == Some(identity.content_label.as_str())
+            && identity.session_generation != 0
+            && identity.document_generation != 0
+            && core
+                .windows
+                .get(&identity.owner.plugin_id)
+                .is_some_and(|w| {
+                    w.owner == identity.owner
+                        && w.timer_session.generation == identity.session_generation
+                        && w.document_generation == identity.document_generation
+                        && !w.document_revoked
+                        && w.phase == PluginWindowPhase::Visible
+                        && w.timer_session.phase == TimerSessionPhase::Active
+                })
+    }
+    pub(crate) fn admit_file_open<T>(
+        self: &Arc<Self>,
+        label: &str,
+        session: u64,
+        document: u64,
+        authorize: impl FnOnce(
+            &WindowActionIdentity,
+        ) -> Result<T, crate::public_plugins::file_open::FileOpenError>,
+    ) -> Result<(FileOpenGuard, T), crate::public_plugins::file_open::FileOpenError> {
+        use crate::public_plugins::file_open::FileOpenError as E;
+        let plugin = plugin_id_from_content_label(label).ok_or(E::ExpiredWindowSessionError)?;
+        let mut core = self.core.lock().map_err(|_| E::FileOpenFailedError)?;
+        let owner = core
+            .windows
+            .get(&plugin)
+            .ok_or(E::ExpiredWindowSessionError)?
+            .owner
+            .clone();
+        let identity = WindowActionIdentity {
+            owner,
+            content_label: label.into(),
+            session_generation: session,
+            document_generation: document,
+        };
+        if !Self::file_identity_current(&core, &identity) {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        let captured = authorize(&identity)?;
+        let permit = PhysicalPickerPermit::acquire()?;
+        core.next_file_picker = core
+            .next_file_picker
+            .checked_add(1)
+            .ok_or(E::FileOpenFailedError)?;
+        let token = core.next_file_picker;
+        core.file_picker = Some((token, plugin, document));
+        Ok((
+            FileOpenGuard {
+                identity,
+                controller: self.clone(),
+                token,
+                _physical: permit,
+            },
+            captured,
+        ))
+    }
+    pub(crate) fn check_file_open<T>(
+        &self,
+        identity: &WindowActionIdentity,
+        authorize: impl FnOnce() -> Result<T, crate::public_plugins::file_open::FileOpenError>,
+    ) -> Result<T, crate::public_plugins::file_open::FileOpenError> {
+        use crate::public_plugins::file_open::FileOpenError as E;
+        let core = self.core.lock().map_err(|_| E::FileOpenFailedError)?;
+        if !Self::file_identity_current(&core, identity) {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        authorize()
+    }
+    // This short lease covers only focus effects. It never spans native selection or reading.
+    fn begin_file_focus(
+        self: &Arc<Self>,
+        identity: &WindowActionIdentity,
+        authorize: impl FnOnce() -> Result<(), crate::public_plugins::file_open::FileOpenError>,
+    ) -> Result<PluginWindowCallLease, crate::public_plugins::file_open::FileOpenError> {
+        use crate::public_plugins::file_open::FileOpenError as E;
+        let mut core = self.core.lock().map_err(|_| E::FileOpenFailedError)?;
+        if !Self::file_identity_current(&core, identity) {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        authorize()?;
+        let w = core
+            .windows
+            .get_mut(&identity.owner.plugin_id)
+            .ok_or(E::ExpiredWindowSessionError)?;
+        w.timer_session.in_flight = w
+            .timer_session
+            .in_flight
+            .checked_add(1)
+            .ok_or(E::FileOpenFailedError)?;
+        Ok(PluginWindowCallLease {
+            controller: self.clone(),
+            owner: identity.owner.clone(),
+            session_generation: identity.session_generation,
+        })
     }
 }
 
@@ -391,7 +540,30 @@ impl PluginWindowController {
         document_generation: u64,
         only_if_blurred: bool,
     ) -> Option<PluginWindowCallLease> {
+        self.begin_document_hide_checked(plugin_id, document_generation, only_if_blurred, None)
+    }
+
+    fn begin_document_hide_checked(
+        self: &Arc<Self>,
+        plugin_id: &str,
+        document_generation: u64,
+        only_if_blurred: bool,
+        expected: Option<&WindowActionIdentity>,
+    ) -> Option<PluginWindowCallLease> {
         let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
+        if expected.is_some_and(|identity| !Self::file_identity_current(&core, identity)) {
+            return None;
+        }
+        if only_if_blurred
+            && core
+                .file_picker
+                .as_ref()
+                .is_some_and(|(_, plugin, document)| {
+                    plugin == plugin_id && *document == document_generation
+                })
+        {
+            return None;
+        }
         let window = core.windows.get_mut(plugin_id)?;
         if window.document_generation != document_generation
             || window.document_revoked
@@ -625,7 +797,12 @@ impl PluginWindowController {
             .ok()
             .and_then(|core| {
                 core.windows.get(plugin_id).map(|window| {
-                    window.phase == PluginWindowPhase::Visible && !window.pinned && !window.focused
+                    window.phase == PluginWindowPhase::Visible
+                        && !window.pinned
+                        && !window.focused
+                        && !core.file_picker.as_ref().is_some_and(|(_, plugin, doc)| {
+                            plugin == plugin_id && *doc == window.document_generation
+                        })
                 })
             })
             .unwrap_or(false)
@@ -860,6 +1037,7 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
   'use strict';
   __PANEL_JSON__
   const windowActionsEnabled = __WINDOW_ACTIONS__;
+  const filesOpenEnabled = typeof __FILES_OPEN__ !== 'undefined' && __FILES_OPEN__;
   let handler = null;
   let invoke = null;
   let readySent = false;
@@ -988,6 +1166,36 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
         throw panelJson.error(panelJson.windowErrorName(error));
       } finally { session.requestBusy = false; }
     };
+    if (filesOpenEnabled) session.files = deepFreeze({
+      async openText() {
+        if (arguments.length !== 0) throw new TypeError('files.openText takes no arguments');
+        const current = () => session.active && timerSession === session;
+        const error = name => Object.assign(new Error(name), { name });
+        if (!current()) throw error('ExpiredWindowSessionError');
+        if (!session.fileReady || session.updating || session.fileBusy) throw error('FileOpenBusyError');
+        session.fileBusy = true;
+        try {
+          const result = await invoke('plugin_window_open_text', { sessionGeneration, documentGeneration });
+          if (!current()) throw 'ExpiredWindowSessionError';
+          if (result === null) return null;
+          if (!result || typeof result !== 'object' || Array.isArray(result)
+            || Object.keys(result).sort().join(',') !== 'byteLength,name,text'
+            || typeof result.name !== 'string' || !result.name || /[\\/:\x00-\x1f]/.test(result.name)
+            || typeof result.text !== 'string' || result.text.includes('\0')
+            || !Number.isInteger(result.byteLength) || result.byteLength < 0 || result.byteLength > 8192) throw 'FileOpenFailedError';
+          for (const character of result.text) {
+            const code = character.charCodeAt(0);
+            if (character.length === 1 && code >= 0xd800 && code <= 0xdfff) throw 'FileOpenFailedError';
+          }
+          const size = new TextEncoder().encode(result.text).length;
+          if (result.byteLength !== size && result.byteLength !== size + 3) throw 'FileOpenFailedError';
+          return deepFreeze({ name: result.name, text: result.text, byteLength: result.byteLength });
+        } catch (failure) {
+          const names = ['FileOpenBusyError','ExpiredWindowSessionError','FileOpenPermissionError','FileOpenUnsupportedError','FileOpenTooLargeError','FileOpenEncodingError','FileOpenFailedError'];
+          throw error(!current() ? 'ExpiredWindowSessionError' : names.includes(failure) ? failure : 'FileOpenFailedError');
+        } finally { session.fileBusy = false; }
+      },
+    });
     return session;
   };
   const sendReady = async () => {
@@ -996,6 +1204,7 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
     await invoke('plugin_window_content_ready');
   };
   const withRequest = (shape) => {
+    if (filesOpenEnabled) Object.defineProperty(shape, 'files', { enumerable: true, get: () => timerSession ? timerSession.files : undefined });
     if (windowActionsEnabled) Object.defineProperty(shape, 'request', { enumerable: true, get: () => timerSession ? timerSession.request : undefined });
     return shape;
   };
@@ -1018,6 +1227,7 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
     configurable: false,
     value: ({ sessionGeneration, documentGeneration }) => {
       if (!canonicalU64(sessionGeneration) || sessionGeneration === '0') throw new TypeError('invalid session generation');
+      if (!canonicalU64(documentGeneration) || documentGeneration === '0') throw new TypeError('invalid document generation');
       if (timerSession) timerSession.active = false;
       timerSession = createTimerSession(sessionGeneration, documentGeneration);
     },
@@ -1042,10 +1252,11 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
       names.forEach((name, index) => root.style.setProperty(`--uipilot-color-${name}`, tokens[index]));
       root.style.setProperty('--uipilot-font-family', 'Segoe UI, system-ui, sans-serif');
       const session = timerSession;
-      if (session) session.updating = true;
+      if (session) { session.updating = true; session.fileReady = false; }
       try {
         await handler(deepFreeze(update));
         await invoke('plugin_window_content_ack', { requestId: update.requestId });
+        if (session && session.active && timerSession === session) session.fileReady = true;
       } finally { if (session) session.updating = false; }
     },
   });
@@ -1060,16 +1271,102 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
 })();
 "#;
 
-fn public_content_bootstrap(runtime_actions: bool) -> String {
+fn public_content_bootstrap(runtime_actions: bool, files_open: bool) -> String {
     PUBLIC_CONTENT_BOOTSTRAP
         .replace(
             "__PANEL_JSON__",
             crate::public_plugins::panel_action::JSON_BOOTSTRAP,
         )
+        .replace("__FILES_OPEN__", if files_open { "true" } else { "false" })
         .replace(
             "__WINDOW_ACTIONS__",
             if runtime_actions { "true" } else { "false" },
         )
+}
+
+/// Admission captures the original shell. The permit moves into the blocking closure, so
+/// dropping the async waiter cannot admit another native dialog while this worker still runs.
+pub(crate) async fn open_text(
+    app: AppHandle,
+    controller: Arc<PluginWindowController>,
+    service: Arc<PublicPluginService>,
+    label: String,
+    session: u64,
+    document: u64,
+) -> Result<
+    Option<crate::public_plugins::file_open::OpenedText>,
+    crate::public_plugins::file_open::FileOpenError,
+> {
+    use crate::public_plugins::file_open::{self, FileOpenError as E};
+    use tauri_plugin_dialog::DialogExt;
+    let manager = service
+        .manager()
+        .map_err(|_| E::FileOpenFailedError)?
+        .clone();
+    let (guard, shell) = controller.admit_file_open(&label, session, document, |identity| {
+        manager.authorize_file_open(&identity.owner)?;
+        app.get_window(
+            &plugin_shell_label(&identity.owner.plugin_id).ok_or(E::ExpiredWindowSessionError)?,
+        )
+        .ok_or(E::ExpiredWindowSessionError)
+    })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let identity = guard.identity.clone();
+        let focus_failed = std::cell::Cell::new(false);
+        let result = file_open::select_and_read(
+            || {
+                controller
+                    .check_file_open(&identity, || manager.authorize_file_open(&identity.owner))
+            },
+            || {
+                app.dialog()
+                    .file()
+                    .set_parent(&shell)
+                    .set_title("选择文本文件（最多 8 KiB）")
+                    .add_filter("文本文件", &["json", "txt", "md", "csv"])
+                    .add_filter("所有文件", &["*"])
+                    .blocking_pick_file()
+                    .map(|selected| {
+                        selected
+                            .into_path()
+                            .map_err(|_| E::FileOpenUnsupportedError)
+                    })
+                    .transpose()
+            },
+            file_open::read_selected,
+            || {
+                let _focus = controller
+                    .begin_file_focus(&identity, || manager.authorize_file_open(&identity.owner))?;
+                if shell.set_focus().is_err() {
+                    focus_failed.set(true);
+                    return Err(E::FileOpenFailedError);
+                }
+                Ok(())
+            },
+        );
+        // Guard remains through focus. Cleanup never looks up a newer shell by its label.
+        drop(guard);
+        if focus_failed.get() {
+            if let Some(_hide) = controller.begin_document_hide_checked(
+                &identity.owner.plugin_id,
+                identity.document_generation,
+                true,
+                Some(&identity),
+            ) {
+                if shell.hide().is_ok() {
+                    controller.finish_timer_session_hide(&identity.owner.plugin_id, true);
+                    controller.close(&identity.owner.plugin_id);
+                } else {
+                    controller
+                        .revoke_document(&identity.owner.plugin_id, identity.document_generation);
+                    let _ = shell.destroy();
+                }
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|_| E::FileOpenFailedError)?
 }
 
 pub(crate) fn content_ready(controller: &PluginWindowController, label: &str) -> bool {
@@ -1414,6 +1711,9 @@ fn create_window(
                     session_generation: transaction.timer_session_generation,
                     document_generation: transaction.document_generation,
                 }),
+            app.state::<Arc<PublicPluginService>>()
+                .manager()?
+                .files_open_enabled(&transaction.owner),
         ),
         content_url,
         on_unmuted,
@@ -1824,6 +2124,131 @@ mod tests {
             request_id: request.into(),
             control_value: format!("/demo {token}"),
         }
+    }
+
+    #[test]
+    fn file_open_physical_guard_survives_submit_and_close_without_leasing_runtime() {
+        use crate::public_plugins::file_open::FileOpenError as E;
+        let c = Arc::new(PluginWindowController::default());
+        let a = owner("file-open", 1, "a");
+        let t = c.submit(a.clone()).unwrap();
+        assert!(c.advance(
+            &a,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible
+        ));
+        assert!(c.activate_timer_session(&a));
+        for (label, session, doc) in [
+            ("main", t.timer_session_generation, t.document_generation),
+            (t.content_label.as_str(), 0, t.document_generation),
+            (
+                t.content_label.as_str(),
+                t.timer_session_generation,
+                t.document_generation + 1,
+            ),
+        ] {
+            assert!(matches!(
+                c.admit_file_open(label, session, doc, |_| Ok(())),
+                Err(E::ExpiredWindowSessionError)
+            ));
+        }
+        assert!(matches!(
+            c.admit_file_open(
+                &t.content_label,
+                t.timer_session_generation,
+                t.document_generation,
+                |_| Err::<(), _>(E::FileOpenPermissionError)
+            ),
+            Err(E::FileOpenPermissionError)
+        ));
+        let (guard, ()) = c
+            .admit_file_open(
+                &t.content_label,
+                t.timer_session_generation,
+                t.document_generation,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let original_identity = guard.identity.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let picker = thread::spawn(move || {
+            let held = guard;
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(held);
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            c.core.try_lock().is_ok(),
+            "blocked physical picker never holds controller mutex"
+        );
+        assert!(!c.should_hide_on_blur(&a.plugin_id));
+        assert!(c
+            .begin_document_hide(&a.plugin_id, t.document_generation, true)
+            .is_none());
+        assert_eq!(
+            c.core.lock().unwrap().windows[&a.plugin_id]
+                .timer_session
+                .in_flight,
+            0
+        );
+        let other = Arc::new(PluginWindowController::default());
+        let other_t = other.submit(a.clone()).unwrap();
+        other.advance(
+            &a,
+            PluginWindowPhase::AwaitingReady,
+            PluginWindowPhase::Visible,
+        );
+        other.activate_timer_session(&a);
+        assert!(matches!(
+            other.admit_file_open(
+                &other_t.content_label,
+                other_t.timer_session_generation,
+                other_t.document_generation,
+                |_| Ok(())
+            ),
+            Err(E::FileOpenBusyError)
+        ));
+        let b = owner("replacement", 1, "b");
+        let next = c.submit(b.clone()).unwrap();
+        assert_eq!(next.document_generation, t.document_generation);
+        assert!(matches!(
+            c.check_file_open(&original_identity, || Ok(())),
+            Err(E::ExpiredWindowSessionError)
+        ));
+        c.advance(
+            &b,
+            PluginWindowPhase::AwaitingAck,
+            PluginWindowPhase::Visible,
+        );
+        c.activate_timer_session(&b);
+        assert!(!c.should_hide_on_blur(&b.plugin_id));
+        assert!(c
+            .begin_document_hide(&b.plugin_id, t.document_generation, true)
+            .is_none());
+        assert!(c.begin_timer_session_close(&b.plugin_id));
+        assert!(c.finish_timer_session_hide(&b.plugin_id, true));
+        assert!(c.revoke_document(&b.plugin_id, t.document_generation));
+        release_tx.send(()).unwrap();
+        picker.join().unwrap();
+        assert_eq!(
+            c.core.lock().unwrap().windows[&b.plugin_id]
+                .timer_session
+                .phase,
+            TimerSessionPhase::Revoked
+        );
+        let (other_guard, ()) = other
+            .admit_file_open(
+                &other_t.content_label,
+                other_t.timer_session_generation,
+                other_t.document_generation,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(!other.should_hide_on_blur(&a.plugin_id));
+        drop(other_guard);
+        assert!(other.should_hide_on_blur(&a.plugin_id));
     }
 
     #[test]

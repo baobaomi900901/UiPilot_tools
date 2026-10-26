@@ -30,6 +30,8 @@ const CLIPBOARD_HISTORY_NOTICE = '授权后，UiPilot 运行、插件启用且�
 
 function permissionLabel(permission: PublicPermission): string {
   switch (permission) {
+    case 'files.openText':
+      return '选择并读取本地 UTF-8 文本文件（最多 8 KiB）'
     case 'url.open':
       return '在默认浏览器打开 HTTP(S) 链接'
     case 'clipboard.write':

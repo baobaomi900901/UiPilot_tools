@@ -4541,6 +4541,55 @@ impl PublicPluginManager {
         Ok(outcome)
     }
 
+    pub(crate) fn files_open_enabled(
+        &self,
+        owner: &crate::plugin_window::PluginWindowOwner,
+    ) -> bool {
+        self.authorize_file_open(owner).is_ok()
+    }
+
+    /// No Runtime scheduling or data-call lease: a user can leave the native picker open indefinitely.
+    pub(crate) fn authorize_file_open(
+        &self,
+        owner: &crate::plugin_window::PluginWindowOwner,
+    ) -> Result<(), super::file_open::FileOpenError> {
+        use super::file_open::FileOpenError as E;
+        let _mutation = self.lock_mutation().map_err(|_| E::FileOpenFailedError)?;
+        let b = self
+            .bundles
+            .confirmed_bundle(&owner.plugin_id)
+            .map_err(|_| E::FileOpenFailedError)?
+            .ok_or(E::ExpiredWindowSessionError)?;
+        if !b.config.installed
+            || !b.config.enabled
+            || b.config.fault.is_some()
+            || b.runtime_recovery_needed
+            || b.config.active_generation != owner.plugin_generation
+            || b.runtime.generation != owner.plugin_generation
+            || b.activation_id != owner.activation_id
+            || b.admission_epoch != owner.admission_epoch
+        {
+            return Err(E::ExpiredWindowSessionError);
+        }
+        if ![PublicPermission::UiWindow, PublicPermission::FilesOpenText]
+            .iter()
+            .all(|p| {
+                b.config.permission_grants.contains(p) && b.runtime.manifest.permissions.contains(p)
+            })
+            || b.runtime.manifest.window.is_none()
+            || !b.runtime.manifest.legacy_command().is_some_and(|c| {
+                c.activation_mode == PublicActivationMode::Submit
+                    && c.output_mode == PublicOutputMode::Window
+            })
+        {
+            return Err(E::FileOpenPermissionError);
+        }
+        if self.host.platform != super::PublicPlatform::Windows {
+            return Err(E::FileOpenUnsupportedError);
+        }
+        Ok(())
+    }
+
     pub(crate) fn window_actions_enabled(
         &self,
         identity: &crate::plugin_window::WindowActionIdentity,
@@ -13370,5 +13419,73 @@ mod tests {
             .expire_network_timeouts(action.deadline - Duration::from_millis(1))
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn file_open_manager_rejects_revoked_grants_and_runtime_recovery_without_reserving_runtime() {
+        use super::super::file_open::FileOpenError as E;
+        for mode in ["ui-grant", "file-grant", "recovery"] {
+            let dir = TestDir::new(&format!("file-open-{mode}"));
+            write_package(&dir.source(), "1.0.0", "fixture");
+            let path = dir.source().join("plugin.json");
+            let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["minimumHostVersion"] = json!("0.13.0");
+            value["command"]["activationMode"] = json!("submit");
+            value["command"]["outputMode"] = json!("window");
+            value["window"] = json!({"entry":"dist/window.html"});
+            value["permissions"] = json!(["ui.window", "files.openText"]);
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            fs::write(dir.source().join("dist/window.html"), "<html></html>").unwrap();
+            let manager = manager(&dir);
+            let now = Instant::now();
+            let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &prepared.token,
+                    BTreeSet::from([PublicPermission::UiWindow, PublicPermission::FilesOpenText]),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+            let bundle = manager
+                .bundles
+                .confirmed_bundle("com.example.activation")
+                .unwrap()
+                .unwrap();
+            let owner = crate::plugin_window::PluginWindowOwner {
+                ui_intent_epoch: 1,
+                submission_token: "test".into(),
+                plugin_id: "com.example.activation".into(),
+                plugin_generation: bundle.runtime.generation,
+                activation_id: bundle.activation_id,
+                admission_epoch: bundle.admission_epoch,
+                request_id: "test".into(),
+                control_value: "/activation".into(),
+            };
+            assert_eq!(manager.authorize_file_open(&owner), Ok(()));
+            let replacement = if mode == "recovery" {
+                bundle.with_runtime_recovery(true)
+            } else {
+                let mut config = bundle.config.clone();
+                config.permission_grants.remove(&if mode == "ui-grant" {
+                    PublicPermission::UiWindow
+                } else {
+                    PublicPermission::FilesOpenText
+                });
+                bundle.with_config(config)
+            };
+            let reservation = manager.bundles.reserve("com.example.activation").unwrap();
+            reservation.begin_committing().unwrap();
+            reservation.mark_durable().unwrap();
+            reservation.publish(Some(replacement)).unwrap();
+            assert_eq!(
+                manager.authorize_file_open(&owner),
+                Err(if mode == "recovery" {
+                    E::ExpiredWindowSessionError
+                } else {
+                    E::FileOpenPermissionError
+                })
+            );
+        }
     }
 }

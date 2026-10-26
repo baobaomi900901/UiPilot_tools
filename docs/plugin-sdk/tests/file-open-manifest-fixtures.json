@@ -1,0 +1,292 @@
+[
+  {
+    "name": "valid-no-runtime-actions",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "submit",
+        "outputMode": "window",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html"
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": true
+  },
+  {
+    "name": "valid-runtime-actions",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "submit",
+        "outputMode": "window",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": true
+  },
+  {
+    "name": "low-host",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.12.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "submit",
+        "outputMode": "window",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": false
+  },
+  {
+    "name": "mixed-platforms",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows",
+        "macos"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "submit",
+        "outputMode": "window",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": false
+  },
+  {
+    "name": "missing-window-declaration",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "submit",
+        "outputMode": "window",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": false
+  },
+  {
+    "name": "live",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "live",
+        "outputMode": "window",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": false
+  },
+  {
+    "name": "main-result",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "command": {
+        "defaultName": "json-workbench",
+        "summary": "校验、格式化 JSON 和保存草稿",
+        "activationMode": "submit",
+        "outputMode": "mainResult",
+        "inputRequired": false,
+        "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+      },
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": []
+    },
+    "valid": false
+  },
+  {
+    "name": "multi-command",
+    "manifest": {
+      "schemaVersion": 1,
+      "pluginId": "com.example.file-open",
+      "version": "1.1.0",
+      "apiVersion": 1,
+      "minimumHostVersion": "0.13.0",
+      "name": "JSON 工作台",
+      "description": "离线校验与格式化 JSON，并显式保存和重新读取草稿。",
+      "supportedPlatforms": [
+        "windows"
+      ],
+      "runtime": {
+        "entry": "dist/runtime.js"
+      },
+      "window": {
+        "entry": "dist/window.html",
+        "runtimeActions": true
+      },
+      "permissions": [
+        "ui.window",
+        "files.openText"
+      ],
+      "settings": [],
+      "commands": [
+        {
+          "id": "one",
+          "defaultName": "json-workbench",
+          "summary": "校验、格式化 JSON 和保存草稿",
+          "activationMode": "submit",
+          "outputMode": "mainResult",
+          "inputRequired": false,
+          "inputPlaceholder": "按 Enter 打开 JSON 工作台"
+        }
+      ]
+    },
+    "valid": false
+  }
+]

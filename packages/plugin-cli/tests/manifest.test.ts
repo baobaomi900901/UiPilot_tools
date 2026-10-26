@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.12.1'
+    tooNewHost.minimumHostVersion = '0.13.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -657,4 +657,15 @@ it('matches the Rust result-action manifest parity fixtures', async () => {
     if (item.permissions) value.permissions = item.permissions
     expect(validate(value).ok, item.name).toBe(item.valid)
   }
+})
+
+it('files.openText requires Windows Host 0.13 and legacy submit window with ui.window without runtimeActions',()=>{
+ const value:any=timerManifest();value.minimumHostVersion='0.13.0';value.permissions=['ui.window','files.openText'];delete value.window.runtimeActions
+ expect(validate(value).ok).toBe(true)
+ for(const patch of [{minimumHostVersion:'0.12.0'},{supportedPlatforms:['windows','macos']},{permissions:['files.openText']},{command:{...value.command,activationMode:'live'}},{command:{...value.command,outputMode:'mainResult'}}])expect(validate({...value,...patch}).ok).toBe(false)
+})
+
+it('matches Rust file-open manifest parity fixtures',async()=>{
+ const cases=JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/file-open-manifest-fixtures.json'),'utf8'))
+ for(const item of cases)expect(validate(item.manifest).ok,item.name).toBe(item.valid)
 })

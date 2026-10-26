@@ -207,6 +207,7 @@
         "ui.window",
         "ui.panel",
         "clipboard.write",
+        "files.openText",
         "url.open",
         "clipboard.read",
         "clipboard.history.read",

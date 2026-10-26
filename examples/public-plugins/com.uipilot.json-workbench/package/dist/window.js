@@ -1,5 +1,5 @@
 const windowApi = window.uipilotPluginWindow
-const ui = Object.fromEntries(['input', 'output', 'format', 'save', 'reload', 'status', 'draft-state', 'byte-count', 'discard', 'discard-message', 'discard-confirm', 'discard-cancel'].map(id => [id, document.getElementById(id)]))
+const ui = Object.fromEntries(['input', 'output', 'import', 'format', 'save', 'reload', 'status', 'draft-state', 'byte-count', 'discard', 'discard-message', 'discard-confirm', 'discard-cancel'].map(id => [id, document.getElementById(id)]))
 const encoder = new TextEncoder()
 const bytes = text => encoder.encode(text).length
 const messages = {
@@ -35,8 +35,9 @@ let draft = { text: '', savedText: null, revision: null, hasSaved: false, editRe
 let activeRequest = null
 let recovery = null
 let confirming = false
+let confirmation = null
 
-function dirty() { return draft.text !== draft.savedText }
+function dirty() { return draft.imported === true || draft.text !== draft.savedText }
 function available() { return typeof session?.request === 'function' }
 function status(text, tone = '') {
   ui.status.textContent = text
@@ -49,6 +50,7 @@ function controls() {
   ui.format.disabled = busy || confirming || !available() || length > 8192
   ui.save.disabled = busy || confirming || !available() || recovery !== null || draft.revision === null || length > 8192
   ui.reload.disabled = busy || confirming || !available()
+  ui.import.disabled = busy || confirming || typeof session?.files?.openText !== 'function' || recovery !== null
   ui.discard.hidden = !confirming
   ui['byte-count'].textContent = String(length) + ' / 8192 字节'
   ui['byte-count'].dataset.overLimit = String(length > 8192)
@@ -99,6 +101,7 @@ async function request(action, payload) {
       draft.revision = data.revision
       draft.savedText = data.text
       draft.hasSaved = true
+      if (draft.editRevision === owner.editRevision) draft.imported = false
       recovery = null
       status(dirty() ? '先前版本已保存；之后的编辑仍未保存。' : '已保存 · 版本 ' + data.revision + '。关闭重开或重启后可读取。')
     } else if (action === 'load') {
@@ -125,6 +128,7 @@ ui.input.addEventListener('input', () => {
   draft.text = ui.input.value
   draft.editRevision += 1
   ui.output.value = ''
+  if (confirming) { confirming = false; confirmation = null }
   controls()
   if (!activeRequest) status(bytes(draft.text) > 8192 ? messages['text-limit'] : recovery ? messages[recovery] ?? messages['action-failed'] : '草稿已更改。格式化不会保存；关闭或隐藏后，未保存内容不会恢复。', bytes(draft.text) > 8192 || recovery ? 'error' : '')
 })
@@ -137,6 +141,8 @@ ui.reload.addEventListener('click', () => {
   if (activeRequest || confirming || !available()) return
   if (dirty() || recovery === 'save-uncertain') {
     confirming = true
+    confirmation = { action: 'load', editRevision: draft.editRevision }
+    ui['discard-confirm'].textContent = '放弃草稿并重新读取'
     ui['discard-message'].textContent = recovery === 'save-uncertain'
       ? '此前保存可能已写入。重新读取成功后将以已保存内容替换当前草稿，未保存编辑会丢失。'
       : '重新读取成功后将以已保存内容替换当前草稿，未保存编辑会丢失。'
@@ -148,20 +154,68 @@ ui.reload.addEventListener('click', () => {
 })
 ui['discard-confirm'].addEventListener('click', () => {
   if (!confirming || activeRequest) return
+  const allowed = confirmation
   confirming = false
-  void request('load', null)
+  confirmation = null
+  if (!allowed || allowed.editRevision !== draft.editRevision) { controls(); return }
+  if (allowed.action === 'import') void importFile()
+  else void request('load', null)
 })
 ui['discard-cancel'].addEventListener('click', () => {
+  const origin = confirmation?.action
   confirming = false
+  confirmation = null
   controls()
-  ui.reload.focus()
+  ;(origin === 'import' ? ui.import : ui.reload).focus()
 })
 
+const fileMessages = {
+  FileOpenBusyError: '文件选择器正忙，请稍后重试。',
+  ExpiredWindowSessionError: '窗口会话已失效，请重新打开工作台。',
+  FileOpenPermissionError: '缺少导入文件权限，请确认插件授权。',
+  FileOpenUnsupportedError: '请选择本地普通文件（UTF-8，最多 8 KiB）。',
+  FileOpenTooLargeError: '文件超过 8 KiB，当前草稿已保留。',
+  FileOpenEncodingError: '文件须为 UTF-8 文本且不含 NUL，当前草稿已保留。',
+  FileOpenFailedError: '文件导入未完成，当前草稿已保留。',
+}
+async function importFile() {
+  if (activeRequest || confirming || recovery || typeof session?.files?.openText !== 'function') return
+  const owner = { session, editRevision: draft.editRevision }
+  activeRequest = owner
+  controls()
+  status('请选择 UTF-8 文本文件（最多 8 KiB）；可以继续编辑。')
+  try {
+    const result = await owner.session.files.openText()
+    if (!current(owner)) return
+    if (result === null) { status('已取消导入，当前草稿已保留。'); return }
+    if (draft.editRevision !== owner.editRevision) { status('选择期间输入已更改，已忽略导入并保留当前草稿。'); return }
+    draft.text = result.text
+    draft.imported = true
+    draft.editRevision += 1
+    ui.input.value = draft.text
+    ui.output.value = ''
+    status('已导入 ' + result.name + ' · 未保存。请显式校验或保存草稿。')
+  } catch (error) {
+    if (current(owner)) status(fileMessages[error?.name] ?? fileMessages.FileOpenFailedError, 'error')
+  } finally { if (current(owner)) { activeRequest = null; controls() } }
+}
+ui.import.addEventListener('click', () => {
+  if (activeRequest || confirming || recovery || typeof session?.files?.openText !== 'function') return
+  if (dirty()) {
+    confirming = true
+    confirmation = { action: 'import', editRevision: draft.editRevision }
+    ui['discard-message'].textContent = '导入成功后将替换当前输入；取消或错误会保留草稿和格式化结果。'
+    ui['discard-confirm'].textContent = '选择文件并替换草稿'
+    controls()
+    ui['discard-confirm'].focus()
+  } else void importFile()
+})
 windowApi.onUpdate(update => {
   // Capture after PREPARE, return synchronously, and invoke only on a later user action.
-  session = { request: windowApi.request, requestId: update.requestId }
+  session = { files: windowApi.files, request: windowApi.request, requestId: update.requestId }
   activeRequest = null
   confirming = false
+  confirmation = null
   recovery = null
   draft = { text: '', savedText: null, revision: null, hasSaved: false, editRevision: 0 }
   ui.input.value = ''

@@ -2436,6 +2436,37 @@ pub(crate) fn plugin_panel_focus_host_input_ack(
 }
 
 #[tauri::command]
+pub(crate) async fn plugin_window_open_text(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_generation: String,
+    document_generation: String,
+) -> Result<
+    Option<crate::public_plugins::file_open::OpenedText>,
+    crate::public_plugins::file_open::FileOpenError,
+> {
+    use crate::public_plugins::file_open::FileOpenError as E;
+    if plugin_window::plugin_id_from_content_label(webview.label()).is_none() {
+        return Err(E::ExpiredWindowSessionError);
+    }
+    let session =
+        parse_canonical_nonzero_u64(&session_generation).ok_or(E::ExpiredWindowSessionError)?;
+    let document =
+        parse_canonical_nonzero_u64(&document_generation).ok_or(E::ExpiredWindowSessionError)?;
+    plugin_window::open_text(
+        app,
+        controller.inner().clone(),
+        service.inner().clone(),
+        webview.label().into(),
+        session,
+        document,
+    )
+    .await
+}
+
+#[tauri::command]
 pub(crate) async fn plugin_window_request(
     webview: tauri::Webview,
     app: AppHandle,

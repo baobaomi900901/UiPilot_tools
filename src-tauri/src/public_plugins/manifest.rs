@@ -24,6 +24,8 @@ pub(crate) enum PublicPermission {
     UiPanel,
     #[serde(rename = "clipboard.write")]
     ClipboardWrite,
+    #[serde(rename = "files.openText")]
+    FilesOpenText,
     #[serde(rename = "url.open")]
     UrlOpen,
     #[serde(rename = "clipboard.read")]
@@ -52,6 +54,7 @@ impl PublicPermission {
             || (matches!(
                 self,
                 Self::UrlOpen
+                    | Self::FilesOpenText
                     | Self::ClipboardHistoryRead
                     | Self::ClipboardHistoryPaste
                     | Self::NetworkHttps
@@ -723,6 +726,20 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest
+        .permissions
+        .contains(&PublicPermission::FilesOpenText)
+        && (minimum_host < [0, 13, 0]
+            || manifest.supported_platforms != [PublicPlatform::Windows]
+            || !manifest.permissions.contains(&PublicPermission::UiWindow)
+            || manifest.window.is_none()
+            || !manifest.legacy_command().is_some_and(|c| {
+                c.activation_mode == PublicActivationMode::Submit
+                    && c.output_mode == PublicOutputMode::Window
+            }))
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.permissions.contains(&PublicPermission::UrlOpen)
         && (minimum_host < [0, 12, 0]
             || manifest.supported_platforms != [PublicPlatform::Windows]
@@ -988,6 +1005,21 @@ mod schema_tests {
         )
     }
 
+    #[test]
+    fn file_open_manifest_parity() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../../../docs/plugin-sdk/tests/file-open-manifest-fixtures.json"
+        ))
+        .unwrap();
+        for item in cases.as_array().unwrap() {
+            assert_eq!(
+                parse(&item["manifest"]).is_ok(),
+                item["valid"].as_bool().unwrap(),
+                "{}",
+                item["name"]
+            );
+        }
+    }
     #[test]
     fn result_action_manifest_shared_parity() {
         let cases: Value = serde_json::from_str(include_str!(
@@ -1568,7 +1600,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 12, 0]
+            [0, 13, 0]
         );
     }
 

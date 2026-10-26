@@ -8294,7 +8294,7 @@ describe('React view and accessibility', () => {
       pluginId: 'com.uipilot.demo-win',
       name: 'Public Plugin Demo Window',
       version: '1.0.2',
-      permissions: ['ui.window', 'clipboard.history.read', 'clipboard.history.paste', 'url.open'],
+      permissions: ['ui.window', 'clipboard.history.read', 'clipboard.history.paste', 'url.open', 'files.openText'],
       isUpdate: false, operation: 'install', previousVersion: null,
       sourceVerified: false,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/prepared/public-prepare-0000000000000001-0000000000000002/icon.png',
@@ -8315,6 +8315,8 @@ describe('React view and accessibility', () => {
     const prepare = mounted.host.querySelector<HTMLElement>('.public-prepare')!
     expect(prepare.textContent).toContain('独立窗口 · ui.window')
     expect(prepare.textContent).toContain('在默认浏览器打开 HTTP(S) 链接 · url.open')
+    expect(prepare.textContent).toContain('选择并读取本地 UTF-8 文本文件（最多 8 KiB） · files.openText')
+    expect(prepare.textContent).not.toContain('files.openText · files.openText')
     expect(prepare.textContent).toContain('剪贴板历史读取 · clipboard.history.read')
     expect(prepare.textContent).toContain('剪贴板历史粘贴 · clipboard.history.paste')
     expect(prepare.textContent).toContain('会在本机记录该插件可用的剪贴板历史摘要')

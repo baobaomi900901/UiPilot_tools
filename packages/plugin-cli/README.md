@@ -2,7 +2,7 @@
 
 Validate and pack UiPilot public plugins locally without installing UiPilot or Rust.
 
-The package version is `0.1.0`; its current validation target is UiPilot Host `0.12.0`, API v1. Windows bearer credential references require `minimumHostVersion >= 0.4.0` and exact declared secret/host bindings; the CLI validates metadata and never reads stored credentials. Historical feature minima remain unchanged. Browser result actions require Windows, `url.open`, `runtime.resultActions: true`, main-result commands and `minimumHostVersion >= 0.12.0`; validation never opens a URL.
+The package version is `0.1.0`; its current validation target is UiPilot Host `0.13.0`, API v1. Windows bearer credential references require `minimumHostVersion >= 0.4.0` and exact declared secret/host bindings; the CLI validates metadata and never reads stored credentials. Historical feature minima remain unchanged. Browser result actions require Windows, `url.open`, `runtime.resultActions: true`, main-result commands and `minimumHostVersion >= 0.12.0`; validation never opens a URL.
 
 The package requires Node.js 20 or newer. Install the supplied npm tarball:
 
@@ -38,3 +38,5 @@ The 0.5.0 Host target accepts both legacy `command` packages and new `commands` 
 New Hosts support old packages and validated package rollback. After a normal transaction or required recovery writes internal state schema 2, older schema-1-only Host binaries are not guaranteed to read that data directory. CLI validation does not migrate Host state or promise binary downgrade compatibility. Unified actions/onAction, per-command shortcuts, independent alias collections, multi-command panel/window and M3 remain outside M2-A.
 
 Windows `window.runtimeActions: true` requires legacy `submit + window`, `ui.window`, and `minimumHostVersion >= 0.9.0`. The CLI validates Manifest metadata only; Host readiness verifies `onWindowAction`.
+
+Windows `files.openText` requires Host 0.13.0+, legacy `submit + window`, a window entry and `ui.window`. It is independent of `window.runtimeActions`; validation never opens files or dialogs.

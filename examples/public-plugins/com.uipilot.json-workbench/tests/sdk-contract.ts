@@ -22,14 +22,27 @@ const onWindowAction: PluginWindowActionHandler = async (invocation, api) => {
 const runtime: PluginRuntimeModule = { onCommand, onWindowAction }
 
 function content(api: Readonly<UiPilotPluginWindowApiV1>) {
+  let files: typeof api.files
   let request: typeof api.request
   api.onUpdate(update => {
+    files = api.files
     request = api.request
     const theme: 'dark' | 'light' = update.theme
     void theme
     // Return promptly; invoke the captured request only from a later user action.
   })
   return async () => {
+    if (files) {
+      const selected: Readonly<{name:string;text:string;byteLength:number}> | null = await files.openText()
+      // @ts-expect-error no arbitrary path or options accepted.
+      await files.openText('C:\\private.txt')
+      // @ts-expect-error files facade is readonly.
+      api.files = files
+      if (selected) {
+        // @ts-expect-error result is readonly.
+        selected.text = 'changed'
+      }
+    }
     if (!request) return
     const load: PluginWindowRequest = { action: 'load', payload: null }
     const data: JsonValue = await request(load)

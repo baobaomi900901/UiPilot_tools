@@ -3007,12 +3007,28 @@ fn window_action_fixture(
     Arc<crate::plugin_window::PluginWindowController>,
     crate::plugin_window::WindowActionIdentity,
 ) {
+    window_action_fixture_options(name, false)
+}
+fn window_action_fixture_options(
+    name: &str,
+    files: bool,
+) -> (
+    TestRoot,
+    Arc<PublicPluginService>,
+    Arc<PublicPluginManager>,
+    Arc<crate::plugin_window::PluginWindowController>,
+    crate::plugin_window::WindowActionIdentity,
+) {
     let root = TestRoot::new(name);
     let source = root.package();
     let mut value = manifest("window");
     value["minimumHostVersion"] = json!("0.9.0");
     value["window"]["runtimeActions"] = json!(true);
     value["settings"] = json!([{ "key":"synthetic", "label":"Synthetic", "type":"secret" }]);
+    if files {
+        value["minimumHostVersion"] = json!("0.13.0");
+        value["permissions"] = json!(["ui.window", "files.openText"]);
+    }
     write_package(&source, &value);
     let app_data = root.0.join("app-data");
     let manager = Arc::new(
@@ -3036,7 +3052,11 @@ fn window_action_fixture(
         .commit_with_readiness(
             "main",
             &prepared.token,
-            BTreeSet::from([PublicPermission::UiWindow]),
+            if files {
+                BTreeSet::from([PublicPermission::UiWindow, PublicPermission::FilesOpenText])
+            } else {
+                BTreeSet::from([PublicPermission::UiWindow])
+            },
             now,
             |_| true,
         )
@@ -3834,12 +3854,13 @@ fn result_action_timeout_promotes_waiting_command_with_fresh_publication_owner()
         .begin_query(crate::result_registry::QueryDomain::Plugin, "next", 2)
         .unwrap();
     assert!(manager
-        .publish_result_actions(&route, false.into(), || registry.publish_prepared_result_actions(
-            token,
-            registry
-                .prepare_result_actions(route.clone(), results)
-                .unwrap()
-        ))
+        .publish_result_actions(&route, false.into(), || registry
+            .publish_prepared_result_actions(
+                token,
+                registry
+                    .prepare_result_actions(route.clone(), results)
+                    .unwrap()
+            ))
         .unwrap()
         .is_some());
 }
@@ -4076,4 +4097,24 @@ pub(super) fn with_running_result_action_for_test(
         .prepare_result_action_with_observer(legacy, registry.clone(), origin, || Ok(arm))
         .unwrap();
     operation(&service, &manager, &registry, &action, &receiver);
+}
+
+#[test]
+fn file_open_manager_requires_declarations_grants_and_current_identity() {
+    let (_root, _service, m, _c, i) = window_action_fixture_options("file-open-authority", true);
+    assert!(m.files_open_enabled(&i.owner));
+    for field in 0..3 {
+        let mut owner = i.owner.clone();
+        match field {
+            0 => owner.activation_id += 1,
+            1 => owner.admission_epoch += 1,
+            _ => owner.plugin_generation += 1,
+        };
+        assert!(!m.files_open_enabled(&owner));
+    }
+    let (_r, _s, legacy, _c, j) = window_action_fixture("file-open-legacy");
+    assert!(!legacy.files_open_enabled(&j.owner));
+    m.set_enabled_with_readiness("com.uipilot.demo", false, |_| true)
+        .unwrap();
+    assert!(!m.files_open_enabled(&i.owner));
 }

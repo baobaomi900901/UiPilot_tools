@@ -4,6 +4,7 @@
   "description": "Session-bound Window Runtime request, ready and update acknowledgement bridge for isolated public plugin content",
   "webviews": ["plugin-content-*"],
   "permissions": [
+    "allow-plugin-window-open-text",
     "allow-plugin-window-request",
     "allow-plugin-window-content-ready",
     "allow-plugin-window-content-ack",

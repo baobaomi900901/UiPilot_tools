@@ -91,7 +91,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - 旧 `command.defaultName` 不包含 `/`；新 `commands` 每项也使用相同名称规则。`command` / `commands` 必须二选一，显式 null 无效。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read` 和 `clipboard.history.paste`。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
+- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read`、`clipboard.history.paste`、`url.open` 和 `files.openText`。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -141,7 +141,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 这是字段片段；完整离线包见 [demo-multi](../../examples/public-plugins/com.uipilot.demo-multi/README.md)。数组限 1–16 项，每项必填唯一 id，匹配 `^[a-z][a-z0-9-]{0,31}$`；defaultName 也须包内唯一。合法 ID 包含 constructor，勿用继承属性进行分派。每项只支持 mainResult，不能声明 window/panel 及 ui.window、ui.panel、timer.control、clipboard.history.* 权限。任一项无效则整包拒绝，不能忽略或退回第一项。
 
-Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.12.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
+Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.13.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
 
 ### 分支 B：子窗口型 Manifest
 
@@ -1084,3 +1084,16 @@ Host 在发布和执行前严格校验：原文与规范化 URL 各限 4096 UTF-
 URL 只保存在 Host 私有快照，界面只接收动作标题与不透明句柄。整个快照使用的复制/URL 权限均须声明并授权；任何一项动作获准后，无论打开成功还是失败，所有兄弟动作都会消耗。成功显示“已请求打开链接”，表示 Windows 已接受请求；失败请显式重新运行，绝不自动重试。没有 Runtime 直接打开 API，也不会因为查询或返回结果而自动打开。浏览器自己的重定向、登录和网络策略由浏览器负责，`network.https` 不授权此动作。
 
 参考 [文本片段 1.1](../../examples/public-plugins/com.uipilot.text-snippet/README.md)：只给合法 URL 的原文和最新片段加“在浏览器打开”，大写行保留复制/保存。先确认新权限，再输入 `https://example.com`，用 Ctrl+K 选择打开并核对一次浏览器请求；普通文本仍按原流程复制、保存和读取。
+
+
+## User-selected text import (Windows Host 0.13.0+)
+
+Declare `files.openText`, `ui.window`, exactly `["windows"]`, `minimumHostVersion >= 0.13.0`, and legacy `command` with `submit + window`. This permission does not require `window.runtimeActions`. Installation/update requires explicit permission consent; cancelling preserves the prior installation, configuration and data. API/Manifest v1 and persisted schemas stay unchanged.
+
+Only opted-in Window content exposes optional readonly `window.uipilotPluginWindow.files`. Capture it in `onUpdate`, then call `files.openText()` with no arguments from an explicit user action after update/ACK. The frozen result is `{name, text, byteLength}` or `null` for cancellation. `name` is a basename, never a path. Maximum original file size is 8192 bytes including an optional leading UTF-8 BOM; the Host strips that BOM once, decodes strict UTF-8, rejects NUL and preserves other whitespace. Empty text and invalid JSON are allowed. The chooser accepts one ordinary local Windows file, with fixed text/all-file filters. No arbitrary path input, file writes, Runtime slot, persistent grant or handle is exposed.
+
+One physical picker is allowed globally. Each facade captures its exact session/document; retained old functions and late success/cancel/error cannot borrow replacement authority. Explicit close, revocation and replacement remain nonblocking. Automatic blur hiding is suppressed only for the physical picker's document until completion; focus is restored only to its still-current authorized original shell.
+
+Errors have sanitized names/messages: `FileOpenBusyError`, `ExpiredWindowSessionError`, `FileOpenPermissionError`, `FileOpenUnsupportedError`, `FileOpenTooLargeError`, `FileOpenEncodingError`, `FileOpenFailedError`. Passing any argument rejects `TypeError` before IPC. Host never logs the selected path, basename, text or native errors. Files outside ordinary local drives, reparse/device/directory/ADS targets and other platforms fail closed.
+
+See [JSON workbench](../../examples/public-plugins/com.uipilot.json-workbench/README.md) for an explicit import/format/save workflow with edit/session ownership and inline dirty-draft confirmation. Native Windows behavior remains user-operated acceptance.
