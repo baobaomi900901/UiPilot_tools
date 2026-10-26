@@ -161,6 +161,7 @@ export interface PluginPanelHostKeyPhysicalInput {
 }
 
 interface PrivatePanelState {
+  commandHotkeyTarget?: CommandHotkeyEntry
   pluginId: string
   commandLabel: string
   inputPlaceholder?: string
@@ -2967,6 +2968,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     nextPanelHostKeyClientSequence = 1n
     panelHostKeyEnqueueTail = Promise.resolve()
     if (!model.panel) return false
+    const panelTarget = model.panel.commandHotkeyTarget
+    if (panelTarget && stableCommandOutputMode === 'panel' && (!stableCommandTarget || stableCommandTarget === panelTarget)) {
+      stableCommandTarget = undefined
+      stableCommandOutputMode = undefined
+    }
     if (composition?.control === model.panel?.suffix.key) composition = undefined
     panelActionToken += 1
     panelSubmissionToken += 1
@@ -3199,6 +3205,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const owner = {
       token: ++panelActionToken,
       viewEpoch: model.viewEpoch,
+      commandHotkeyTarget: stableCommandOutputMode === 'panel' ? stableCommandTarget : undefined,
       invocationId: model.invocationId,
       control: model.queryControl,
       querySequence: model.querySequence,
@@ -3242,10 +3249,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         model.searchPending = false
         model.executePending = false
         model.launcherMode = 'panel'
+        if (owner.commandHotkeyTarget) {
+          // The Panel suffix takes over the temporary hotkey argument control.
+          model.mainResultCommand = undefined
+          completionOrigin = undefined
+        }
         model.query = ''
         model.queryControlValue = ''
         clearResults()
         model.panel = {
+          commandHotkeyTarget: owner.commandHotkeyTarget,
           pluginId: identity.pluginId,
           commandLabel: identity.commandLabel,
           ...(identity.inputPlaceholder === undefined ? {} : { inputPlaceholder: identity.inputPlaceholder }),

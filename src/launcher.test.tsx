@@ -10306,6 +10306,85 @@ describe('command hotkey entry', () => {
     expect(core.getSnapshot().mainResultCommand).toBeUndefined()
     core.destroy()
   })
+  async function openHotkeyPanel(inputRequired: boolean) {
+    const fake = await startedCore()
+    fake.emit(shown('panel-hotkey-exit'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    vi.mocked(fake.client.resolvePublicPluginCommandEntry).mockResolvedValueOnce({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'notes', outputMode: 'panel', activationMode: 'submit', inputRequired, inputPlaceholder: '内容' })
+    const identity = { pluginId: entry.pluginId, commandLabel: 'notes', sessionEpoch: u64('71'), hostKeys: [] }
+    vi.mocked(fake.client.openPluginPanel).mockResolvedValueOnce(identity)
+    vi.mocked(fake.client.submitPluginPanel).mockResolvedValue(identity)
+    fake.core.commandHotkeyEntry(entry)
+    if (inputRequired) {
+      await vi.waitFor(() => expect(fake.core.getSnapshot().mainResultCommand).toBeDefined())
+      expect(fake.client.openPluginPanel).not.toHaveBeenCalled()
+      fake.core.text({ kind: 'ordinaryInput', control: fake.core.getSnapshot().mainResultCommand!.suffixControl, value: 'initial', inputType: 'insertText' })
+      fake.core.keyDown('Enter', false)
+    }
+    await vi.waitFor(() => expect(fake.core.getSnapshot().panel?.sessionEpoch).toBe('71'))
+    await vi.waitFor(() => expect(fake.core.getSnapshot().panel?.submitPending).toBe(false))
+    expect(fake.client.openPluginPanel).toHaveBeenCalledWith({ pluginId: entry.pluginId, argument: inputRequired ? 'initial' : '', stableCommandTarget: entry })
+    return fake
+  }
+
+  it.each([false, true])('restores default and ordinary search after closing a Panel hotkey with required input %s', async (required) => {
+    const fake = await openHotkeyPanel(required)
+    const { core, client } = fake
+    try {
+      vi.mocked(client.searchApps).mockImplementation(async () => ({ requestId: 'after-panel', items: [panelItem('')] } as unknown as SearchResponse))
+      vi.mocked(client.searchApps).mockClear()
+      await core.closePanel()
+      expect(core.getSnapshot().mainResultCommand).toBeUndefined()
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ query: '' }))
+      expect(vi.mocked(client.searchApps).mock.lastCall![0]).not.toHaveProperty('stableCommandTarget')
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'ordinary', inputType: 'insertText' })
+      await vi.waitFor(() => expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ query: 'ordinary' })))
+      expect(vi.mocked(client.searchApps).mock.lastCall![0]).not.toHaveProperty('stableCommandTarget')
+    } finally { core.destroy() }
+  })
+
+  it.each(['reset', 'error'] as const)('clears required-input Panel hotkey ownership after host %s', async (exit) => {
+    const fake = await openHotkeyPanel(true)
+    const { core, client } = fake
+    try {
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().panel!.suffixControl, value: 'updated', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(client.submitPluginPanel).toHaveBeenLastCalledWith(expect.objectContaining({ argument: 'updated' })))
+      vi.mocked(client.searchApps).mockClear()
+      if (exit === 'reset') fake.emitPanelReset({ sessionEpoch: '71' })
+      else fake.emitPanelError({ sessionEpoch: '71' })
+      expect(core.getSnapshot().panel).toBeUndefined()
+      expect(core.getSnapshot().mainResultCommand).toBeUndefined()
+      await vi.waitFor(() => expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ query: '' })))
+      expect(vi.mocked(client.searchApps).mock.lastCall![0]).not.toHaveProperty('stableCommandTarget')
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'ordinary', inputType: 'insertText' })
+      await vi.waitFor(() => expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ query: 'ordinary' })))
+      expect(vi.mocked(client.searchApps).mock.lastCall![0]).not.toHaveProperty('stableCommandTarget')
+    } finally { core.destroy() }
+  })
+
+  it('keeps a newer command owner when an old Panel close settles', async () => {
+    const fake = await openHotkeyPanel(true)
+    const { core, client } = fake
+    try {
+      const closed = deferred<void>()
+      vi.mocked(client.closePluginPanel).mockReturnValueOnce(closed.promise)
+      const closing = core.closePanel()
+      const newer = { ...entry, commandId: 'newer' }
+      const resolved = deferred<import('./protocol').CommandEntryResolution>()
+      vi.mocked(client.resolvePublicPluginCommandEntry).mockReturnValueOnce(resolved.promise)
+      core.commandHotkeyEntry(newer)
+      closed.resolve()
+      await closing
+      resolved.resolve({ pluginId: newer.pluginId, commandId: newer.commandId, commandLabel: 'newer', outputMode: 'mainResult', activationMode: 'submit', inputRequired: true, inputPlaceholder: '内容' })
+      await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand?.commandId).toBe('newer'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().mainResultCommand!.suffixControl, value: 'kept', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ query: '/newer kept', submit: true, stableCommandTarget: newer })))
+    } finally { core.destroy() }
+  })
+
   it('offers foreground and hidden chords to recording before navigation and suppresses delayed delivery', async () => {
     const fake = await startedSettingsCore(); const { core } = fake
     const consume = vi.fn()
