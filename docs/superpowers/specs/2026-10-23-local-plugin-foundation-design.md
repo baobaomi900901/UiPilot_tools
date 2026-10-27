@@ -349,3 +349,13 @@ Host0.13.0与JSON工作台1.1.1保持不变，本轮无代码修改、构建或�
 结合前四组，本轮Form/ActionPanel在templates1.2.0中的五组已下发核心人工验收全部通过，无已报告待修问题。组合保持Host0.13.0与templates1.2.0（源码5517126c9dfff92f44fbe3623d98fdda3639578d）；本次仅记录结果，无源码变动、重复检查、重建或重打包。特殊窄视口及完整跨插件矩阵未单独确认，不扩大结论。
 
 标准UI已完成List/Detail/ActionBar及本轮Form/ActionPanel的基础可复用能力与实际插件核心验收。整个M5及基座尚未完成；下一条明确系统能力缺口为授权粘贴到前台应用，需要先冻结Host权限、动作和焦点恢复合同，再用真实插件交付及人工验证。后续另有真实凭据服务、生命周期扩展及总验收；普通Enter次数仍按用户要求搁置。
+
+## 2026-10-27 授权文本粘贴交付，Host0.14.0人工待测
+
+完成clipboard.paste+clipboard.write权限及严格pasteText结果动作，沿用主结果授权和原应用捕获；键释放等待后在主线程核对归属、写剪贴板、隐藏恢复及单次粘贴发送。文本片段1.2.0增加原文/大写/最新片段的次级粘贴动作，默认复制、旧存储和保存/读取/URL保持；templates1.2.0不变。源码74525b6，审查编译条件修复77ab4f36b05325d2b03340c6bdd6fa75907f9b8c，完整切片Spec/Quality PASS。
+
+实施记录包含result_action45、result_paste6、manifest14、snippet12、protocol14、launcher32、CLI84项针对性检查，以及类型/schema/前端构建结果。专用test-instrumentation检查仍存在BASE已有command_hotkeys未加cfg的构建缺陷，单独记录待修；普通验收构建成功，不混淆这两个结果。
+
+交付目录.superpowers/deliveries/uipilot-0.14.0-acceptance；宿主40,212,992字节，SHA256 d6eb14f98cb8ea2bbde4049e82694a7b4756fb7bb2ef0b9a22083772acfc5973；文本片段1.2.0包SHA256 db042eccd03f10ec117da0873891d8eb43ab529ec92820567fb64817cb1f76c9。CLI打包和归档验证通过，PE0.14.0/UiPilot Acceptance及identifier核对通过，767个输入构建前后稳定、五资源一致、旧15个宿主及templates1.2.0包未变。证据delivery-evidence.json。
+
+首组下发版本与原设置保留、升级授权取消后再确认、记事本原文单次粘贴。真实系统行为全部待用户测试，代理未运行UiPilot或系统剪贴板/按键。后续跨目标、键盘/鼠标、失败路径和旧能力短回归分组下发。整个M5与基座尚未完成，不因本次交付上调或宣称已完成总验收。

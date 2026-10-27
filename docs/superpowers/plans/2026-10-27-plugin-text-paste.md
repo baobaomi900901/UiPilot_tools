@@ -16,9 +16,9 @@ subagent-driven-development单写入者。针对性RED→最小实现→GREEN并
 
 **Dependencies:** 设计Manifest/精确合同、目标归属/执行顺序、参考插件章节。现有copy/url/runtime和权限consent路径保持。
 
-- [ ] 权限/version/Host+CLI schema同步、严格pasteText解析与整快照requirements、public outcome及前端owner反馈。
-- [ ] 新show lease捕获/检查、键释放异步等待、主线程短执行闭包；claim/write边界和锁释放；guarded native write/sequence/send。输出typed错误，无副作用重试。
-- [ ] 文本片段1.2.0次级粘贴入口与文档、当前Host版本0.14；现有存储/默认copy保持。
+- [x] 权限/version/Host+CLI schema同步、严格pasteText解析与整快照requirements、public outcome及前端owner反馈。
+- [x] 新show lease捕获/检查、键释放异步等待、主线程短执行闭包；claim/write边界和锁释放；guarded native write/sequence/send。输出typed错误，无副作用重试。
+- [x] 文本片段1.2.0次级粘贴入口与文档、当前Host版本0.14；现有存储/默认copy保持。
 
 **Distinct test coverage:** 设计验证节全部具体时序分配至相应native driver/registry/manifest/frontend/example测试。特别单列：等待时发生newshow→旧lease拒绝且零write；等待时撤权/newquery→零write；write成功后自身hide撤销source仍允许固定target发送；write之后外部seq/foreground/keys变化→零send且consumed；写失败→不hide、不send且consumed；hide后target失效→不重试；partial batch→不重放；重复visible show保留capture但旧state lease失效；两个并发同source→一个claim。使用生产调度编排或可注入driver，不能仅源字符串断言代替竞态测试。
 
@@ -30,9 +30,17 @@ subagent-driven-development单写入者。针对性RED→最小实现→GREEN并
 
 **Dependencies:** Task1完整切片Spec/Quality通过与clean源码commit。
 
-- [ ] CLI build一次、pack snippet1.2.0到新归档、目录/归档validate。
-- [ ] 复制现有五个资源，冻结源码/dist和包hash；沿用0.13 build-host.ps1/verify-build.mjs模式只改目标版本与包清单。
-- [ ] offline locked native acceptance build一次；核对PE0.14.0/UiPilot Acceptance、identifier、源输入稳定、旧0.13及templates1.2.0不变。
-- [ ] 写evidence/短人工用例，第一组版本+权限取消确认+记事本中文显式粘贴。后续跨目标和旧能力回归分组；全部native状态待用户确认。
+- [x] CLI build一次、pack snippet1.2.0到新归档、目录/归档validate。
+- [x] 复制现有五个资源，冻结源码/dist和包hash；沿用0.13 build-host.ps1/verify-build.mjs模式只改目标版本与包清单。
+- [x] offline locked native acceptance build一次；核对PE0.14.0/UiPilot Acceptance、identifier、源输入稳定、旧0.13及templates1.2.0不变。
+- [x] 写evidence/短人工用例，第一组版本+权限取消确认+记事本中文显式粘贴。后续跨目标和旧能力回归分组；全部native状态待用户确认。
 
 **Verify:** existing CLI pack/validate；cargo build --manifest-path src-tauri/Cargo.toml --bin uipilot --features tauri/custom-protocol --offline --locked，过程环境TAURI_CONFIG指定com.uipilot.launcher.acceptance/UiPilot Acceptance，不得启动exe。旧资源与二进制只读，禁止覆盖交付文件。
+
+## 2026-10-27 交付状态
+
+Task1源码74525b6，独立审查发现的result_paste编译条件遗漏由77ab4f36b05325d2b03340c6bdd6fa75907f9b8c修复并复查；Spec/Quality PASS。实施记录包含针对性的Rust、前端、CLI、SDK、schema及前端构建结果。test-instrumentation专用检查仍受BASE已有command_hotkeys未加cfg影响，已记录待修，不宣称该配置检查通过。
+
+Task2完成：CLI构建、目录打包与归档校验通过；普通offline/locked acceptance构建成功，PE版本0.14.0、产品UiPilot Acceptance。767个源码/前端输入构建前后一致，五资源与旧15个宿主及templates1.2.0包保持。证据位于.superpowers/deliveries/uipilot-0.14.0-acceptance/delivery-evidence.json。源码冻结77ab4f3，后续计划/路线图提交仅记录交付。
+
+宿主SHA256 d6eb14f98cb8ea2bbde4049e82694a7b4756fb7bb2ef0b9a22083772acfc5973；插件包SHA256 db042eccd03f10ec117da0873891d8eb43ab529ec92820567fb64817cb1f76c9。代理未运行真实程序或操作系统剪贴板/按键。第一组版本、授权取消/确认、记事本单次粘贴人工待验收，后续跨目标和失败回归待下发；本计划实现与交付完成不代表整个基座完成。
