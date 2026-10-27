@@ -46,6 +46,7 @@ mod model;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod quicklinks;
 
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod result_paste;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod result_registry;
