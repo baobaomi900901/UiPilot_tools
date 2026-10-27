@@ -142,6 +142,31 @@ function Get-PackageCompletion($Request, [int]$ExitCode, [bool]$Cancelled) {
         return $result
     } catch { return [pscustomobject]@{State='Failed'; Message=('Packaging failed: ' + $_.Exception.Message + ' See run.log.')} }
 }
+function Publish-PackageArtifact($Request, $Result) {
+    Test-PackageCancelled $Request
+    if ($Result.State -ne 'Success' -or $Result.RunId -cne $Request.RunId) { throw 'No successful build to publish.' }
+    $source=[string]$Result.Artifact
+    if ((Split-Path -Parent $source) -cne $Request.RunDirectory -or -not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'Unexpected artifact path.' }
+    if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Result.Sha256) { throw 'Artifact hash mismatch.' }
+    $folder=if ($Request.Mode -eq 'Setup') { 'setup' } else { 'plugins' }
+    $output=Assert-PackageDirectoryPath (Join-Path $Request.Root ('artifacts/packages/' + $folder))
+    [IO.Directory]::CreateDirectory($output) | Out-Null
+    $null=Assert-PackageDirectoryPath $output
+    $destination=Join-Path $output (Split-Path -Leaf $source)
+    if (Test-Path -LiteralPath $destination) {
+        $existing=Get-Item -LiteralPath $destination -Force
+        if ($existing.PSIsContainer -or ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Output must be an ordinary file.' }
+    }
+    $temporary=Join-Path $output ('.publish-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::Copy($source,$temporary,$false)
+        if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Result.Sha256) { throw 'Published artifact hash mismatch.' }
+        Test-PackageCancelled $Request
+        if ([IO.File]::Exists($destination)) { [IO.File]::Replace($temporary,$destination,[NullString]::Value) }
+        else { [IO.File]::Move($temporary,$destination) }
+        return $destination
+    } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
 function Initialize-PackageOwnership {
     if ('UiPilot.PackagingJob' -as [type]) { return }
     # Assign a suspended worker before it can spawn children. No name scans.

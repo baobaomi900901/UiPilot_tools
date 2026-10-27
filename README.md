@@ -17,7 +17,7 @@ npm run tauri -- build # 原生应用构建
 
 ## 可视化打包
 
-Windows 下双击根目录 **Pack.cmd**，选择 Setup 或插件包及输出目录，查看实时日志并打开产物目录。每次运行独立保留产物、SHA256 与日志，支持取消本次构建进程树。准备条件、固定构建流程与人工验收见[打包工具说明](docs/packaging-tool.md)。
+Windows 下在终端运行 **.\Pack.cmd**（也可双击）：输入 `1` 打包主程序 Setup，输入 `2` 后从列表选择一个插件打包。产物固定在 `artifacts/packages/setup` 和 `artifacts/packages/plugins`，同名文件在新包成功后自动覆盖。准备条件和使用方法见[打包工具说明](docs/packaging-tool.md)。
 
 ## 验证
 

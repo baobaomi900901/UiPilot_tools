@@ -194,17 +194,37 @@ try {
             Assert ($job.Process.HasExited -and $job.Process.ExitCode -eq 7) 'natural exit code retained'
         } finally { $job.Dispose() }
     }
-    Test 'PowerShell 5.1 parser and static GUI wiring' {
-        foreach ($name in @('package-runtime.ps1','package-runner.ps1','package-gui.ps1','test-package-tool.ps1')) {
+    Test 'fixed outputs replace same-name packages only after successful validation' {
+        ResetFake; $root=Fixture
+        $request=New-PackageRun $root Plugin (Join-Path $root 'artifacts/packages/.runs') (Join-Path $root 'plugin 中文 & 空格')
+        $result=Invoke-PackageBuild $request $script:tools $fake
+        $published=Publish-PackageArtifact $request $result
+        Assert ($published -eq (Join-Path $root 'artifacts/packages/plugins/com.test.plugin-1.2.3.uipilot-plugin')) 'fixed plugin output'
+        [IO.File]::WriteAllText($published,'old-package')
+        $again=Publish-PackageArtifact $request $result
+        Assert ($again -eq $published -and [IO.File]::ReadAllText($published) -eq 'fake-archive') 'replace same filename'
+        $result.Sha256='invalid'
+        MustFail { Publish-PackageArtifact $request $result } 'hash'
+        Assert ([IO.File]::ReadAllText($published) -eq 'fake-archive') 'failed validation preserves previous artifact'
+        ResetFake; $setup=New-PackageRun $root Setup (Join-Path $root 'artifacts/packages/.runs')
+        $setupResult=Invoke-PackageBuild $setup $script:tools $fake
+        Assert ((Publish-PackageArtifact $setup $setupResult) -eq (Join-Path $root 'artifacts/packages/setup/UiPilot_tools_0.14.0_x64-setup.exe')) 'fixed setup output'
+    }
+    Test 'console menu accepts only listed numbers and cancellation' {
+        . (Join-Path $PSScriptRoot 'package-console.ps1')
+        Assert ((ConvertTo-PackageMenuIndex '2' 2) -eq 2) 'plugin menu option'
+        Assert ((ConvertTo-PackageMenuIndex '0' 2) -eq 0) 'cancel selection'
+        foreach ($invalid in @('3','-1','abc','1;exit','')) { MustFail { ConvertTo-PackageMenuIndex $invalid 2 } 'number' }
+    }
+    Test 'PowerShell 5.1 parser and console entry' {
+        foreach ($name in @('package-runtime.ps1','package-runner.ps1','package-console.ps1','test-package-tool.ps1')) {
             $tokens=$null; $errors=$null
             [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name),[ref]$tokens,[ref]$errors) | Out-Null
             Assert ($errors.Count -eq 0) "PS5.1 parser: $name $errors"
         }
-        $gui=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'package-gui.ps1'))
-        foreach ($wire in @('TabControl','FolderBrowserDialog','FormClosing','Get-PackageCompletion','Start-PackageWorker','Stop-PackageWorker','Timer','AccessibleName')) { Assert $gui.Contains($wire) "GUI wiring $wire" }
         $cmd=[IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot) 'Pack.cmd'))
-        Assert ($cmd -match '-STA' -and $cmd -match '%~dp0') 'double click fixed root STA'
-        Assert ($cmd.Contains('MessageBox') -and $cmd -notmatch '\bpause\b') 'startup failure must remain visible with hidden console'
+        Assert ($cmd.Contains('package-console.ps1') -and $cmd -match '%~dp0') 'fixed root console entry'
+        Assert ($cmd -notmatch 'WindowStyle Hidden|MessageBox|package-gui') 'interactive console stays visible'
     }
     Write-Output "PACKAGE_TOOL_PASS $script:passed tests"
 }
