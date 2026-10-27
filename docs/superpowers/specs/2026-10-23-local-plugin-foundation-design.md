@@ -384,3 +384,13 @@ Host0.13.0与JSON工作台1.1.1保持不变，本轮无代码修改、构建或�
 验收组合保持Host0.14.0与文本片段1.2.0，构建源码77ab4f36b05325d2b03340c6bdd6fa75907f9b8c。本次仅记录用户反馈，无源码修改、重复自动检查、重建或重打包。交付目录manual-cases.zh-CN.md记录四组结果；delivery-evidence.json保留原始构建时点信息，不以修改构建证据代替人工记录。
 
 目标关闭、无可靠目标及完整原生竞态矩阵仍未人工确认；此前记录的test-instrumentation专用构建旧command_hotkeys编译条件问题仍待修复。本轮核心收口不代表M5或整个本地插件基座全部完成。后续按总路线处理剩余能力、生命周期扩展和整体验收；用户偏好短组人工用例保持，普通Enter次数继续搁置。
+
+## 2026-10-27 关闭构建与凭据测试遗留项，转入本地凭据人工验收
+
+0536eed仅为command_hotkeys模块补上与hotkey/settings一致的编译条件。先复现test-instrumentation配置E0432，再修复；offline/locked库检查、同配置bin uipilot检查及普通库检查均exit0，独立审查PASS。普通配置仍有既存测试辅助方法dead-code提示。本次未运行原生应用，未制作替代0.14.0宿主；该问题已解决，不再列待修。
+
+既存三项凭据界面失败已复现并查明：较新的busy fieldset禁用了收藏和同级输入，旧测试在禁用控件上click/focus没有真实发生。3458149仅修正测试，明确断言保存期间禁止收藏IPC，结束后释放busy且可收藏；焦点用启用的返回按钮验证确实移走，再检查保存完成不能抢回。没有削弱产品互斥或焦点保护。credential consent and settings定向组22通过、366无关项跳过，diff检查和独立复核PASS；不宣称全仓测试已执行。
+
+下一人工节点是M4本机凭据表单/持久化/清除，使用现有com.uipilot.demo-credentials1.0.0与已验收Host0.14.0，不添加新API或修改插件。新归档.superpowers/deliveries/credentials-1.0.0-acceptance/plugins/com.uipilot.demo-credentials-1.0.0.uipilot-plugin，3553字节，SHA256 7beffe5c44b30a22f1d916a814c322503652397b25ac3cb86aad810c40dbb70c；目录和归档验证通过，原0.14宿主hash保持。新kit内manual-cases.zh-CN.md和evidence.json记录证据。
+
+首组三项：安装声明取消/确认及未配置status；关闭网络访问，只保存虚构synthetic-demo-token并验证status与重启保留；清除取消保持、明确清除及重启后未配置。示例域名无真实服务，本组只运行status，不运行request。用户无需提供任何真实密钥。这一节点不验证真实认证服务、HTTPS运输或在途撤权；凭据人工结果待反馈，M6/M7扩展及最终代表插件组合验收仍待收口。普通Enter次数继续按用户要求搁置。
