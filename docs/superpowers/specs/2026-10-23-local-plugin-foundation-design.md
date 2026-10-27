@@ -394,3 +394,9 @@ Host0.13.0与JSON工作台1.1.1保持不变，本轮无代码修改、构建或�
 下一人工节点是M4本机凭据表单/持久化/清除，使用现有com.uipilot.demo-credentials1.0.0与已验收Host0.14.0，不添加新API或修改插件。新归档.superpowers/deliveries/credentials-1.0.0-acceptance/plugins/com.uipilot.demo-credentials-1.0.0.uipilot-plugin，3553字节，SHA256 7beffe5c44b30a22f1d916a814c322503652397b25ac3cb86aad810c40dbb70c；目录和归档验证通过，原0.14宿主hash保持。新kit内manual-cases.zh-CN.md和evidence.json记录证据。
 
 首组三项：安装声明取消/确认及未配置status；关闭网络访问，只保存虚构synthetic-demo-token并验证status与重启保留；清除取消保持、明确清除及重启后未配置。示例域名无真实服务，本组只运行status，不运行request。用户无需提供任何真实密钥。这一节点不验证真实认证服务、HTTPS运输或在途撤权；凭据人工结果待反馈，M6/M7扩展及最终代表插件组合验收仍待收口。普通Enter次数继续按用户要求搁置。
+
+## 2026-10-27 凭据本地首组人工通过
+
+用户对已下发三项回复“符合预期”：安装取消后再确认、网络关闭时status未配置；保存虚构synthetic-demo-token后输入清空，status已配置且不显示值，完全退出重启仍已配置；清除取消保留，明确清除及重启后未配置。仅上述实际下发范围记为人工通过，不推定真实服务或传输结果。
+
+继续沿用Host0.14.0与demo-credentials1.0.0，无代码修改、重建或重复自动检查。下一组为键盘保存与清除取消、深浅主题及显式清除、网络授权取消/确认和关闭后request拒绝。只使用虚构值，不在网络已开启时调用示例request。凭据真实服务与完整在途撤权/生命周期矩阵仍待验收。
