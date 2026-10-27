@@ -26,21 +26,23 @@ UiPilot 打包工具
 
 ## 环境与流程
 
-需要 Windows PowerShell 5.1、Node.js/npm，以及在项目运行过 `npm ci`。Setup 还需要 Windows x64、仓库指定的 Rust/MSVC 工具链、C++ 构建工具及 Everything 资源。首次 Setup 构建可能下载工具链依赖。
+打包器需要 Python 3.10+，仅使用标准库，无需安装 Python 第三方包。`Pack.cmd` 优先使用 `py -3`，否则使用 PATH 中的 `python`。还需要 Node.js/npm，以及在项目运行过 `npm ci`。Setup 还需要 Windows x64、Windows PowerShell 5.1（现有构建钩子使用）、仓库指定的 Rust/MSVC 工具链、C++ 构建工具及 Everything 资源。首次 Setup 构建可能下载工具链依赖。
 
 Setup 复用 `npm run tauri -- build --bundles nsis` 和既有生产 Everything Helper 钩子；只生成安装包，不运行安装器。插件依次执行当前 CLI 构建、源码校验、pack 和归档校验，不执行插件 Runtime。worker 仅清除自身的构建环境覆盖，不修改全局环境。取消或关闭终端会通过 Job Object 清理本次 worker 及后代，不按进程名结束其他任务。
 
 直接运行脚本（无结尾按键暂停）：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-console.ps1
+python -X utf8 scripts/package.py
 ```
 
 聚焦检查：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-tool.ps1
+python -X utf8 -m unittest discover -s scripts -p test_package.py -v
 ```
+
+维护入口：`scripts/package.py` 包含菜单、插件发现、构建与产物发布；`scripts/package_job.py` 仅封装 Windows Job Object 进程生命周期。`Pack.cmd` 只负责启动 Python 和结束后的按键暂停。原有项目构建钩子继续复用，不需要迁移到 Python。
 
 人工验收：选一个插件打包两次，确认固定目录中的同名文件更新；选择 `1` 确认生成 Setup。真实 Setup 生成与安装验收分开执行。
 

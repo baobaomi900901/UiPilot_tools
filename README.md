@@ -15,9 +15,9 @@ npm run tauri -- build # 原生应用构建
 
 完整开发入口需要已准备的 Everything.exe 及可用服务；请参阅 `scripts/dev-with-everything.ps1`。验证不安装或修改服务。安装器构建入口为 `npm run build:managed-everything`，其系统与 VM 验收独立进行。
 
-## 可视化打包
+## 终端交互打包
 
-Windows 下在终端运行 **.\Pack.cmd**（也可双击）：输入 `1` 打包主程序 Setup，输入 `2` 后从列表选择一个插件打包。产物固定在 `artifacts/packages/setup` 和 `artifacts/packages/plugins`，同名文件在新包成功后自动覆盖。准备条件和使用方法见[打包工具说明](docs/packaging-tool.md)。
+Windows 下安装 Python 3.10+ 后，在终端运行 **.\Pack.cmd**（也可双击），或直接执行 `python -X utf8 scripts/package.py`：输入 `1` 打包主程序 Setup，输入 `2` 后从列表选择一个插件打包。打包器仅使用 Python 标准库。产物固定在 `artifacts/packages/setup` 和 `artifacts/packages/plugins`，同名文件在新包成功后自动覆盖。准备条件和使用方法见[打包工具说明](docs/packaging-tool.md)。
 
 ## 验证
 
