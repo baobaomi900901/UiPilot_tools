@@ -196,6 +196,7 @@ try {
         foreach ($wire in @('TabControl','FolderBrowserDialog','FormClosing','Get-PackageCompletion','Start-PackageWorker','Stop-PackageWorker','Timer','AccessibleName')) { Assert $gui.Contains($wire) "GUI wiring $wire" }
         $cmd=[IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot) 'Pack.cmd'))
         Assert ($cmd -match '-STA' -and $cmd -match '%~dp0') 'double click fixed root STA'
+        Assert ($cmd.Contains('MessageBox') -and $cmd -notmatch '\bpause\b') 'startup failure must remain visible with hidden console'
     }
     Write-Output "PACKAGE_TOOL_PASS $script:passed tests"
 }
