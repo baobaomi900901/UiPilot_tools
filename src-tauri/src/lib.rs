@@ -842,7 +842,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 90);
+        assert_eq!(production.matches("commands::").count(), 91);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -863,6 +863,8 @@ mod tests {
             "delete_quicklink",
             "choose_quicklink_icon",
             "prepare_public_plugin_install",
+            "get_public_plugin_diagnostics",
+            "copy_public_plugin_diagnostics",
             "commit_public_plugin_install",
             "cancel_public_plugin_install",
             "set_plugin_enabled",
@@ -892,6 +894,8 @@ mod tests {
             "plugin_panel_request_hide_admit_observed",
             "plugin_panel_request_hide_commit",
             "plugin_panel_request",
+            "plugin_window_open_text",
+            "plugin_window_request",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -917,6 +921,8 @@ mod tests {
             "publish_plugin_results",
             "search_files",
             "execute_result",
+            "execute_result_action",
+            "retire_result_actions",
             "list_plugins",
             "install_plugin",
             "reload_plugin",
@@ -1624,6 +1630,17 @@ mod tests {
         );
         let production_root_without_process_control_exception =
             production_root.replacen(process_control_exception, "mod process_control;", 1);
+        let process_elevation_exception = concat!(
+            "#[allow(dead_code, reason = \"Task 2 supplies the private protocol boundary\")]\n",
+            "mod process_elevation;"
+        );
+        assert_eq!(production_root.matches(process_elevation_exception).count(), 1);
+        let production_root_without_process_control_exception =
+            production_root_without_process_control_exception.replacen(
+                process_elevation_exception,
+                "mod process_elevation;",
+                1,
+            );
         let allow_prefix = ["allow", "("].concat();
         assert!(!production_root_without_process_control_exception.contains(&allow_prefix));
 

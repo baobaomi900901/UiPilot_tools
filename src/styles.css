@@ -1,6 +1,6 @@
 @import './ui-theme.css';
-@import './credential-settings.css';
 @import 'overlayscrollbars/styles/overlayscrollbars.css';
+@import './credential-settings.css';
 
 :root {
   color: var(--uipilot-ui-foreground);
