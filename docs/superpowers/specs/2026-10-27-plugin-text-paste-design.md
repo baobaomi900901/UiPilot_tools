@@ -22,7 +22,7 @@ Host版本0.14.0；API/schema仍v1。新增权限clipboard.paste，只允许supp
 
 1. main命令解析、resolve后捕获当前lease/target；无有效目标则前置失败。为允许Enter/Space选动作后释放触发键，最多500ms在非UI线程每10ms检查Ctrl/Shift/Alt/左右Win/Enter/Space是否释放。只读按键高位，不保持任何管理锁，不写剪贴板、不隐藏、不发键；超时返回pasteInputBusy。这是一次请求的前置等待，不是重试副作用。
 2. 完成等待后排入一个run_on_main_thread闭包，async caller通过channel等待typed outcome，不能在UI线程等待另一个UI任务。闭包执行时重查main可见且GetForegroundWindow精确等于main HWND、lease当前、目标仍是原PID/有效非本进程外部窗口、触发/修饰键均已释放；对不满足者零副作用失败。
-3. 在legacy admission read → public mutation → scheduler → registry既有顺序下重新验证完整owner/grants/publication/lease并claim。scheduler/registry仅包claim，之后释放它们；在public mutation与legacy read仍持有时写入固定文本，并取得这次写入完成对应的非零clipboard sequence。不能把任意复制发生后的序列误认成本次写入：原生写入在OpenClipboard guard内完成Empty/SetCF_UNICODETEXT及获取sequence，释放剪贴板后返回；无原剪贴板读取/备份/恢复。
+3. 在legacy admission read → public mutation → scheduler → registry既有顺序下重新验证完整owner/grants/publication/lease并claim。scheduler/registry仅包claim，之后释放它们；在public mutation与legacy read仍持有时写入固定文本，并取得这次写入完成对应的非零clipboard sequence。不能把任意复制发生后的序列误认成本次写入：原生写入以当前main HWND调用OpenClipboard（不得传NULL），在guard内完成Empty/SetCF_UNICODETEXT及获取sequence，释放剪贴板后返回；UTF16终止符及GlobalAlloc由RAII持有，SetClipboardData成功才转移内存所有权，失败释放；无原剪贴板读取/备份/恢复。
 4. **必须释放全部legacy/public/scheduler/registry管理锁后**，同一主线程闭包执行clear_and_hide_window(...ExplicitReturn)，恢复绑定原目标。此函数会清理registry和重新进入manager，绝不放在持锁effect回调里。claim后的自身hide使结果lease过期是正常消费，不得用该过期取消自身后续发送。闭包不sleep、不重试，不拆出第二个排队hide任务。
 5. native发送helper内最后再检查：show generation未变、目标IsWindow/PID非本进程且GetForegroundWindow精确相同、键已释放、clipboard sequence仍等于本次写入。任何失配立即失败不发键。一个SendInput批次仅Ctrl-down/V-down/V-up/Ctrl-up；检查返回事件数量，不补发、不合成释放用户按住的键。部分成功也作为不确定失败并消费。不得复用忽略target的旧history helper作为安全检查。
 
@@ -43,3 +43,6 @@ com.uipilot.text-snippet升级1.2.0，minimumHost0.14.0，新增clipboard.paste�
 ## 原生行为依据
 
 [Microsoft SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)：返回插入事件数，受UIPI和现有键状态影响，不能等同目标完成编辑。[GetAsyncKeyState](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getasynckeystate)：仅高位判断当前按下状态。[GetClipboardSequenceNumber](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclipboardsequencenumber)：序列随内容改变，零代表无法取得；不读取内容。
+
+[Microsoft OpenClipboard](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard)：NULL owner配合EmptyClipboard会使SetClipboardData失败，因此传入宿主main HWND。
+
