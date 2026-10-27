@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "com.uipilot.auth-check",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minimumHostVersion": "0.4.0",
+  "name": "认证链路验收",
+  "description": "仅用公开测试值验收 httpbun.com 认证链路，勿填真实密钥。",
+  "supportedPlatforms": ["windows"],
+  "command": {
+    "defaultName": "auth-check",
+    "summary": "使用公开测试值验收认证链路",
+    "activationMode": "submit",
+    "outputMode": "mainResult",
+    "inputRequired": false,
+    "inputPlaceholder": "status 或 request"
+  },
+  "runtime": { "entry": "dist/runtime.js" },
+  "permissions": ["network.https"],
+  "network": {
+    "httpsHosts": ["httpbun.com"],
+    "credentials": [
+      { "id": "acceptance-token", "settingKey": "test-token", "host": "httpbun.com", "type": "bearer" }
+    ]
+  },
+  "settings": [{ "type": "secret", "key": "test-token", "label": "公开测试凭据（勿填真实密钥）" }]
+}
