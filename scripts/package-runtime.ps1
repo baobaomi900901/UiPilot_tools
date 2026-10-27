@@ -1,5 +1,17 @@
 ﻿# Shared packaging core; dot-source only. Windows PowerShell 5.1.
 Set-StrictMode -Version Latest
+function Get-PackageSha256([string]$Path) {
+    # Stream directly through .NET; do not depend on PowerShell module discovery.
+    $stream=[IO.File]::OpenRead($Path)
+    $algorithm=$null
+    try {
+        $algorithm=[Security.Cryptography.SHA256]::Create()
+        return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-','').ToLowerInvariant()
+    } finally {
+        if ($null -ne $algorithm) { $algorithm.Dispose() }
+        $stream.Dispose()
+    }
+}
 function Write-PackageJson([string]$Path, $Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false)) }
 function Read-PackageJson([string]$Path) { return ([IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json) }
 function Assert-PackageDirectoryPath([string]$Path) {
@@ -100,7 +112,7 @@ function Invoke-PackageBuild($Request, $Tools, [scriptblock]$RunCommand = ${func
     $root=[string]$Request.Root; $artifact=''; $before=''; $started=[DateTime]::UtcNow
     if ($Request.Mode -eq 'Setup') {
         $candidate=Join-Path $root ('src-tauri/target/release/bundle/nsis/' + $Request.ProductName + '_' + $Request.Version + '_x64-setup.exe')
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $item=Get-Item -LiteralPath $candidate; $before=$item.LastWriteTimeUtc.Ticks.ToString() + ':' + (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash }
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $item=Get-Item -LiteralPath $candidate; $before=$item.LastWriteTimeUtc.Ticks.ToString() + ':' + (Get-PackageSha256 $candidate) }
         $steps=@(@{Stage='Building production Release / Windows x64 / NSIS'; Args=@($Tools.NpmCli,'run','tauri','--','build','--bundles','nsis')})
     } else {
         $manifest=Get-PackageManifest $Request.Source; $artifact=Join-Path $Request.RunDirectory ($manifest.pluginId + '-' + $manifest.version + '.uipilot-plugin')
@@ -121,13 +133,13 @@ function Invoke-PackageBuild($Request, $Tools, [scriptblock]$RunCommand = ${func
     }
     if ($Request.Mode -eq 'Setup') {
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw 'No fresh current-version production Setup was generated.' }
-        $item=Get-Item -LiteralPath $candidate; $after=$item.LastWriteTimeUtc.Ticks.ToString() + ':' + (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash
+        $item=Get-Item -LiteralPath $candidate; $after=$item.LastWriteTimeUtc.Ticks.ToString() + ':' + (Get-PackageSha256 $candidate)
         if ($item.LastWriteTimeUtc -lt $started.AddSeconds(-2) -or $before -eq $after -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'No fresh current-version production Setup was generated; existing Setup is stale.' }
         $artifact=Join-Path $Request.RunDirectory $item.Name; [IO.File]::Copy($candidate,$artifact,$false)
     }
     Test-PackageCancelled $Request
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf) -or (Get-Item -LiteralPath $artifact).Length -eq 0) { throw 'Expected output artifact is missing or empty.' }
-    $hash=(Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash=Get-PackageSha256 $artifact
     $result=[pscustomobject]@{ SchemaVersion=1; RunId=$Request.RunId; State='Success'; Artifact=$artifact; Sha256=$hash; Message='Packaging completed.' }
     Write-PackageLog $Request ("SHA256 $hash  $artifact")
     return $result
@@ -138,7 +150,7 @@ function Get-PackageCompletion($Request, [int]$ExitCode, [bool]$Cancelled) {
         $result=Read-PackageJson (Join-Path $Request.RunDirectory 'result.json')
         if ($ExitCode -ne 0 -or $result.RunId -cne $Request.RunId -or $result.State -ne 'Success') { throw $result.Message }
         if ((Split-Path -Parent $result.Artifact) -cne $Request.RunDirectory -or -not (Test-Path -LiteralPath $result.Artifact -PathType Leaf)) { throw 'Expected artifact is missing.' }
-        if ((Get-FileHash -LiteralPath $result.Artifact -Algorithm SHA256).Hash.ToLowerInvariant() -cne $result.Sha256) { throw 'Output SHA256 mismatch.' }
+        if ((Get-PackageSha256 $result.Artifact) -cne $result.Sha256) { throw 'Output SHA256 mismatch.' }
         return $result
     } catch { return [pscustomobject]@{State='Failed'; Message=('Packaging failed: ' + $_.Exception.Message + ' See run.log.')} }
 }
@@ -147,7 +159,7 @@ function Publish-PackageArtifact($Request, $Result) {
     if ($Result.State -ne 'Success' -or $Result.RunId -cne $Request.RunId) { throw 'No successful build to publish.' }
     $source=[string]$Result.Artifact
     if ((Split-Path -Parent $source) -cne $Request.RunDirectory -or -not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'Unexpected artifact path.' }
-    if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Result.Sha256) { throw 'Artifact hash mismatch.' }
+    if ((Get-PackageSha256 $source) -cne $Result.Sha256) { throw 'Artifact hash mismatch.' }
     $folder=if ($Request.Mode -eq 'Setup') { 'setup' } else { 'plugins' }
     $output=Assert-PackageDirectoryPath (Join-Path $Request.Root ('artifacts/packages/' + $folder))
     [IO.Directory]::CreateDirectory($output) | Out-Null
@@ -160,7 +172,7 @@ function Publish-PackageArtifact($Request, $Result) {
     $temporary=Join-Path $output ('.publish-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [IO.File]::Copy($source,$temporary,$false)
-        if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Result.Sha256) { throw 'Published artifact hash mismatch.' }
+        if ((Get-PackageSha256 $temporary) -cne $Result.Sha256) { throw 'Published artifact hash mismatch.' }
         Test-PackageCancelled $Request
         if ([IO.File]::Exists($destination)) { [IO.File]::Replace($temporary,$destination,[NullString]::Value) }
         else { [IO.File]::Move($temporary,$destination) }

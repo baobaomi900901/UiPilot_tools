@@ -49,6 +49,27 @@ $fake = {
 }
 function ResetFake { $script:calls.Clear(); $script:failAt=0; $script:createSetup=$true; $script:cancelAt=0 }
 try {
+    Test 'hashing and publication work when Get-FileHash is unavailable' {
+        function Get-FileHash { throw 'Get-FileHash unavailable in this environment.' }
+        ResetFake; $root=Fixture
+        $request=New-PackageRun $root Setup (Join-Path $root 'artifacts/packages/.runs')
+        $result=Invoke-PackageBuild $request $script:tools $fake
+        Write-PackageJson (Join-Path $request.RunDirectory 'result.json') $result
+        Assert ((Get-PackageCompletion $request 0 $false).State -eq 'Success') 'completion must not depend on module autoload'
+        $published=Publish-PackageArtifact $request $result
+        Assert (Test-Path -LiteralPath $published -PathType Leaf) 'publish without Get-FileHash'
+        $known=Join-Path $root 'hash-vector.txt'
+        [IO.File]::WriteAllText($known,'abc',[Text.Encoding]::ASCII)
+        Assert ((Get-PackageSha256 $known) -ceq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'standard SHA256 vector'
+        $secondRequest=New-PackageRun $root Setup (Join-Path $root 'artifacts/packages/.runs')
+        $again=Invoke-PackageBuild $secondRequest $script:tools $fake
+        Assert ($again.State -eq 'Success') 'existing Setup freshness hash also works'
+        [IO.File]::WriteAllText($published,'previous-output')
+        [IO.File]::WriteAllText($result.Artifact,'tampered')
+        Assert ((Get-PackageCompletion $request 0 $false).State -eq 'Failed') 'tampering still rejected'
+        MustFail { Publish-PackageArtifact $request $result } 'hash'
+        Assert ([IO.File]::ReadAllText($published) -eq 'previous-output') 'failed hash preserves old output'
+    }
     Test 'plugin pipeline passes literal special paths and validates final archive' {
         ResetFake; $root=Fixture
         $request=New-PackageRun -Root $root -Mode Plugin -OutputRoot (Join-Path $root '输出 & packages') -Source (Join-Path $root 'plugin 中文 & 空格')
