@@ -1,3 +1,4 @@
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod command_hotkeys;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 use std::sync::Arc;
