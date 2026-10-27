@@ -57,9 +57,10 @@ function urlActions(text) {
     return [{ id: 'open', title: '在浏览器打开', type: 'openUrl', url: text }]
   } catch { return [] }
 }
+const pasteActions = text => text.length ? [{ id: 'paste', title: '粘贴到原应用', type: 'pasteText', text }] : []
 function latestRows(current) {
   if (!current.hasSaved) return [information('尚未保存片段'), readRow()]
-  return [{ id: 'text', title: '最新片段', detail: current.text, actions: [copyAction(current.text), readAction(), ...urlActions(current.text)], defaultActionId: 'copy' }]
+  return [{ id: 'text', title: '最新片段', detail: current.text, actions: [copyAction(current.text), readAction(), ...urlActions(current.text), ...pasteActions(current.text)], defaultActionId: 'copy' }]
 }
 function response(requestId, results) {
   const reply = { requestId, results }
@@ -81,7 +82,7 @@ export async function onCommand(invocation, api) {
     const current = await load(api)
     return response(invocation.requestId, [[text, 'text', '原文'], [upper, 'uppercase', '大写']].map(([value, id, title]) => ({
       id, title, detail: value, defaultActionId: 'copy', actions: [copyAction(value),
-        { id: 'save', title: '保存为最新片段', type: 'runtime', payload: { text: value, expectedRevision: current.revision } }, ...(id === 'text' ? urlActions(value) : [])],
+        { id: 'save', title: '保存为最新片段', type: 'runtime', payload: { text: value, expectedRevision: current.revision } }, ...(id === 'text' ? urlActions(value) : []), ...pasteActions(value)],
     })))
   } catch (error) { return failure(invocation.requestId, error) }
 }

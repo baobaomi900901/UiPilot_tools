@@ -5557,6 +5557,125 @@ impl Drop for ResultActionCleanup<'_> {
         self.service.cleanup_retired_result_actions(self.registry);
     }
 }
+struct NativeResultPaste<'a> {
+    window: &'a WebviewWindow,
+    registry: &'a ResultRegistry,
+    public: &'a PublicPluginService,
+    legacy: &'a PluginManager,
+    lifecycle: &'a LifecycleCoordinator,
+    origin: &'a crate::public_plugins::result_action::ResultActionOrigin,
+    lease: crate::lifecycle::ResultPasteLease,
+    main_hwnd: isize,
+}
+impl crate::result_paste::PasteDriver for NativeResultPaste<'_> {
+    fn preflight(
+        &mut self,
+    ) -> Result<(), crate::public_plugins::result_action::ResultActionErrorCode> {
+        use crate::result_paste::native;
+        crate::result_paste::preflight(
+            self.window.is_visible().unwrap_or(false),
+            native::main_is_foreground(self.main_hwnd),
+            self.lifecycle.result_paste_lease_current(self.lease),
+            native::target_valid(self.lease.target),
+            native::keys_released(),
+        )
+    }
+    fn admit_write(
+        &mut self,
+    ) -> Result<u32, crate::public_plugins::result_action::ResultActionOutcome> {
+        use crate::public_plugins::result_action::{
+            ResultActionErrorCode as E, ResultActionOutcome as O,
+        };
+        self.legacy
+            .with_public_result_admission(|| {
+                self.public.manager().map(|manager| {
+                    manager.write_paste_result_action(
+                        self.registry,
+                        self.origin,
+                        || {
+                            crate::result_paste::preflight(
+                                self.window.is_visible().unwrap_or(false),
+                                crate::result_paste::native::main_is_foreground(self.main_hwnd),
+                                self.lifecycle.result_paste_lease_current(self.lease),
+                                crate::result_paste::native::target_valid(self.lease.target),
+                                crate::result_paste::native::keys_released(),
+                            )
+                        },
+                        |text| crate::result_paste::native::write_text(self.main_hwnd, text),
+                    )
+                })
+            })
+            .and_then(Result::ok)
+            .unwrap_or_else(|| Err(O::failed(E::ActionUnavailable, false)))
+    }
+    fn hide_restore(
+        &mut self,
+    ) -> Result<(), crate::public_plugins::result_action::ResultActionErrorCode> {
+        clear_and_hide_window(
+            self.registry,
+            &self.window.as_ref().window(),
+            HideReason::ExplicitReturn,
+        )
+        .map_err(|_| crate::public_plugins::result_action::ResultActionErrorCode::PasteFailed)
+    }
+    fn send(
+        &mut self,
+        sequence: u32,
+    ) -> Result<(), crate::public_plugins::result_action::ResultActionErrorCode> {
+        crate::result_paste::native::send(
+            self.lease.target,
+            sequence,
+            self.lifecycle.result_paste_generation_current(self.lease),
+        )
+    }
+}
+async fn execute_paste_result_action(
+    window: WebviewWindow,
+    registry: ResultRegistry,
+    public: Arc<PublicPluginService>,
+    legacy: Arc<PluginManager>,
+    origin: crate::public_plugins::result_action::ResultActionOrigin,
+) -> crate::public_plugins::result_action::ResultActionOutcome {
+    use crate::public_plugins::result_action::{
+        ResultActionErrorCode as E, ResultActionOutcome as O,
+    };
+    let lifecycle = Arc::clone(window.state::<Arc<LifecycleCoordinator>>().inner());
+    let Some(lease) = lifecycle.result_paste_lease() else {
+        return O::failed(E::PasteTargetUnavailable, false);
+    };
+    let main_hwnd = match window.hwnd() {
+        Ok(hwnd) => hwnd.0 as isize,
+        Err(_) => return O::failed(E::PasteTargetUnavailable, false),
+    };
+    match tauri::async_runtime::spawn_blocking(crate::result_paste::wait_for_keys).await {
+        Ok(Ok(())) => {}
+        Ok(Err(code)) => return O::failed(code, false),
+        Err(_) => return O::failed(E::ActionUnavailable, false),
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let app = window.app_handle().clone();
+    if app
+        .run_on_main_thread(move || {
+            let outcome = crate::result_paste::execute(&mut NativeResultPaste {
+                window: &window,
+                registry: &registry,
+                public: &public,
+                legacy: &legacy,
+                lifecycle: &lifecycle,
+                origin: &origin,
+                lease,
+                main_hwnd,
+            });
+            let _ = sender.send(outcome);
+        })
+        .is_err()
+    {
+        return O::failed(E::ActionUnavailable, false);
+    }
+    receiver
+        .await
+        .unwrap_or_else(|_| O::failed(E::ActionUnavailable, true))
+}
 #[tauri::command]
 pub(crate) async fn execute_result_action(
     window: WebviewWindow,
@@ -5578,6 +5697,9 @@ pub(crate) async fn execute_result_action(
         Err(code) => return Ok(O::failed(code, false)),
     };
     let legacy = Arc::clone(app.state::<Arc<PluginManager>>().inner());
+    if matches!(origin.action, PublicResultAction::PasteText { .. }) {
+        return Ok(execute_paste_result_action(window, registry, public, legacy, origin).await);
+    }
     if matches!(
         origin.action,
         PublicResultAction::CopyText { .. } | PublicResultAction::OpenUrl { .. }

@@ -3866,6 +3866,14 @@ impl PublicPluginManager {
         {
             return Err(E::PluginPermissionDenied);
         }
+        if requirements.paste
+            && (!c
+                .permission_grants
+                .contains(&PublicPermission::ClipboardPaste)
+                || !m.permissions.contains(&PublicPermission::ClipboardPaste))
+        {
+            return Err(E::PluginPermissionDenied);
+        }
         if requirements.url
             && (!c.permission_grants.contains(&PublicPermission::UrlOpen)
                 || !m.permissions.contains(&PublicPermission::UrlOpen))
@@ -3929,6 +3937,54 @@ impl PublicPluginManager {
             ),
             Ok(Ok(())) => ResultActionOutcome::Copied,
             Ok(Err(code)) => ResultActionOutcome::failed(code, true),
+        }
+    }
+    pub(crate) fn write_paste_result_action(
+        &self,
+        registry: &crate::result_registry::ResultRegistry,
+        origin: &super::result_action::ResultActionOrigin,
+        preclaim: impl FnOnce() -> Result<(), super::result_action::ResultActionErrorCode>,
+        write: impl FnOnce(&str) -> Result<u32, ()>,
+    ) -> Result<u32, super::result_action::ResultActionOutcome> {
+        use super::result_action::*;
+        let admitted = (|| {
+            let _mutation = self
+                .lock_mutation()
+                .map_err(|_| ResultActionErrorCode::ActionUnavailable)?;
+            self.checked_result_owner(&origin.route, origin.requirements)?;
+            let PublicResultAction::PasteText { text, .. } = &origin.action else {
+                return Err(ResultActionErrorCode::UnknownResult);
+            };
+            preclaim()?;
+            self.scheduler.with_result_publication(
+                &origin.route.plugin_id,
+                origin
+                    .route
+                    .result_publication
+                    .as_ref()
+                    .ok_or(ResultActionErrorCode::StaleRequest)?,
+                || registry.claim_result_action(origin, None),
+            )??;
+            Ok(write(text))
+        })();
+        match admitted {
+            Err(code) => Err(ResultActionOutcome::failed(
+                code,
+                matches!(
+                    code,
+                    ResultActionErrorCode::ActionAlreadyExecuted
+                        | ResultActionErrorCode::ActionInProgress
+                ),
+            )),
+            Ok(Err(())) => Err(ResultActionOutcome::failed(
+                ResultActionErrorCode::ClipboardWriteFailed,
+                true,
+            )),
+            Ok(Ok(sequence)) if sequence != 0 => Ok(sequence),
+            Ok(Ok(_)) => Err(ResultActionOutcome::failed(
+                ResultActionErrorCode::ClipboardWriteFailed,
+                true,
+            )),
         }
     }
     pub(crate) fn open_url_result_action(
@@ -12690,6 +12746,109 @@ mod tests {
             .collect();
         (registry, origins)
     }
+    fn paste_result_rows() -> Vec<super::super::result_action::PublicActionResult> {
+        use super::super::result_action::*;
+        vec![PublicActionResult {
+            id: "url".into(),
+            title: "Link".into(),
+            subtitle: None,
+            detail: None,
+            actions: vec![
+                PublicResultAction::PasteText {
+                    id: "paste".into(),
+                    title: "Paste".into(),
+                    text: "private-paste".into(),
+                },
+                PublicResultAction::CopyText {
+                    id: "copy".into(),
+                    title: "Copy".into(),
+                    text: "private-copy".into(),
+                },
+                PublicResultAction::Runtime {
+                    id: "save".into(),
+                    title: "Save".into(),
+                    payload: Value::Null,
+                },
+            ],
+            default_action_id: Some("copy".into()),
+        }]
+    }
+    fn install_paste_result_package(manager: &PublicPluginManager, path: &Path) {
+        write_multi_package(path, "1.1.0", "lower", false);
+        opt_in_result_package(path);
+        let file = path.join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        value["minimumHostVersion"] = json!("0.14.0");
+        value["permissions"] = json!(["clipboard.write", "clipboard.paste"]);
+        fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(path), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::ClipboardWrite,
+                    PublicPermission::ClipboardPaste,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+    }
+    // This publishes through the real registry, optionally bypassing owner validation
+    // so denial tests can present an otherwise valid private source to admission.
+    fn paste_result_source(
+        manager: &PublicPluginManager,
+        checked: bool,
+    ) -> (
+        crate::result_registry::ResultRegistry,
+        Vec<super::super::result_action::ResultActionOrigin>,
+    ) {
+        use super::super::result_action::*;
+        let registry = crate::result_registry::ResultRegistry::default();
+        registry.on_show("url-action".into());
+        let token = registry
+            .begin_query(crate::result_registry::QueryDomain::Plugin, "url-action", 1)
+            .unwrap();
+        let route = manager.route("/upper").unwrap().unwrap();
+        let rows = paste_result_rows();
+        let requirements = ResultActionRequirements::rows(&rows);
+        let prepared = registry
+            .prepare_result_actions(route.clone(), rows)
+            .unwrap();
+        let publish = || registry.publish_prepared_result_actions(token, prepared);
+        let response = if checked {
+            manager
+                .publish_result_actions(&route, requirements, publish)
+                .unwrap()
+        } else {
+            publish()
+        }
+        .unwrap();
+        let wire = serde_json::to_string(&response).unwrap();
+        for private in ["private-paste", "pasteText", "private-copy"] {
+            assert!(!wire.contains(private));
+        }
+        let row = &response.items[0];
+        let origins = row
+            .result_actions
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .map(|action| {
+                registry
+                    .resolve_result_action(&ExecuteResultActionRequest {
+                        request_id: response.request_id.clone(),
+                        result_id: row.result_id.clone(),
+                        action_id: action.action_id.clone(),
+                    })
+                    .unwrap()
+            })
+            .collect();
+        (registry, origins)
+    }
     fn revoke_result_grant(manager: &PublicPluginManager, permission: PublicPermission) {
         let bundle = manager
             .bundles
@@ -12706,6 +12865,172 @@ mod tests {
             .unwrap();
     }
     #[test]
+    fn result_action_paste_consumes_once_and_releases_mutation_before_hide() {
+        use super::super::result_action::*;
+        for fail in [false, true] {
+            let dir = TestDir::new("paste-claim");
+            let manager = manager(&dir);
+            install_paste_result_package(&manager, &dir.source());
+            let (registry, origins) = paste_result_source(&manager, true);
+            assert_eq!(
+                origins[0].requirements,
+                ResultActionRequirements {
+                    copy: true,
+                    url: false,
+                    paste: true
+                }
+            );
+            let mut calls = 0;
+            assert!(matches!(
+                manager.write_paste_result_action(
+                    &registry,
+                    &origins[0],
+                    || Err(ResultActionErrorCode::PasteTargetUnavailable),
+                    |_| panic!("lease changed before claim")
+                ),
+                Err(ResultActionOutcome::Failed {
+                    source_consumed: false,
+                    ..
+                })
+            ));
+            let result = manager.write_paste_result_action(
+                &registry,
+                &origins[0],
+                || Ok(()),
+                |text| {
+                    assert_eq!(text, "private-paste");
+                    calls += 1;
+                    assert!(manager.mutation.try_lock().is_err());
+                    assert!(registry.claim_result_action(&origins[0], None).is_err());
+                    if fail {
+                        Err(())
+                    } else {
+                        Ok(42)
+                    }
+                },
+            );
+            assert_eq!(result.is_ok(), !fail);
+            assert_eq!(calls, 1);
+            assert!(manager.mutation.try_lock().is_ok());
+            if let Err(ResultActionOutcome::Failed {
+                source_consumed, ..
+            }) = result
+            {
+                assert!(source_consumed);
+            }
+            assert!(matches!(
+                manager.copy_result_action(&registry, &origins[1], |_| panic!("sibling replay")),
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::ActionAlreadyExecuted,
+                    source_consumed: true
+                }
+            ));
+            registry.hide_and_clear(); // Reentrant clear is safe after every manager guard has left.
+            assert!(manager
+                .write_paste_result_action(
+                    &registry,
+                    &origins[0],
+                    || Ok(()),
+                    |_| panic!("hidden replay")
+                )
+                .is_err());
+        }
+    }
+    #[test]
+    fn result_action_paste_snapshot_grants_and_stale_query_prevent_every_write() {
+        use super::super::result_action::*;
+        for permission in [
+            PublicPermission::ClipboardPaste,
+            PublicPermission::ClipboardWrite,
+        ] {
+            let dir = TestDir::new("paste-grant");
+            let manager = manager(&dir);
+            install_paste_result_package(&manager, &dir.source());
+            let (registry, origins) = paste_result_source(&manager, true);
+            revoke_result_grant(&manager, permission);
+            assert!(matches!(
+                manager.write_paste_result_action(
+                    &registry,
+                    &origins[0],
+                    || Ok(()),
+                    |_| panic!("revoked write")
+                ),
+                Err(ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::PluginPermissionDenied,
+                    source_consumed: false
+                })
+            ));
+            assert!(matches!(
+                manager.copy_result_action(&registry, &origins[1], |_| panic!("weakened copy")),
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::PluginPermissionDenied,
+                    source_consumed: false
+                }
+            ));
+            assert!(manager
+                .publish_result_actions(&origins[0].route, origins[0].requirements, || panic!(
+                    "revoked publication"
+                ))
+                .is_err());
+        }
+        let dir = TestDir::new("paste-stale-query");
+        let manager = manager(&dir);
+        install_paste_result_package(&manager, &dir.source());
+        let (registry, origins) = paste_result_source(&manager, true);
+        registry
+            .begin_query(crate::result_registry::QueryDomain::Plugin, "url-action", 2)
+            .unwrap();
+        assert!(manager
+            .write_paste_result_action(
+                &registry,
+                &origins[0],
+                || Ok(()),
+                |_| panic!("stale query write")
+            )
+            .is_err());
+    }
+    #[test]
+    fn result_action_paste_concurrent_source_has_one_claim() {
+        let dir = TestDir::new("paste-concurrent");
+        let manager = Arc::new(manager(&dir));
+        install_paste_result_package(&manager, &dir.source());
+        let (registry, origins) = paste_result_source(&manager, true);
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let manager = manager.clone();
+                let registry = registry.clone();
+                let origin = origins[0].clone();
+                let writes = writes.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager
+                        .write_paste_result_action(
+                            &registry,
+                            &origin,
+                            || Ok(()),
+                            |_| {
+                                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Ok(42)
+                            },
+                        )
+                        .is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|success| *success)
+                .count(),
+            1
+        );
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
     fn result_action_url_opens_once_and_failure_consumes_every_sibling() {
         use super::super::result_action::*;
         for fail in [false, true] {
@@ -12717,7 +13042,8 @@ mod tests {
                 origins[0].requirements,
                 ResultActionRequirements {
                     copy: true,
-                    url: true
+                    url: true,
+                    paste: false
                 }
             );
             let mut calls = 0;
@@ -12976,6 +13302,137 @@ mod tests {
         let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
         assert!(prepared.is_update);
         assert!(prepared.permissions.contains(&PublicPermission::UrlOpen));
+        assert_eq!(
+            manager.commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::ClipboardWrite]),
+                now,
+                |_| panic!("denied readiness")
+            ),
+            Err(PublicPluginManagementError::PermissionDenied)
+        );
+        assert_eq!(
+            manager
+                .state
+                .config("com.example.activation")
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            manager
+                .storage
+                .get(&scope, "com.example.activation", "snippet.latest")
+                .unwrap(),
+            Some(json!({"schemaVersion":1,"revision":3,"text":"saved"}))
+        );
+        assert!(manager.route("/retained").unwrap().is_some());
+    }
+    #[test]
+    fn result_action_runtime_replacement_preserves_full_paste_and_copy_requirements() {
+        use super::super::result_action::*;
+        for declared in [false, true] {
+            let dir = TestDir::new("paste-replacement");
+            let manager = manager(&dir);
+            if declared {
+                install_paste_result_package(&manager, &dir.source());
+            } else {
+                write_multi_package(&dir.source(), "1.0.0", "lower", false);
+                opt_in_result_package(&dir.source());
+                install_multi(&manager, &dir.source());
+            }
+            let route = manager.route("/upper").unwrap().unwrap();
+            let (registry, origin) = result_action_fixture(&manager, route.clone(), false);
+            let now = Instant::now();
+            let reserved = manager.reserve_result_action(&origin).unwrap();
+            let dispatch = manager
+                .admit_result_action(&registry, &origin, reserved, now)
+                .unwrap();
+            assert!(
+                manager
+                    .scheduler
+                    .complete(&dispatch.context, now)
+                    .unwrap()
+                    .accepted
+            );
+            let rows = paste_result_rows();
+            let requirements = ResultActionRequirements::rows(&rows);
+            let prepared = registry.prepare_result_actions(route, rows).unwrap();
+            let result = manager.finish_result_action(
+                &registry,
+                &origin,
+                &dispatch.context,
+                prepared,
+                requirements,
+            );
+            if !declared {
+                assert!(matches!(
+                    result,
+                    Err(ResultActionErrorCode::PluginPermissionDenied)
+                ));
+                continue;
+            }
+            let response = result.unwrap();
+            let row = &response.items[0];
+            let copy = registry
+                .resolve_result_action(&ExecuteResultActionRequest {
+                    request_id: response.request_id.clone(),
+                    result_id: row.result_id.clone(),
+                    action_id: row.result_actions.as_ref().unwrap().actions[1]
+                        .action_id
+                        .clone(),
+                })
+                .unwrap();
+            assert_eq!(copy.requirements, requirements);
+            revoke_result_grant(&manager, PublicPermission::ClipboardPaste);
+            assert!(matches!(
+                manager.copy_result_action(&registry, &copy, |_| panic!("replacement weakened")),
+                ResultActionOutcome::Failed {
+                    code: ResultActionErrorCode::PluginPermissionDenied,
+                    ..
+                }
+            ));
+        }
+    }
+    #[test]
+    fn result_action_paste_update_denied_consent_preserves_installed_config_and_data() {
+        let dir = TestDir::new("paste-update-consent");
+        let manager = manager(&dir);
+        write_multi_package(&dir.source(), "1.0.0", "lower", false);
+        opt_in_result_package(&dir.source());
+        install_multi(&manager, &dir.source());
+        manager
+            .rename_command("com.example.activation", "upper", Some("retained"))
+            .unwrap();
+        let scope = PluginDataScope::new("com.example.activation").unwrap();
+        manager
+            .storage
+            .set(
+                &scope,
+                "com.example.activation",
+                "snippet.latest",
+                json!({"schemaVersion":1,"revision":3,"text":"saved"}),
+            )
+            .unwrap();
+        let before = manager
+            .state
+            .config("com.example.activation")
+            .unwrap()
+            .unwrap();
+        write_multi_package(&dir.source(), "1.1.0", "lower", false);
+        opt_in_result_package(&dir.source());
+        let file = dir.source().join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        value["minimumHostVersion"] = json!("0.14.0");
+        value["permissions"] = json!(["clipboard.write", "clipboard.paste"]);
+        fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert!(prepared.is_update);
+        assert!(prepared
+            .permissions
+            .contains(&PublicPermission::ClipboardPaste));
         assert_eq!(
             manager.commit_with_readiness(
                 "main",

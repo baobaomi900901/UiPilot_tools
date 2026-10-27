@@ -24,6 +24,8 @@ pub(crate) enum PublicPermission {
     UiPanel,
     #[serde(rename = "clipboard.write")]
     ClipboardWrite,
+    #[serde(rename = "clipboard.paste")]
+    ClipboardPaste,
     #[serde(rename = "files.openText")]
     FilesOpenText,
     #[serde(rename = "url.open")]
@@ -54,6 +56,7 @@ impl PublicPermission {
             || (matches!(
                 self,
                 Self::UrlOpen
+                    | Self::ClipboardPaste
                     | Self::FilesOpenText
                     | Self::ClipboardHistoryRead
                     | Self::ClipboardHistoryPaste
@@ -737,6 +740,18 @@ fn validate_manifest(
                 c.activation_mode == PublicActivationMode::Submit
                     && c.output_mode == PublicOutputMode::Window
             }))
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest
+        .permissions
+        .contains(&PublicPermission::ClipboardPaste)
+        && (minimum_host < [0, 14, 0]
+            || manifest.supported_platforms != [PublicPlatform::Windows]
+            || !manifest.runtime.result_actions
+            || !manifest
+                .permissions
+                .contains(&PublicPermission::ClipboardWrite))
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -1600,7 +1615,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 13, 0]
+            [0, 14, 0]
         );
     }
 

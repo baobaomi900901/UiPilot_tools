@@ -1097,3 +1097,17 @@ One physical picker is allowed globally. Each facade captures its exact session/
 Errors have sanitized names/messages: `FileOpenBusyError`, `ExpiredWindowSessionError`, `FileOpenPermissionError`, `FileOpenUnsupportedError`, `FileOpenTooLargeError`, `FileOpenEncodingError`, `FileOpenFailedError`. Passing any argument rejects `TypeError` before IPC. Host never logs the selected path, basename, text or native errors. Files outside ordinary local drives, reparse/device/directory/ADS targets and other platforms fail closed.
 
 See [JSON workbench](../../examples/public-plugins/com.uipilot.json-workbench/README.md) for an explicit import/format/save workflow with edit/session ownership and inline dirty-draft confirmation. Native Windows behavior remains user-operated acceptance.
+
+## Host 0.14.0：显式粘贴到原应用
+
+Windows `mainResult` 插件可声明 `clipboard.paste` 与 `clipboard.write`，要求 `minimumHostVersion: "0.14.0"`、`supportedPlatforms: ["windows"]`、`runtime.resultActions: true` 并导出 `onAction`。安装或升级时用户须确认完整权限；取消新增授权会保留旧插件和数据。历史权限 `clipboard.history.paste` 不授权此动作。
+
+```js
+{ id: 'paste', title: '粘贴到原应用', type: 'pasteText', text: '你好，世界' }
+```
+
+文本为 1..8192 UTF-8 字节且不含 NUL，不 trim，保留中文和换行；额外字段、空值、过长或整响应超过 64 KiB 时整体拒绝。整快照同时校验两项权限，包括执行其复制/保存等兄弟动作和 Runtime 返回新结果。文本及窗口目标仅存在后端，前端只拿不透明句柄；没有 Runtime 任意按键或目标窗口 API。
+
+与复制相比，粘贴会先写入剪贴板，然后隐藏 UiPilot，返回本次唤起前捕获的原应用并请求一次 Ctrl+V。请从目标编辑器唤起 UiPilot，再通过动作菜单主动选择“粘贴到原应用”，并松开触发键。成功“已请求粘贴”只表示 Windows 接受输入批次；不会确认目标已插入或自动保存文档。关闭目标、变更焦点/剪贴板或仍按住按键会阻止发送；不自动重试或重新显示抢焦点。写入后失败仍保留本次文本，绝不恢复覆盖后来复制的内容。所有兄弟动作一次消费；需核对目标后显式重新运行。
+
+[文本片段 1.2](../../examples/public-plugins/com.uipilot.text-snippet/README.md) 保留 Enter 默认复制，在非空原文、大写和最新片段上增加次级粘贴。保存、URL、重读及 `snippet.latest` 记录合同保持。真实系统效果需用户从记事本自行验收；代理测试只使用注入 driver 和假存储。

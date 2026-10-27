@@ -28,6 +28,11 @@ describe('main result action protocol', () => {
   it('rejects unknown outcome fields/codes instead of guessing consumption', () => {
     expect(parseResultActionOutcome({ kind: 'copied' })).toEqual({ kind: 'copied' })
     expect(parseResultActionOutcome({ kind: 'urlOpened' })).toEqual({ kind: 'urlOpened' })
+    expect(parseResultActionOutcome({ kind: 'pasteSent' })).toEqual({ kind: 'pasteSent' })
+    expect(parseResultActionOutcome({ kind: 'pasteSent', text: 'private' })).toBeNull()
+    for (const code of ['pasteTargetUnavailable', 'pasteInputBusy', 'pasteFailed']) {
+      expect(parseResultActionOutcome({ kind: 'failed', code, sourceConsumed: false })).not.toBeNull()
+    }
     expect(parseResultActionOutcome({ kind: 'failed', code: 'urlOpenFailed', sourceConsumed: true })).not.toBeNull()
     expect(parseResultActionOutcome({ kind: 'urlOpened', url: 'https://private.example' })).toBeNull()
     expect(parseResultActionOutcome({ kind: 'failed', code: 'actionBusy', sourceConsumed: false })).not.toBeNull()

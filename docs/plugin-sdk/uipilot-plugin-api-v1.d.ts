@@ -341,6 +341,8 @@ declare global {
 /** Windows Host 0.10.0+, runtime.resultActions: true. IDs are business strings, not Host handles. */
 export type PluginResultAction =
   | { id: string; title: string; type: 'copyText'; text: string }
+  /** Windows Host 0.14.0+, clipboard.paste + clipboard.write. 1..8192 UTF-8 bytes, no NUL. */
+  | { id: string; title: string; type: 'pasteText'; text: string }
   | { id: string; title: string; type: 'runtime'; payload: JsonValue }
   /** Windows Host 0.12.0+, declared and granted url.open. Explicit user action only. */
   | { id: string; title: string; type: 'openUrl'; url: string }

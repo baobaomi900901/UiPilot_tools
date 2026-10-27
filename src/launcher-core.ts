@@ -3568,10 +3568,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       const outcome = parseResultActionOutcome(value)
       if (!outcome) { failResultAction(owner, actionUncertain, true); return }
       if (outcome.kind === 'copied') { failResultAction(owner, '已复制', true); return }
+      if (outcome.kind === 'pasteSent') { failResultAction(owner, '已请求粘贴', true); return }
       if (outcome.kind === 'urlOpened') { failResultAction(owner, '已请求打开链接', true); return }
       if (outcome.kind === 'failed') {
         const stale = outcome.code === 'staleRequest' || outcome.code === 'unknownResult'
-        const status = stale ? '结果已过期，请重新运行'
+        const status = outcome.code === 'pasteTargetUnavailable' ? '无法返回原应用，请从目标应用重新唤起后重试。'
+          : outcome.code === 'pasteInputBusy' ? '请松开按键后重新执行。'
+          : outcome.code === 'pasteFailed' ? '粘贴未确认，请检查目标应用后重新运行命令。'
+          : stale ? '结果已过期，请重新运行'
           : outcome.sourceConsumed ? actionUncertain
           : outcome.code === 'actionBusy' ? '插件正忙，请稍后再试'
           : outcome.code === 'pluginPermissionDenied' ? '插件无权执行此动作'

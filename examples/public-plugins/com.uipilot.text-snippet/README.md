@@ -13,7 +13,7 @@ C:\Users\moby\.codex\worktrees\local-plugin-foundation\UiPilot_tools\examples\pu
 或者使用 **选择插件包**，选择验证后生成的归档文件：
 
 ```text
-C:\Users\moby\.codex\worktrees\local-plugin-foundation\UiPilot_tools\.superpowers\deliveries\uipilot-0.12.0-acceptance\plugins\com.uipilot.text-snippet-1.1.0.uipilot-plugin
+C:\Users\moby\.codex\worktrees\local-plugin-foundation\UiPilot_tools\.superpowers\deliveries\uipilot-0.14.0-acceptance\plugins\com.uipilot.text-snippet-1.2.0.uipilot-plugin
 ```
 
 安装本示例不会自动保存或读取系统剪贴板。插件的最新片段仅存在于本插件的私有存储中。
@@ -47,3 +47,13 @@ node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipil
 ```
 
 开发目录之外的 README、测试及 package.json 不属于安装包；不要将它们移入 package。
+
+## 1.2：粘贴到原应用（Windows Host 0.14.0）
+
+升级需确认新增 `clipboard.paste`，同时保留 `clipboard.write` / `url.open`。取消新增权限更新时，旧版、命令绑定和已存片段保持。
+
+从临时记事本唤起 UiPilot，输入 `/text-snippet 你好，世界`，通过 Ctrl+K 或右键菜单显式选择“粘贴到原应用”并松开按键。Host 写剪贴板、隐藏启动器并返回唤起前的目标，只请求一次 Ctrl+V。成功为“已请求粘贴”，不承诺目标完成插入或保存文档；请用户自行核对。Enter 仍复制；非空原文、大写、最新片段才有粘贴，空保存片段保留复制/读取。
+
+所有动作一次消费；无目标、按键未释放、目标失效或内容/焦点变化时不会自动重试。写入后失败仍可能已改变剪贴板，保留该文本，不覆盖后来复制的内容；检查目标后显式重新运行。文本上限 8192 UTF-8 字节，动作增加的文本副本也计入整响应 64 KiB 限制，因此很长转换结果可能整体被容量检查拒绝。没有 Runtime 直接输入、任意窗口选择或自动保存目标文档能力。
+
+第一组人工验收：确认 Host 0.14.0/snippet 1.2.0；取消权限升级核对旧版数据，再确认升级；从普通记事本唤起，选择中文粘贴，核对仅一次。后续分组检查重新唤起换目标、快捷键入口、无目标/目标关闭，以及旧复制/保存/最新读取/URL流程。代理不启动 Host 或触发系统粘贴。

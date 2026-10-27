@@ -105,6 +105,12 @@ pub(crate) struct ClipboardPasteTarget {
     pub(crate) pid: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResultPasteLease {
+    pub(crate) state_generation: u64,
+    pub(crate) target: ClipboardPasteTarget,
+}
+
 impl From<ForegroundCapture> for ClipboardPasteTarget {
     fn from(capture: ForegroundCapture) -> Self {
         Self {
@@ -967,6 +973,25 @@ impl LifecycleCoordinator {
         }
     }
 
+    fn result_paste_lease_unvalidated(&self) -> Option<ResultPasteLease> {
+        let state = self.foreground_capture.lock().ok()?;
+        Some(ResultPasteLease {
+            state_generation: state.show_generation,
+            target: state.capture?.into(),
+        })
+    }
+    pub(crate) fn result_paste_lease(&self) -> Option<ResultPasteLease> {
+        let lease = self.result_paste_lease_unvalidated()?;
+        validate_clipboard_paste_target(lease.target).then_some(lease)
+    }
+    pub(crate) fn result_paste_lease_current(&self, lease: ResultPasteLease) -> bool {
+        self.result_paste_lease_unvalidated() == Some(lease)
+    }
+    pub(crate) fn result_paste_generation_current(&self, lease: ResultPasteLease) -> bool {
+        self.foreground_capture
+            .lock()
+            .is_ok_and(|s| s.show_generation == lease.state_generation)
+    }
     pub(crate) fn clipboard_paste_target_for_explicit_return(
         &self,
     ) -> Option<ClipboardPasteTarget> {
@@ -3788,6 +3813,40 @@ mod tests {
         Arc::new(LifecycleCoordinator::default())
     }
 
+    #[test]
+    fn result_paste_lease_tracks_state_generation_separately_from_capture() {
+        let coordinator = LifecycleCoordinator::default();
+        coordinator.capture_foreground_for_show_with(
+            false,
+            ForegroundObservation::External { hwnd: 42, pid: 99 },
+        );
+        let old = coordinator.result_paste_lease_unvalidated().unwrap();
+        let mut observations = 0;
+        crate::result_paste::wait_for_keys_with(
+            || {
+                observations += 1;
+                if observations == 2 {
+                    coordinator
+                        .capture_foreground_for_show_with(true, ForegroundObservation::UiPilot);
+                }
+                observations == 2
+            },
+            || {},
+        )
+        .unwrap();
+        let current = coordinator.result_paste_lease_unvalidated().unwrap();
+        assert_eq!(old.target, current.target);
+        assert!(!coordinator.result_paste_lease_current(old));
+        assert!(coordinator.result_paste_lease_current(current));
+        coordinator
+            .foreground_capture
+            .lock()
+            .unwrap()
+            .capture
+            .take();
+        assert!(!coordinator.result_paste_lease_current(current));
+        assert!(coordinator.result_paste_generation_current(current));
+    }
     #[test]
     fn foreground_capture_policy_replaces_clears_and_keeps_only_visible_uipilot_repeat() {
         let coordinator = coordinator_for_test();

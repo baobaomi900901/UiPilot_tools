@@ -34,6 +34,8 @@ function permissionLabel(permission: PublicPermission): string {
       return '选择并读取本地 UTF-8 文本文件（最多 8 KiB）'
     case 'url.open':
       return '在默认浏览器打开 HTTP(S) 链接'
+    case 'clipboard.paste':
+      return '粘贴到原应用（写入剪贴板并向唤起 UiPilot 前的应用发送一次粘贴）'
     case 'clipboard.write':
       return '写入剪贴板'
     case 'clipboard.read':

@@ -39,6 +39,11 @@ pub(crate) enum PublicResultAction {
         title: String,
         text: String,
     },
+    PasteText {
+        id: String,
+        title: String,
+        text: String,
+    },
     OpenUrl {
         id: String,
         title: String,
@@ -53,12 +58,16 @@ pub(crate) enum PublicResultAction {
 impl PublicResultAction {
     pub(crate) fn id(&self) -> &str {
         match self {
-            Self::CopyText { id, .. } | Self::OpenUrl { id, .. } | Self::Runtime { id, .. } => id,
+            Self::CopyText { id, .. }
+            | Self::PasteText { id, .. }
+            | Self::OpenUrl { id, .. }
+            | Self::Runtime { id, .. } => id,
         }
     }
     pub(crate) fn title(&self) -> &str {
         match self {
             Self::CopyText { title, .. }
+            | Self::PasteText { title, .. }
             | Self::OpenUrl { title, .. }
             | Self::Runtime { title, .. } => title,
         }
@@ -72,18 +81,25 @@ impl PublicResultAction {
 pub(crate) struct ResultActionRequirements {
     pub(crate) copy: bool,
     pub(crate) url: bool,
+    pub(crate) paste: bool,
 }
 #[cfg(test)]
 impl From<bool> for ResultActionRequirements {
     fn from(copy: bool) -> Self {
-        Self { copy, url: false }
+        Self {
+            copy,
+            url: false,
+            paste: false,
+        }
     }
 }
 impl ResultActionRequirements {
     pub(crate) fn actions<'a>(actions: impl Iterator<Item = &'a PublicResultAction>) -> Self {
         let mut requirements = Self::default();
         for action in actions {
-            requirements.copy |= action.is_copy();
+            requirements.copy |=
+                action.is_copy() || matches!(action, PublicResultAction::PasteText { .. });
+            requirements.paste |= matches!(action, PublicResultAction::PasteText { .. });
             requirements.url |= matches!(action, PublicResultAction::OpenUrl { .. });
         }
         requirements
@@ -189,12 +205,16 @@ pub(crate) enum ResultActionErrorCode {
     PluginPermissionDenied,
     ClipboardWriteFailed,
     UrlOpenFailed,
+    PasteTargetUnavailable,
+    PasteInputBusy,
+    PasteFailed,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum ResultActionOutcome {
     Copied,
     UrlOpened,
+    PasteSent,
     ResultsUpdated {
         response: crate::model::SearchResponse,
     },
@@ -325,7 +345,7 @@ pub(crate) fn parse(
                 let obj = action.as_object().ok_or_else(invalid)?;
                 // serde Option is deliberately avoided: payload is required even when null.
                 let required = match obj.get("type").and_then(Value::as_str) {
-                    Some("copyText") => &["id", "title", "type", "text"][..],
+                    Some("copyText" | "pasteText") => &["id", "title", "type", "text"][..],
                     Some("runtime") => &["id", "title", "type", "payload"][..],
                     Some("openUrl") => &["id", "title", "type", "url"][..],
                     _ => return Err(invalid()),
@@ -351,6 +371,11 @@ pub(crate) fn parse(
                 }
                 if let PublicResultAction::CopyText { text, .. } = &action {
                     if text.len() > 16 * 1024 || text.contains('\0') {
+                        return Err(invalid());
+                    }
+                }
+                if let PublicResultAction::PasteText { text, .. } = &action {
+                    if text.is_empty() || text.len() > 8192 || text.contains('\0') {
                         return Err(invalid());
                     }
                 }
@@ -415,6 +440,21 @@ mod tests {
     }
     fn row() -> Value {
         json!({"id":"constructor","title":"Text","actions":[{"id":"copy","title":"Copy","type":"copyText","text":""}],"defaultActionId":"copy"})
+    }
+    #[test]
+    fn result_action_paste_text_strict_bounds() {
+        for text in [" ".to_owned(), "汉\n".to_owned(), "a".repeat(8192)] {
+            let rows = parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"paste","title":"Paste","type":"pasteText","text":text}],"defaultActionId":"paste"}))).unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+        for text in [
+            "".to_owned(),
+            "a".repeat(8193),
+            "汉".repeat(2731),
+            "a\0b".to_owned(),
+        ] {
+            assert!(parse(&context(), response(json!({"id":"x","title":"x","actions":[{"id":"paste","title":"Paste","type":"pasteText","text":text}]}))).is_err());
+        }
     }
     #[test]
     fn result_action_open_url_validates_and_canonicalizes_private_destinations() {

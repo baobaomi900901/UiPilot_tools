@@ -32,9 +32,9 @@ const allActions = reply => reply.results.flatMap(row => row.actions)
 test('manifest declares only the two Windows submit commands and clipboard-write capability', async () => {
   await runtime()
   const manifest = JSON.parse(readFileSync(new URL('../package/plugin.json', import.meta.url)))
-  assert.equal(manifest.pluginId, 'com.uipilot.text-snippet'); assert.equal(manifest.version, '1.1.0')
-  assert.equal(manifest.minimumHostVersion, '0.12.0'); assert.deepEqual(manifest.supportedPlatforms, ['windows'])
-  assert.deepEqual(manifest.permissions, ['clipboard.write', 'url.open']); assert.equal(manifest.runtime.resultActions, true)
+  assert.equal(manifest.pluginId, 'com.uipilot.text-snippet'); assert.equal(manifest.version, '1.2.0')
+  assert.equal(manifest.minimumHostVersion, '0.14.0'); assert.deepEqual(manifest.supportedPlatforms, ['windows'])
+  assert.deepEqual(manifest.permissions, ['clipboard.write', 'url.open', 'clipboard.paste']); assert.equal(manifest.runtime.resultActions, true)
   assert.deepEqual(manifest.commands.map(row => [row.id, row.defaultName, row.activationMode, row.outputMode, row.inputRequired]), [
     ['transform', 'text-snippet', 'submit', 'mainResult', true], ['latest', 'latest-snippet', 'submit', 'mainResult', false],
   ])
@@ -96,8 +96,8 @@ test('unknown schema, invalid/excessive records, and unsafe revisions block ever
 })
 test('UTF-8 boundaries, uppercase expansion, NUL and compact-JSON overflow produce bounded information without actions/writes', async () => {
   const state = store()
-  assert.equal((await command(state, 'transform', '😀'.repeat(2048))).results.length, 2)
-  for (const text of ['汉'.repeat(2731), 'ŉ'.repeat(4096), '\0', '\u0001'.repeat(8192)]) {
+  assert.equal((await command(state, 'transform', '😀'.repeat(2000))).results.length, 2)
+  for (const text of ['😀'.repeat(2048), '汉'.repeat(2731), 'ŉ'.repeat(4096), '\0', '\u0001'.repeat(8192)]) {
     const reply = await command(state, 'transform', text); assert.equal(allActions(reply).length, 0)
   }
   assert.equal(state.writes, 0)
@@ -119,10 +119,10 @@ test('save rejects and lost acknowledgements stay uncertain with exactly one wri
 test('URL actions appear only on exact valid original/latest text and preserve copy defaults without effects', async () => {
   for (const text of ['https://example.com/Case?q=%20#x', 'HTTPS://例子.测试/路径', 'http://localhost:80/%00']) {
     const state = store(record(text)); const reply = await command(state, 'transform', text)
-    assert.deepEqual(reply.results[0].actions.at(-1), { id: 'open', title: '在浏览器打开', type: 'openUrl', url: text })
+    assert.deepEqual(reply.results[0].actions.find(a => a.type === 'openUrl'), { id: 'open', title: '在浏览器打开', type: 'openUrl', url: text })
     assert.equal(reply.results[1].actions.some(a => a.type === 'openUrl'), false)
     const latest = await command(state, 'latest', '')
-    assert.equal(latest.results[0].actions.at(-1).url, text)
+    assert.equal(latest.results[0].actions.find(a => a.type === 'openUrl').url, text)
     assert.equal(latest.results[0].defaultActionId, 'copy'); assert.equal(reply.results[0].defaultActionId, 'copy')
     assert.equal(state.writes, 0)
   }
@@ -131,4 +131,19 @@ test('URL actions appear only on exact valid original/latest text and preserve c
     for (const reply of [await command(state, 'transform', text), await command(state, 'latest', '')]) assert.equal(allActions(reply).some(a => a.type === 'openUrl'), false, text)
     assert.equal(state.writes, 0)
   }
+})
+
+ test('paste is explicit and copy stays default', async () => {
+  const reply = await command(store(), 'transform', '汉字')
+  for (const row of reply.results) {
+    assert.equal(row.defaultActionId, 'copy')
+    assert.equal(row.actions.find(a => a.type === 'pasteText')?.text, row.detail)
+  }
+})
+
+test('empty saved snippet has copy and read but no paste, and maximum latest text remains bounded', async () => {
+  const empty = await command(store(record('')), 'latest')
+  assert.equal(empty.results[0].actions.some(a => a.type === 'pasteText'), false)
+  const maximum = await command(store(record('x'.repeat(8192))), 'latest')
+  assert.equal(maximum.results[0].actions.find(a => a.type === 'pasteText').text.length, 8192)
 })

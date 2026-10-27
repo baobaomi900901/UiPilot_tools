@@ -491,6 +491,39 @@ describe('main result actions', () => {
     core.destroy()
   })
 
+  it.each([
+    ['pasteTargetUnavailable', false, '无法返回原应用，请从目标应用重新唤起后重试。'],
+    ['pasteInputBusy', false, '请松开按键后重新执行。'],
+    ['pasteFailed', true, '粘贴未确认，请检查目标应用后重新运行命令。'],
+  ] as const)('shows %s with explicit consumption', async (code, sourceConsumed, status) => {
+    const { core, client } = await setup()
+    vi.mocked(client.executeResultAction).mockResolvedValue({ kind: 'failed', code, sourceConsumed })
+    core.executeResultAction(0, 'save-req-actions-0')
+    await vi.waitFor(() => expect(core.getSnapshot().status).toBe(status))
+    expect(core.getSnapshot().resultActionsDisabled).toBe(sourceConsumed)
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('reports one accepted paste request and ignores its completion after the normal hidden event', async () => {
+    const first = await setup()
+    vi.mocked(first.client.executeResultAction).mockResolvedValue({ kind: 'pasteSent' })
+    first.core.executeResultAction(0, 'save-req-actions-0')
+    await vi.waitFor(() => expect(first.core.getSnapshot().status).toBe('已请求粘贴'))
+    expect(first.core.getSnapshot().resultActionsDisabled).toBe(true)
+    first.core.destroy()
+    const second = await setup()
+    const pending = deferred<ResultActionOutcome>()
+    vi.mocked(second.client.executeResultAction).mockReturnValue(pending.promise)
+    second.core.executeResultAction(0, 'save-req-actions-0')
+    second.emitHidden()
+    const hidden = second.core.getSnapshot()
+    pending.resolve({ kind: 'pasteSent' })
+    await Promise.resolve(); await Promise.resolve()
+    expect(second.core.getSnapshot().results).toEqual(hidden.results)
+    expect(second.core.getSnapshot().status).toBe(hidden.status)
+    second.core.destroy()
+  })
+
   it('installs fresh handles after a highlight change without autoexecution or suffix replacement', async () => {
     const { core, client } = await setup()
     const pending = deferred<ResultActionOutcome>()
@@ -510,7 +543,7 @@ describe('main result actions', () => {
     core.destroy()
   })
 
-  it.each(['success', 'url-opened', 'failure', 'reject'] as const)('retires before debounce and ignores old %s while a new action is pending', async (kind) => {
+  it.each(['success', 'url-opened', 'paste-sent', 'failure', 'reject'] as const)('retires before debounce and ignores old %s while a new action is pending', async (kind) => {
     const { core, client } = await setup()
     const old = deferred<ResultActionOutcome>()
     const next = deferred<ResultActionOutcome>()
@@ -528,6 +561,7 @@ describe('main result actions', () => {
     expect(core.getSnapshot().status).toBe('正在执行动作…')
     if (kind === 'success') old.resolve({ kind: 'resultsUpdated', response: response('req-too-late') })
     else if (kind === 'url-opened') old.resolve({ kind: 'urlOpened' })
+    else if (kind === 'paste-sent') old.resolve({ kind: 'pasteSent' })
     else if (kind === 'failure') old.resolve({ kind: 'failed', code: 'actionTimedOut', sourceConsumed: true })
     else old.reject(new Error('private failure'))
     await Promise.resolve(); await Promise.resolve()

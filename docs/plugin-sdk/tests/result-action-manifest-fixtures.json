@@ -172,5 +172,100 @@
       "url.open"
     ],
     "valid": false
+  },
+  {
+    "name": "paste-valid",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.14.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "clipboard.paste"
+    ],
+    "valid": true
+  },
+  {
+    "name": "paste-old-host",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.13.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "clipboard.paste"
+    ],
+    "valid": false
+  },
+  {
+    "name": "paste-missing-write",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.14.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.paste"
+    ],
+    "valid": false
+  },
+  {
+    "name": "paste-no-result-actions",
+    "runtime": {
+      "entry": "dist/runtime.js"
+    },
+    "minimum": "0.14.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "clipboard.paste"
+    ],
+    "valid": false
+  },
+  {
+    "name": "paste-other-platform",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.14.0",
+    "platforms": [
+      "windows",
+      "macos"
+    ],
+    "permissions": [
+      "clipboard.write",
+      "clipboard.paste"
+    ],
+    "valid": false
+  },
+  {
+    "name": "paste-history-not-authority",
+    "runtime": {
+      "entry": "dist/runtime.js",
+      "resultActions": true
+    },
+    "minimum": "0.14.0",
+    "platforms": [
+      "windows"
+    ],
+    "permissions": [
+      "clipboard.history.paste",
+      "clipboard.paste"
+    ],
+    "valid": false
   }
 ]

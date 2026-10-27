@@ -68,10 +68,11 @@ export interface ResultActionMetadata {
 export type ResultActionErrorCode =
   | 'actionBusy' | 'actionInProgress' | 'actionAlreadyExecuted' | 'actionFailed'
   | 'actionInvalidResponse' | 'actionTimedOut' | 'actionUnavailable' | 'actionCancelled'
-  | 'staleRequest' | 'unknownResult' | 'pluginPermissionDenied' | 'clipboardWriteFailed' | 'urlOpenFailed'
+  | 'staleRequest' | 'unknownResult' | 'pluginPermissionDenied' | 'clipboardWriteFailed' | 'urlOpenFailed' | 'pasteTargetUnavailable' | 'pasteInputBusy' | 'pasteFailed'
 export type ResultActionOutcome =
   | { kind: 'copied' }
   | { kind: 'urlOpened' }
+  | { kind: 'pasteSent' }
   | { kind: 'resultsUpdated'; response: SearchResponse }
   | { kind: 'failed'; code: ResultActionErrorCode; sourceConsumed: boolean }
 export interface SearchResponse {
@@ -201,6 +202,7 @@ export type PublicPermission =
   | 'ui.window'
   | 'ui.panel'
   | 'clipboard.write'
+  | 'clipboard.paste'
   | 'url.open'
   | 'files.openText'
   | 'clipboard.read'
@@ -783,7 +785,7 @@ function exactDenseArray(value: unknown[]): boolean {
 const resultActionErrors = new Set<ResultActionErrorCode>([
   'actionBusy', 'actionInProgress', 'actionAlreadyExecuted', 'actionFailed',
   'actionInvalidResponse', 'actionTimedOut', 'actionUnavailable', 'actionCancelled',
-  'staleRequest', 'unknownResult', 'pluginPermissionDenied', 'clipboardWriteFailed', 'urlOpenFailed',
+  'staleRequest', 'unknownResult', 'pluginPermissionDenied', 'clipboardWriteFailed', 'urlOpenFailed', 'pasteTargetUnavailable', 'pasteInputBusy', 'pasteFailed',
 ])
 
 function opaqueResultHandle(value: unknown): value is string {
@@ -816,7 +818,7 @@ export function parseResultActionMetadata(value: unknown): ResultActionMetadata 
 export function parseResultActionOutcome(value: unknown): ResultActionOutcome | null {
   const outcome = plainRecord(value)
   if (!outcome) return null
-  if (outcome.kind === 'copied' || outcome.kind === 'urlOpened') return exactKeys(outcome, ['kind']) ? { kind: outcome.kind } : null
+  if (outcome.kind === 'copied' || outcome.kind === 'urlOpened' || outcome.kind === 'pasteSent') return exactKeys(outcome, ['kind']) ? { kind: outcome.kind } : null
   if (outcome.kind === 'failed') {
     return exactKeys(outcome, ['code', 'kind', 'sourceConsumed']) &&
       resultActionErrors.has(outcome.code as ResultActionErrorCode) && typeof outcome.sourceConsumed === 'boolean'
@@ -948,7 +950,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 }
 
 const publicPermissions = new Set<PublicPermission>([
-  'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
+  'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.paste', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])
