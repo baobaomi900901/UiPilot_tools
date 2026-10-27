@@ -175,6 +175,17 @@ try {
             if (-not $unrelated.HasExited) { $unrelated.Kill(); $unrelated.WaitForExit() }; $unrelated.Dispose()
         }
     }
+    Test 'owned worker natural exit preserves its real exit code' {
+        Initialize-PackageOwnership
+        $root=Fixture; $node=(Get-Command node.exe).Source
+        $job=[UiPilot.PackagingJob]::new($node,'-e "process.exit(7)"',$root)
+        try {
+            $deadline=[DateTime]::UtcNow.AddSeconds(10)
+            while (-not $job.IsEmpty -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 30 }
+            Assert $job.IsEmpty 'bounded natural worker completion'
+            Assert ($job.Process.HasExited -and $job.Process.ExitCode -eq 7) 'natural exit code retained'
+        } finally { $job.Dispose() }
+    }
     Test 'PowerShell 5.1 parser and static GUI wiring' {
         foreach ($name in @('package-runtime.ps1','package-runner.ps1','package-gui.ps1','test-package-tool.ps1')) {
             $tokens=$null; $errors=$null

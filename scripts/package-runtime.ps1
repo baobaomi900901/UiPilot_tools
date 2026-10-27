@@ -179,6 +179,7 @@ namespace UiPilot {
     try {
      if(!AssignProcessToJobObject(job,pi.process)) throw new Win32Exception();
      Process=Process.GetProcessById(pi.pid);
+     IntPtr retainedHandle=Process.Handle; // Retain exit status before resuming.
      if(ResumeThread(pi.thread)==0xffffffff) throw new Win32Exception();
     } catch { TerminateProcess(pi.process,1); throw; }
     finally { CloseHandle(pi.thread); CloseHandle(pi.process); }

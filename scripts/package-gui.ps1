@@ -7,7 +7,7 @@ try {
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'Use Pack.cmd to start this window in STA mode.' }
     $root=Split-Path -Parent $PSScriptRoot
     $config=Read-PackageJson (Join-Path $root 'src-tauri/tauri.conf.json')
-    $script:state=@{ Worker=$null; Request=$null; Cancelled=$false; CloseAfterCancel=$false; Reader=$null; Watch=[Diagnostics.Stopwatch]::new(); LastOutput=(Join-Path $root 'artifacts/packages') }
+    $script:state=@{ Worker=$null; Request=$null; Cancelled=$false; Reader=$null; Watch=[Diagnostics.Stopwatch]::new(); LastOutput=(Join-Path $root 'artifacts/packages') }
     $form=New-Object Windows.Forms.Form
     $form.Text='UiPilot 打包工具'; $form.Size=New-Object Drawing.Size(860,680); $form.MinimumSize=New-Object Drawing.Size(720,560)
     $form.StartPosition='CenterScreen'; $form.Font=[Drawing.SystemFonts]::MessageBoxFont
@@ -91,7 +91,7 @@ try {
     })
     $start.add_Click({
         try {
-            Set-Busy $true; $log.Clear(); $status.Text='预检'; $script:state.Request=$null; $script:state.Cancelled=$false; $script:state.CloseAfterCancel=$false
+            Set-Busy $true; $log.Clear(); $status.Text='预检'; $script:state.Request=$null; $script:state.Cancelled=$false
             $mode=if ($tabs.SelectedIndex -eq 0) { 'Setup' } else { 'Plugin' }
             $request=New-PackageRun $root $mode $output.Text $source.Text
             $script:state.Request=$request; $script:state.LastOutput=$request.RunDirectory; $location.Text=$request.RunDirectory
@@ -128,15 +128,14 @@ try {
                 $script:state.Watch.Stop(); $worker.Dispose(); $script:state.Worker=$null
                 if ($null -ne $script:state.Reader) { $script:state.Reader.Dispose(); $script:state.Reader=$null }
                 Set-Busy $false
-                if ($script:state.CloseAfterCancel) { $form.Close() }
             }
         } catch { $status.Text='诊断：' + $_.Exception.Message }
     })
     $form.add_FormClosing({
         param($sender,$event)
         if ($null -ne $script:state.Worker) {
-            $event.Cancel=$true; $script:state.CloseAfterCancel=$true
-            try { Cancel-Run } catch { $status.Text='取消失败：' + $_.Exception.Message; $script:state.Cancelled=$false; $cancel.Enabled=$true }
+            $event.Cancel=$true
+            $status.Text='任务运行中：请先点击“取消”，等待本次进程树退出后再关闭窗口。'
         }
     })
     $timer.Start()
