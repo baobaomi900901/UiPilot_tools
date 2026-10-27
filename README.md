@@ -15,6 +15,10 @@ npm run tauri -- build # 原生应用构建
 
 完整开发入口需要已准备的 Everything.exe 及可用服务；请参阅 `scripts/dev-with-everything.ps1`。验证不安装或修改服务。安装器构建入口为 `npm run build:managed-everything`，其系统与 VM 验收独立进行。
 
+## 可视化打包
+
+Windows 下双击根目录 **Pack.cmd**，选择 Setup 或插件包及输出目录，查看实时日志并打开产物目录。每次运行独立保留产物、SHA256 与日志，支持取消本次构建进程树。准备条件、固定构建流程与人工验收见[打包工具说明](docs/packaging-tool.md)。
+
 ## 验证
 
 ```powershell

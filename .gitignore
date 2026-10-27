@@ -249,3 +249,4 @@ __marimo__/
 # Everything runtime data (bundled exe + lock file are tracked)
 /src-tauri/resources/everything/Everything.db
 /src-tauri/resources/everything/Everything.ini
+/artifacts/packages/
