@@ -1,0 +1,14 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "UiPilot_tools Protected",
+  "identifier": "com.uipilot.launcher.protected",
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "./windows/elevation-installer-hooks.nsh"
+      }
+    }
+  }
+}
