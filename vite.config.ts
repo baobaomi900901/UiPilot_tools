@@ -1,7 +1,9 @@
 import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
+import { preserveBuildOutput } from './scripts/preserve-build-output.mjs'
 
 export default defineConfig(({ mode }) => ({
+  plugins: [preserveBuildOutput()],
   test: {
     include: ['src/**/*.test.{ts,tsx}', 'examples/plugins/**/*.test.js'],
     exclude: ['**/.worktrees/**'],

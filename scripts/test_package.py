@@ -137,6 +137,13 @@ class PackagingTests(unittest.TestCase):
             self.assertNotIn("TAURI_CONFIG", env)
             self.assertEqual(os.environ["CARGO_TARGET_DIR"], "wrong")
 
+    def test_cli_help_uses_utf8_even_with_legacy_redirected_encoding(self):
+        env = dict(os.environ, PYTHONIOENCODING='gbk')
+        result = subprocess.run([sys.executable, str(Path(pack.__file__)), '--help'],
+                                capture_output=True, env=env, creationflags=0x08000000)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('终端交互打包工具', result.stdout.decode('utf-8'))
+
     @unittest.skipUnless(os.name == "nt", "Windows job ownership")
     def test_owned_worker_preserves_exit_code_and_literal_paths(self):
         from package_job import OwnedWorker

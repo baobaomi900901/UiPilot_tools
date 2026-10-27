@@ -12,7 +12,8 @@ UiPilot 打包工具
 
 - 输入 `1`：直接打包生产 Release / Windows x64 / NSIS Setup。
 - 输入 `2`：显示 `examples/public-plugins/*/package` 下插件的名称、ID、版本，再输入编号，只打包选中的插件；输入 `0` 取消。
-- 执行期间显示实时日志；Ctrl+C 取消。结束后显示产物路径和 SHA256，按任意键关闭。
+- 默认显示当前阶段、阶段耗时及去重后的简短警告；长步骤每 15 秒提示仍在执行。Ctrl+C 取消。结束后显示总耗时、产物路径、大小和 SHA256，通过 `Pack.cmd` 启动时按任意键关闭。
+- 原始构建输出始终完整保存在 `run.log`。失败时额外展示最后 18 行输出；需要实时查看全部细节时加 `--verbose`，例如 `uv run scripts/package.py --verbose` 或 `.\Pack.cmd --verbose`。
 
 固定产物位置（相对于项目根目录）：
 
@@ -33,16 +34,23 @@ Setup 复用 `npm run tauri -- build --bundles nsis` 和既有生产 Everything 
 直接运行脚本（无结尾按键暂停）：
 
 ```powershell
+uv run scripts/package.py
+# 或使用已安装的 Python
 python -X utf8 scripts/package.py
 ```
 
 聚焦检查：
 
 ```powershell
-python -X utf8 -m unittest discover -s scripts -p test_package.py -v
+python -X utf8 -m unittest discover -s scripts -p 'test_package*.py' -v
+node --test scripts/test-preserve-build-output.mjs
 ```
 
-维护入口：`scripts/package.py` 包含菜单、插件发现、构建与产物发布；`scripts/package_job.py` 仅封装 Windows Job Object 进程生命周期。`Pack.cmd` 只负责启动 Python 和结束后的按键暂停。原有项目构建钩子继续复用，不需要迁移到 Python。
+维护入口：`scripts/package.py` 包含菜单、插件发现、构建与产物发布；`scripts/package_job.py` 仅封装 Windows Job Object 进程生命周期；`scripts/package_progress.py` 处理终端摘要。`Pack.cmd` 只负责启动 Python 和结束后的按键暂停。原有项目构建钩子继续复用。
+
+重复打包加速：Vite 仍执行类型检查和完整前端构建、正常清理旧资源。`scripts/preserve-build-output.mjs` 作为 Vite 插件，在构建前后比较文件内容，仅为同路径且字节完全相同的文件保留旧修改时间，避免 Cargo 因重写相同资源而重复编译嵌入前端的 Rust 主程序。内容变化、新增文件、Rust 源码或工具链变更仍由正常构建流程处理；首次构建不保证加速。Everything 助手身份检查、生产与测试产物隔离、NSIS 构建和最终哈希校验均保留。
+
+2026-10-27 本机重复 Setup 打包对照：未改业务源码，优化前约 175.6 秒，优化后约 89.5 秒（减少约 49%）；主程序 Cargo 阶段由 2 分 04 秒降到 0.91 秒。两次均生成并发布完整 Setup，未运行安装器。这是单机单次对照，工具启动、磁盘、杀毒扫描和 NSIS 压缩开销会使总耗时波动。原始记录位于本机忽略目录 `.runs/setup-20261027-231450-0fd07a40ebd54f19be2eeaaa9c93e698` 和 `.runs/setup-20261027-232132-b4878ebe39674f85b6c533731c77df10`（完整前缀为 `artifacts/packages/`）。
 
 人工验收：选一个插件打包两次，确认固定目录中的同名文件更新；选择 `1` 确认生成 Setup。真实 Setup 生成与安装验收分开执行。
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import codecs
+import argparse
 import hashlib
 import json
 import os
@@ -268,21 +269,24 @@ def worker(request_path):
     return 0
 
 
-def execute(req):
+def execute(req, verbose=False):
     from package_job import OwnedWorker
+    from package_progress import Progress
     directory = Path(req["runDirectory"])
     request_path = directory / "request.json"
     write_json(request_path, req)
     logfile = directory / "run.log"
     logfile.touch()
     print(f"\n开始打包（Ctrl+C 可取消）。同名产物成功后自动覆盖。\n日志：{logfile}")
+    progress = Progress(req['mode'], verbose=verbose)
     try:
         with OwnedWorker([sys.executable, "-u", str(Path(__file__).resolve()), "--worker", str(request_path)], req["root"]) as job:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             with logfile.open("rb") as stream:
                 while True:
                     code = job.poll()
-                    print(decoder.decode(stream.read(), final=code is not None), end="", flush=True)
+                    progress.feed(decoder.decode(stream.read(), final=code is not None))
+                    progress.tick()
                     if code is not None:
                         break
                     time.sleep(0.1)
@@ -290,7 +294,8 @@ def execute(req):
         if code:
             raise RuntimeError(result.get("message", f"Worker failed (exit {code})"))
         artifact = publish(req, result)
-        print(f"\n打包成功：{artifact}\nSHA256：{result['sha256']}")
+        progress.finish(True)
+        print(f"\n打包成功：{artifact}\n大小：{artifact.stat().st_size / 1024 / 1024:.2f} MiB\nSHA256：{result['sha256']}")
         return 0
     except KeyboardInterrupt:
         (directory / "cancel.flag").touch()
@@ -298,11 +303,17 @@ def execute(req):
         print("\n已取消，原有产物保留。")
         return 130
     except Exception as error:
+        progress.finish(False)
         print(f"\n打包失败：{error}\n日志目录：{directory}")
         return 1
 
 
 def main():
+    # uv / redirected Windows consoles may otherwise default to GBK. Keep the
+    # console and our UTF-8 log consistent, and flush progress as each line arrives.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
     if sys.version_info < (3, 10):
         print("请安装 Python 3.10 或更新版本。")
         return 1
@@ -311,9 +322,12 @@ def main():
         return 1
     if len(sys.argv) == 3 and sys.argv[1] == "--worker":
         return worker(Path(sys.argv[2]).absolute())
+    parser = argparse.ArgumentParser(description='UiPilot 终端交互打包工具')
+    parser.add_argument('--verbose', action='store_true', help='同时显示完整构建输出')
+    args = parser.parse_args()
     try:
         selected = choose_package(ROOT)
-        return execute(new_run(ROOT, *selected)) if selected else 0
+        return execute(new_run(ROOT, *selected), verbose=args.verbose) if selected else 0
     except (EOFError, KeyboardInterrupt):
         return 0
     except Exception as error:
