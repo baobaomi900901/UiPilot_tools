@@ -9514,7 +9514,7 @@ describe('credential consent and settings', () => {
     })
   }
 
-  it('releases package busy state after a command favorite advances the inventory revision', async () => {
+  it('blocks command favorite while saving a secret and releases package busy state afterward', async () => {
     const ui = await setup()
     try {
       await ui.open()
@@ -9524,12 +9524,20 @@ describe('credential consent and settings', () => {
       await enter(secret, 'synthetic-value')
       await act(async () => button('保存 Current API token').click())
       expect(secret.readOnly).toBe(true)
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [{ ...item, commands: item.commands.map((command) => ({ ...command, favorite: true })) }] })
-      await act(async () => button('设为常用').click())
-      await vi.waitFor(() => expect(button('取消常用')).not.toBeNull())
+      const favorite = button('设为常用')
+      expect(favorite.matches(':disabled')).toBe(true)
+      await act(async () => favorite.click())
+      expect(ui.client.setPublicPluginFavorite).not.toHaveBeenCalled()
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '42', hotkeyRevision: '0', items: [item] })
       await act(async () => pending.resolve())
       await vi.waitFor(() => expect(secret.readOnly).toBe(false))
       expect(ui.host.querySelector('.public-plugin-detail')?.getAttribute('aria-busy')).toBe('false')
+      expect(favorite.matches(':disabled')).toBe(false)
+      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ revision: '43', hotkeyRevision: '0', items: [{ ...item, commands: item.commands.map((command) => ({ ...command, favorite: true })) }] })
+      await act(async () => favorite.click())
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledExactlyOnceWith({ pluginId: item.pluginId, commandId: 'default', favorite: true })
+      await vi.waitFor(() => expect(button('取消常用')).not.toBeNull())
+      expect(secret.readOnly).toBe(false)
     } finally { await ui.cleanup() }
   })
   it('shows candidate binding keys and change markers; cancel preserves the installed version', async () => {
@@ -9656,9 +9664,18 @@ describe('credential consent and settings', () => {
       const pending = deferred<void>()
       vi.mocked(ui.client.savePublicPluginSettings).mockReturnValueOnce(pending.promise)
       await act(async () => { button('保存 Current API token').focus(); button('保存 Current API token').click() })
-      await act(async () => { other.focus(); if (blur) other.blur() })
+      expect(other.matches(':disabled')).toBe(true)
+      const pendingFocus = document.activeElement
+      await act(async () => other.focus())
+      expect(document.activeElement).toBe(pendingFocus)
+      const back = button('返回插件列表')
+      expect(back.matches(':disabled')).toBe(false)
+      await act(async () => back.focus())
+      expect(document.activeElement).toBe(back)
+      if (blur) await act(async () => back.blur())
+      expect(document.activeElement).toBe(blur ? document.body : back)
       await act(async () => pending.resolve())
-      expect(document.activeElement).toBe(blur ? document.body : other)
+      expect(document.activeElement).toBe(blur ? document.body : back)
     } finally { await ui.cleanup() }
   })
 
