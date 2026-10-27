@@ -10086,7 +10086,10 @@ describe('independent command management', () => {
       expect(document.activeElement).toBe(moved ? input(ui.host, 'constructor') : retry)
       if (!moved) {
         await act(async () => retry.click())
-        expect(document.activeElement).toBe(input(ui.host, 'upper'))
+        // The removed recovery action returns focus to this row's live recorder.
+        const recorder = button(ui.host, '录制命令快捷键 upper')
+        expect(recorder.disabled).toBe(false)
+        expect(document.activeElement).toBe(recorder)
         expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
         expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
       }

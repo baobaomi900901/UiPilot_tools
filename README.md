@@ -1,6 +1,6 @@
 # UiPilot
 
-Windows x64 启动器与本地公开插件宿主（当前版本 0.5.0）。宿主为 Tauri 2、React 和 Rust；公开插件使用受控的 v1 Runtime / Panel / Window API。
+Windows x64 启动器与本地公开插件宿主（当前版本 0.14.0）。宿主为 Tauri 2、React 和 Rust；公开插件使用受控的 v1 Runtime / Panel / Window API。
 
 ## 工具链与开发
 
@@ -47,6 +47,7 @@ npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uip
 | `src/` | React 启动器、设置及前端状态 |
 | `src-tauri/src/` | Rust 宿主、系统集成与公开插件运行时 |
 | `packages/plugin-cli/` | 独立本地插件打包与静态校验 CLI |
+| packages/plugin-ui/ | 随插件离线分发的 List、Detail、Form、ActionPanel 组件 |
 | `examples/public-plugins/` | 可测试的本地插件参考包 |
 | `docs/plugin-sdk/` | 公开插件教程、API、类型和 Schema |
 | `docs/ui-guidelines.md` | 宿主及插件 UI 规范 |
@@ -68,11 +69,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-demo-plu
 
 本仓库路线以本地包为范围；在线商店、在线发布、自动下载和云同步不属于当前基座。真实凭据请求、系统安装和服务变更需要单独的人工验收环境。
 
-Windows Host `0.4.0+` 支持将已授权的 secret 作为精确 HTTPS host 的 bearer 引用消费，Runtime 仅提交 credential ID。参见 [credential demo](examples/public-plugins/com.uipilot.demo-credentials/README.md) 与 [SDK 合同](docs/plugin-sdk/public-plugin-v1.md#host-managed-https)。示例测试仅使用合成值和离线 fake provider；服务端回显、配置保存失败的非回滚与后续核验恢复边界必须按合同处理。CLI npm 包版本独立保持 `0.1.0`，校验目标 Host 为 `0.5.0`。
+Windows Host `0.4.0+` 支持将已授权的 secret 作为精确 HTTPS host 的 bearer 引用消费，Runtime 仅提交 credential ID。参见 [credential demo](examples/public-plugins/com.uipilot.demo-credentials/README.md) 与 [SDK 合同](docs/plugin-sdk/public-plugin-v1.md#host-managed-https)。示例测试仅使用合成值和离线 fake provider；服务端回显、配置保存失败的非回滚与后续核验恢复边界必须按合同处理。CLI npm 包版本独立保持 `0.1.0`，校验目标 Host 为 `0.14.0`。
 
 
-## 0.5.0 本地发布准备
+## 0.14.0 本地插件基座交付
 
-Host 与独立 CLI 的 Host target 已同步至 `0.5.0`。一个 `commands` 包可提供 1–16 条独立搜索、执行、改启动名和收藏的 mainResult 命令，共用一个 Runtime、设置、存储、权限和包级生命周期。完整离线参考包见 [demo-multi](examples/public-plugins/com.uipilot.demo-multi/README.md)。旧 `command` 包及历史功能最低版本保持兼容；CLI npm 包仍为 `0.1.0`，Manifest/API、inventory/report schema 仍为 1，内部 state schema 为 2。
+Host 与 CLI 校验目标为0.14.0，CLI npm包版本独立保持0.1.0。已交付本地打包安装、多命令与统一结果动作、逐命令全局快捷键、普通设置及凭据消费、Panel/Window到Runtime调用、标准插件UI、浏览器链接、选定文本导入、授权粘贴、升级卸载及恢复诊断。各切片核心人工验收和最终代表组合测试已通过，详见[交付清单与已知限制](docs/local-plugin-foundation-delivery.md)。
 
-新 Host 内支持旧包与按普通校验、授权和冲突规则回退插件包版本。一旦正常事务或必要恢复写入 state schema 2，只懂 schema 1 的旧 Host 二进制不保证可读取该数据目录，不提供自动回写旧 schema。M2-A 在 `b84bda3` 已通过全仓自动验证和最终独立代码评审，真实 Windows Host 人工验收仍待执行；此交付不代表完整 M2 的 actions/onAction、每命令快捷键、独立别名集合、多命令 panel/window 或 M3 已完成，也不包含在线发布。
+开发者从[公开插件教程](docs/plugin-sdk/public-plugin-developer-guide.md)开始，选择最接近的参考插件：
+
+| 场景 | 示例 |
+| --- | --- |
+| 多命令、结果动作、共享存储 | [文本片段](examples/public-plugins/com.uipilot.text-snippet/README.md) |
+| 面板表单、预览、标准UI | [文本模板](examples/public-plugins/com.uipilot.templates/README.md) |
+| 独立窗口与用户选定文本导入 | [JSON工作台](examples/public-plugins/com.uipilot.json-workbench/README.md) |
+| 实际Host认证HTTPS | [认证链路验收](examples/public-plugins/com.uipilot.auth-check/README.md) |
+| SDK组件复用 | [Plugin UI](packages/plugin-ui/README.md) |
+
+公开插件保持受控v1合同；能力最低Host版本、权限及平台要求以SDK和manifest为准。旧单命令包保持兼容。数据schema升级后的目录不保证可由更旧Host读取，不提供任意插件数据的自动迁移或旧schema回写。
+
+临时测试副本与中间产物不纳入Git；测试夹具和插件package内的分发代码属于源码，必须保留。已验收程序、插件包及原始构建记录保存在本机忽略目录 .superpowers/deliveries/，远端源码不包含这些交付二进制。可审计的版本、文件大小和SHA256清单见[交付文件清单](docs/releases/local-plugin-foundation-0.14.0-artifacts.json)。
+
+普通Enter次数问题按用户要求暂缓；安装器/干净VM发行验收独立安排。在线商店、在线安装发布和云同步不属于本轮范围。

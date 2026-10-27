@@ -9,7 +9,7 @@
 宿主构建源码：77ab4f36b05325d2b03340c6bdd6fa75907f9b8c。
 宿主SHA256：d6eb14f98cb8ea2bbde4049e82694a7b4756fb7bb2ef0b9a22083772acfc5973。
 构建标识：com.uipilot.launcher.acceptance。
-源码保留在本地分支 codex/local-plugin-foundation；本次收口没有重建程序、运行真实Host、合并主分支或推送远程。
+源码保留在本地分支 codex/local-plugin-foundation；此前人工验收收口时没有重建程序、运行真实Host、合并主分支或推送远程；后续仓库整理与推送见文末记录。
 
 ## 已交付能力
 
@@ -41,7 +41,7 @@
 | 凭据演示 | 1.0.0 | credentials-1.0.0-acceptance/plugins/com.uipilot.demo-credentials-1.0.0.uipilot-plugin |
 | 认证链路验收 | 1.0.0 | auth-check-1.0.0-acceptance/plugins/com.uipilot.auth-check-1.0.0.uipilot-plugin |
 
-本次最终清单：[final-inventory.json](../.superpowers/deliveries/uipilot-0.14.0-acceptance/final-inventory.json)。宿主及5项附属资源与原构建证据一致。各目录原始构建证据保留构建时状态，不覆盖为事后人工结果。
+本次最终清单：[交付文件清单](releases/local-plugin-foundation-0.14.0-artifacts.json)。清单是最终验收时的文件快照，不记录后续仓库测试运行。宿主及5项附属资源与原构建证据一致。各目录原始构建证据保留构建时状态，不覆盖为事后人工结果。
 
 ## 最终人工结论
 
@@ -59,3 +59,11 @@
 - 交付包和原始证据位于忽略目录，只存在于本机工作树；保留此目录。源码提交不能替代这些本地产物和用户数据的备份。
 
 下一阶段可以开始独立业务插件开发或产品体验改进；本轮基座不再新增必测项。
+
+## 2026-10-27 仓库整理
+
+README已更新至0.14.0并补充开发入口和源码导航；校验值清单已纳入Git，原始程序和验收包继续本地保留。清理58个已核实临时文件，共40,828,029字节：旧基线/格式化前副本、升级暂存目录、与已保留包hash一致的重复包、中间exe及构建日志。保留小型构建元数据、必要评审记录、依赖缓存、测试夹具及所有验收目录。
+
+成果使用codex/local-plugin-foundation分支推送至origin，保留原有原子开发提交并新增详细收尾提交，不改写已有历史。D:/code/UiPilot_tools主目录原有未提交修改保持原状。
+
+本轮推送前验证：完整前端22个测试文件通过，525项通过、18项跳过；首次发现两项焦点断言沿用旧启动键输入框预期，现已按d09eec3引入的同命令行录制按钮回退行为更新。四种恢复/主动移焦场景通过，保留不抢焦点与不重复提交断言；宿主实现未修改。文档本地链接和git diff --check通过，独立审查通过。未重建程序或重新执行原生人工验收。

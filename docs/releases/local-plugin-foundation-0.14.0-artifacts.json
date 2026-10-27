@@ -1,0 +1,63 @@
+{
+  "date": "2026-10-27",
+  "hostVersion": "0.14.0",
+  "hostSourceCommit": "77ab4f36b05325d2b03340c6bdd6fa75907f9b8c",
+  "inspectedSourceHead": "86bdc46b0b4ebd54acfc11665a7071c5b0edd2a7",
+  "resourcesVerified": 5,
+  "artifacts": [
+    {
+      "path": "uipilot-0.14.0-acceptance/uipilot.exe",
+      "bytes": 40212992,
+      "sha256": "d6eb14f98cb8ea2bbde4049e82694a7b4756fb7bb2ef0b9a22083772acfc5973"
+    },
+    {
+      "path": "uipilot-0.5.0-acceptance/plugins/com.uipilot.notes-1.2.5.uipilot-plugin",
+      "bytes": 85248,
+      "sha256": "1e58d0ebe18531a533a275bb2d2f7eca61c23b5a644c63b2d99b7722a27653a6"
+    },
+    {
+      "path": "uipilot-0.5.0-acceptance/plugins/com.uipilot.demo-multi-1.0.1.uipilot-plugin",
+      "bytes": 2432,
+      "sha256": "9c74f9e132b646b5d79cdbeb108974cae899051bda84c83568d8905579450e66"
+    },
+    {
+      "path": "uipilot-0.8.0-acceptance/plugins/com.uipilot.demo-settings-1.0.1.uipilot-plugin",
+      "bytes": 2122,
+      "sha256": "435292532f5d76b2634cc7285de4d25f13fb25592abe09fe6f031ef231a889bd"
+    },
+    {
+      "path": "uipilot-0.9.0-acceptance/plugins/com.uipilot.pomodoro-1.2.0.uipilot-plugin",
+      "bytes": 1757040,
+      "sha256": "03c471f794481a9dc62fa6beb5718623f16372cc789ad9832d4cc4ebf5a1b08c"
+    },
+    {
+      "path": "uipilot-0.13.0-acceptance/plugins/com.uipilot.json-workbench-1.1.1.uipilot-plugin",
+      "bytes": 25696,
+      "sha256": "87e9142ea1e907f83683dd8244dba3a96cf66cb1870330e9b3e999786d4306b0"
+    },
+    {
+      "path": "templates-1.2.0-acceptance/plugins/com.uipilot.templates-1.2.0.uipilot-plugin",
+      "bytes": 53709,
+      "sha256": "5415156aba651cf3592f23f510cfae2d440ac728f2c72b2ec40126d6feb2dddd"
+    },
+    {
+      "path": "uipilot-0.14.0-acceptance/plugins/com.uipilot.text-snippet-1.2.0.uipilot-plugin",
+      "bytes": 33507,
+      "sha256": "db042eccd03f10ec117da0873891d8eb43ab529ec92820567fb64817cb1f76c9"
+    },
+    {
+      "path": "credentials-1.0.0-acceptance/plugins/com.uipilot.demo-credentials-1.0.0.uipilot-plugin",
+      "bytes": 3553,
+      "sha256": "7beffe5c44b30a22f1d916a814c322503652397b25ac3cb86aad810c40dbb70c"
+    },
+    {
+      "path": "auth-check-1.0.0-acceptance/plugins/com.uipilot.auth-check-1.0.0.uipilot-plugin",
+      "bytes": 3374,
+      "sha256": "67489fcbe0c43b9c19bb913a01ebe17fa454d1e8db314cdd852a70bd11d77213"
+    }
+  ],
+  "finalManualCombination": "user-confirmed all three passed",
+  "authManual": "both groups user-confirmed passed",
+  "rebuilt": false,
+  "currentHeadFullSuiteRerun": false
+}
