@@ -19,7 +19,7 @@ function Assert-PackageDirectoryPath([string]$Path) {
 }
 function Get-PackageManifest([string]$Source) {
     $manifest = Read-PackageJson (Join-Path $Source 'plugin.json'); $id = [string]$manifest.pluginId; $version = [string]$manifest.version
-    if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9_-]$' -or $id -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { throw 'Plugin ID is not a safe filename.' }
+    if ($id -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$' -or $id -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { throw 'Plugin ID is not a safe filename.' }
     if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') { throw 'Plugin version is not a safe version.' }
     return $manifest
 }

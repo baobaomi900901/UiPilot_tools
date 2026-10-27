@@ -61,6 +61,14 @@ try {
         Assert ($result.State -eq 'Success') 'success only after all stages'
         Assert (Test-Path -LiteralPath (Join-Path $request.RunDirectory 'run.log')) 'persistent log'
     }
+    Test 'single-character plugin ID remains compatible with CLI' {
+        ResetFake; $root=Fixture; $source=Join-Path $root 'plugin 中文 & 空格'
+        Write-PackageJson (Join-Path $source 'plugin.json') @{pluginId='a'; version='1.2.3'}
+        $request=New-PackageRun $root Plugin (Join-Path $root 'out') $source
+        $result=Invoke-PackageBuild $request $script:tools $fake
+        Assert ($script:calls.Count -eq 4) 'single-character ID completes full pipeline'
+        Assert ((Split-Path $result.Artifact -Leaf) -ceq 'a-1.2.3.uipilot-plugin') 'single-character ID creates safe expected filename'
+    }
     Test 'unique runs preserve previous outputs' {
         $root=Fixture; $output=Join-Path $root 'out'
         $a=New-PackageRun $root Plugin $output (Join-Path $root 'plugin 中文 & 空格')
