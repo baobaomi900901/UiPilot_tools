@@ -1,4 +1,5 @@
 @import './ui-theme.css';
+@import './credential-settings.css';
 @import 'overlayscrollbars/styles/overlayscrollbars.css';
 
 :root {

@@ -391,6 +391,7 @@ export type ClassifiedTextRecord =
   | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
+  validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
   listenHidden(handler: () => void): Promise<() => void>
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
@@ -677,7 +678,7 @@ export interface FileSnapshot {
   selected?: FileResultView
 }
 
-export type SettingsTabKey = 'general' | 'plugins' | 'messages'
+export type SettingsTabKey = 'general' | 'plugins' | 'messages' | 'credentials'
 
 export interface MessageCenterStateSnapshot {
   readonly status: 'unknown' | 'ready' | 'unavailable'

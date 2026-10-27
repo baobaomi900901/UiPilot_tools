@@ -46,6 +46,8 @@
     "allow-reload-plugin",
     "allow-delete-plugin",
     "allow-load-settings",
+    "allow-set-settings-pinned",
+    "allow-validate-youdao-translation",
     "allow-save-settings",
     "allow-save-hotkey",
     "allow-set-theme-preference",

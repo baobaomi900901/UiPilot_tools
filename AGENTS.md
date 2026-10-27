@@ -9,6 +9,29 @@ In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the re
 If there is no `.codegraph/` directory, skip CodeGraph entirely - indexing is the user's decision.
 <!-- CODEGRAPH_END -->
 
+## Task Completion Message Push
+
+Project default switch: `task_completion_push: false`.
+Set it to `true` to enable completion notifications by default for all project
+conversations. In an individual conversation, the user's latest instruction
+“开启消息推送” or “关闭消息推送” overrides the project default for that
+conversation and remains effective until changed. Conversation overrides do
+not modify this file. If no override exists, use the project default.
+
+When enabled, after completing the user's task and its required verification,
+and before the final response, execute this command once in PowerShell:
+
+```powershell
+uv run "C:\Users\moby\Documents\WindowsPowerShell\MyShell\public\_script\wechat_send.py" --contact "猫叔叔" --content "任务已完成"
+```
+
+Enabling the switch authorizes this completion message. Send once per completed
+user task, with the coordinating agent responsible for sending when subagents
+are involved. Progress updates, clarification or approval requests, failed or
+blocked tasks, and switch-only changes do not trigger notifications. When
+disabled, skip the command. If sending fails or its outcome is unknown, report
+that in the final response without automatically retrying or claiming delivery.
+
 ## Implementation Plans
 
 When creating or updating files under `docs/superpowers/plans/`, read and

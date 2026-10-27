@@ -39,6 +39,8 @@ fn main() {
             "commit_find_ready",
             "get_find_ready_status",
             "set_find_pinned",
+            "set_settings_pinned",
+            "validate_youdao_translation",
             "set_find_preview_preference",
             "load_find_thumbnail",
             "hide_find_window",

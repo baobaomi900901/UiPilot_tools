@@ -8,6 +8,7 @@ use std::{
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
@@ -84,6 +85,74 @@ use crate::{
 };
 
 const ACTIVATION_REFUSED_MESSAGE: &str = "Windows 拒绝了前台切换，已发送启动请求";
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct YoudaoValidationInput {
+    app_id: String,
+    app_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct YoudaoValidationResult {
+    valid: bool,
+    message: String,
+}
+
+#[tauri::command]
+pub(crate) async fn validate_youdao_translation(
+    window: WebviewWindow,
+    input: YoudaoValidationInput,
+) -> Result<YoudaoValidationResult, CommandError> {
+    require_main_window(&window)?;
+    let app_id = input.app_id.trim().to_owned();
+    let app_key = input.app_key.trim().to_owned();
+    if app_id.is_empty() || app_key.is_empty() {
+        return Ok(YoudaoValidationResult {
+            valid: false,
+            message: "App ID 和 App Key 不能为空".into(),
+        });
+    }
+    let q = "uipilot";
+    let salt = format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    );
+    let curtime = chrono::Utc::now().timestamp().to_string();
+    let mut digest = Sha256::new();
+    digest.update(format!("{app_id}{q}{salt}{curtime}{app_key}"));
+    let sign = format!("{:x}", digest.finalize());
+    let response = reqwest::Client::new()
+        .post("https://openapi.youdao.com/api")
+        .form(&[
+            ("q", q),
+            ("from", "auto"),
+            ("to", "zh"),
+            ("appKey", app_id.as_str()),
+            ("salt", salt.as_str()),
+            ("signType", "v3"),
+            ("curtime", curtime.as_str()),
+            ("sign", sign.as_str()),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|_| CommandError::window_failed())?;
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| CommandError::window_failed())?;
+    let valid = body.get("errorCode").and_then(serde_json::Value::as_str) == Some("0");
+    Ok(YoudaoValidationResult {
+        valid,
+        message: if valid {
+            "验证成功".into()
+        } else {
+            "App ID 或 App Key 无效".into()
+        },
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HideReason {
@@ -752,6 +821,21 @@ fn require_find_label(label: &str) -> Result<(), CommandError> {
 
 fn require_find_window(window: &WebviewWindow) -> Result<(), CommandError> {
     require_find_label(window.label())
+}
+
+#[tauri::command]
+pub(crate) fn set_settings_pinned(
+    window: WebviewWindow,
+    coordinator: State<'_, Arc<LifecycleCoordinator>>,
+    active: bool,
+    pinned: bool,
+) -> Result<(), CommandError> {
+    require_main_window(&window)?;
+    window
+        .set_always_on_top(!active || pinned)
+        .map_err(|_| CommandError::window_failed())?;
+    coordinator.set_settings_pinned(active && pinned);
+    Ok(())
 }
 
 #[tauri::command]
@@ -6189,6 +6273,9 @@ pub(crate) fn clear_and_hide_window(
 ) -> Result<(), CommandError> {
     let settings = window.state::<SettingsStore>();
     let lifecycle = Arc::clone(window.state::<Arc<LifecycleCoordinator>>().inner());
+    if lifecycle.settings_pinned() && reason != HideReason::ExplicitReturn {
+        return Ok(());
+    }
     let app = window.app_handle().clone();
     let panel_controller = Arc::clone(window.state::<Arc<PluginPanelController>>().inner());
     let result = clear_and_hide_with(

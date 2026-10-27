@@ -194,6 +194,7 @@ export const client: LauncherClient = {
       Object.freeze({ preference: Object.freeze({ engine: input.preference.engine }) }),
     ),
   hideLauncher: () => invoke<void>('hide_launcher'),
+  validateYoudaoTranslation: (input) => invoke('validate_youdao_translation', { input }),
 }
 
 export const pluginWindowClient: PluginWindowClient = {
@@ -289,7 +290,10 @@ const teardown = () => {
 window.addEventListener('pagehide', teardown)
 
 try {
-  root.render(createElement(LauncherView, { core, onReady }))
+  root.render(createElement(LauncherView, {
+    core, onReady,
+    setSettingsPinned: (active: boolean, pinned: boolean) => invoke<void>('set_settings_pinned', { active, pinned }),
+  }))
 } catch {
   failMount()
 }

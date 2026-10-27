@@ -171,6 +171,9 @@ fn setup_production_lifecycle(
     let event_panel_controller = Arc::clone(&panel_controller);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(focused) => {
+            if !*focused && event_coordinator.settings_pinned() {
+                return;
+            }
             let transfers =
                 event_app.state::<Arc<window_transfer::MainWindowTransferCoordinator>>();
             let expected_blur = !*focused && transfers.consume_expected_main_blur();
@@ -462,6 +465,8 @@ pub fn run() {
             commands::commit_find_ready,
             commands::get_find_ready_status,
             commands::set_find_pinned,
+            commands::set_settings_pinned,
+            commands::validate_youdao_translation,
             commands::set_find_preview_preference,
             commands::load_find_thumbnail,
             commands::hide_find_window,
@@ -829,13 +834,15 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 88);
+        assert_eq!(production.matches("commands::").count(), 90);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
             "commit_find_ready",
             "get_find_ready_status",
             "set_find_pinned",
+            "set_settings_pinned",
+            "validate_youdao_translation",
             "set_find_preview_preference",
             "load_find_thumbnail",
             "hide_find_window",

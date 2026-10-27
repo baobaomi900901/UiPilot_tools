@@ -537,6 +537,7 @@ pub(crate) struct LifecycleCoordinator {
     lifecycle_phase: AtomicU8,
     lifecycle_attempt_epoch: AtomicU64,
     window_move_active: AtomicBool,
+    settings_pinned: AtomicBool,
     transient_focus_suppressions: AtomicUsize,
     readiness: Mutex<Readiness>,
     exit_gate: Mutex<ExitGate>,
@@ -557,6 +558,7 @@ impl Default for LifecycleCoordinator {
             lifecycle_phase: AtomicU8::new(FileIndexPhase::Running as u8),
             lifecycle_attempt_epoch: AtomicU64::new(0),
             window_move_active: AtomicBool::new(false),
+            settings_pinned: AtomicBool::new(false),
             transient_focus_suppressions: AtomicUsize::new(0),
             readiness: Mutex::new(Readiness::default()),
             exit_gate: Mutex::new(ExitGate::default()),
@@ -1638,6 +1640,14 @@ impl LifecycleCoordinator {
         Ok(())
     }
 
+    pub(crate) fn set_settings_pinned(&self, pinned: bool) {
+        self.settings_pinned.store(pinned, Ordering::Release);
+    }
+
+    pub(crate) fn settings_pinned(&self) -> bool {
+        self.settings_pinned.load(Ordering::Acquire)
+    }
+
     pub(crate) fn handle_focus_event_with<H>(
         &self,
         focused: bool,
@@ -1648,6 +1658,7 @@ impl LifecycleCoordinator {
     {
         if !focused
             && (self.window_move_active.load(Ordering::Acquire)
+                || self.settings_pinned.load(Ordering::Acquire)
                 || self.transient_focus_loss_suppressed())
         {
             return Ok(());
@@ -4713,6 +4724,24 @@ mod tests {
             .unwrap();
 
         coordinator.observe_window_move_message(WM_EXITSIZEMOVE);
+        let hides = Cell::new(0);
+        coordinator
+            .handle_focus_event_with(false, || {
+                hides.set(hides.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(hides.get(), 1);
+    }
+
+    #[test]
+    fn settings_pin_suppresses_focus_loss_until_released() {
+        let coordinator = coordinator_for_test();
+        coordinator.set_settings_pinned(true);
+        coordinator
+            .handle_focus_event_with(false, || panic!("pinned settings must stay visible"))
+            .unwrap();
+        coordinator.set_settings_pinned(false);
         let hides = Cell::new(0);
         coordinator
             .handle_focus_event_with(false, || {

@@ -61,6 +61,7 @@ $mainPath = Join-Path $PSScriptRoot 'dev-with-everything.ps1'
 $mainSource = Get-Content -LiteralPath $mainPath -Raw -Encoding utf8
 Assert-Condition $mainSource.Contains(". (Join-Path `$PSScriptRoot 'dev-everything-runtime.ps1')") 'Dev script must load the runtime helper'
 Assert-Condition (-not $mainSource.Contains("Get-Process -Name 'Everything' -ErrorAction SilentlyContinue | Select-Object -First 1")) 'Dev script must not confuse the service with an interactive client'
+Assert-Condition (-not $mainSource.Contains("Start-Process -FilePath `$everythingPath")) 'Dev script must let the backend own the UiPilot client'
 Assert-Condition (-not $mainSource.Contains('-Verb RunAs')) 'Dev startup must never elevate'
 Assert-Condition $mainSource.Contains('UIPILOT_DEV_PORT') 'Dev script must use the selected frontend port'
 

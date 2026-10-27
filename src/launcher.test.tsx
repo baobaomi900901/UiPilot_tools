@@ -906,12 +906,12 @@ function installMatchMedia(initial: boolean) {
   }
 }
 
-async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
+async function mountLauncherView(core: ReturnType<typeof createLauncherCore>, setSettingsPinned?: (active: boolean, pinned: boolean) => Promise<void>) {
   const host = document.createElement('div')
   document.body.append(host)
   const root = createRoot(host)
   const onReady = vi.fn()
-  await act(async () => root.render(<LauncherView core={core} onReady={onReady} />))
+  await act(async () => root.render(<LauncherView core={core} onReady={onReady} setSettingsPinned={setSettingsPinned} />))
   return {
     host,
     onReady,
@@ -922,7 +922,7 @@ async function mountLauncherView(core: ReturnType<typeof createLauncherCore>) {
   }
 }
 
-function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): HTMLElement {
+function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | '密钥配置'): HTMLElement {
   const tab = [...host.querySelectorAll<HTMLElement>('[role="tab"]')].find(
     (candidate) => label === '消息'
       ? candidate.querySelector('.settings-message-tab-badge') !== null
@@ -932,7 +932,7 @@ function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): 
   return tab
 }
 
-async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息' | '插件'): Promise<HTMLElement> {
+async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | '密钥配置'): Promise<HTMLElement> {
   const tab = settingsTab(host, label)
   await act(async () => {
     tab.focus()
@@ -6886,7 +6886,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.settings-plugin-panel .settings-scroll-content')).toBeTruthy())
 
     expect(launcherViewSource).toContain("from 'overlayscrollbars-react'")
-    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(5)
+    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(6)
     expect(launcherViewSource).toContain('className="quicklinks-list-scroll"')
     expect(launcherViewSource).toContain('className="quicklinks-editor-scroll"')
     expect(launcherViewSource).not.toContain('./overlay-scroll-area')
@@ -7477,6 +7477,7 @@ describe('React view and accessibility', () => {
       settingsTab(mounted.host, '通用'),
       settingsTab(mounted.host, '消息'),
       settingsTab(mounted.host, '插件'),
+      settingsTab(mounted.host, '密钥配置'),
     ])
     expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true')
     expect(settingsTab(mounted.host, '消息').getAttribute('aria-selected')).toBe('false')
@@ -7489,6 +7490,10 @@ describe('React view and accessibility', () => {
     expect(mounted.host.textContent).not.toContain('保存')
     expect(mounted.host.textContent).not.toContain('重新加载设置')
     expect(mounted.host.querySelector('button[aria-label="关闭"]')).toBeNull()
+    await activateSettingsTab(mounted.host, '密钥配置')
+    expect(core.getSnapshot().settingsTab).toBe('credentials')
+    expect(mounted.host.querySelector('.credential-settings')).not.toBeNull()
+    await activateSettingsTab(mounted.host, '通用')
     await act(async () => {
       settingsTab(mounted.host, '通用').dispatchEvent(
         new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
@@ -7500,6 +7505,31 @@ describe('React view and accessibility', () => {
       mounted.host.querySelector<HTMLInputElement>('[role="combobox"]'),
     ))
     await mounted.unmount()
+  })
+
+  it('pins settings, retries failed native updates, and releases the pin on exit', async () => {
+    installMatchMedia(false)
+    const { core, emit } = await startedCore(settingsFixture)
+    const setPinned = vi.fn<(active: boolean, pinned: boolean) => Promise<void>>().mockResolvedValue(undefined)
+    const mounted = await mountLauncherView(core, setPinned)
+    await act(async () => emit(shown('settings-pin', 'settings')))
+    const button = () => mounted.host.querySelector<HTMLButtonElement>('.settings-header button[aria-pressed]')!
+    await vi.waitFor(() => expect(button().disabled).toBe(false))
+    setPinned.mockRejectedValueOnce(new Error('native failure'))
+    await act(async () => button().click())
+    expect(button().getAttribute('aria-pressed')).toBe('false')
+    expect(button().getAttribute('aria-label')).toBe('重试置顶设置')
+    await act(async () => button().click())
+    expect(setPinned).toHaveBeenLastCalledWith(true, true)
+    expect(button().getAttribute('aria-pressed')).toBe('true')
+    await act(async () => button().click())
+    expect(setPinned).toHaveBeenLastCalledWith(true, false)
+    expect(button().getAttribute('aria-pressed')).toBe('false')
+    await act(async () => button().click())
+    await act(async () => core.navigate('launcher'))
+    expect(setPinned).toHaveBeenLastCalledWith(false, false)
+    await mounted.unmount()
+    core.destroy()
   })
 
   it('routes focus right into the active settings panel and left back to its menu tab', async () => {

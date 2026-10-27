@@ -3024,7 +3024,8 @@ pub(crate) fn register_main_focus_events(
             let transfers =
                 lost_app.state::<Arc<crate::window_transfer::MainWindowTransferCoordinator>>();
             let expected_transfer_blur = transfers.consume_expected_main_webview_blur();
-            let transient_focus_suppressed = lifecycle.transient_focus_loss_suppressed();
+            let transient_focus_suppressed =
+                lifecycle.transient_focus_loss_suppressed() || lifecycle.settings_pinned();
             let ticket = controller
                 .main_content_lost_focus(expected_transfer_blur || transient_focus_suppressed);
             trace_panel_focus(&lost_app, controller.as_ref(), "main-lost-focus", || {

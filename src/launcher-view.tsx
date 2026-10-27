@@ -16,7 +16,7 @@ import {
   type InputProps,
   type InputRef,
 } from 'antd'
-import { ArrowLeft, ArrowRightLeft, Calculator, Calendar, Clock, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Plus, Ruler, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
+import { ArrowLeft, ArrowRightLeft, Calculator, Calendar, Clock, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Pin, PinOff, Plus, Ruler, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -31,6 +31,7 @@ import { AppVersion } from './app-version'
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 
 import { sameFavoriteTarget, type LauncherCore } from './launcher-core'
+import { CredentialSettings, createCredentialDraft } from './credential-settings'
 import { MessageCenterPanel } from './message-center-panel'
 import { bindNativeTextInput } from './native-input'
 import { PluginIcon } from './plugin-icon'
@@ -54,6 +55,7 @@ import { formatHotkeyDisplay } from './hotkey-recorder'
 export interface LauncherViewProps {
   core: LauncherCore
   onReady: (result: 'ready' | 'failed') => void
+  setSettingsPinned?: (active: boolean, pinned: boolean) => Promise<void>
 }
 
 interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
@@ -258,6 +260,7 @@ function settingsTabKey(target: EventTarget): SettingsTabKey | null {
   if (controlledPanel?.endsWith('-panel-general')) return 'general'
   if (controlledPanel?.endsWith('-panel-messages')) return 'messages'
   if (controlledPanel?.endsWith('-panel-plugins')) return 'plugins'
+  if (controlledPanel?.endsWith('-panel-credentials')) return 'credentials'
   return null
 }
 
@@ -294,7 +297,7 @@ function scrollFileResultIntoView(container: HTMLElement | null, selected: HTMLE
   }
 }
 
-export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.Element {
+export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewProps): React.JSX.Element {
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
@@ -324,6 +327,32 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
   const panelHostRef = useRef<HTMLDivElement | null>(null)
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
+  const [credentialDraft, setCredentialDraft] = useState(createCredentialDraft)
+  const [settingsPinned, setSettingsPin] = useState(false)
+  const [appliedPin, setAppliedPin] = useState(false)
+  const [pinAttempt, setPinAttempt] = useState(0)
+  const [pinPending, setPinPending] = useState(false)
+  const [pinError, setPinError] = useState(false)
+  const pinQueue = useRef(Promise.resolve())
+  const pinSessionActive = useRef(false)
+  useEffect(() => { setSettingsPin(false) }, [snapshot.view, snapshot.viewEpoch])
+  useEffect(() => {
+    let current = true
+    const active = snapshot.view === 'settings'
+    if (!active && !pinSessionActive.current) return
+    pinSessionActive.current = active
+    setPinPending(true)
+    setPinError(false)
+    pinQueue.current = pinQueue.current
+      .then(() => setSettingsPinned?.(active, active && settingsPinned))
+      .then(() => { if (current) { setAppliedPin(active && settingsPinned); setPinPending(false) } })
+      .catch(() => { if (current) { setPinPending(false); setPinError(true) } })
+    return () => { current = false }
+  }, [snapshot.view, snapshot.viewEpoch, settingsPinned, pinAttempt])
+  useEffect(() => () => {
+    if (!pinSessionActive.current) return
+    pinQueue.current = pinQueue.current.then(() => setSettingsPinned?.(false, false)).catch(() => {})
+  }, [])
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const restoreSettingsTabFocus = useRef(false)
   const activeSettingsTab = snapshot.settingsTab
@@ -2211,6 +2240,17 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
             <h1>设置</h1>
           </div>
           <AppVersion />
+          <Tooltip title={pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'}>
+            <Button
+              aria-label={pinError ? '重试置顶设置' : appliedPin ? '取消置顶' : '置顶设置窗口'}
+              aria-pressed={appliedPin}
+              disabled={snapshot.hidePending || pinPending}
+              icon={appliedPin ? <Pin size={17} aria-hidden /> : <PinOff size={17} aria-hidden />}
+              type={appliedPin ? 'primary' : 'text'}
+              size="small"
+              onClick={() => pinError ? setPinAttempt((attempt) => attempt + 1) : setSettingsPin((pinned) => !pinned)}
+            />
+          </Tooltip>
         </header>
       </div>
       <div
@@ -2243,10 +2283,21 @@ export function LauncherView({ core, onReady }: LauncherViewProps): React.JSX.El
               children: messageSettingsPanel,
             },
             { key: 'plugins', label: '插件', children: pluginSettingsPanel },
+            {
+              key: 'credentials',
+              label: '密钥配置',
+              children: (
+                <OverlayScrollbarsComponent className="settings-tab-panel" options={settingsScrollbarOptions}>
+                  <div className="settings-scroll-content">
+                    <CredentialSettings draft={credentialDraft} setDraft={setCredentialDraft} validateYoudao={core.client.validateYoudaoTranslation} />
+                  </div>
+                </OverlayScrollbarsComponent>
+              ),
+            },
           ]}
           tabPlacement="start"
           onChange={(key) => {
-            if (key !== 'general' && key !== 'messages' && key !== 'plugins') return
+            if (key !== 'general' && key !== 'messages' && key !== 'plugins' && key !== 'credentials') return
             selectSettingsTab(key)
           }}
         />

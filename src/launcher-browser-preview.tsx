@@ -293,6 +293,7 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
 const noMessages = { revision: '0', unreadCount: 0, messages: [] }
 
 const client: LauncherClient = {
+  validateYoudaoTranslation: async () => ({ valid: false, message: 'Preview mode' }),
   listenShown: async (handler) => {
     queueMicrotask(() => handler({
       invocationId: 'browser-preview',
