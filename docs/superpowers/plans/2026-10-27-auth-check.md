@@ -7,15 +7,19 @@
 ### Task 1: 独立认证测试插件
 **Files:** examples/public-plugins/com.uipilot.auth-check/{package/plugin.json,package/dist/runtime.js,tests/runtime.test.js,tests/sdk-contract.ts,README.md}；scripts/verify-local-foundation.test.mjs精确库存及当前版本断言。
 **Dependencies:** 设计固定合同、来源及验证章节；先读公开插件教程、UI规范及SDK。
-- [ ] 按固定合同实现本地status/显式request、固定凭据引用和静态结果，包内不出现自行构造的Authorization。
-- [ ] 离线模拟测试先失败再通过；SDK类型覆盖实际请求字段，拒绝明文getter/凭据对象。
-- [ ] README记录公开测试值、外部服务边界、少量人工请求、失败恢复及代理未执行原生请求；发现断言纳入新插件且校正过时版本常量。
+- [x] 按固定合同实现本地status/显式request、固定凭据引用和静态结果，包内不出现自行构造的Authorization。
+- [x] 离线模拟测试先失败再通过；SDK类型覆盖实际请求字段，拒绝明文getter/凭据对象。
+- [x] README记录公开测试值、外部服务边界、少量人工请求、失败恢复及代理未执行原生请求；发现断言纳入新插件且校正过时版本常量。
 **Distinct test coverage:** body/headers getter不得被访问；恶意错误message不进结果；空/status/未知输入不得发请求；每个request最多一次；HTTP401与网络错误区分，其他状态不能成功；真实Host结果不得由mock推断。
 **Verify:** node --test examples/public-plugins/com.uipilot.auth-check/tests/runtime.test.js；node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.auth-check/tests/sdk-contract.ts；node --test scripts/verify-local-foundation.test.mjs；现有CLI validate新package。
 
 ### Task 2: 打包与人工交付
 **Files:** .superpowers/deliveries/auth-check-1.0.0-acceptance（忽略目录）；本计划、总路线图。
 **Dependencies:** Task1完整切片审查通过。
-- [ ] 现有CLI打包、归档校验，输入前后稳定/包hash/旧Host与旧凭据包未变。
-- [ ] 三项短人工用例与交付证据，记录实际HTTPS仍待测。
+- [x] 现有CLI打包、归档校验，输入前后稳定/包hash/旧Host与旧凭据包未变。
+- [x] 三项短人工用例与交付证据，记录实际HTTPS仍待测。
 **Verify:** node packages/plugin-cli/dist/cli.mjs pack及validate（--platform windows --json），git diff --check、包hash与旧验收Hosthash核对。不重建或启动宿主。
+## 交付记录（2026-10-27）
+Task1源码ba5f9b2031a0a260ce0e97b88fbe71afd1b6233b，独立Spec/Quality审查PASS。离线runtime10/10、严格SDK类型exit0、发现脚本18/18、目录与最终归档validate均通过。Task2交付包3374字节，SHA256 67489fcbe0c43b9c19bb913a01ebe17fa454d1e8db314cdd852a70bd11d77213；8个打包输入前后不变，旧Host0.14.0与demo-credentials包哈希未变。
+
+交付目录为.superpowers/deliveries/auth-check-1.0.0-acceptance，包含plugins、manual-cases.zh-CN.md、evidence.json及前后输入快照。开发/打包任务完成；真实HTTPS人工验收仍待用户，不将离线结果计为原生通过。当前组为未配置状态、正确公开值200、错误值401及恢复200。后续为清除凭据、插件网络撤销/恢复。
