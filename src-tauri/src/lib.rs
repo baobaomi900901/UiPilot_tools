@@ -70,6 +70,9 @@ mod clipboard_history;
 mod screenshot;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod clipboard_image;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod public_plugins;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
