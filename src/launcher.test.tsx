@@ -7519,15 +7519,46 @@ describe('React view and accessibility', () => {
     await act(async () => button().click())
     expect(button().getAttribute('aria-pressed')).toBe('false')
     expect(button().getAttribute('aria-label')).toBe('重试置顶设置')
-    await act(async () => button().click())
+    expect(button().getAttribute('aria-keyshortcuts')).toBe('Control+t')
+    const shortcut = (repeat = false) => button().dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, repeat, bubbles: true, cancelable: true }))
+    await act(async () => { shortcut() })
     expect(setPinned).toHaveBeenLastCalledWith(true, true)
     expect(button().getAttribute('aria-pressed')).toBe('true')
-    await act(async () => button().click())
+    const calls = setPinned.mock.calls.length
+    await act(async () => { shortcut(true) })
+    expect(setPinned).toHaveBeenCalledTimes(calls)
+    await act(async () => { shortcut() })
     expect(setPinned).toHaveBeenLastCalledWith(true, false)
     expect(button().getAttribute('aria-pressed')).toBe('false')
     await act(async () => button().click())
     await act(async () => core.navigate('launcher'))
     expect(setPinned).toHaveBeenLastCalledWith(false, false)
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('leaves Ctrl+T to shortcut recording and ignores it outside settings', async () => {
+    installMatchMedia(false)
+    const { core, emit } = await startedCore(settingsFixture)
+    const setPinned = vi.fn<(active: boolean, pinned: boolean) => Promise<void>>().mockResolvedValue(undefined)
+    const mounted = await mountLauncherView(core, setPinned)
+    await act(async () => emit(shown('settings-pin-recording', 'settings')))
+    const button = mounted.host.querySelector<HTMLButtonElement>('.settings-header button[aria-pressed]')!
+    await vi.waitFor(() => expect(button.disabled).toBe(false))
+    const record = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="录制快捷键"]')!
+    await act(async () => record.click())
+    const calls = setPinned.mock.calls.length
+    await act(async () => document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 't', code: 'KeyT', ctrlKey: true, bubbles: true, cancelable: true,
+    })))
+    expect(setPinned).toHaveBeenCalledTimes(calls)
+    expect(button.getAttribute('aria-pressed')).toBe('false')
+    await act(async () => core.navigate('launcher'))
+    const afterExit = setPinned.mock.calls.length
+    await act(async () => mounted.host.querySelector('[role="combobox"]')?.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 't', ctrlKey: true, bubbles: true, cancelable: true,
+    })))
+    expect(setPinned).toHaveBeenCalledTimes(afterExit)
     await mounted.unmount()
     core.destroy()
   })

@@ -5,6 +5,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, typ
 import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
 import type { FileCategory, FileResultKind } from './protocol'
 import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
+import { isWindowPinShortcut } from './window-pin-shortcut'
 
 const CATEGORY_LABELS: Record<FileCategory, string> = {
   all: '全部', folder: '文件夹', excel: 'Excel', word: 'Word', ppt: 'PPT',
@@ -77,7 +78,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
-      if (event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.isComposing && event.key.toLowerCase() === 't') {
+      if (isWindowPinShortcut(event)) {
         event.preventDefault()
         event.stopPropagation()
         if (!event.repeat) core.setPinned(!core.getSnapshot().pinned)

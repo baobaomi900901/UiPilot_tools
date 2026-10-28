@@ -5,6 +5,7 @@ import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPluginWindowCore } from './plugin-window-core'
 import { PluginWindowView } from './plugin-window-view'
+import { WINDOW_PIN_SHORTCUT_EVENT } from './window-pin-shortcut'
 
 const pluginWindowViewSource = readFileSync('src/plugin-window-view.tsx', 'utf8')
 const stylesSource = readFileSync('src/styles.css', 'utf8')
@@ -47,8 +48,20 @@ describe('plugin window shell view', () => {
     await act(async () => pin?.click())
     expect(setPinned).toHaveBeenCalledWith({ pinned: true })
     expect(host.querySelector('button[aria-label="取消固定"]')?.getAttribute('aria-pressed')).toBe('true')
+    expect(pin?.getAttribute('aria-keyshortcuts')).toBe('Control+t')
+    await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true })))
+    expect(setPinned).toHaveBeenLastCalledWith({ pinned: false })
+    await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, repeat: true })))
+    expect(setPinned).toHaveBeenCalledTimes(2)
+    await act(async () => window.dispatchEvent(new Event(WINDOW_PIN_SHORTCUT_EVENT)))
+    expect(setPinned).toHaveBeenLastCalledWith({ pinned: true })
     await act(async () => closeButton?.click())
     expect(close).toHaveBeenCalledOnce()
+    await act(async () => root?.unmount())
+    root = undefined
+    window.dispatchEvent(new Event(WINDOW_PIN_SHORTCUT_EVENT))
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true }))
+    expect(setPinned).toHaveBeenCalledTimes(3)
     expect(pluginWindowViewSource).toContain("from 'lucide-react'")
     expect(pluginWindowViewSource).not.toContain('@ant-design/icons')
     expect(stylesSource).toMatch(

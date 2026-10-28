@@ -69,6 +69,7 @@ interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
 
 export { HOTKEY_RECORDING_CURRENT_DOM_EVENT } from './hotkey-recorder-input'
 import { HotkeyRecorderInput } from './hotkey-recorder-input'
+import { isWindowPinShortcut } from './window-pin-shortcut'
 
 const QUICKLINKS_STATUS_DURATION_MS = 2000
 const QUICKLINK_EDITOR_FOCUSABLE_SELECTOR = 'input:not(:disabled), textarea:not(:disabled), button:not(:disabled)'
@@ -1077,6 +1078,15 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     return true
   }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (isWindowPinShortcut(event.nativeEvent)) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!event.repeat && !snapshot.hidePending && !pinPending) {
+        if (pinError) setPinAttempt((attempt) => attempt + 1)
+        else setSettingsPin((pinned) => !pinned)
+      }
+      return
+    }
     const isComposing = composing(event)
     const primaryModifier = event.ctrlKey || event.metaKey
     if (
@@ -2240,10 +2250,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             <h1>设置</h1>
           </div>
           <AppVersion />
-          <Tooltip title={pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'}>
+          <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
             <Button
               aria-label={pinError ? '重试置顶设置' : appliedPin ? '取消置顶' : '置顶设置窗口'}
               aria-pressed={appliedPin}
+              aria-keyshortcuts="Control+t"
               disabled={snapshot.hidePending || pinPending}
               icon={appliedPin ? <Pin size={17} aria-hidden /> : <PinOff size={17} aria-hidden />}
               type={appliedPin ? 'primary' : 'text'}

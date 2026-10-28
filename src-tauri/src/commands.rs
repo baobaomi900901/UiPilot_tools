@@ -1996,6 +1996,31 @@ pub(crate) fn plugin_window_content_ack(
 }
 
 #[tauri::command]
+pub(crate) fn plugin_window_content_toggle_pin(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginWindowController>>,
+    session_generation: String,
+) -> Result<(), CommandError> {
+    let session = parse_canonical_nonzero_u64(&session_generation)
+        .ok_or(PublicPluginManagementError::InvalidCaller)?;
+    let lease = controller
+        .inner()
+        .begin_window_call(webview.label(), session, true)
+        .map_err(|_| PublicPluginManagementError::InvalidCaller)?;
+    let label = plugin_window::plugin_shell_label(&lease.owner().plugin_id)
+        .ok_or(PublicPluginManagementError::InvalidCaller)?;
+    let shell = app
+        .get_webview(&label)
+        .ok_or(PublicPluginManagementError::Unavailable)?;
+    // Route only to this plugin's trusted shell; content never receives native pin authority.
+    shell
+        .eval("window.dispatchEvent(new Event('uipilot-window-pin-shortcut'));")
+        .map_err(|_| PublicPluginManagementError::Unavailable)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) fn plugin_window_content_close(
     webview: tauri::Webview,
     app: AppHandle,
@@ -8456,6 +8481,11 @@ mod tests {
         let content_close = command_body("plugin_window_content_close");
         assert!(content_close.contains("webview.label()"));
         assert!(!content_close.contains("plugin_id:"));
+        let content_pin = command_body("plugin_window_content_toggle_pin");
+        assert!(content_pin.contains("begin_window_call(webview.label(), session, true)"));
+        assert!(content_pin.contains("plugin_shell_label(&lease.owner().plugin_id)"));
+        assert!(!content_pin.contains("plugin_id:"));
+        assert!(!content_pin.contains("label: String"));
         let commit = command_body("commit_plugin_window_transfer");
         let guard = commit.find("require_main_window(&window)?;").unwrap();
         let transfer = commit.find("plugin_window::commit(").unwrap();

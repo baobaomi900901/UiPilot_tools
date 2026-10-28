@@ -69,6 +69,7 @@ fn main() {
             "plugin_window_content_ready",
             "plugin_window_content_ack",
             "plugin_window_content_close",
+            "plugin_window_content_toggle_pin",
             "plugin_window_storage_get",
             "plugin_window_storage_set",
             "plugin_window_storage_remove",

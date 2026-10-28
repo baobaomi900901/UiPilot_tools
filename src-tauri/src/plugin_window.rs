@@ -1042,6 +1042,17 @@ pub(crate) const PUBLIC_CONTENT_BOOTSTRAP: &str = r#"
   let invoke = null;
   let readySent = false;
   let timerSession = null;
+  let pinShortcutPending = false;
+  document.addEventListener('keydown', (event) => {
+    if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.isComposing || event.key.toLowerCase() !== 't') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (event.repeat || pinShortcutPending || !invoke || !timerSession || !timerSession.active) return;
+    pinShortcutPending = true;
+    void invoke('plugin_window_content_toggle_pin', { sessionGeneration: timerSession.sessionGeneration })
+      .catch(() => {})
+      .finally(() => { pinShortcutPending = false; });
+  }, true);
   const U64_MAX = '18446744073709551615';
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;

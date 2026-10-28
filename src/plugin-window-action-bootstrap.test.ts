@@ -6,13 +6,37 @@ const template = (file: string, name: string) => readFileSync(file, 'utf8').matc
 const windowBridge = (enabled = true, result: () => Promise<any> = async () => ({ ok: true })) => {
   const invoke = vi.fn(async (command: string) => command === 'plugin_window_request' ? result() : undefined)
   const window: any = { __TAURI_INTERNALS__: { invoke } }
-  const document = { documentElement: { style: { setProperty() {} }, dataset: {} } }
+  const document = { addEventListener: vi.fn(), documentElement: { style: { setProperty() {} }, dataset: {} } }
   const source = template('src-tauri/src/plugin_window.rs', 'PUBLIC_CONTENT_BOOTSTRAP').replace('__PANEL_JSON__', json).replace('__WINDOW_ACTIONS__', String(enabled))
   vm.runInNewContext(source, { window, document, TextEncoder, Object, Reflect, Error, TypeError, Promise, WeakSet, setTimeout })
   const prepare = (session = '7', document = '1') => window.__UIPILOT_PLUGIN_TIMER_PREPARE__({ sessionGeneration: session, documentGeneration: document })
-  return { window, invoke, api: window.uipilotPluginWindow, prepare }
+  return { window, invoke, api: window.uipilotPluginWindow, prepare, document }
 }
 describe('window action executable bootstrap', () => {
+  it('routes Ctrl+T from plugin content through its current session and consumes held-key repeats', async () => {
+    const b = windowBridge()
+    const keydown = b.document.addEventListener.mock.calls.find(([type]) => type === 'keydown')![1]
+    const press = (extra = {}) => {
+      const event = { key: 't', ctrlKey: true, preventDefault: vi.fn(), stopImmediatePropagation: vi.fn(), ...extra }
+      keydown(event)
+      return event
+    }
+    press()
+    expect(b.invoke).not.toHaveBeenCalled()
+    b.prepare('7')
+    for (const extra of [{ repeat: true }, { shiftKey: true }, { altKey: true }, { metaKey: true }, { isComposing: true }, { ctrlKey: false }]) press(extra)
+    expect(b.invoke).not.toHaveBeenCalled()
+    const event = press()
+    press()
+    expect(event.preventDefault).toHaveBeenCalledOnce()
+    expect(event.stopImmediatePropagation).toHaveBeenCalledOnce()
+    expect(b.invoke).toHaveBeenCalledExactlyOnceWith('plugin_window_content_toggle_pin', { sessionGeneration: '7' })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    b.prepare('8')
+    press({ key: 'T' })
+    expect(b.invoke).toHaveBeenLastCalledWith('plugin_window_content_toggle_pin', { sessionGeneration: '8' })
+    expect(b.api.togglePinned).toBeUndefined()
+  })
   it('omits legacy property, installs a new bound capability before update and expires old timer/storage/request', async () => {
     expect(Object.prototype.hasOwnProperty.call(windowBridge(false).api, 'request')).toBe(false)
     const b = windowBridge()

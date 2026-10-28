@@ -5,7 +5,7 @@ function bridge(enabled = true, reply: () => Promise<any> = async () => ({ name:
  const source = readFileSync('src-tauri/src/plugin_window.rs','utf8').match(/PUBLIC_CONTENT_BOOTSTRAP: &str = r#"([\s\S]*?)"#;/)![1]!.replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js','utf8')).replace('__WINDOW_ACTIONS__','false').replaceAll('__FILES_OPEN__',String(enabled))
  const invoke = vi.fn(async (command: string) => command === 'plugin_window_open_text' ? reply() : undefined)
  const window: any = { __TAURI_INTERNALS__: { invoke } }
- vm.runInNewContext(source, {window,document:{documentElement:{style:{setProperty(){}}}},TextEncoder,Object,Reflect,Error,TypeError,Promise,WeakSet,setTimeout})
+ vm.runInNewContext(source, {window,document:{addEventListener(){},documentElement:{style:{setProperty(){}}}},TextEncoder,Object,Reflect,Error,TypeError,Promise,WeakSet,setTimeout})
  const prepare=(n='1')=>window.__UIPILOT_PLUGIN_TIMER_PREPARE__({sessionGeneration:n,documentGeneration:'1'})
  return { api: window.uipilotPluginWindow, window, invoke, prepare, async ready() { prepare();window.uipilotPluginWindow.onUpdate(()=>{});await window.__UIPILOT_PLUGIN_WINDOW_UPDATE__({requestId:'r',theme:'light'}) } }
 }
