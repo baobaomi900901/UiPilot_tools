@@ -126,6 +126,37 @@ describe('FindView', () => {
     expect(fake.client.hide).toHaveBeenCalledWith({ invocationId: 'inv-1', force: true })
   })
 
+  it('toggles pin with Ctrl+T from search and categories without repeating or changing the query', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    const input = host.querySelector<HTMLInputElement>('[role="combobox"]')!
+    const press = (target: Element, extra: KeyboardEventInit = {}) => {
+      const event = new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true, cancelable: true, ...extra })
+      target.dispatchEvent(event)
+      return event
+    }
+    await act(async () => { press(input) })
+    expect(fake.client.setPinned).not.toHaveBeenCalled()
+    await act(async () => fake.emitForward())
+    await act(async () => { expect(press(input).defaultPrevented).toBe(true) })
+    expect(fake.client.setPinned).toHaveBeenLastCalledWith({ invocationId: 'inv-1', pinned: true })
+    expect(host.querySelector('button[aria-label="取消固定"]')?.getAttribute('aria-keyshortcuts')).toBe('Control+t')
+    await act(async () => {
+      press(input, { repeat: true })
+      press(input, { shiftKey: true })
+      press(input, { altKey: true })
+      press(input, { metaKey: true })
+      press(input, { isComposing: true })
+      press(input, { ctrlKey: false })
+    })
+    expect(fake.client.setPinned).toHaveBeenCalledTimes(1)
+    await act(async () => { press(host.querySelector('.find-category')!, { key: 'T' }) })
+    expect(fake.client.setPinned).toHaveBeenLastCalledWith({ invocationId: 'inv-1', pinned: false })
+    expect(host.querySelector('button[aria-label="固定窗口"]')?.getAttribute('aria-pressed')).toBe('false')
+    expect(core.getSnapshot().query).toBe('quarterly')
+  })
+
   it('uses the shared UiPilot theme and semantic surface tokens', () => {
     expect(findViewSource).toContain("from './ui-theme'")
     expect(findViewSource).toContain('uiThemeConfig(scheme)')

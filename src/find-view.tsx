@@ -77,6 +77,12 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.isComposing && event.key.toLowerCase() === 't') {
+        event.preventDefault()
+        event.stopPropagation()
+        if (!event.repeat) core.setPinned(!core.getSnapshot().pinned)
+        return
+      }
       if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
         event.preventDefault()
         event.stopPropagation()
@@ -130,7 +136,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               onChange={(event) => core.setQuery(event.currentTarget.value)}
               onKeyDown={onKeyDown}
             />
-            <Tooltip title={snapshot.pinned ? '取消固定' : '固定窗口'}>
+            <Tooltip title={`${snapshot.pinned ? '取消固定' : '固定窗口'} (Ctrl+T)`}>
               <Button
                 className={snapshot.pinned ? 'find-icon-button is-selected' : 'find-icon-button'}
                 type="text"
@@ -144,6 +150,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                 )}
                 aria-label={snapshot.pinned ? '取消固定' : '固定窗口'}
                 aria-pressed={snapshot.pinned}
+                aria-keyshortcuts="Control+t"
                 tabIndex={-1}
                 disabled={disabled || snapshot.pinPending || !snapshot.invocationId}
                 onClick={() => core.setPinned(!snapshot.pinned)}
