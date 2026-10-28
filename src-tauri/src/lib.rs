@@ -44,6 +44,9 @@ mod quick_evaluation;
 mod browser_open;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod webview_reload_guard;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod web_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -422,6 +425,7 @@ pub fn run() {
 
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let builder = builder
+        .plugin(webview_reload_guard::init())
         .plugin(tauri_plugin_single_instance::init(
             move |app, _args, _cwd| {
                 let _ = single_instance_coordinator.request_show(app, ShowTarget::Launcher);
@@ -1705,6 +1709,10 @@ mod tests {
             ("model.rs", include_str!("model.rs")),
             ("result_registry.rs", include_str!("result_registry.rs")),
             ("find_window.rs", include_str!("find_window.rs")),
+            (
+                "webview_reload_guard.rs",
+                include_str!("webview_reload_guard.rs"),
+            ),
             ("settings.rs", include_str!("settings.rs")),
             ("plugins.rs", include_str!("plugins.rs")),
         ];
