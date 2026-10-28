@@ -67,6 +67,9 @@ mod result_registry;
 mod clipboard_history;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod screenshot;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod public_plugins;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
