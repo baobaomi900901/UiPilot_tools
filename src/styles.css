@@ -1224,7 +1224,7 @@ label,
 .settings-tabs .ant-tabs-tab-btn {
   width: 100%;
   text-align: left;
-  border-radius: var(--uipilot-ui-radius-sm);
+  border-radius: 0;
   padding: 0;
   margin-left: 0;
   font-size: var(--uipilot-ui-font-label);
@@ -2021,10 +2021,15 @@ label,
 
 .settings-tabs .ant-tabs.ant-tabs-left > .ant-tabs-nav .ant-tabs-tab {
   padding: 8px 10px;
-  border-radius: var(--uipilot-ui-radius-sm);
+  border-radius: 0;
 }
 
-.settings-tabs .ant-tabs .ant-tabs-tab.ant-tabs-tab-focus .ant-tabs-tab-btn:focus-visible,
+.settings-tabs .ant-tabs-tab-btn:focus-visible,
+.settings-tabs .ant-tabs .ant-tabs-tab.ant-tabs-tab-focus .ant-tabs-tab-btn:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
 .settings-view .ant-btn:focus-visible,
 .plugin-window-shell .ant-btn:focus-visible,
 .find-icon-button.ant-btn:focus-visible {
