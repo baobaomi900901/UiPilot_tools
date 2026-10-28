@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-release-screenshot-image"
+description = "Enables the release_screenshot_image command without any pre-configured scope."
+commands.allow = ["release_screenshot_image"]
+
+[[permission]]
+identifier = "deny-release-screenshot-image"
+description = "Denies the release_screenshot_image command without any pre-configured scope."
+commands.deny = ["release_screenshot_image"]
