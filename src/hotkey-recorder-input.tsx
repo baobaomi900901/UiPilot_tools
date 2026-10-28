@@ -1,14 +1,29 @@
 import { Button, Input, type InputRef } from 'antd'
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { formatHotkeyDisplay, reduceHotkeyRecorder, type RecorderState } from './hotkey-recorder'
 import type { HotkeyRecordingPhase } from './launcher-core'
 export const HOTKEY_RECORDING_CURRENT_DOM_EVENT = 'uipilot-hotkey-recording-current'
 const noopPhase = (_phase: HotkeyRecordingPhase) => {}
 
+// The native suppression flag belongs to the main window, so all its recorder
+// instances share one lease, including while IPC is arming or releasing it.
+let recordingOwner: { id: symbol; releasing: boolean } | undefined
+const ownerListeners = new Set<() => void>()
+const subscribeOwner = (listener: () => void) => {
+  ownerListeners.add(listener)
+  return () => { ownerListeners.delete(listener) }
+}
+const getOwner = () => recordingOwner
+function publishOwner(owner: typeof recordingOwner): void {
+  recordingOwner = owner
+  ownerListeners.forEach((listener) => listener())
+}
+
 interface HotkeyRecorderInputProps {
   onCommit: (canonical: string) => void | Promise<void>
-  onRecordingPhase?: (phase: HotkeyRecordingPhase) => void
+  onRecordingPhase?: (phase: HotkeyRecordingPhase) => void | Promise<void>
   allowDoubleTap?: boolean
+  allowSameValue?: boolean
   label?: string
   value: string
   disabled?: boolean
@@ -16,14 +31,29 @@ interface HotkeyRecorderInputProps {
   name?: string
 }
 
-export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, allowDoubleTap = true, label = '快捷键', value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
+export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, allowDoubleTap = true, allowSameValue = false, label = '快捷键', value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
+  const [ownerId] = useState(() => Symbol('hotkey-recorder'))
+  const owner = useSyncExternalStore(subscribeOwner, getOwner, getOwner)
+  const blockedByOwner = owner !== undefined && (owner.id !== ownerId || owner.releasing)
   const [recorderState, setRecorderState] = useState<RecorderState>(() => ({ status: 'idle', baseline: value }))
+  const [arming, setArming] = useState(false)
+  const [armingFailed, setArmingFailed] = useState(false)
+  const armRevision = useRef(0)
   const recorderStateRef = useRef(recorderState)
   const inputRef = useRef<InputRef>(null)
   const actionRef = useRef<HTMLButtonElement>(null)
   const returnFocusToAction = useRef(false)
   const pendingCommit = useRef<{ canonical: string; finalState: RecorderState } | undefined>(undefined)
   const recording = recorderState.status === 'recording'
+
+  const releaseRecording = useCallback((phase: 'idle' | 'completed') => {
+    if (recordingOwner?.id !== ownerId || recordingOwner.releasing) return
+    publishOwner({ id: ownerId, releasing: true })
+    void (async () => {
+      try { await onRecordingPhase(phase) } catch { /* The next arm retries host synchronization. */ }
+      finally { if (recordingOwner?.id === ownerId) publishOwner(undefined) }
+    })()
+  }, [onRecordingPhase, ownerId])
 
   const updateRecorderState = useCallback((next: RecorderState) => {
     recorderStateRef.current = next
@@ -36,19 +66,19 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
     updateRecorderState({ status: 'idle', baseline: value, pendingTap: undefined })
   }, [updateRecorderState, value])
 
-  useEffect(() => () => onRecordingPhase('idle'), [onRecordingPhase])
+  useEffect(() => () => { armRevision.current += 1; releaseRecording('idle') }, [releaseRecording])
 
   useEffect(() => {
     const completeCurrentHotkeyRecording = (event: Event) => {
       const canonical = (event as CustomEvent<unknown>).detail
       if (typeof canonical === 'string' && (!allowDoubleTap && canonical.startsWith('Double'))) return
-      if (recorderStateRef.current.status !== 'recording') return
+      if (recorderStateRef.current.status !== 'recording' || recordingOwner?.id !== ownerId || recordingOwner.releasing) return
       pendingCommit.current = undefined
       returnFocusToAction.current = true
-      onRecordingPhase(typeof canonical === 'string' ? 'completed' : 'idle')
+      releaseRecording(typeof canonical === 'string' ? 'completed' : 'idle')
       if (typeof canonical === 'string') {
         updateRecorderState({ status: 'idle', baseline: canonical })
-        if (canonical !== value) void onCommit(canonical)
+        if (canonical !== value || allowSameValue) void onCommit(canonical)
         return
       }
       updateRecorderState(
@@ -59,7 +89,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
     return () => {
       window.removeEventListener(HOTKEY_RECORDING_CURRENT_DOM_EVENT, completeCurrentHotkeyRecording)
     }
-  }, [onRecordingPhase, onCommit, allowDoubleTap, value, updateRecorderState])
+  }, [releaseRecording, ownerId, onCommit, allowDoubleTap, allowSameValue, value, updateRecorderState])
 
   const display =
     recording ? '按下快捷键…' : value ? formatHotkeyDisplay(value) : '未设置'
@@ -69,26 +99,46 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
       inputRef.current?.input?.focus()
       return
     }
-    if (!disabled && returnFocusToAction.current) {
+    if (!disabled && !blockedByOwner && returnFocusToAction.current) {
       returnFocusToAction.current = false
       actionRef.current?.focus()
     }
-  }, [disabled, recording])
+  }, [disabled, blockedByOwner, recording])
 
-  const toggleRecording = useCallback(() => {
+  const toggleRecording = useCallback(async () => {
     if (disabled) return
+    if (recording) {
+      releaseRecording('idle')
+      updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state)
+      return
+    }
+    // Reserve synchronously: two clicks in one render cannot both arm the host.
+    if (recordingOwner) return
+    publishOwner({ id: ownerId, releasing: false })
     pendingCommit.current = undefined
-    onRecordingPhase(recording ? 'idle' : 'recording')
+    const revision = ++armRevision.current
+    setArmingFailed(false)
+    setArming(true)
+    try {
+      await onRecordingPhase('recording')
+    } catch {
+      releaseRecording('idle')
+      if (armRevision.current === revision) { setArming(false); setArmingFailed(true) }
+      return
+    }
+    const currentOwner = getOwner()
+    if (armRevision.current !== revision || currentOwner?.id !== ownerId || currentOwner.releasing) return
+    setArming(false)
     updateRecorderState(reduceHotkeyRecorder(
       recorderStateRef.current,
-      recording ? { type: 'cancel' } : { type: 'start', baseline: value },
+      { type: 'start', baseline: value },
     ).state)
-  }, [onRecordingPhase, disabled, recording, updateRecorderState, value])
+  }, [onRecordingPhase, releaseRecording, ownerId, disabled, recording, updateRecorderState, value])
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Tab') {
       pendingCommit.current = undefined
-      onRecordingPhase('idle')
+      releaseRecording('idle')
       updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state)
       event.stopPropagation()
       return
@@ -98,7 +148,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
     if (event.key === 'Escape') {
       pendingCommit.current = undefined
       returnFocusToAction.current = true
-      onRecordingPhase('idle')
+      releaseRecording('idle')
       updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'cancel' }).state)
       return
     }
@@ -116,9 +166,9 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
       allowDoubleTap,
     })
     if (result.commit) {
-      if (result.commit === value) {
+      if (result.commit === value && !allowSameValue) {
         returnFocusToAction.current = true
-        onRecordingPhase('completed')
+        releaseRecording('completed')
         updateRecorderState(result.state)
         return
       }
@@ -136,7 +186,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
     if (!pending) return
     pendingCommit.current = undefined
     returnFocusToAction.current = true
-    onRecordingPhase('completed')
+    releaseRecording('completed')
     updateRecorderState(pending.finalState)
     void onCommit(pending.canonical)
   }
@@ -150,20 +200,21 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
         value={display}
         id={id}
         name={name}
-        disabled={disabled || !recording}
+        disabled={disabled || !recording || blockedByOwner}
         tabIndex={recording ? 0 : -1}
         onBlur={() => {
           if (recorderStateRef.current.status !== 'recording') return
           pendingCommit.current = undefined
-          onRecordingPhase('idle')
+          releaseRecording('idle')
           updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'blur' }).state)
         }}
         onKeyDown={handleKeyDown}
         onKeyUp={handleKeyUp}
       />
-      <Button ref={actionRef} aria-label={`录制${label}`} disabled={disabled} onClick={toggleRecording}>
+      <Button ref={actionRef} aria-label={`录制${label}`} disabled={disabled || arming || blockedByOwner} onClick={() => void toggleRecording()}>
         {recording ? '取消录制' : '重新录制'}
       </Button>
+      {armingFailed && <span role="status">无法开始录制，请重试。</span>}
     </div>
   )
 }

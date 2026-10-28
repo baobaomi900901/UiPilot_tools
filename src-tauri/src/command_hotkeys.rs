@@ -230,16 +230,24 @@ pub(crate) fn saved_matches(settings: &Settings, entry: &CommandEntry) -> bool {
 }
 pub(crate) fn launcher_conflicts(settings: &Settings, chord: &str) -> bool {
     settings
-        .public_plugin_command_hotkeys
-        .values()
-        .any(|commands| {
-            commands
-                .values()
-                .any(|saved| HotkeyKind::parse(saved).is_ok_and(|h| h.canonical() == chord))
-        })
+        .screenshot_hotkey
+        .as_deref()
+        .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
+        || settings
+            .public_plugin_command_hotkeys
+            .values()
+            .any(|commands| {
+                commands
+                    .values()
+                    .any(|saved| HotkeyKind::parse(saved).is_ok_and(|h| h.canonical() == chord))
+            })
 }
 pub(crate) fn conflicts(settings: &Settings, plugin: &str, command: &str, chord: &str) -> bool {
     HotkeyKind::parse(&settings.hotkey).is_ok_and(|h| h.canonical() == chord)
+        || settings
+            .screenshot_hotkey
+            .as_deref()
+            .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
         || settings
             .public_plugin_command_hotkeys
             .iter()
@@ -255,6 +263,16 @@ pub(crate) fn conflicts(settings: &Settings, plugin: &str, command: &str, chord:
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::BTreeSet};
+    #[test]
+    fn screenshot_saved_chord_conflicts_with_launcher_and_plugin() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "hotkey": "Alt+Space", "autostart": false, "screenshotHotkey": "Ctrl+P"
+        }))
+        .unwrap();
+        let chord = command_chord("Ctrl+P").unwrap().to_string();
+        assert!(launcher_conflicts(&settings, &chord));
+        assert!(conflicts(&settings, "com.example.a", "default", &chord));
+    }
     #[test]
     fn command_hotkey_uncertain_retry_cleans_real_ids_without_phantom_removed_ids() {
         use std::cell::Cell;

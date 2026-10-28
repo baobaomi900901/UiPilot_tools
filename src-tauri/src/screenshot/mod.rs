@@ -1,8 +1,11 @@
-pub mod geometry;
-pub mod model;
-pub mod selection;
-pub mod output;
+pub(crate) mod commands;
 pub(crate) mod display_gate;
-pub(crate) mod service;
+pub mod geometry;
+pub(crate) mod hotkey;
+pub mod model;
+pub mod output;
+pub mod selection;
+pub mod service;
+pub(crate) mod window;
 #[cfg(windows)]
 pub(crate) mod windows;

@@ -16,7 +16,7 @@ import {
   type InputProps,
   type InputRef,
 } from 'antd'
-import { ArrowLeft, ArrowRightLeft, Calculator, Calendar, Clock, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Pin, PinOff, Plus, Ruler, Save, Search, Settings, Star, Trash2, X } from 'lucide-react'
+import { ArrowLeft, ArrowRightLeft, Calculator, Calendar, Clock, FolderSearch, ImageIcon, Link2, PanelsTopLeft, Pin, PinOff, Plus, Ruler, Save, ScanLine, Search, Settings, Star, Trash2, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -204,10 +204,10 @@ function BuiltInResultIcon({ kind }: { kind: ResultIconKind }) {
       </span>
     )
   }
-  if (kind === 'find' || kind === 'quicklinks') {
-    const Icon = kind === 'find' ? FolderSearch : Link2
+  if (kind === 'find' || kind === 'quicklinks' || kind === 'screenshot') {
+    const Icon = kind === 'screenshot' ? ScanLine : kind === 'find' ? FolderSearch : Link2
     return (
-      <span className={`built-in-result-icon built-in-result-icon-${kind}`} data-result-icon-kind={kind}>
+      <span className={`built-in-result-icon built-in-result-icon-${kind === 'screenshot' ? 'find' : kind}`} data-result-icon-kind={kind}>
         <Icon aria-hidden size={26} strokeWidth={1.8} />
       </span>
     )
@@ -339,7 +339,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const hotkeyRecordingActive = useRef(false)
   const handleHotkeyRecordingPhase = useCallback((phase: HotkeyRecordingPhase) => {
     hotkeyRecordingActive.current = phase === 'recording'
-    core.setHotkeyRecordingPhase(phase)
+    return core.setHotkeyRecordingPhase(phase)
   }, [core])
   useEffect(() => {
     if (snapshot.view !== 'settings') return
@@ -1961,6 +1961,20 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 name={`settings-hotkey-${settings.hotkey.key}`}
                 disabled={locked}
               />
+            </Form.Item>
+            <Form.Item label="截图快捷键" htmlFor="settings-screenshot-hotkey" help={settings.screenshotHotkeyStatus === 'unavailable' ? '快捷键不可用，请重新录制或清除后重试。' : settings.screenshotHotkeyStatus === 'active' ? '已启用' : '未设置'}>
+              <HotkeyRecorderInput
+                label="截图快捷键"
+                id="settings-screenshot-hotkey"
+                name="settings-screenshot-hotkey"
+                allowDoubleTap={false}
+                allowSameValue={settings.screenshotHotkeyStatus === 'unavailable'}
+                value={settings.screenshotHotkey ?? ''}
+                disabled={locked}
+                onCommit={core.saveScreenshotHotkey}
+                onRecordingPhase={handleHotkeyRecordingPhase}
+              />
+              <Button aria-label="清除截图快捷键" disabled={locked || settings.screenshotHotkey === null} onClick={() => void core.saveScreenshotHotkey(null)}>清除</Button>
             </Form.Item>
             <Checkbox
               checked={settings.autostart}

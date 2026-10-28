@@ -424,7 +424,7 @@ pub(crate) fn valid_quicklink_command(command: &str) -> bool {
 }
 
 pub(crate) fn reserved_quicklink_command(command: &str) -> bool {
-    matches!(command, "find" | "quicklinks" | "web-search")
+    matches!(command, "find" | "quicklinks" | "screenshot" | "web-search")
 }
 
 pub(crate) fn expand_template(template: &str, query: &str) -> Result<Url, QuicklinkErrorCode> {

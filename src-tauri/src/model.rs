@@ -7,6 +7,7 @@ use crate::settings::BuiltinFeature;
 pub(crate) enum ResultIconKind {
     Find,
     Quicklinks,
+    Screenshot,
     Calculator,
     Currency,
     Date,
@@ -95,6 +96,7 @@ pub(crate) enum LauncherResultActivation {
         favorite: bool,
     },
     OpenQuicklinks,
+    OpenScreenshot,
     OpenFind {
         query: String,
     },

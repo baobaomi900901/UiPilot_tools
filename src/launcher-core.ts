@@ -100,7 +100,8 @@ export interface LauncherCore {
   readonly setWebSearchEngine: (engine: WebSearchEngine) => void
   readonly setHotkeyCanonical: (value: string) => void
   readonly commandHotkeyEntry: (payload: unknown) => void
-  readonly setHotkeyRecordingPhase: (phase: HotkeyRecordingPhase) => void
+  readonly setHotkeyRecordingPhase: (phase: HotkeyRecordingPhase) => Promise<void>
+  readonly saveScreenshotHotkey: (value: string | null) => Promise<void>
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly clearMessages: () => Promise<void>
   readonly setFileCategory: (category: FileCategory) => void
@@ -257,6 +258,8 @@ interface TextControl {
 
 interface PrivateSettings {
   hotkey: TextControl
+  screenshotHotkey: string | null
+  screenshotHotkeyStatus: 'unset' | 'active' | 'unavailable'
   autostart: boolean
   webSearchEngine: WebSearchEngine
 }
@@ -487,7 +490,7 @@ function safeApplicationIcon(value: unknown): string | undefined {
 }
 
 function safeResultIconKind(value: unknown): ResultIconKind | undefined {
-  return value === 'find' || value === 'quicklinks' || value === 'calculator' || value === 'currency' || value === 'date' || value === 'timeZone' || value === 'unit' || value === 'webSearch'
+  return value === 'find' || value === 'quicklinks' || value === 'screenshot' || value === 'calculator' || value === 'currency' || value === 'date' || value === 'timeZone' || value === 'unit' || value === 'webSearch'
     ? value
     : undefined
 }
@@ -514,7 +517,7 @@ function safeResultFavorite(value: unknown): ResultFavorite | undefined {
   }
   if (target?.kind === 'builtin') {
     const record = exactPlainRecord(target, ['feature', 'kind'])
-    return record && (record.feature === 'find' || record.feature === 'quicklinks' || record.feature === 'webSearch')
+    return record && (record.feature === 'find' || record.feature === 'quicklinks' || record.feature === 'screenshot' || record.feature === 'webSearch')
       ? { target: { kind: 'builtin', feature: record.feature }, favorite: favorite.favorite }
       : undefined
   }
@@ -553,6 +556,9 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
   }
   if (candidate?.kind === 'openQuicklinks') {
     return exactPlainRecord(value, ['kind']) ? { kind: 'openQuicklinks' } : undefined
+  }
+  if (candidate?.kind === 'openScreenshot') {
+    return exactPlainRecord(value, ['kind']) ? { kind: 'openScreenshot' } : undefined
   }
   if (candidate?.kind === 'completion') {
     const record = exactPlainRecord(value, ['completionText', 'kind'])
@@ -677,6 +683,9 @@ function favoriteMatchesResult(
   if (favorite.target.feature === 'quicklinks') {
     return activation.kind === 'openQuicklinks'
   }
+  if (favorite.target.feature === 'screenshot') {
+    return activation.kind === 'openScreenshot' && iconKind === 'screenshot'
+  }
   return iconKind === 'webSearch' &&
     (activation.kind === 'completion' || activation.kind === 'executeResult')
 }
@@ -751,6 +760,8 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   const settings = model.settings
     ? Object.freeze({
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
+        screenshotHotkey: model.settings.screenshotHotkey,
+        screenshotHotkeyStatus: model.settings.screenshotHotkeyStatus,
         autostart: model.settings.autostart,
         theme: model.theme,
         webSearchEngine: model.settings.webSearchEngine,
@@ -912,6 +923,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let started = false
   let unlisten: (() => void) | undefined
   let unlistenHidden: (() => void) | undefined
+  let unlistenScreenshotError: (() => void) | undefined
   let unlistenPanelError: (() => void) | undefined
   let unlistenPanelReset: (() => void) | undefined
   let unlistenPanelFocusHostInput: (() => void) | undefined
@@ -931,6 +943,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let quicklinksOperationToken = 0
   let slashSearchTimer: ReturnType<typeof setTimeout> | undefined
   let executeToken = 0
+  let screenshotExecutionToken: number | undefined
   let hideToken = 0
   let resultKey = 1
   let controlKey = 2
@@ -1028,6 +1041,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     model.settings = {
       hotkey: newTextControl(view.hotkey),
+      screenshotHotkey: view.screenshotHotkey,
+      screenshotHotkeyStatus: view.screenshotHotkeyStatus,
       autostart: view.autostart,
       webSearchEngine: view.webSearchEngine,
     }
@@ -2130,6 +2145,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           ...(favorite === undefined ? {} : { favorite }),
           ...(item.hasDefaultAction === undefined ? {} : { hasDefaultAction: item.hasDefaultAction }),
           ...(actionMetadata === undefined ? {} : actionMetadata),
+          ...(activation.kind === 'openScreenshot' ? {
+            actions: [{ actionId: 'screenshot-region', title: '区域截图' }, { actionId: 'screenshot-window', title: '窗口截图' }],
+            defaultActionId: 'screenshot-region',
+          } : {}),
         }]
       })
       model.results = applications
@@ -2993,6 +3012,19 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     finishSettingsMutation(operation, false)
   }
 
+  async function saveScreenshotHotkey(value: string | null): Promise<void> {
+    if (!settingsEditable() || !model.settings) return
+    const operation = startSettingsOperation('hotkey')
+    if (!operation) return
+    try {
+      await client.setScreenshotHotkey({ input: { hotkey: value } })
+    } catch (error) {
+      finishSettingsMutation(operation, true, error)
+      return
+    }
+    finishSettingsMutation(operation, false)
+  }
+
   function discardPanelUi(): boolean {
     pendingPanelFocusRequest = undefined
     panelHostKeyEpoch = undefined
@@ -3058,22 +3090,28 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(retiredActions || discardedPanel || discardedQuicklinks || wasHiding || resetView)
   }
 
-  function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): void {
-    if (destroyed) return
+  let recordingQueue: Promise<void> = Promise.resolve()
+  function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): Promise<void> {
+    // Arm the host before the shared recorder accepts input. Sequential IPC also
+    // prevents a late start response from undoing a subsequent cancellation.
+    recordingQueue = recordingQueue.catch(() => {}).then(() => client.setHotkeyRecording({ recording: phase === 'recording' }))
+    const armed = phase === 'recording' ? recordingQueue : recordingQueue.catch(() => {})
+    if (destroyed) return armed
     if (phase === 'recording' && model.view === 'settings') {
       hotkeyRecording = true
       hotkeyShowConsumedDuringRecording = false
       hotkeyShowGraceUntil = 0
-      return
+      return armed
     }
     if (phase === 'completed' && hotkeyRecording) {
       hotkeyRecording = false
       hotkeyShowGraceUntil = Date.now() + HOTKEY_RECORDING_SHOW_GRACE_MS
-      return
+      return armed
     }
     hotkeyRecording = false
     hotkeyShowConsumedDuringRecording = false
     hotkeyShowGraceUntil = 0
+    return armed
   }
 
   function resetPanelUi(status = ''): void {
@@ -3483,6 +3521,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const changed = requestId !== undefined || resultActionOwner !== undefined || model.resultActionMenu !== undefined
     resultActionSource = undefined
     model.resultActionMenu = undefined
+    if (screenshotExecutionToken !== undefined) {
+      screenshotExecutionToken = undefined
+      executeToken = ++token
+      model.executePending = false
+    }
     if (resultActionOwner) {
       resultActionOwner = undefined
       executeToken = ++token
@@ -3503,7 +3546,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         !Number.isInteger(index) || model.executePending || model.resultActionsDisabled) return
     const result = model.results[index]
     if (!result?.actions?.length || !resultActionSource || model.requestId !== resultActionSource) return
-    invalidateFavoriteInteraction()
+    if (result.favorite) openPluginContextMenu(index)
+    else invalidateFavoriteInteraction()
     model.selectedIndex = index
     model.resultActionMenu = Object.freeze({ resultKey: result.key })
     publish(true)
@@ -3512,6 +3556,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function closeResultActionMenu(): void {
     if (!model.resultActionMenu) return
     model.resultActionMenu = undefined
+    closePluginContextMenu()
     publish(true)
   }
 
@@ -3539,7 +3584,39 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
   }
 
+  function executeScreenshot(index: number, mode: 'region' | 'window'): void {
+    if (destroyed || sequenceExhausted || model.view !== 'launcher' || model.launcherMode !== 'applications' ||
+        model.executePending || model.hidePending || model.searchPending || model.resultActionsDisabled ||
+        !model.invocationId || !model.requestId || model.requestId !== resultActionSource ||
+        model.query !== model.queryControlValue || model.results[index]?.activation.kind !== 'openScreenshot') return
+    const owner = { token: ++token, epoch: model.viewEpoch, invocationId: model.invocationId, sequence: model.querySequence }
+    executeToken = owner.token
+    screenshotExecutionToken = owner.token
+    model.executePending = true
+    model.resultActionMenu = undefined
+    model.status = ''
+    publish(true)
+    const finish = (failed: boolean): void => {
+      if (destroyed || executeToken !== owner.token || model.viewEpoch !== owner.epoch ||
+          model.invocationId !== owner.invocationId || model.querySequence !== owner.sequence) return
+      model.executePending = false
+      screenshotExecutionToken = undefined
+      if (failed) model.status = '截图未能启动，请重试'
+      publish(true)
+    }
+    let pending: Promise<void>
+    try { pending = client.startScreenshot({ mode, invocationId: owner.invocationId, querySequence: owner.sequence }) }
+    catch (error) { pending = Promise.reject(error) }
+    void pending.then(() => finish(false), () => finish(true))
+  }
+
   function executeResultAction(index: number, actionId: string): void {
+    if (model.results[index]?.activation.kind === 'openScreenshot') {
+      if (actionId === 'screenshot-region' || actionId === 'screenshot-window') {
+        executeScreenshot(index, actionId === 'screenshot-window' ? 'window' : 'region')
+      }
+      return
+    }
     const command = model.mainResultCommand
     const row = model.results[index]
     const requestId = model.requestId
@@ -4039,16 +4116,26 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     let hiddenRegistered: (() => void) | undefined
     let panelErrorsRegistered: (() => void) | undefined
     let panelResetsRegistered: (() => void) | undefined
+    let screenshotErrorsRegistered: (() => void) | undefined
     try {
       registered = await client.listenShown(shown)
       hiddenRegistered = await client.listenHidden(hidden)
       panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
       panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
+      screenshotErrorsRegistered = await client.listenScreenshotError((payload) => {
+        const error = exactPlainRecord(payload, ['code', 'invocationId', 'querySequence'])
+        if (destroyed || !error || typeof error.code !== 'string' || model.view !== 'launcher' ||
+            error.invocationId !== model.invocationId || error.querySequence !== model.querySequence) return
+        model.status = error.code === 'resourceLimit' ? '截图超出内存限制，请缩小范围后重试'
+          : error.code === 'layoutChanged' ? '显示配置已变化，请重新截图' : '截图未能完成，请重试'
+        publish(true)
+      })
     } catch {
       registered?.()
       hiddenRegistered?.()
       panelErrorsRegistered?.()
       panelResetsRegistered?.()
+      screenshotErrorsRegistered?.()
       unlistenPanelFocusHostInput?.()
       unlistenPanelFocusHostInput = undefined
       failInitialization()
@@ -4059,12 +4146,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hiddenRegistered()
       panelErrorsRegistered()
       panelResetsRegistered()
+      screenshotErrorsRegistered()
       return
     }
     unlisten = registered
     unlistenHidden = hiddenRegistered
     unlistenPanelError = panelErrorsRegistered
     unlistenPanelReset = panelResetsRegistered
+    unlistenScreenshotError = screenshotErrorsRegistered
     await messageCenter.start()
     if (destroyed) return
     const operation = startSettingsOperation('load', {
@@ -4122,6 +4211,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlisten = undefined
     unlistenHidden?.()
     unlistenHidden = undefined
+    unlistenScreenshotError?.()
+    unlistenScreenshotError = undefined
     unlistenPanelError?.()
     unlistenPanelError = undefined
     unlistenPanelReset?.()
@@ -4266,6 +4357,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     commandHotkeyEntry,
     setHotkeyRecordingPhase,
     saveHotkeyCanonical,
+    saveScreenshotHotkey,
     clearMessages,
     setFileCategory,
     cycleFileCategory,

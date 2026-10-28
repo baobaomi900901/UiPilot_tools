@@ -166,6 +166,8 @@ pub(crate) enum HideReason {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SettingsView {
     hotkey: String,
+    screenshot_hotkey: Option<String>,
+    screenshot_hotkey_status: &'static str,
     autostart: bool,
     file_preview_enabled: bool,
     theme: ThemePreference,
@@ -1303,6 +1305,71 @@ pub(crate) struct CommandEntryResolution {
 fn command_hotkey_access<T>(label: &str, protected: impl FnOnce() -> T) -> Result<T, CommandError> {
     require_main_label(label)?;
     Ok(protected())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ScreenshotHotkeyInput {
+    #[serde(deserialize_with = "deserialize_nullable_hotkey")]
+    hotkey: Option<String>,
+}
+
+#[tauri::command]
+pub(crate) async fn set_screenshot_hotkey(
+    window: WebviewWindow,
+    input: ScreenshotHotkeyInput,
+) -> Result<(), CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    let replacement = input
+        .hotkey
+        .as_deref()
+        .map(crate::hotkey::command_chord)
+        .transpose()
+        .map_err(|_| CommandError::settings_failed())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+        let _critical = coordinator
+            .reserve_critical()
+            .map_err(|_| CommandError::settings_failed())?;
+        let _operation = coordinator
+            .lock_hotkey_operation()
+            .map_err(|_| CommandError::settings_failed())?;
+        let settings = app.state::<SettingsStore>();
+        let canonical = replacement.map(|s| s.to_string());
+        if canonical
+            .as_deref()
+            .is_some_and(|s| crate::screenshot::hotkey::conflicts(&settings.snapshot(), s))
+        {
+            return Err(CommandError::hotkey_conflict());
+        }
+        let native = app.global_shortcut();
+        coordinator
+            .screenshot_hotkeys
+            .edit(
+                replacement,
+                &mut |s| native.register(s).map_err(|_| ()),
+                &mut |s| native.unregister(s).map_err(|_| ()),
+                || settings.set_screenshot_hotkey(canonical).map_err(|_| ()),
+            )
+            .map_err(|_| CommandError::settings_failed())
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+}
+
+#[tauri::command]
+pub(crate) async fn set_hotkey_recording(
+    window: WebviewWindow,
+    recording: bool,
+) -> Result<(), CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Arc<LifecycleCoordinator>>()
+            .set_hotkey_recording(recording)
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+    .map_err(|_| CommandError::settings_failed())
 }
 
 #[tauri::command]
@@ -4447,13 +4514,39 @@ fn quicklinks_result(favorite: bool) -> (crate::model::ResultItem, Option<Result
     )
 }
 
+fn screenshot_result(favorite: bool) -> (crate::model::ResultItem, Option<ResultAction>) {
+    (
+        crate::model::ResultItem {
+            result_actions: None,
+            result_id: String::new(),
+            activation: LauncherResultActivation::OpenScreenshot,
+            title: "/screenshot".into(),
+            subtitle: Some("截图 · 框选桌面区域或选择窗口".into()),
+            icon: None,
+            plugin_icon_url: None,
+            icon_kind: Some(ResultIconKind::Screenshot),
+            detail: None,
+            favorite: Some(ResultFavorite::builtin(
+                BuiltinFeature::Screenshot,
+                favorite,
+            )),
+            has_default_action: true,
+        },
+        None,
+    )
+}
+
 fn builtin_prefix_results(
     prefix: &str,
     find_favorite: bool,
     quicklinks_favorite: bool,
     web_search_favorite: bool,
+    screenshot_favorite: bool,
 ) -> Vec<(crate::model::ResultItem, Option<ResultAction>)> {
     let mut entries = Vec::new();
+    if "screenshot".starts_with(prefix) {
+        entries.push(screenshot_result(screenshot_favorite));
+    }
     if "find".starts_with(prefix) {
         entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
     }
@@ -4926,11 +5019,17 @@ where
     let web_search_favorite = request
         .favorite_builtin_features
         .contains(&BuiltinFeature::WebSearch);
+    let screenshot_favorite = request
+        .favorite_builtin_features
+        .contains(&BuiltinFeature::Screenshot);
     if query == "/find" {
         entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
         replace_local_results = true;
     } else if query == "/quicklinks" {
         entries.push(quicklinks_result(quicklinks_favorite));
+        replace_local_results = true;
+    } else if query == "/screenshot" {
+        entries.push(screenshot_result(screenshot_favorite));
         replace_local_results = true;
     } else if query == "/web-search" {
         command_hint = Some("请输入搜索内容".into());
@@ -4968,6 +5067,7 @@ where
             find_favorite,
             quicklinks_favorite,
             web_search_favorite,
+            screenshot_favorite,
         ));
         entries.extend(
             plugin_catalog(prefix)
@@ -4990,6 +5090,7 @@ where
         if catalog_query.is_empty() {
             entries.push(find_result(String::new(), "搜索文件".into(), find_favorite));
             entries.push(quicklinks_result(quicklinks_favorite));
+            entries.push(screenshot_result(screenshot_favorite));
             entries.extend(builtin_completion_result(
                 "web-search",
                 "使用默认搜索引擎搜索".into(),
@@ -4999,6 +5100,10 @@ where
             ));
         } else {
             let mut applications = snapshot();
+            let normalized_query = catalog_query.to_lowercase();
+            if "screenshot".contains(&normalized_query) || "截图".contains(&normalized_query) {
+                entries.push(screenshot_result(screenshot_favorite));
+            }
             decorate(&mut applications);
             entries.extend(
                 apps::rank(&applications, catalog_query)
@@ -5231,7 +5336,7 @@ pub(crate) fn load_settings(
     public_plugins: State<'_, Arc<PublicPluginService>>,
 ) -> Result<SettingsView, CommandError> {
     require_main_window(&window)?;
-    let view = load_settings_ready_with(
+    let mut view = load_settings_ready_with(
         || {
             coordinator
                 .mark_frontend_ready(&app)
@@ -5240,6 +5345,9 @@ pub(crate) fn load_settings(
         || load_settings_core(&settings),
     )?;
     public_plugins.inner().start_enabled_runtimes(&app)?;
+    view.screenshot_hotkey_status = coordinator
+        .screenshot_hotkeys
+        .status(view.screenshot_hotkey.as_deref());
     Ok(view)
 }
 
@@ -5255,6 +5363,12 @@ where
 fn load_settings_core(settings: &SettingsStore) -> SettingsView {
     let settings = settings.snapshot();
     SettingsView {
+        screenshot_hotkey_status: if settings.screenshot_hotkey.is_some() {
+            "unavailable"
+        } else {
+            "unset"
+        },
+        screenshot_hotkey: settings.screenshot_hotkey,
         hotkey: settings.hotkey,
         autostart: settings.autostart,
         file_preview_enabled: settings.file_preview_enabled,
@@ -5454,6 +5568,11 @@ pub(crate) async fn set_theme_preference(
                 .state::<SettingsStore>()
                 .set_theme_preference_with_revision(preference.theme)
                 .map_err(|_| ())?;
+            if let Some(screenshot) =
+                app_for_worker.try_state::<Arc<crate::screenshot::window::ScreenshotHost>>()
+            {
+                screenshot.emit_theme(&app_for_worker);
+            }
             if let Some(find) = app_for_worker.get_webview_window("find") {
                 find.emit(
                     "find://theme-changed",
@@ -6377,6 +6496,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_hotkey_input_is_exact_and_main_guard_runs_before_protected_access() {
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"hotkey": 1}),
+            serde_json::json!({"hotkey": null, "pluginId": "forged"}),
+        ] {
+            assert!(serde_json::from_value::<super::ScreenshotHotkeyInput>(invalid).is_err());
+        }
+        assert!(serde_json::from_value::<super::ScreenshotHotkeyInput>(
+            serde_json::json!({"hotkey": null})
+        )
+        .is_ok());
+        for label in ["screenshot", "find", "plugin-runtime", "forged"] {
+            let accessed = std::cell::Cell::new(false);
+            assert!(super::command_hotkey_access(label, || accessed.set(true)).is_err());
+            assert!(!accessed.get());
+        }
+    }
     use std::{
         cell::{Cell, RefCell},
         collections::{BTreeMap, BTreeSet},
@@ -6904,6 +7042,45 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_catalog_routes_and_favorites_are_host_owned() {
+        use crate::model::{LauncherResultActivation, ResultFavorite, ResultIconKind};
+        for query in ["/screenshot", "/scr", "截图", "screenshot", ""] {
+            let registry = ResultRegistry::default();
+            registry.on_show("screenshot-query".into());
+            let favorites = BTreeSet::from([BuiltinFeature::Screenshot]);
+            let response = search_apps_with_catalog(
+                &registry,
+                CatalogSearchRequest {
+                    query,
+                    invocation_id: "screenshot-query",
+                    query_sequence: 1,
+                    submit: false,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &favorites,
+                    quicklinks: &[],
+                },
+                |_| Ok(Vec::new()),
+                Vec::new,
+                |_| {},
+            )
+            .unwrap();
+            let rows = response
+                .items
+                .iter()
+                .filter(|item| item.icon_kind == Some(ResultIconKind::Screenshot))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1, "query {query}");
+            assert_eq!(rows[0].activation, LauncherResultActivation::OpenScreenshot);
+            assert_eq!(
+                rows[0].favorite,
+                Some(ResultFavorite::builtin(BuiltinFeature::Screenshot, true))
+            );
+            assert!(rows[0].has_default_action);
+            assert!(response.auto_execute_result_id.is_none());
+        }
+    }
+
+    #[test]
     fn public_plugin_prompt_and_dispatch_decisions_preserve_activation_modes() {
         let mut route = PublicPluginRoute {
             result_publication: None,
@@ -7243,6 +7420,7 @@ mod tests {
             vec![
                 ("/find".into(), None),
                 ("/quicklinks".into(), None),
+                ("/screenshot".into(), None),
                 ("/web-search".into(), Some("/web-search ".into())),
                 ("/alpha".into(), None),
                 (demo_title, None),
@@ -7267,11 +7445,13 @@ mod tests {
         let favorites = BTreeSet::from([
             BuiltinFeature::Find,
             BuiltinFeature::Quicklinks,
+            BuiltinFeature::Screenshot,
             BuiltinFeature::WebSearch,
         ]);
         for (query, expected_title, expected_feature, expected_hint) in [
             ("/find", "/find", "find", None),
             ("/quicklinks", "/quicklinks", "quicklinks", None),
+            ("/screenshot", "/screenshot", "screenshot", None),
             (
                 "/web-search",
                 "/web-search",
@@ -7493,6 +7673,7 @@ mod tests {
                 "/find",
                 "/alpha",
                 "/quicklinks",
+                "/screenshot",
                 "/web-search",
                 demo_title.as_str(),
             ]
@@ -7535,7 +7716,13 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/quicklinks", "/web-search", "/alpha"]
+            vec![
+                "/find",
+                "/quicklinks",
+                "/screenshot",
+                "/web-search",
+                "/alpha"
+            ]
         );
     }
 
@@ -7651,7 +7838,7 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/quicklinks", "/web-search"]
+            vec!["/find", "/quicklinks", "/screenshot", "/web-search"]
         );
 
         let direct = search_apps_with_catalog(
@@ -7821,6 +8008,7 @@ mod tests {
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
             public_plugin_command_hotkeys: BTreeMap::new(),
+            screenshot_hotkey: None,
         };
         fs::write(
             dir.path().join("settings.json"),
@@ -10056,7 +10244,7 @@ mod tests {
                 .iter()
                 .map(|item| item.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/find", "/quicklinks", "/web-search"]
+            vec!["/find", "/quicklinks", "/screenshot", "/web-search"]
         );
     }
 
@@ -10228,6 +10416,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(load_settings_core(&store)).unwrap(),
             serde_json::json!({
+                "screenshotHotkey": null,
+                "screenshotHotkeyStatus": "unset",
                 "hotkey": "Alt+Space",
                 "autostart": false,
                 "filePreviewEnabled": true,

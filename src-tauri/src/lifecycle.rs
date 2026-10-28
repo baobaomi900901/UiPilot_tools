@@ -519,6 +519,7 @@ pub(crate) enum ReservationError {
 pub(crate) struct NativeHotkeyEvent {
     pub(crate) shortcut: Shortcut,
     epoch: u64,
+    screenshot_epoch: u64,
 }
 
 pub(crate) struct HotkeyOperationGuard<'a> {
@@ -533,6 +534,7 @@ impl Drop for HotkeyOperationGuard<'_> {
 
 #[derive(Debug)]
 pub(crate) struct LifecycleCoordinator {
+    screenshot_display: Arc<crate::screenshot::display_gate::DisplayGate>,
     next_invocation: AtomicU64,
     lifecycle_phase: AtomicU8,
     lifecycle_attempt_epoch: AtomicU64,
@@ -547,6 +549,8 @@ pub(crate) struct LifecycleCoordinator {
     hotkey_operation: Mutex<()>,
     hotkey_event_epoch: AtomicU64,
     pub(crate) command_hotkeys: CommandHotkeys,
+    pub(crate) screenshot_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys,
+    hotkey_recording: AtomicBool,
     hotkey_hook: Mutex<Option<HotkeyHook>>,
     foreground_capture: Mutex<ForegroundCaptureState>,
 }
@@ -554,6 +558,7 @@ pub(crate) struct LifecycleCoordinator {
 impl Default for LifecycleCoordinator {
     fn default() -> Self {
         Self {
+            screenshot_display: Arc::default(),
             next_invocation: AtomicU64::new(0),
             lifecycle_phase: AtomicU8::new(FileIndexPhase::Running as u8),
             lifecycle_attempt_epoch: AtomicU64::new(0),
@@ -568,6 +573,8 @@ impl Default for LifecycleCoordinator {
             hotkey_operation: Mutex::new(()),
             hotkey_event_epoch: AtomicU64::new(0),
             command_hotkeys: CommandHotkeys::default(),
+            screenshot_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys::default(),
+            hotkey_recording: AtomicBool::new(false),
             hotkey_hook: Mutex::new(None),
             foreground_capture: Mutex::new(ForegroundCaptureState::default()),
         }
@@ -1074,10 +1081,30 @@ impl LifecycleCoordinator {
         })
     }
 
+    pub(crate) fn set_hotkey_recording(&self, recording: bool) -> Result<(), ()> {
+        let _operation = self.lock_hotkey_operation()?;
+        self.hotkey_recording.store(recording, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn suppress_screenshot_display(
+        &self,
+    ) -> Option<crate::screenshot::display_gate::DisplayLease> {
+        let lease = self.screenshot_display.acquire()?;
+        // Queued readiness work predating selection must not reopen an old command later.
+        self.readiness.lock().ok()?.pending_target = None;
+        Some(lease)
+    }
+
     // Called under the plugin's own shortcut mutex: only copy atomics, never take a host lock.
     pub(crate) fn capture_native_hotkey(&self, shortcut: Shortcut) -> Option<NativeHotkeyEvent> {
+        let screenshot_epoch = self.screenshot_display.ticket()?;
         let epoch = self.hotkey_event_epoch.load(Ordering::Acquire);
-        (epoch % 2 == 0).then_some(NativeHotkeyEvent { shortcut, epoch })
+        (epoch % 2 == 0).then_some(NativeHotkeyEvent {
+            shortcut,
+            epoch,
+            screenshot_epoch,
+        })
     }
 
     fn lock_native_hotkey_event(
@@ -1085,8 +1112,10 @@ impl LifecycleCoordinator {
         event: &NativeHotkeyEvent,
     ) -> Option<std::sync::MutexGuard<'_, ()>> {
         let guard = self.hotkey_operation.lock().ok()?;
-        (event.epoch % 2 == 0 && self.hotkey_event_epoch.load(Ordering::Acquire) == event.epoch)
-            .then_some(guard)
+        (event.epoch % 2 == 0
+            && self.hotkey_event_epoch.load(Ordering::Acquire) == event.epoch
+            && self.screenshot_display.accepts(event.screenshot_epoch))
+        .then_some(guard)
     }
 
     pub(crate) fn dispatch_queued_native_hotkey(
@@ -1271,6 +1300,9 @@ impl LifecycleCoordinator {
         for binding in self.command_hotkeys.entries() {
             let _ = app.global_shortcut().unregister(binding.shortcut);
         }
+        for shortcut in self.screenshot_hotkeys.registrations() {
+            let _ = app.global_shortcut().unregister(shortcut);
+        }
     }
 
     pub(crate) fn uninstall_hook_for_exit(&self) {
@@ -1398,6 +1430,34 @@ impl LifecycleCoordinator {
     }
 
     pub(crate) fn dispatch_native_hotkey(self: &Arc<Self>, app: &AppHandle, shortcut: &Shortcut) {
+        let Some(screenshot_epoch) = self.screenshot_display.ticket() else {
+            return;
+        };
+        if self.hotkey_recording.load(Ordering::Acquire) {
+            let _ = app.emit_to(
+                "main",
+                crate::HOTKEY_RECORDING_CURRENT_EVENT,
+                shortcut.to_string(),
+            );
+            return;
+        }
+        if self.screenshot_hotkeys.candidate(shortcut.id()).is_some() {
+            let saved = app.state::<SettingsStore>().snapshot().screenshot_hotkey;
+            if saved
+                .as_deref()
+                .and_then(|s| crate::hotkey::command_chord(s).ok())
+                == Some(*shortcut)
+            {
+                let _ = app
+                    .state::<Arc<crate::screenshot::window::ScreenshotHost>>()
+                    .start(
+                        app,
+                        crate::screenshot::model::ScreenshotMode::Region,
+                        crate::screenshot::service::Origin::Hotkey,
+                    );
+            }
+            return;
+        }
         if let Some(entry) = self.command_hotkeys.candidate(shortcut.id()) {
             if !self.command_entry_current(app, &entry) {
                 return;
@@ -1409,6 +1469,9 @@ impl LifecycleCoordinator {
                 let show_app = app.clone();
                 let coordinator = Arc::clone(self);
                 let _ = dispatcher.run_on_main_thread(move || {
+                    if !coordinator.screenshot_display.accepts(screenshot_epoch) {
+                        return;
+                    }
                     if !coordinator.command_entry_current(&show_app, &entry) {
                         return;
                     }
@@ -1535,16 +1598,44 @@ impl LifecycleCoordinator {
         }
     }
 
+    pub(crate) fn reconcile_screenshot_hotkey(self: &Arc<Self>, app: &AppHandle) -> Result<(), ()> {
+        let _critical = self.reserve_critical().map_err(|_| ())?;
+        let _operation = self.lock_hotkey_operation()?;
+        let saved = app.state::<SettingsStore>().snapshot();
+        let replacement = saved
+            .screenshot_hotkey
+            .as_deref()
+            .map(crate::hotkey::command_chord)
+            .transpose()?;
+        if replacement.is_some_and(|s| crate::screenshot::hotkey::conflicts(&saved, &s.to_string()))
+        {
+            return Err(());
+        }
+        let native = app.global_shortcut();
+        self.screenshot_hotkeys.edit(
+            replacement,
+            &mut |s| native.register(s).map_err(|_| ()),
+            &mut |s| native.unregister(s).map_err(|_| ()),
+            || Ok(()),
+        )
+    }
+
     pub(crate) fn request_show(
         self: &Arc<Self>,
         app: &AppHandle,
         target: ShowTarget,
     ) -> Result<(), LifecycleError> {
+        let Some(screenshot_epoch) = self.screenshot_display.ticket() else {
+            return Ok(());
+        };
         let dispatcher = app.clone();
         let app_for_show = app.clone();
         self.request_show_with(target, move |coordinator, target| {
             dispatcher
                 .run_on_main_thread(move || {
+                    if !coordinator.screenshot_display.accepts(screenshot_epoch) {
+                        return;
+                    }
                     coordinator.handle_request_main(&app_for_show, target);
                 })
                 .map_err(|_| ())
@@ -1597,10 +1688,16 @@ impl LifecycleCoordinator {
     where
         D: FnOnce(Arc<Self>, ShowTarget) -> Result<(), ()>,
     {
+        if self.screenshot_display.ticket().is_none() {
+            return Ok(());
+        }
         dispatch(Arc::clone(self), target).map_err(|_| LifecycleError::MainThreadDispatchFailed)
     }
 
     fn handle_request_main(self: &Arc<Self>, app: &AppHandle, target: ShowTarget) {
+        if self.screenshot_display.ticket().is_none() {
+            return;
+        }
         let target = {
             let mut readiness = self.readiness.lock().expect("readiness lock poisoned");
             readiness.request_command(target, None)
@@ -1691,6 +1788,9 @@ impl LifecycleCoordinator {
         target: ShowTarget,
         command_entry: Option<CommandEntry>,
     ) -> Result<ShowOutcome, LifecycleError> {
+        if self.screenshot_display.ticket().is_none() {
+            return Ok(ShowOutcome::Ignored);
+        }
         let Some((window, registry)) = self.show_main_with_resolver(
             || self.observe_exit(),
             || {
@@ -2640,6 +2740,102 @@ pub(crate) fn install_find_position_hook(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_recording_invalidates_queued_events_before_and_during_recording() {
+        let coordinator = LifecycleCoordinator::default();
+        let chord = crate::hotkey::command_chord("Ctrl+P").unwrap();
+        let before = coordinator.capture_native_hotkey(chord).unwrap();
+        coordinator.set_hotkey_recording(true).unwrap();
+        assert!(coordinator.lock_native_hotkey_event(&before).is_none());
+        let during = coordinator.capture_native_hotkey(chord).unwrap();
+        assert!(coordinator.hotkey_recording.load(Ordering::Acquire));
+        coordinator.set_hotkey_recording(false).unwrap();
+        assert!(coordinator.lock_native_hotkey_event(&during).is_none());
+        let after = coordinator.capture_native_hotkey(chord).unwrap();
+        assert!(coordinator.lock_native_hotkey_event(&after).is_some());
+    }
+
+    #[test]
+    fn screenshot_shared_gate_allows_only_one_competing_saved_chord() {
+        for screenshot_first in [true, false] {
+            let coordinator = Arc::new(LifecycleCoordinator::default());
+            let settings = Arc::new(Mutex::new(Settings::default()));
+            let chord = crate::hotkey::command_chord("Ctrl+P").unwrap().to_string();
+            let wins = Arc::new(AtomicUsize::new(0));
+            let mut workers = Vec::new();
+            for screenshot in [screenshot_first, !screenshot_first] {
+                let coordinator = Arc::clone(&coordinator);
+                let settings = Arc::clone(&settings);
+                let chord = chord.clone();
+                let wins = Arc::clone(&wins);
+                workers.push(std::thread::spawn(move || {
+                    let _operation = coordinator.lock_hotkey_operation().unwrap();
+                    let mut settings = settings.lock().unwrap();
+                    let conflicts = if screenshot {
+                        crate::screenshot::hotkey::conflicts(&settings, &chord)
+                    } else {
+                        crate::command_hotkeys::conflicts(
+                            &settings,
+                            "com.example.plugin",
+                            "default",
+                            &chord,
+                        )
+                    };
+                    if conflicts {
+                        return;
+                    }
+                    if screenshot {
+                        settings.screenshot_hotkey = Some(chord);
+                    } else {
+                        settings.public_plugin_command_hotkeys.insert(
+                            "com.example.plugin".into(),
+                            std::collections::BTreeMap::from([("default".into(), chord)]),
+                        );
+                    }
+                    wins.fetch_add(1, Ordering::Relaxed);
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(wins.load(Ordering::Relaxed), 1);
+        }
+    }
+    #[test]
+    fn screenshot_gate_retires_queued_hotkeys_and_does_not_dispatch_shows() {
+        let coordinator = std::sync::Arc::new(super::LifecycleCoordinator::default());
+        let shortcut = "Ctrl+Shift+F9".parse().unwrap();
+        let old = coordinator.capture_native_hotkey(shortcut).unwrap();
+        let guard = coordinator.suppress_screenshot_display().unwrap();
+        assert!(coordinator.capture_native_hotkey(shortcut).is_none());
+        coordinator
+            .request_show_with(super::ShowTarget::Launcher, |_, _| {
+                panic!("selection must not dispatch queued launcher work")
+            })
+            .unwrap();
+        drop(guard);
+        assert!(coordinator.lock_native_hotkey_event(&old).is_none());
+        let current = coordinator.capture_native_hotkey(shortcut).unwrap();
+        assert!(coordinator.lock_native_hotkey_event(&current).is_some());
+    }
+
+    #[test]
+    fn screenshot_gate_drops_pending_readiness_command() {
+        let coordinator = super::LifecycleCoordinator::default();
+        coordinator
+            .readiness
+            .lock()
+            .unwrap()
+            .request(super::ShowTarget::Launcher);
+        let guard = coordinator.suppress_screenshot_display().unwrap();
+        drop(guard);
+        assert!(coordinator
+            .readiness
+            .lock()
+            .unwrap()
+            .pending_target
+            .is_none());
+    }
     use std::{
         cell::{Cell, RefCell},
         panic::{catch_unwind, AssertUnwindSafe},

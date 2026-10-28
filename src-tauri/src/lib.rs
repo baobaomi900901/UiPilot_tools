@@ -335,6 +335,7 @@ fn setup_production_lifecycle(
         .install_native_effects(toast, tray_attention, attention_audio)
         .map_err(|_| lifecycle_setup_error())?;
     let mut reserved_plugin_names = vec![
+        "screenshot".into(),
         "find".into(),
         "math".into(),
         "quicklinks".into(),
@@ -359,6 +360,7 @@ fn setup_production_lifecycle(
         .map_err(|_| lifecycle_setup_error())?;
     let _ = coordinator.reconcile_runtime_settings(app.handle(), &persisted_settings);
     let _ = coordinator.reconcile_command_hotkeys(app.handle());
+    let _ = coordinator.reconcile_screenshot_hotkey(app.handle());
     let _ = apps::start_initial_refresh(Arc::clone(app_cache))?;
     coordinator
         .mark_setup_ready(app.handle())
@@ -440,7 +442,14 @@ pub fn run() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
-                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Released {
+                        shortcut_coordinator.screenshot_hotkeys.release(*shortcut);
+                    }
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed
+                        && shortcut_coordinator
+                            .screenshot_hotkeys
+                            .accepts_press(*shortcut)
+                    {
                         if let Some(event) = shortcut_coordinator.capture_native_hotkey(*shortcut) {
                             let _ = shortcut_sender.send((app.clone(), event));
                         }
@@ -477,7 +486,16 @@ pub fn run() {
         .manage(Arc::clone(&plugin_window_controller))
         .manage(Arc::clone(&plugin_panel_controller))
         .manage(Arc::clone(&main_window_transfers))
+        .manage(Arc::new(screenshot::window::ScreenshotHost::default()))
         .invoke_handler(tauri::generate_handler![
+            screenshot::commands::start_screenshot,
+            screenshot::commands::get_screenshot_state,
+            screenshot::commands::read_screenshot_image,
+            screenshot::commands::release_screenshot_image,
+            screenshot::commands::copy_screenshot,
+            screenshot::commands::save_screenshot,
+            screenshot::commands::retake_screenshot,
+            screenshot::commands::close_screenshot,
             commands::open_find_window,
             commands::prepare_find_initialization,
             commands::commit_find_ready,
@@ -565,6 +583,8 @@ pub fn run() {
             commands::load_settings,
             commands::save_settings,
             commands::save_hotkey,
+            commands::set_screenshot_hotkey,
+            commands::set_hotkey_recording,
             commands::set_file_preview_preference,
             commands::set_theme_preference,
             commands::set_web_search_engine,
@@ -631,6 +651,8 @@ pub fn run() {
                 api.prevent_exit();
             }
             tauri::RunEvent::Exit => {
+                _app.state::<Arc<screenshot::window::ScreenshotHost>>()
+                    .shutdown(_app);
                 if let Some(everything_runtime) = _app
                     .try_state::<Arc<file_search::everything_runtime::EverythingRuntimeSupervisor>>(
                     )
@@ -853,7 +875,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 91);
+        assert_eq!(production.matches("commands::").count(), 102);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -942,6 +964,8 @@ mod tests {
             "load_settings",
             "save_settings",
             "save_hotkey",
+            "set_screenshot_hotkey",
+            "set_hotkey_recording",
             "set_file_preview_preference",
             "set_theme_preference",
             "set_web_search_engine",
@@ -990,6 +1014,49 @@ mod tests {
     fn save_hotkey_command_is_declared_and_allowed() {
         assert!(include_str!("../build.rs").contains("\"save_hotkey\","));
         assert!(include_str!("../capabilities/main.json").contains("\"allow-save-hotkey\""));
+    }
+
+    #[test]
+    fn screenshot_hotkey_commands_are_main_only() {
+        for command in ["set_screenshot_hotkey", "set_hotkey_recording"] {
+            assert!(include_str!("../build.rs").contains(&format!("\"{command}\",")));
+            let permission = command.replace('_', "-");
+            assert!(
+                include_str!("../capabilities/main.json").contains(&format!("allow-{permission}"))
+            );
+            for other in [
+                include_str!("../capabilities/screenshot.json"),
+                include_str!("../capabilities/find.json"),
+                include_str!("../capabilities/plugin-runtime.json"),
+            ] {
+                assert!(!other.contains(&permission));
+            }
+        }
+    }
+
+    #[test]
+    fn screenshot_preview_commands_and_transfer_ack_are_preview_only() {
+        for command in [
+            "get_screenshot_state",
+            "read_screenshot_image",
+            "release_screenshot_image",
+            "copy_screenshot",
+            "save_screenshot",
+            "retake_screenshot",
+            "close_screenshot",
+        ] {
+            assert!(include_str!("../build.rs").contains(&format!("\"{command}\",")));
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(include_str!("../capabilities/screenshot.json")
+                .contains(&format!("\"{permission}\"")));
+            for other in [
+                include_str!("../capabilities/main.json"),
+                include_str!("../capabilities/find.json"),
+                include_str!("../capabilities/plugin-runtime.json"),
+            ] {
+                assert!(!other.contains(&permission));
+            }
+        }
     }
 
     #[test]
@@ -1647,7 +1714,10 @@ mod tests {
             "#[allow(dead_code, reason = \"Task 2 supplies the private protocol boundary\")]\n",
             "mod process_elevation;"
         );
-        assert_eq!(production_root.matches(process_elevation_exception).count(), 1);
+        assert_eq!(
+            production_root.matches(process_elevation_exception).count(),
+            1
+        );
         let production_root_without_process_control_exception =
             production_root_without_process_control_exception.replacen(
                 process_elevation_exception,

@@ -44,6 +44,7 @@ pub(crate) enum WebSearchEngine {
 pub(crate) enum BuiltinFeature {
     Find,
     Quicklinks,
+    Screenshot,
     WebSearch,
 }
 
@@ -51,6 +52,8 @@ pub(crate) enum BuiltinFeature {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
     pub(crate) hotkey: String,
+    #[serde(default)]
+    pub(crate) screenshot_hotkey: Option<String>,
     pub(crate) autostart: bool,
     #[serde(default)]
     pub(crate) theme: ThemePreference,
@@ -112,6 +115,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: "Shift+Space".into(),
+            screenshot_hotkey: None,
             autostart: false,
             theme: ThemePreference::System,
             web_search_engine: WebSearchEngine::Bing,
@@ -215,6 +219,16 @@ impl SettingsStore {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
         candidate.hotkey = hotkey;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_screenshot_hotkey(
+        &self,
+        hotkey: Option<String>,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.screenshot_hotkey = hotkey;
         self.persist(&mut state, candidate)
     }
 
@@ -489,6 +503,37 @@ fn valid_app_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_preference_defaults_to_null_and_survives_unrelated_saves_and_restart() {
+        let dir = TestDir::new("screenshot-hotkey");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.snapshot()).unwrap()["screenshotHotkey"],
+            serde_json::Value::Null
+        );
+        store
+            .set_command_hotkey("com.example.saved", "default", Some("Ctrl+N".into()))
+            .unwrap();
+        store.set_screenshot_hotkey(Some("Ctrl+P".into())).unwrap();
+        store
+            .update_user_settings(SettingsUpdate {
+                hotkey: "Alt+Space".into(),
+                autostart: false,
+                theme: ThemePreference::Dark,
+                web_search_engine: WebSearchEngine::Bing,
+            })
+            .unwrap();
+        let restored = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            restored.snapshot().screenshot_hotkey.as_deref(),
+            Some("Ctrl+P")
+        );
+        restored.set_screenshot_hotkey(None).unwrap();
+        assert!(restored
+            .snapshot()
+            .public_plugin_command_hotkeys
+            .contains_key("com.example.saved"));
+    }
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
@@ -663,6 +708,9 @@ mod tests {
         store
             .set_builtin_feature_favorite(BuiltinFeature::WebSearch, true)
             .unwrap();
+        store
+            .set_builtin_feature_favorite(BuiltinFeature::Screenshot, true)
+            .unwrap();
         drop(store);
 
         let reloaded = SettingsStore::load(dir.path()).unwrap();
@@ -676,6 +724,7 @@ mod tests {
             BTreeSet::from([
                 BuiltinFeature::Find,
                 BuiltinFeature::Quicklinks,
+                BuiltinFeature::Screenshot,
                 BuiltinFeature::WebSearch
             ])
         );
@@ -690,7 +739,11 @@ mod tests {
                 .unwrap()
                 .snapshot()
                 .favorite_builtin_features,
-            BTreeSet::from([BuiltinFeature::Quicklinks, BuiltinFeature::WebSearch])
+            BTreeSet::from([
+                BuiltinFeature::Quicklinks,
+                BuiltinFeature::Screenshot,
+                BuiltinFeature::WebSearch
+            ])
         );
     }
 
@@ -1228,6 +1281,7 @@ mod tests {
     fn file_preview_preference_updates_only_that_field() {
         let dir = TestDir::new("file-preview-only-field");
         let persisted = Settings {
+            screenshot_hotkey: None,
             hotkey: "Ctrl+Space".into(),
             autostart: true,
             theme: ThemePreference::System,

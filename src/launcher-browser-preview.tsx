@@ -17,6 +17,8 @@ import {
 const previewParameters = new URLSearchParams(window.location.search)
 const previewTheme = previewParameters.get('theme') === 'light' ? 'light' : 'dark'
 const settings: SettingsView = {
+  screenshotHotkey: null,
+  screenshotHotkeyStatus: 'unset',
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
@@ -344,6 +346,8 @@ const client: LauncherClient = {
   deleteQuicklink: async () => undefined,
   chooseQuicklinkIcon: async () => null,
   openFind: async () => ({ status: 'forwarded' }),
+  startScreenshot: async () => undefined,
+  listenScreenshotError: async () => () => undefined,
   executeResult: async () => ({ status: 'launchRequested' }),
   executeResultAction: async () => {
     if (previewParameters.get('actionScenario') === 'pending') await new Promise(resolve => window.setTimeout(resolve, 2500))
@@ -450,6 +454,8 @@ const client: LauncherClient = {
   loadSettings: async () => settings,
   saveSettings: async () => undefined,
   saveHotkey: async ({ hotkey }) => ({ hotkey: hotkey.hotkey }),
+  setScreenshotHotkey: async () => {},
+  setHotkeyRecording: async () => {},
   setThemePreference: async () => undefined,
   setWebSearchEngine: async () => undefined,
   hideLauncher: async () => undefined,

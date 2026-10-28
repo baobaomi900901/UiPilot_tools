@@ -17,6 +17,7 @@ import * as nativeInput from './native-input'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import nativeInputSource from './native-input.ts?raw'
 import { LauncherView } from './launcher-view'
+import { HotkeyRecorderInput } from './hotkey-recorder-input'
 // @ts-expect-error Vite supplies the raw source module in Vitest.
 import launcherViewSource from './launcher-view.tsx?raw'
 import {
@@ -83,6 +84,80 @@ it('keeps managed Everything startup and unavailable messages fixed in the launc
   expect(launcherCoreSource).toContain("fileSearchStarting: '文件搜索正在准备'")
   expect(launcherCoreSource).toContain("searchUnavailable: '文件搜索服务不可用'")
   expect(launcherCoreSource).not.toContain("fileSearchStarting: 'private runtime diagnostic'")
+})
+
+describe('screenshot launcher entry', () => {
+  const item = { resultId: 'screenshot', title: '/screenshot', iconKind: 'screenshot',
+    activation: { kind: 'openScreenshot' }, hasDefaultAction: true,
+    favorite: { target: { kind: 'builtin', feature: 'screenshot' }, favorite: false } }
+  async function setup() {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockResolvedValue({ requestId: 'capture-results', items: [item], replaceLocalResults: true } as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('capture-invocation'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/screenshot', inputType: 'insertText' })
+    await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalled())
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    return { ...fake, core }
+  }
+  it('searches without capture and enters region once with current query authority', async () => {
+    const { client, core } = await setup()
+    expect(core.getSnapshot().results).toHaveLength(1)
+    expect(client.startScreenshot).not.toHaveBeenCalled()
+    core.keyDown('Enter', false)
+    core.keyDown('Enter', false)
+    expect(client.startScreenshot).toHaveBeenCalledExactlyOnceWith({ mode: 'region', invocationId: 'capture-invocation', querySequence: core.getSnapshot().querySequence })
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot().query).toBe('/screenshot')
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('offers window action and ignores actions after the query changes', async () => {
+    const { client, core } = await setup()
+    core.executeResultAction(0, 'screenshot-window')
+    expect(client.startScreenshot).toHaveBeenCalledWith(expect.objectContaining({ mode: 'window' }))
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'new query', inputType: 'insertText' })
+    core.executeResultAction(0, 'screenshot-window')
+    expect(client.startScreenshot).toHaveBeenCalledOnce()
+    core.destroy()
+  })
+  it('rejects a screenshot favorite attached to another activation', async () => {
+    const { client, core } = await setup()
+    vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'forged', items: [{ ...item, activation: { kind: 'openQuicklinks' } }], replaceLocalResults: true } as SearchResponse)
+    vi.mocked(client.searchApps).mockClear()
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'changed', inputType: 'insertText' })
+    await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalled())
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().results).toHaveLength(0)
+    core.destroy()
+  })
+  it('retires pending screenshot execution when query ownership changes', async () => {
+    const { client, core } = await setup()
+    const pending = deferred<void>()
+    vi.mocked(client.startScreenshot).mockReturnValueOnce(pending.promise)
+    core.keyDown('Enter', false)
+    expect(core.getSnapshot().executePending).toBe(true)
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'replacement', inputType: 'insertText' })
+    expect(core.getSnapshot().executePending).toBe(false)
+    pending.reject(new Error('late old failure'))
+    await Promise.resolve()
+    expect(core.getSnapshot().status).not.toContain('截图未能启动')
+    core.destroy()
+  })
+  it('shows only capture errors owned by the current invocation and query', async () => {
+    const { core, emitScreenshotError } = await setup()
+    const querySequence = core.getSnapshot().querySequence
+    emitScreenshotError({ code: 'resourceLimit', invocationId: 'older', querySequence })
+    expect(core.getSnapshot().status).toBe('')
+    emitScreenshotError({ code: 'resourceLimit', invocationId: 'capture-invocation', querySequence })
+    expect(core.getSnapshot().status).toContain('内存限制')
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'newer', inputType: 'insertText' })
+    emitScreenshotError({ code: 'resourceLimit', invocationId: 'capture-invocation', querySequence })
+    expect(core.getSnapshot().status).not.toContain('内存限制')
+    core.destroy()
+  })
 })
 
 describe('retired validation settings contract', () => {
@@ -260,6 +335,8 @@ function deferred<T>() {
 }
 
 const emptySettings: SettingsView = {
+  screenshotHotkey: null,
+  screenshotHotkeyStatus: 'unset',
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
@@ -268,6 +345,8 @@ const emptySettings: SettingsView = {
 }
 
 const settingsFixture: SettingsView = {
+  screenshotHotkey: null,
+  screenshotHotkeyStatus: 'unset',
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
@@ -287,6 +366,7 @@ function fakeClient() {
   let panelErrorHandler: ((payload: unknown) => void) | undefined
   let panelResetHandler: ((payload: unknown) => void) | undefined
   let panelFocusHandler: ((payload: unknown) => void) | undefined
+  let screenshotErrorHandler: ((payload: unknown) => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
@@ -332,6 +412,8 @@ function fakeClient() {
     chooseQuicklinkIcon: vi.fn(async () => null),
     commitPluginWindowTransfer: vi.fn(async () => {}),
     openFind: vi.fn(async () => ({ status: 'forwarded' as const })),
+    startScreenshot: vi.fn(async () => undefined),
+    listenScreenshotError: vi.fn(async (handler) => { screenshotErrorHandler = handler; return vi.fn() }),
     searchFiles: vi.fn(async () => null),
     setFilePreviewPreference: vi.fn(async () => undefined),
     setThemePreference: vi.fn(async () => undefined),
@@ -378,6 +460,8 @@ function fakeClient() {
     loadSettings: vi.fn(async () => emptySettings),
     saveSettings: vi.fn(async () => undefined),
     saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
+    setScreenshotHotkey: vi.fn(async () => {}),
+    setHotkeyRecording: vi.fn(async () => {}),
     hideLauncher: vi.fn(async () => undefined),
   } as unknown as TestLauncherClient
   return {
@@ -389,6 +473,9 @@ function fakeClient() {
     emitHidden() {
       if (!hiddenHandler) throw new Error('hidden listener is not installed')
       hiddenHandler()
+    },
+    emitScreenshotError(payload: unknown) {
+      screenshotErrorHandler?.(payload)
     },
     emitMessageState(payload: unknown) {
       if (!messageStateHandler) throw new Error('message state listener is not installed')
@@ -5110,6 +5197,138 @@ describe('native trust', () => {
 })
 
 describe('settings ownership', () => {
+  it('keeps recorder ownership across idle peer unmount and discards a retired arm response', async () => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore()
+    const armed = deferred<void>()
+    const released = deferred<void>()
+    vi.mocked(client.setHotkeyRecording).mockReturnValueOnce(armed.promise).mockReturnValueOnce(released.promise)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    const renderRecorders = (labels: string[]) => root.render(<>{labels.map((label) => <HotkeyRecorderInput key={label} label={label} value="" onCommit={() => {}} onRecordingPhase={core.setHotkeyRecordingPhase} />)}</>)
+    try {
+      await act(async () => renderRecorders(['launcher', 'screenshot', 'plugin command']))
+      await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="录制launcher"]')!.click())
+      await act(async () => renderRecorders(['launcher', 'plugin command']))
+      expect(client.setHotkeyRecording).toHaveBeenCalledExactlyOnceWith({ recording: true })
+      const peer = host.querySelector<HTMLButtonElement>('button[aria-label="录制plugin command"]')!
+      expect(peer.disabled).toBe(true)
+      await act(async () => renderRecorders(['plugin command']))
+      await act(async () => armed.resolve())
+      expect(client.setHotkeyRecording).toHaveBeenLastCalledWith({ recording: false })
+      expect(peer.disabled).toBe(true)
+      expect(host.querySelector<HTMLInputElement>('input')!.disabled).toBe(true)
+      await act(async () => released.resolve())
+      await act(async () => peer.click())
+      expect(host.querySelector<HTMLInputElement>('input')!.disabled).toBe(false)
+      expect(client.setHotkeyRecording).toHaveBeenNthCalledWith(3, { recording: true })
+    } finally {
+      await act(async () => { armed.resolve(); released.resolve(); root.unmount() })
+      host.remove()
+      core.destroy()
+    }
+  })
+
+  it.each(['keyboard', 'native'] as const)('retries the unavailable saved screenshot chord through %s recording', async (source) => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore({ ...settingsFixture, screenshotHotkey: 'Ctrl+P', screenshotHotkeyStatus: 'unavailable' })
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input[aria-label="截图快捷键"]')!
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="录制截图快捷键"]')!.click())
+      await act(async () => {
+        if (source === 'native') window.dispatchEvent(new CustomEvent('uipilot-hotkey-recording-current', { detail: 'Ctrl+P' }))
+        else {
+          input.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', code: 'KeyP', ctrlKey: true, bubbles: true }))
+          input.dispatchEvent(new KeyboardEvent('keyup', { key: 'p', code: 'KeyP', ctrlKey: true, bubbles: true }))
+        }
+      })
+      expect(client.setScreenshotHotkey).toHaveBeenCalledExactlyOnceWith({ input: { hotkey: 'Ctrl+P' } })
+      expect(client.saveHotkey).not.toHaveBeenCalled()
+    } finally { await mounted.unmount() }
+  })
+
+  it('keeps one recorder owner while arming and releasing before a peer can record', async () => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore()
+    const armed = deferred<void>()
+    const released = deferred<void>()
+    let nativeRecording = false
+    vi.mocked(client.setHotkeyRecording).mockImplementationOnce(async () => { await armed.promise; nativeRecording = true })
+      .mockImplementationOnce(async () => { await released.promise; nativeRecording = false })
+      .mockImplementation(async ({ recording }) => { nativeRecording = recording })
+    const mounted = await mountLauncherView(core)
+    try {
+      const launcher = mounted.host.querySelector<HTMLInputElement>('input[aria-label="快捷键"]')!
+      const screenshot = mounted.host.querySelector<HTMLInputElement>('input[aria-label="截图快捷键"]')!
+      const first = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="录制快捷键"]')!
+      const second = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="录制截图快捷键"]')!
+      await act(async () => { first.click(); second.click() })
+      expect(second.disabled).toBe(true)
+      expect(client.setHotkeyRecording).toHaveBeenCalledTimes(1)
+      await act(async () => armed.resolve())
+      expect(document.activeElement).toBe(launcher)
+      expect(launcher.disabled).toBe(false)
+      expect(screenshot.disabled).toBe(true)
+      expect(nativeRecording).toBe(true)
+      await act(async () => launcher.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+      expect(second.disabled).toBe(true)
+      await act(async () => released.resolve())
+      expect(second.disabled).toBe(false)
+      await act(async () => second.click())
+      expect(document.activeElement).toBe(screenshot)
+      expect(screenshot.disabled).toBe(false)
+      expect(nativeRecording).toBe(true)
+      expect(client.setHotkeyRecording).toHaveBeenNthCalledWith(3, { recording: true })
+      expect(client.startScreenshot).not.toHaveBeenCalled()
+    } finally {
+      await act(async () => { armed.resolve(); released.resolve() })
+      await mounted.unmount()
+    }
+  })
+
+  it('shows the dedicated screenshot hotkey recorder without a default binding', async () => {
+    installMatchMedia(false)
+    const { core } = await settingsCore()
+    const mounted = await mountLauncherView(core)
+    const input = mounted.host.querySelector<HTMLInputElement>('input[aria-label="截图快捷键"]')
+    expect(input).not.toBeNull()
+    expect(input?.value).toBe('未设置')
+    expect(mounted.host.textContent).toContain('截图快捷键')
+    await mounted.unmount()
+  })
+  it('waits for host recording suppression before accepting screenshot shortcut input', async () => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore()
+    const armed = deferred<void>()
+    vi.mocked(client.setHotkeyRecording).mockReturnValueOnce(armed.promise)
+    const mounted = await mountLauncherView(core)
+    const input = mounted.host.querySelector<HTMLInputElement>('input[aria-label="截图快捷键"]')!
+    const record = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="录制截图快捷键"]')!
+    await act(async () => record.click())
+    expect(client.setHotkeyRecording).toHaveBeenCalledWith({ recording: true })
+    expect(input.disabled).toBe(true)
+    await act(async () => armed.resolve())
+    expect(input.disabled).toBe(false)
+    await act(async () => {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', code: 'KeyP', ctrlKey: true, bubbles: true, cancelable: true }))
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'p', code: 'KeyP', ctrlKey: true, bubbles: true, cancelable: true }))
+    })
+    expect(client.setScreenshotHotkey).toHaveBeenCalledWith({ input: { hotkey: 'Ctrl+P' } })
+    expect(client.startScreenshot).not.toHaveBeenCalled()
+    expect(client.setHotkeyRecording).toHaveBeenLastCalledWith({ recording: false })
+    await mounted.unmount()
+  })
+  it('clears only the screenshot hotkey and reloads its authoritative status', async () => {
+    const { core, client } = await settingsCore({ ...settingsFixture, screenshotHotkey: 'Ctrl+P', screenshotHotkeyStatus: 'unavailable' })
+    vi.mocked(client.loadSettings).mockResolvedValue(settingsFixture)
+    await core.saveScreenshotHotkey(null)
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.screenshotHotkeyStatus).toBe('unset'))
+    expect(client.setScreenshotHotkey).toHaveBeenCalledWith({ input: { hotkey: null } })
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    expect(client.setPublicPluginCommandHotkey).not.toHaveBeenCalled()
+  })
   async function settingsCore(settings: SettingsView = settingsFixture) {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settings)
@@ -6277,7 +6496,7 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
-  it('renders and owns the quicklinks builtin favorite context menu', async () => {
+  it.each(['quicklinks', 'screenshot'] as const)('renders and owns the %s builtin favorite context menu', async (feature) => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -6289,9 +6508,10 @@ describe('React view and accessibility', () => {
         resultId: 'quicklinks',
         title: '/quicklinks',
         subtitle: '管理快速链接',
-        activation: { kind: 'openQuicklinks' },
+        activation: { kind: feature === 'screenshot' ? 'openScreenshot' : 'openQuicklinks' },
+        iconKind: feature,
         favorite: {
-          target: { kind: 'builtin', feature: 'quicklinks' },
+          target: { kind: 'builtin', feature },
           favorite: false,
         },
         hasDefaultAction: false,
@@ -6319,7 +6539,7 @@ describe('React view and accessibility', () => {
       })
       await act(async () => menuItem!.click())
       expect(fake.client.setBuiltinFeatureFavorite).toHaveBeenCalledWith({
-        feature: 'quicklinks',
+        feature,
         favorite: true,
       })
       expect(fake.client.executeResult).not.toHaveBeenCalled()
@@ -7444,6 +7664,8 @@ describe('React view and accessibility', () => {
       theme: 'system',
       webSearchEngine: 'bing',
       applications: [{ appId: 'legacy', displayName: 'LiveCaptions', aliases: ['caption'] }],
+      screenshotHotkey: null,
+      screenshotHotkeyStatus: 'unset',
     } as SettingsView)
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -8722,7 +8944,7 @@ describe('real adapter and startup', () => {
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://hidden', expect.any(Function)))
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 10)).toEqual([
+    expect(order.slice(0, 11)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
       'hotkey-recording://current',
       'command-hotkey://entry',
@@ -8730,6 +8952,7 @@ describe('real adapter and startup', () => {
       'launcher://hidden',
       'uipilot-plugin-panel-error',
       'uipilot-plugin-panel-reset',
+      'screenshot://error',
       'message-center://state-changed',
       'get_message_summary',
       'load_settings',
@@ -8907,6 +9130,7 @@ describe('real adapter and startup', () => {
     const shownUnlisten = vi.fn()
     const hiddenUnlisten = vi.fn()
     const messageUnlisten = vi.fn()
+    const screenshotErrorUnlisten = vi.fn()
     const panelUnlisten = vi.fn()
     const panelResetUnlisten = vi.fn()
     const panelFocusUnlisten = vi.fn()
@@ -8939,6 +9163,7 @@ describe('real adapter and startup', () => {
       if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
       if (event === 'hotkey-recording://current') return hotkeyRecordingUnlisten
       if (event === 'command-hotkey://entry') return commandHotkeyUnlisten
+      if (event === 'screenshot://error') return screenshotErrorUnlisten
       return messageUnlisten
     })
     tauriCapture.invoke.mockImplementation((command) =>
@@ -8970,6 +9195,7 @@ describe('real adapter and startup', () => {
       await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
       expect(hiddenUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
+      expect(screenshotErrorUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
       expect(panelFocusUnlisten).toHaveBeenCalledOnce()
@@ -8987,6 +9213,7 @@ describe('real adapter and startup', () => {
       expect(shownUnlisten).toHaveBeenCalledOnce()
       expect(hiddenUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
+      expect(screenshotErrorUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
       expect(panelResetUnlisten).toHaveBeenCalledOnce()
       expect(panelFocusUnlisten).toHaveBeenCalledOnce()
@@ -9001,7 +9228,7 @@ describe('real adapter and startup', () => {
 
   it('tears down once and keeps the production adapter source narrow', async () => {
     resetAdapterDocument()
-    const unlistens = Array.from({ length: 8 }, () => vi.fn())
+    const unlistens = Array.from({ length: 9 }, () => vi.fn())
     tauriCapture.listen.mockImplementation(async (_event, _handler) => unlistens[tauriCapture.listen.mock.calls.length - 1]!)
     tauriCapture.invoke.mockImplementation((command) =>
       Promise.resolve(command === 'load_settings' ? emptySettings : undefined),
@@ -9040,7 +9267,7 @@ describe('real adapter and startup', () => {
     expect(mainSource).toContain('getCurrentWindow().label')
     expect(mainSource).not.toContain('.hide(')
     expect(mainSource).not.toMatch(/\b(?:path|pid|hwnd|appId)\b/i)
-    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(3)
+    expect(mainSource.match(/root\.unmount\(\)/g)).toHaveLength(4)
   })
 })
 

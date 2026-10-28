@@ -1,7 +1,7 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
-export type ResultIconKind = 'find' | 'quicklinks' | 'calculator' | 'currency' | 'date' | 'timeZone' | 'unit' | 'webSearch'
-export type BuiltinFeature = 'find' | 'quicklinks' | 'webSearch'
+export type ResultIconKind = 'find' | 'quicklinks' | 'screenshot' | 'calculator' | 'currency' | 'date' | 'timeZone' | 'unit' | 'webSearch'
+export type BuiltinFeature = 'find' | 'quicklinks' | 'screenshot' | 'webSearch'
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string; commandId: string }>
   | Readonly<{ kind: 'builtin'; feature: BuiltinFeature }>
@@ -28,6 +28,7 @@ export type LauncherResultActivation =
   | { kind: 'panelActivation'; pluginId: string; initialArgument: string; favorite: boolean }
   | { kind: 'openFind'; query: string }
   | { kind: 'openQuicklinks' }
+  | { kind: 'openScreenshot' }
   | { kind: 'executeResult' }
   | { kind: 'informational' }
 
@@ -148,6 +149,8 @@ export interface QuicklinksSnapshot {
 
 export interface SettingsView {
   hotkey: string
+  screenshotHotkey: string | null
+  screenshotHotkeyStatus: 'unset' | 'active' | 'unavailable'
   autostart: boolean
   filePreviewEnabled: boolean
   theme: ThemePreference
@@ -408,6 +411,8 @@ export interface LauncherClient {
   deleteQuicklink(input: { id: string }): Promise<void>
   chooseQuicklinkIcon(): Promise<QuicklinkIconCandidate | null>
   openFind(input: OpenFindInput): Promise<OpenFindOutcome>
+  startScreenshot(input: { mode: 'region' | 'window'; invocationId: string; querySequence: number }): Promise<void>
+  listenScreenshotError(handler: (payload: unknown) => void): Promise<() => void>
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   executeResultAction(input: { requestId: string; resultId: string; actionId: string }): Promise<unknown>
   retireResultActions(input: { requestId: string }): Promise<void>
@@ -446,6 +451,8 @@ export interface LauncherClient {
   loadSettings(): Promise<SettingsView>
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
+  setScreenshotHotkey(input: { input: { hotkey: string | null } }): Promise<void>
+  setHotkeyRecording(input: { recording: boolean }): Promise<void>
   setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
   setWebSearchEngine(input: { preference: { engine: WebSearchEngine } }): Promise<void>
   hideLauncher(): Promise<void>
@@ -612,6 +619,8 @@ export type SettingsLoadStatus = 'loading' | 'ready' | 'error'
 
 export interface SettingsSnapshot {
   hotkey: TextControlView
+  screenshotHotkey: string | null
+  screenshotHotkeyStatus: 'unset' | 'active' | 'unavailable'
   autostart: boolean
   theme: ThemePreference
   webSearchEngine: WebSearchEngine

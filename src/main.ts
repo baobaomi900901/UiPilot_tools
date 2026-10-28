@@ -82,6 +82,8 @@ export const client: LauncherClient = {
   deleteQuicklink: (input) => invoke('delete_quicklink', input),
   chooseQuicklinkIcon: () => invoke<QuicklinkIconCandidate | null>('choose_quicklink_icon'),
   openFind: (input) => invoke('open_find_window', { input }),
+  startScreenshot: (input) => invoke('start_screenshot', input),
+  listenScreenshotError: (handler) => listen('screenshot://error', (event) => handler(event.payload)),
   executeResult: (input) => invoke<ExecuteOutcome>('execute_result', input),
   executeResultAction: (request) => invoke<unknown>('execute_result_action', { request }),
   retireResultActions: (request) => invoke<void>('retire_result_actions', { request }),
@@ -183,6 +185,8 @@ export const client: LauncherClient = {
   loadSettings: () => invoke<SettingsView>('load_settings'),
   saveSettings: (input) => invoke<void>('save_settings', input),
   saveHotkey: (input) => invoke<HotkeySettingsView>('save_hotkey', input),
+  setScreenshotHotkey: (input) => invoke('set_screenshot_hotkey', input),
+  setHotkeyRecording: (input) => invoke('set_hotkey_recording', input),
   setThemePreference: (input) =>
     invoke<void>(
       'set_theme_preference',
@@ -331,6 +335,23 @@ void (async () => {
   }
   await core.start()
 })()
+} else if (label === 'screenshot') {
+  void (async () => {
+    const [{createScreenshotClient}, {createScreenshotCore}, {ScreenshotView}] = await Promise.all([
+      import('./screenshot-client'), import('./screenshot-core'), import('./screenshot-view'),
+    ])
+    const instance = (window as Window & {__UIPILOT_SCREENSHOT_INSTANCE__?: unknown}).__UIPILOT_SCREENSHOT_INSTANCE__
+    const core = createScreenshotCore(createScreenshotClient(instance), String(instance))
+    const root = createRoot(host, {onUncaughtError: () => core.destroy()})
+    const teardown = () => {
+      window.removeEventListener('pagehide', teardown)
+      core.destroy()
+      root.unmount()
+    }
+    window.addEventListener('pagehide', teardown)
+    root.render(createElement(ScreenshotView, {core}))
+    await core.start()
+  })().catch(() => {host.textContent = '截图预览暂不可用。'})
 } else if (label.startsWith('plugin-shell-')) {
   const core = createPluginWindowCore(pluginWindowClient)
   const root = createRoot(host, { onUncaughtError: () => core.destroy() })
