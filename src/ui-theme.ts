@@ -28,7 +28,7 @@ const light = Object.freeze<UiSemanticTokens>({
   accentForeground: '#171719',
   background: '#f7f7f8',
   border: '#d9d9dc',
-  destructive: '#dc4343',
+  destructive: '#c62828',
   foreground: '#171719',
   input: '#b9b9bd',
   muted: '#f1f1f2',
@@ -97,11 +97,15 @@ export function uiThemeConfig(scheme: UiColorScheme): ThemeConfig {
       borderRadiusSM: 6,
       controlHeight: 36,
       controlHeightSM: 28,
-      fontFamily: 'Inter, "Inter Fallback", -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif',
+      fontFamily: "Inter, 'Microsoft YaHei UI', system-ui, sans-serif",
+      fontSize: 14,
+      lineWidthFocus: 2,
       motion: false,
     },
     components: {
       Button: {
+        controlHeight: 32,
+        fontWeight: 500,
         defaultBg: tokens.secondary,
         defaultBorderColor: tokens.border,
         defaultColor: tokens.foreground,
@@ -129,8 +133,8 @@ export function uiThemeConfig(scheme: UiColorScheme): ThemeConfig {
         selectorBg: tokens.secondary,
       },
       Switch: {
-        colorPrimary: tokens.primary,
-        colorPrimaryHover: scheme === 'dark' ? '#e8e8e8' : '#2e2e30',
+        colorPrimary: scheme === 'dark' ? '#59d499' : '#168c59',
+        colorPrimaryHover: scheme === 'dark' ? '#59d499' : '#168c59',
       },
       Tabs: {
         itemColor: tokens.mutedForeground,

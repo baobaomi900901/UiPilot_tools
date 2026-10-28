@@ -181,6 +181,7 @@ const previewLegacyPlugins: PluginInventorySnapshot = {
 const panelPreview = previewParameters.get('mode') === 'panel'
 const settingsPreview = previewParameters.get('mode') === 'settings'
 const quicklinksPreview = previewParameters.get('mode') === 'quicklinks'
+const mainResultPreview = previewParameters.get('mode') === 'main-result'
 const requestedPanelCommand = previewParameters.get('command')
 const panelPreviewCommand = requestedPanelCommand && /^[a-z][a-z0-9-]{0,31}$/u.test(requestedPanelCommand)
   ? requestedPanelCommand
@@ -210,6 +211,25 @@ function loadAppIcon(): Promise<string | null> {
 }
 
 async function searchResponse(query: string, querySequence: number): Promise<SearchResponse> {
+  if (mainResultPreview && query.startsWith('/translate')) {
+    const argument = query.slice('/translate'.length).trimStart()
+    const scenario = previewParameters.get('scenario')
+    if (scenario === 'loading') await new Promise(resolve => window.setTimeout(resolve, 2500))
+    if (scenario === 'error') throw new Error('Synthetic result load failure')
+    return {
+      requestId: `preview-main-result-${querySequence}`,
+      mainResultCommand: { pluginId: 'com.uipilot.translate', commandId: 'default', commandLabel: 'translate', argument },
+      items: scenario === 'empty' ? [] : [
+        { title: '保持专注，完成眼前的工作。', subtitle: '中文 · 简体', detail: 'Stay focused and finish the task at hand.' },
+        { title: 'Stay focused and finish the task at hand.', subtitle: 'English · 英语', detail: '保持专注，完成眼前的工作。' },
+        { title: '专注于当下，让每一项工作都有清晰的结果与下一步。', subtitle: '另一种表达 · 长文本预览', detail: 'Focus on the present and make every task lead to a clear result and a practical next step.' },
+      ].map((item, index) => ({
+        ...item, resultId: `preview-translation-${index}`, activation: { kind: 'executeResult' }, hasDefaultAction: true,
+        actions: [{ actionId: `copy-${index}`, title: '复制译文' }, { actionId: `copy-source-${index}`, title: '复制原文' }],
+        defaultActionId: `copy-${index}`,
+      })),
+    }
+  }
   if (panelPreview) {
     return {
       requestId: `browser-preview-${querySequence}`,
@@ -325,7 +345,12 @@ const client: LauncherClient = {
   chooseQuicklinkIcon: async () => null,
   openFind: async () => ({ status: 'forwarded' }),
   executeResult: async () => ({ status: 'launchRequested' }),
-  executeResultAction: async () => ({ kind: 'copied' }),
+  executeResultAction: async () => {
+    if (previewParameters.get('actionScenario') === 'pending') await new Promise(resolve => window.setTimeout(resolve, 2500))
+    return previewParameters.get('actionScenario') === 'error'
+      ? { kind: 'failed', code: 'clipboardWriteFailed', sourceConsumed: false }
+      : { kind: 'copied' }
+  },
   retireResultActions: async () => undefined,
   openPluginPanel: async () => ({
     sessionEpoch: revisionOne,
@@ -499,6 +524,10 @@ const stopPanelContentPreview = mountPanelContentPreview(host)
 
 async function startPreview(): Promise<void> {
   await core.start()
+  if (mainResultPreview) {
+    await core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/translate Stay focused', inputType: 'insertText' })
+    return
+  }
   if (!quicklinksPreview || core.getSnapshot().view !== 'launcher') return
   await core.text({
     kind: 'ordinaryInput',

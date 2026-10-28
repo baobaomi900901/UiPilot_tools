@@ -11,8 +11,6 @@ import type { ExecuteOutcome, FileSearchResponse, FindClient } from './protocol'
 const stylesSource = readFileSync('src/styles.css', 'utf8')
 const findViewSource = readFileSync('src/find-view.tsx', 'utf8')
 const findPreviewSource = readFileSync('src/find-browser-preview.tsx', 'utf8')
-const notesStylesSource = readFileSync('examples/public-plugins/com.uipilot.notes/package/dist/panel.css', 'utf8')
-const clipboardStylesSource = readFileSync('examples/public-plugins/com.uipilot.clipboard-history/package/dist/panel.css', 'utf8')
 
 function response(): FileSearchResponse {
   return {
@@ -97,6 +95,63 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 describe('FindView', () => {
+  it('names the search input and executes the selected result from category focus once', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward())
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    expect(host.querySelector('[role="combobox"]')?.getAttribute('aria-label')).toBe('搜索文件')
+    const category = host.querySelector<HTMLButtonElement>('.find-category')!
+    category.focus()
+    const key = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    await act(async () => category.dispatchEvent(key))
+    expect(key.defaultPrevented).toBe(true)
+    expect(fake.client.executeResult).toHaveBeenCalledOnce()
+    const repeated = new KeyboardEvent('keydown', { key: 'Enter', repeat: true, bubbles: true, cancelable: true })
+    await act(async () => category.dispatchEvent(repeated))
+    expect(repeated.defaultPrevented).toBe(true)
+    expect(fake.client.executeResult).toHaveBeenCalledOnce()
+  })
+
+  it('handles category Escape with the same pinned behavior as the search input', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward())
+    const category = host.querySelector<HTMLButtonElement>('.find-category')!
+    category.focus()
+    await act(async () => category.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(fake.client.hide).toHaveBeenCalledWith({ invocationId: 'inv-1', force: false })
+    vi.mocked(fake.client.hide).mockClear()
+    await act(async () => core.setPinned(true))
+    await vi.waitFor(() => expect(core.getSnapshot().pinned).toBe(true))
+    await act(async () => category.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(fake.client.hide).not.toHaveBeenCalled()
+  })
+
+  it('preserves composing and modified category keys and the space button action', async () => {
+    const fake = fakeClient()
+    const core = createFindCore(fake.client)
+    const host = await mount(core)
+    await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+    await act(async () => fake.emitForward())
+    const category = host.querySelector<HTMLButtonElement>('.find-category')!
+    for (const init of [
+      { key: 'Enter', isComposing: true }, { key: 'Escape', isComposing: true },
+      { key: 'Enter', ctrlKey: true }, { key: 'Enter', altKey: true },
+      { key: 'Enter', metaKey: true }, { key: 'Escape', shiftKey: true }, { key: ' ' },
+    ]) {
+      const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true })
+      await act(async () => category.dispatchEvent(event))
+      expect(event.defaultPrevented).toBe(false)
+    }
+    expect(fake.client.executeResult).not.toHaveBeenCalled()
+    expect(fake.client.hide).not.toHaveBeenCalled()
+  })
+
   it('keeps controls disabled until readiness is confirmed', async () => {
     const fake = fakeClient()
     let resolveForward!: (unlisten: () => void) => void
@@ -205,9 +260,9 @@ describe('FindView', () => {
     expect(footer.querySelector('.status-region')).not.toBeNull()
     expect(host.querySelector('.find-surface > .status-region')).toBeNull()
     expect(stylesSource).toMatch(
-      /\.find-surface\s*\{[^}]*grid-template-rows:\s*48px 48px minmax\(0,\s*1fr\) 44px;/s,
+      /\.find-surface\s*\{[^}]*grid-template-rows:\s*60px 48px minmax\(0,\s*1fr\) 36px;/s,
     )
-    expect(stylesSource).toMatch(/\.find-footer\s*\{[^}]*height:\s*28px;/s)
+    expect(stylesSource).toMatch(/\.find-footer\s*\{[^}]*height:\s*22px;/s)
   })
 
   it('collapses the preview as a right-side drawer when its switch is off', async () => {
@@ -262,29 +317,20 @@ describe('FindView', () => {
     )
   })
 
-  it('matches the notes directory treatment for the selected search result', () => {
-    for (const declaration of [
-      'selection-surface: #e9e9ec;',
-      'selection-border: rgba(23, 23, 25, 0.2);',
-      'selection-surface: #1b1c1e;',
-      'selection-border: rgba(255, 255, 255, 0.17);',
-    ]) {
-      expect(notesStylesSource).toContain(`--note-${declaration}`)
-      expect(stylesSource).toContain(`--find-${declaration}`)
-    }
+  it('uses shared semantic selection tokens for the selected search result', () => {
+    expect(stylesSource).toContain('--find-selection-surface: var(--uipilot-ui-selection);')
+    expect(stylesSource).toContain('--find-selection-border: var(--uipilot-ui-selection-border);')
     expect(stylesSource).toMatch(
       /\.find-surface \.result-row\.is-selected\s*\{[^}]*background:\s*var\(--find-selection-surface\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--find-selection-border\);/s,
     )
     expect(stylesSource).not.toContain('--find-selection-accent')
   })
 
-  it('matches the clipboard-history category selected state', () => {
-    expect(clipboardStylesSource).toMatch(
-      /--panel-card:\s*color-mix\(in srgb, var\(--uipilot-color-text, #171719\) 7%, var\(--panel-canvas\)\);/,
-    )
+  it('keeps category selection distinct without a focus outline', () => {
     expect(stylesSource).toMatch(
       /\.find-surface\s*\{[^}]*--find-category-selection-surface:\s*color-mix\(in srgb, var\(--uipilot-ui-foreground\) 7%, var\(--uipilot-ui-background\)\);/s,
     )
+    expect(stylesSource).toMatch(/\.find-surface \.file-category:focus-visible\s*\{[^}]*outline:\s*none;/s)
     expect(stylesSource).toMatch(
       /\.find-surface \.file-category\.is-selected\s*\{[^}]*color:\s*var\(--uipilot-ui-foreground\);[^}]*background:\s*var\(--find-category-selection-surface\);[^}]*font-weight:\s*500;/s,
     )

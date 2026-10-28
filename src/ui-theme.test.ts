@@ -78,7 +78,7 @@ describe('shared UiPilot visual theme', () => {
       borderRadiusSM: 6,
       controlHeight: 36,
       controlHeightSM: 28,
-      fontFamily: 'Inter, "Inter Fallback", -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif',
+      fontFamily: "Inter, 'Microsoft YaHei UI', system-ui, sans-serif",
       motion: false,
     })
     expect(dark.token).toMatchObject({
@@ -89,12 +89,12 @@ describe('shared UiPilot visual theme', () => {
       colorBorder: uiSemanticTokens.dark.border,
     })
     expect(light.components?.Switch).toMatchObject({
-      colorPrimary: '#18191a',
-      colorPrimaryHover: '#2e2e30',
+      colorPrimary: '#168c59',
+      colorPrimaryHover: '#168c59',
     })
     expect(dark.components?.Switch).toMatchObject({
-      colorPrimary: '#ffffff',
-      colorPrimaryHover: '#e8e8e8',
+      colorPrimary: '#59d499',
+      colorPrimaryHover: '#59d499',
     })
     expect(light.algorithm).not.toBe(dark.algorithm)
   })
@@ -121,10 +121,10 @@ describe('shared UiPilot visual theme', () => {
 
   it('applies Raycast chrome to launcher results, settings tabs, and plugin details', () => {
     expect(applicationCssSource).toMatch(
-      /\.launcher-view \.result-row\.is-selected\s*\{[^}]*background:\s*var\(--uipilot-ui-surface-card\);[^}]*box-shadow:\s*none;/s,
+      /\.launcher-view \.result-row\.is-selected\s*\{[^}]*background:\s*var\(--uipilot-ui-selection\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--uipilot-ui-selection-border\);/s,
     )
     expect(applicationCssSource).toMatch(
-      /\.settings-tabs \.ant-tabs-tab-active\s*\{[^}]*background:\s*var\(--uipilot-ui-accent\);/s,
+      /\.settings-tabs \.ant-tabs-tab-active\s*\{[^}]*background:\s*var\(--uipilot-ui-selection\);/s,
     )
     expect(applicationCssSource).toMatch(
       /\.settings-view \.ant-btn:not\([^}]*background:\s*var\(--uipilot-ui-surface-elevated\);/s,
@@ -132,6 +132,48 @@ describe('shared UiPilot visual theme', () => {
     expect(applicationCssSource).toMatch(
       /\.public-plugin-detail-list\s*\{[^}]*grid-template-columns:\s*92px minmax\(0, 1fr\);[^}]*padding:\s*8px 0 0;/s,
     )
+  })
+
+  it('keeps native panel and window public palettes aligned with the host theme', () => {
+    for (const file of ['plugin_panel.rs', 'plugin_window.rs']) {
+      const source = readFileSync(`src-tauri/src/${file}`, 'utf8')
+      const palettes = source.match(/const tokens = dark\s*\? (\[[^\]]+\])\s*: (\[[^\]]+\])/)
+      expect(palettes, file).not.toBeNull()
+      for (const [index, scheme] of [[1, 'dark'], [2, 'light']] as const) {
+        const colors = JSON.parse(palettes![index].replaceAll("'", '"'))
+        const tokens = uiSemanticTokens[scheme]
+        expect(colors, `${file}: ${scheme}`).toEqual([
+          tokens.background, tokens.surface, tokens.foreground, tokens.mutedForeground,
+          tokens.border, tokens.primary, tokens.destructive,
+        ])
+      }
+      expect(source, file).toContain(uiThemeConfig('light').token!.fontFamily)
+    }
+  })
+
+  it('keeps Ant colors synchronized with the CSS source of truth', () => {
+    const lightBlock = themeCssSource.slice(0, themeCssSource.indexOf(":root[data-color-scheme='dark']"))
+    const darkBlock = themeCssSource.slice(themeCssSource.indexOf(":root[data-color-scheme='dark']"))
+    for (const [scheme, block] of [['light', lightBlock], ['dark', darkBlock]] as const) {
+      for (const key of semanticKeys) {
+        const cssName = key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)
+        expect(block, `${scheme}.${key}`).toContain(`--uipilot-ui-${cssName}: ${uiSemanticTokens[scheme][key]};`)
+      }
+    }
+  })
+
+  it('keeps small error text readable on both page and dialog surfaces', () => {
+    const luminance = (hex: string) => {
+      const channels = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255)
+        .map((channel) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+      return channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722
+    }
+    for (const tokens of Object.values(uiSemanticTokens)) {
+      for (const surface of [tokens.background, tokens.surface]) {
+        const values = [luminance(tokens.destructive), luminance(surface)]
+        expect((Math.max(...values) + 0.05) / (Math.min(...values) + 0.05)).toBeGreaterThanOrEqual(4.5)
+      }
+    }
   })
 
   it('adds only Lucide and no Tailwind or Radix dependency', () => {

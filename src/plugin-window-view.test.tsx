@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPluginWindowCore } from './plugin-window-core'
 import { PluginWindowView } from './plugin-window-view'
 import { WINDOW_PIN_SHORTCUT_EVENT } from './window-pin-shortcut'
+import * as uiTheme from './ui-theme'
 
 const pluginWindowViewSource = readFileSync('src/plugin-window-view.tsx', 'utf8')
 const stylesSource = readFileSync('src/styles.css', 'utf8')
@@ -18,9 +19,36 @@ afterEach(() => {
   host?.remove()
   root = undefined
   host = undefined
+  delete document.documentElement.dataset.colorScheme
+  vi.restoreAllMocks()
 })
 
 describe('plugin window shell view', () => {
+  it('uses the injected theme initially and follows theme changes until unmount', async () => {
+    const configure = vi.spyOn(uiTheme, 'uiThemeConfig')
+    const disconnect = vi.spyOn(MutationObserver.prototype, 'disconnect')
+    document.documentElement.dataset.colorScheme = 'dark'
+    const core = createPluginWindowCore({
+      getIdentity: async () => ({ name: 'JSON', iconUrl: null }),
+      setPinned: async ({ pinned }) => ({ pinned }),
+      close: async () => {},
+    })
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    await act(async () => root?.render(<PluginWindowView core={core} />))
+    expect(configure).toHaveBeenLastCalledWith('dark')
+    await act(async () => { document.documentElement.dataset.colorScheme = 'light' })
+    expect(configure).toHaveBeenLastCalledWith('light')
+    await act(async () => root?.unmount())
+    root = undefined
+    expect(disconnect).toHaveBeenCalled()
+    configure.mockClear()
+    await act(async () => { document.documentElement.dataset.colorScheme = 'dark' })
+    expect(configure).not.toHaveBeenCalled()
+    core.destroy()
+  })
+
   it('renders only host pin/close controls in a drag region', async () => {
     const getIdentity = vi.fn(async () => ({
       name: 'Public Plugin Demo Window',

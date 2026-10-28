@@ -125,6 +125,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               ref={(node) => { inputRef.current = node?.input ?? null }}
               value={snapshot.query}
               placeholder="搜索文件"
+              aria-label="搜索文件"
               autoComplete="off"
               spellCheck={false}
               tabIndex={-1}
@@ -185,6 +186,13 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                   disabled={disabled || !snapshot.invocationId}
                   onClick={() => core.setCategory(category)}
                   onKeyDown={(event) => {
+                    if (event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey || (event.shiftKey && event.key !== 'Tab')) return
+                    if (event.key === 'Enter' || event.key === 'Escape') {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      if (!event.repeat) core.keyDown(event.key, false)
+                      return
+                    }
                     if (
                       event.key !== 'Tab' ||
                       event.ctrlKey ||
@@ -292,6 +300,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             <footer className="find-footer file-toolbar">
               <span>{snapshot.indexStatus === 'building' ? `正在索引，已有 ${snapshot.total} 条结果` : `共 ${snapshot.total} 条结果`}</span>
               <div className="status-region" role="status" aria-live="polite" aria-atomic="true">{snapshot.status}</div>
+              <span className="find-preview-label" aria-hidden="true">预览</span>
               <Switch
                 aria-label="文件预览"
                 checked={snapshot.previewEnabled}

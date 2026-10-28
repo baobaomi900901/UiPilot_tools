@@ -9,6 +9,8 @@
   --uipilot-ui-surface-raised: #ffffff;
   --uipilot-ui-surface-elevated: #f1f1f2;
   --uipilot-ui-surface-card: #e9e9eb;
+  --uipilot-ui-selection: #e9e9ec;
+  --uipilot-ui-selection-border: rgba(23, 23, 25, 0.2);
   --uipilot-ui-primary: #18191a;
   --uipilot-ui-primary-foreground: #ffffff;
   --uipilot-ui-secondary: #f1f1f2;
@@ -17,7 +19,7 @@
   --uipilot-ui-muted-foreground: #6f6f74;
   --uipilot-ui-accent: #e9e9eb;
   --uipilot-ui-accent-foreground: #171719;
-  --uipilot-ui-destructive: #dc4343;
+  --uipilot-ui-destructive: #c62828;
   --uipilot-ui-border: #d9d9dc;
   --uipilot-ui-hairline-strong: #b9b9bd;
   --uipilot-ui-input: #b9b9bd;
@@ -25,8 +27,8 @@
   --uipilot-ui-scrollbar: rgba(23, 23, 25, 0.35);
   --uipilot-ui-icon-blue: #1f8dd6;
   --uipilot-ui-icon-blue-soft: rgba(31, 141, 214, 0.14);
-  --uipilot-ui-icon-red: #dc4343;
-  --uipilot-ui-icon-red-soft: rgba(220, 67, 67, 0.14);
+  --uipilot-ui-icon-red: #c62828;
+  --uipilot-ui-icon-red-soft: rgba(198, 40, 40, 0.14);
   --uipilot-ui-icon-green: #168c59;
   --uipilot-ui-icon-green-soft: rgba(22, 140, 89, 0.14);
   --uipilot-ui-icon-yellow: #b98000;
@@ -43,6 +45,8 @@
   --uipilot-ui-surface-raised: #101111;
   --uipilot-ui-surface-elevated: #101111;
   --uipilot-ui-surface-card: #121212;
+  --uipilot-ui-selection: #1b1c1e;
+  --uipilot-ui-selection-border: rgba(255, 255, 255, 0.17);
   --uipilot-ui-primary: #ffffff;
   --uipilot-ui-primary-foreground: #000000;
   --uipilot-ui-secondary: #101111;
@@ -68,13 +72,24 @@
 }
 
 :root {
+  --uipilot-font-family: Inter, 'Microsoft YaHei UI', system-ui, sans-serif;
+  --uipilot-ui-font-meta: 12px;
+  --uipilot-ui-font-label: 13px;
+  --uipilot-ui-font-body: 14px;
+  --uipilot-ui-font-heading: 16px;
+  --uipilot-ui-search-height: 44px;
+  --uipilot-ui-toolbar-height: 48px;
+  --uipilot-ui-status-height: 36px;
   --uipilot-ui-radius: 10px;
   --uipilot-ui-radius-sm: 6px;
   --uipilot-ui-control-radius: 8px;
   --uipilot-color-surface: var(--uipilot-ui-surface);
+  --uipilot-color-background: var(--uipilot-ui-background);
   --uipilot-color-text: var(--uipilot-ui-foreground);
+  --uipilot-color-text-muted: var(--uipilot-ui-muted-foreground);
   --uipilot-color-border: var(--uipilot-ui-border);
   --uipilot-color-accent: var(--uipilot-ui-primary);
+  --uipilot-color-danger: var(--uipilot-ui-destructive);
 }
 
 .launcher-status-region:has(.launcher-footer-actions) {
