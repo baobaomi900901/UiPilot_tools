@@ -562,7 +562,7 @@ struct RuntimeInner {
 pub(crate) struct EverythingRuntimeSupervisor {
     inner: Arc<RuntimeInner>,
     backend: Arc<dyn RuntimeBackend>,
-    readiness_timeout: Duration,
+    connection_timeout: Duration,
     poll_interval: Duration,
     restart_backoffs: [Duration; 3],
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -590,7 +590,7 @@ impl EverythingRuntimeSupervisor {
 
     pub(crate) fn with_backend(
         backend: Arc<dyn RuntimeBackend>,
-        readiness_timeout: Duration,
+        connection_timeout: Duration,
         poll_interval: Duration,
         restart_backoffs: [Duration; 3],
     ) -> Self {
@@ -608,7 +608,7 @@ impl EverythingRuntimeSupervisor {
                 changed: Condvar::new(),
             }),
             backend,
-            readiness_timeout,
+            connection_timeout,
             poll_interval,
             restart_backoffs,
             worker: Mutex::new(None),
@@ -631,14 +631,14 @@ impl EverythingRuntimeSupervisor {
         }
         let inner = Arc::clone(&self.inner);
         let backend = Arc::clone(&self.backend);
-        let readiness_timeout = self.readiness_timeout;
+        let connection_timeout = self.connection_timeout;
         let poll_interval = self.poll_interval;
         let restart_backoffs = self.restart_backoffs;
         *worker = Some(std::thread::spawn(move || {
             run_supervisor_worker(
                 inner,
                 backend,
-                readiness_timeout,
+                connection_timeout,
                 poll_interval,
                 restart_backoffs,
             );
@@ -833,7 +833,7 @@ enum MonitorOutcome {
 fn run_supervisor_worker(
     inner: Arc<RuntimeInner>,
     backend: Arc<dyn RuntimeBackend>,
-    readiness_timeout: Duration,
+    connection_timeout: Duration,
     poll_interval: Duration,
     restart_backoffs: [Duration; 3],
 ) {
@@ -857,7 +857,7 @@ fn run_supervisor_worker(
             generation
         };
         let deadline = Instant::now()
-            .checked_add(readiness_timeout)
+            .checked_add(connection_timeout)
             .unwrap_or_else(Instant::now);
         let cancelled_inner = Arc::clone(&inner);
         let cancelled = move || {
@@ -888,7 +888,7 @@ fn run_supervisor_worker(
             }
         }
 
-        match await_readiness(&inner, &mut runtime, deadline, poll_interval) {
+        match await_readiness(&inner, &mut runtime, poll_interval) {
             Ok(()) => {
                 let mut state = inner.state.lock().expect("runtime state poisoned");
                 if state.shutdown {
@@ -947,7 +947,6 @@ fn retire_runtime(runtime: &mut StartedRuntime, query_gate: &RuntimeQueryGate) {
 fn await_readiness(
     inner: &RuntimeInner,
     runtime: &mut StartedRuntime,
-    deadline: Instant,
     poll_interval: Duration,
 ) -> Result<(), RuntimeUnavailableReason> {
     loop {
@@ -957,24 +956,17 @@ fn await_readiness(
         if runtime.process.poll_exited()? {
             return Err(RuntimeUnavailableReason::ProcessLaunchFailed);
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(RuntimeUnavailableReason::StartupTimedOut);
-        }
-        let operation_timeout = deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_secs(1));
-        match runtime.client.database_loaded(operation_timeout) {
+        // A responsive indexer may need minutes to replay an old USN journal.
+        // The connection deadline must not kill it and restart the same work on
+        // every host launch. Individual IPC calls and shutdown remain bounded.
+        match runtime.client.database_loaded(Duration::from_secs(1)) {
             Ok(true) => break,
-            Ok(false) => std::thread::sleep(
-                poll_interval.min(deadline.saturating_duration_since(Instant::now())),
-            ),
+            Ok(false) => std::thread::sleep(poll_interval),
             Err(_) => return Err(RuntimeUnavailableReason::IpcUnavailable),
         }
     }
     let query_deadline = Instant::now()
         .checked_add(Duration::from_secs(1))
-        .map(|value| value.min(deadline))
         .ok_or(RuntimeUnavailableReason::StartupTimedOut)?;
     let result = runtime
         .client
@@ -2227,6 +2219,120 @@ mod tests {
         let lease = runtime.ready_client().expect("ready lease missing");
         assert_eq!(lease.generation(), 1);
         runtime.shutdown();
+    }
+
+    #[test]
+    fn unresponsive_connection_still_times_out_without_retry() {
+        let (plan, process) = ready_plan(0);
+        let backend = FakeBackend::blocked(vec![plan]);
+        let runtime = EverythingRuntimeSupervisor::with_backend(
+            Arc::clone(&backend) as Arc<dyn RuntimeBackend>,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            [Duration::ZERO; 3],
+        );
+        runtime.start_async();
+        wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Unavailable);
+        assert_eq!(
+            runtime.snapshot().reason,
+            Some(RuntimeUnavailableReason::StartupTimedOut)
+        );
+        runtime.shutdown();
+        assert_eq!(backend.starts.load(Ordering::Acquire), 1);
+        assert_eq!(process.shutdowns.load(Ordering::Acquire), 0);
+    }
+
+    struct IndexingClient {
+        loaded: AtomicBool,
+        calls: AtomicUsize,
+        fail: AtomicBool,
+    }
+
+    impl EverythingRuntimeClient for IndexingClient {
+        fn database_loaded(&self, timeout: Duration) -> Result<bool, EverythingClientError> {
+            assert!(timeout <= Duration::from_secs(1));
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail.load(Ordering::Acquire) {
+                Err(EverythingClientError::IpcUnavailable)
+            } else {
+                Ok(self.loaded.load(Ordering::Acquire))
+            }
+        }
+
+        fn query(
+            &self,
+            spec: EverythingQuerySpec,
+        ) -> Result<EverythingQueryResult, EverythingClientError> {
+            assert!(self.loaded.load(Ordering::Acquire));
+            assert!(spec.deadline > Instant::now());
+            FakeClient::ready(0).query(spec)
+        }
+
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn responsive_indexing_outlives_connection_deadline_and_still_cancels_or_fails() {
+        for outcome in ["ready", "shutdown", "ipc-error", "process-exit"] {
+            let client = Arc::new(IndexingClient {
+                loaded: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                fail: AtomicBool::new(false),
+            });
+            let process = Arc::new(ProcessControl::default());
+            let backend = FakeBackend::new(vec![StartPlan::Ready {
+                client: Arc::clone(&client) as Arc<dyn EverythingRuntimeClient>,
+                process: Box::new(FakeProcess(Arc::clone(&process))),
+            }]);
+            let runtime = EverythingRuntimeSupervisor::with_backend(
+                Arc::clone(&backend) as Arc<dyn RuntimeBackend>,
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+                [Duration::ZERO; 3],
+            );
+            runtime.start_async();
+            wait_until(|| client.calls.load(Ordering::Acquire) > 0);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(
+                runtime.snapshot().status,
+                EverythingRuntimeStatus::Starting,
+                "{outcome}"
+            );
+            assert!(matches!(
+                runtime.ready_client(),
+                Err(EverythingRuntimeStatus::Starting)
+            ));
+            match outcome {
+                "ready" => {
+                    client.loaded.store(true, Ordering::Release);
+                    wait_until(|| runtime.snapshot().status == EverythingRuntimeStatus::Ready);
+                }
+                "ipc-error" => {
+                    client.fail.store(true, Ordering::Release);
+                    wait_until(|| {
+                        runtime.snapshot().status == EverythingRuntimeStatus::Unavailable
+                    });
+                    assert_eq!(
+                        runtime.snapshot().reason,
+                        Some(RuntimeUnavailableReason::IpcUnavailable)
+                    );
+                }
+                "process-exit" => {
+                    process.exit();
+                    wait_until(|| {
+                        runtime.snapshot().status == EverythingRuntimeStatus::Unavailable
+                    });
+                    assert_eq!(
+                        runtime.snapshot().reason,
+                        Some(RuntimeUnavailableReason::ProcessLaunchFailed)
+                    );
+                }
+                _ => {}
+            }
+            runtime.shutdown();
+            assert_eq!(process.shutdowns.load(Ordering::Acquire), 1);
+            assert_eq!(backend.starts.load(Ordering::Acquire), 1);
+        }
     }
 
     #[test]

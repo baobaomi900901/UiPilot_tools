@@ -352,8 +352,12 @@ Supervisor 启动步骤：
 8. `EverythingClient::connect_owned("UiPilot", expected_pid, ...)` 枚举同名 IPC 窗口，并用
    `GetWindowThreadProcessId` 只接受 PID 等于 child PID 的 HWND；每次重连都重复验证，不使用启动前检查
    代替连接时身份绑定。
-9. 在 60 秒异步启动期限内验证 owned IPC 可达、DB loaded，以及 Query2 probe 返回
-   固定 request flags 和实际 date-modified sort。空索引是合法 Ready，`total` 只记录为诊断值。
+9. 在 60 秒异步连接期限内验证 owned IPC 可达。连接后，进程仍存活且 DB loaded 查询正常
+   响应但返回 false 时保持 Starting，允许旧索引补处理磁盘变更超过 60 秒，不因总耗时终止
+   正常索引进程。每次 IPC 状态查询仍限制为 1 秒；IPC 失败或进程退出进入 Unavailable，
+   宿主退出可取消等待并回收自己持有的客户端。DB loaded 后用独立 1 秒期限执行 Query2 probe，
+   验证固定 request flags 和实际 date-modified sort。空索引是合法 Ready，`total` 只记录为诊断值。
+   这一分阶段期限修订于 2026-10-28，避免旧数据库追赶 USN journal 时被每次启动的总期限反复中断。
 
 固定 INI 禁用托盘图标、更新提示、自更新、HTTP、ETP、FTP、全局快捷键和非 UiPilot 所需的网络入口。
 客户端以当前用户普通权限运行，不从应用内触发 UAC。
