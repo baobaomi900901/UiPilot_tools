@@ -4,3 +4,5 @@ pub mod selection;
 pub mod output;
 pub(crate) mod display_gate;
 pub(crate) mod service;
+#[cfg(windows)]
+pub(crate) mod windows;
