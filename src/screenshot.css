@@ -1,0 +1,23 @@
+.screenshot-shell { position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; outline:none; background:var(--uipilot-ui-background); color:var(--uipilot-ui-foreground); font:14px Inter,'Microsoft YaHei UI',system-ui,sans-serif; font-feature-settings:'calt','kern','liga','ss03'; letter-spacing:0; }
+.screenshot-titlebar { height:44px; min-height:44px; display:flex; align-items:center; gap:8px; padding:0 12px; border-bottom:1px solid var(--uipilot-ui-border); box-sizing:border-box; }
+.screenshot-titlebar strong { font-size:14px; font-weight:500; }
+.screenshot-spacer { flex:1; }
+.screenshot-toolbar { height:48px; min-height:48px; display:flex; align-items:center; gap:8px; padding:0 12px; border-bottom:1px solid var(--uipilot-ui-border); background:var(--uipilot-ui-surface); box-sizing:border-box; }
+.screenshot-dimensions { font-size:12px; color:var(--uipilot-ui-muted-foreground); white-space:nowrap; }
+.screenshot-shell button { display:inline-flex; align-items:center; justify-content:center; gap:6px; height:32px; padding:0 10px; flex-shrink:0; border:1px solid var(--uipilot-ui-border); border-radius:6px; background:var(--uipilot-ui-surface-elevated); color:var(--uipilot-ui-foreground); font:500 13px Inter,'Microsoft YaHei UI',system-ui,sans-serif; cursor:pointer; transition:background 120ms ease,border-color 120ms ease; }
+.screenshot-shell button:hover:enabled { background:var(--uipilot-ui-selection); border-color:var(--uipilot-ui-hairline-strong); }
+.screenshot-shell button:focus-visible { outline:2px solid var(--uipilot-ui-hairline-strong); outline-offset:2px; }
+.screenshot-shell button:disabled { opacity:.5; cursor:default; }
+.screenshot-shell .screenshot-primary,.screenshot-shell .screenshot-primary:hover:enabled { background:var(--uipilot-ui-primary); color:var(--uipilot-ui-primary-foreground); border-color:var(--uipilot-ui-primary); }
+.screenshot-shell .screenshot-close { width:28px; height:28px; padding:0; background:transparent; border-color:transparent; }
+.screenshot-shell .screenshot-close:hover { color:var(--uipilot-ui-destructive); }
+.screenshot-canvas { flex:1; min-height:0; overflow:auto; display:flex; align-items:center; justify-content:center; padding:16px; }
+.screenshot-canvas img { display:block; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; }
+.screenshot-actual-size { display:block; }
+.screenshot-actual-size img { max-width:none; max-height:none; }
+.screenshot-empty { display:flex; flex-direction:column; align-items:center; gap:12px; color:var(--uipilot-ui-muted-foreground); }
+.screenshot-status { display:flex; align-items:center; gap:12px; height:36px; min-height:36px; padding:0 12px; border-top:1px solid var(--uipilot-ui-border); background:var(--uipilot-ui-surface); color:var(--uipilot-ui-muted-foreground); font-size:12px; }
+.screenshot-status [role] { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.screenshot-error { color:var(--uipilot-ui-destructive); }
+.screenshot-shell .screenshot-scale { height:24px; background:transparent; border-color:transparent; font-size:12px; padding:0 4px; }
+@media (forced-colors:active) { .screenshot-shell button:disabled { opacity:1; color:GrayText; } .screenshot-shell button:focus-visible { outline-color:Highlight; } }
