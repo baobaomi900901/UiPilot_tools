@@ -30,7 +30,7 @@ import ReactMarkdown from 'react-markdown'
 import { AppVersion } from './app-version'
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 
-import { sameFavoriteTarget, type LauncherCore } from './launcher-core'
+import { sameFavoriteTarget, type HotkeyRecordingPhase, type LauncherCore } from './launcher-core'
 import { CredentialSettings, createCredentialDraft } from './credential-settings'
 import { MessageCenterPanel } from './message-center-panel'
 import { bindNativeTextInput } from './native-input'
@@ -336,6 +336,25 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const [pinError, setPinError] = useState(false)
   const pinQueue = useRef(Promise.resolve())
   const pinSessionActive = useRef(false)
+  const hotkeyRecordingActive = useRef(false)
+  const handleHotkeyRecordingPhase = useCallback((phase: HotkeyRecordingPhase) => {
+    hotkeyRecordingActive.current = phase === 'recording'
+    core.setHotkeyRecordingPhase(phase)
+  }, [core])
+  useEffect(() => {
+    if (snapshot.view !== 'settings') return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (hotkeyRecordingActive.current || !isWindowPinShortcut(event)) return
+      event.preventDefault()
+      event.stopPropagation()
+      if (!event.repeat && !snapshot.hidePending && !pinPending) {
+        if (pinError) setPinAttempt((attempt) => attempt + 1)
+        else setSettingsPin((pinned) => !pinned)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [snapshot.view, snapshot.hidePending, pinPending, pinError])
   useEffect(() => { setSettingsPin(false) }, [snapshot.view, snapshot.viewEpoch])
   useEffect(() => {
     let current = true
@@ -1078,15 +1097,6 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     return true
   }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
-    if (isWindowPinShortcut(event.nativeEvent)) {
-      event.preventDefault()
-      event.stopPropagation()
-      if (!event.repeat && !snapshot.hidePending && !pinPending) {
-        if (pinError) setPinAttempt((attempt) => attempt + 1)
-        else setSettingsPin((pinned) => !pinned)
-      }
-      return
-    }
     const isComposing = composing(event)
     const primaryModifier = event.ctrlKey || event.metaKey
     if (
@@ -1945,7 +1955,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
               <HotkeyRecorderInput
                 onCommit={core.saveHotkeyCanonical}
-                onRecordingPhase={core.setHotkeyRecordingPhase}
+                onRecordingPhase={handleHotkeyRecordingPhase}
                 value={settings.hotkey.value}
                 id={`settings-hotkey-${settings.hotkey.key}`}
                 name={`settings-hotkey-${settings.hotkey.key}`}
@@ -2191,7 +2201,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             key={`${selectedPublicPlugin.pluginId}:${publicPluginDetail!.session}`}
             plugin={selectedPublicPlugin}
             inventoryRevision={publicPluginDetail!.revision}
-            hotkeyRevision={publicPluginDetail!.hotkeyRevision} onRecordingPhase={core.setHotkeyRecordingPhase}
+            hotkeyRevision={publicPluginDetail!.hotkeyRevision} onRecordingPhase={handleHotkeyRecordingPhase}
             reload={async (beforePublish) => {
               const session = publicPluginDetail!.session
               if (detailSession.current !== session) return

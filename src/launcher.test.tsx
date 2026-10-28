@@ -7537,6 +7537,38 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
+  it('toggles settings pin while a sidebar tab owns focus', async () => {
+    installMatchMedia(false)
+    const { core, emit } = await startedCore(settingsFixture)
+    const setPinned = vi.fn<(active: boolean, pinned: boolean) => Promise<void>>().mockResolvedValue(undefined)
+    const mounted = await mountLauncherView(core, setPinned)
+    await act(async () => emit(shown('settings-pin-sidebar', 'settings')))
+    const pin = () => mounted.host.querySelector<HTMLButtonElement>('.settings-header button[aria-pressed]')!
+    await vi.waitFor(() => expect(pin().disabled).toBe(false))
+    const tab = settingsTab(mounted.host, '通用')
+    tab.focus()
+    const shortcut = () => tab.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 't', code: 'KeyT', ctrlKey: true, bubbles: true, cancelable: true,
+    }))
+    await act(async () => { shortcut() })
+    expect(setPinned).toHaveBeenLastCalledWith(true, true)
+    expect(pin().getAttribute('aria-pressed')).toBe('true')
+    expect(document.activeElement).toBe(tab)
+    await act(async () => { shortcut() })
+    expect(setPinned).toHaveBeenLastCalledWith(true, false)
+    expect(pin().getAttribute('aria-pressed')).toBe('false')
+    // Clicking a non-focusable sidebar background can leave the keyboard target on body.
+    tab.blur()
+    expect(document.activeElement).toBe(document.body)
+    await act(async () => document.body.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 't', code: 'KeyT', ctrlKey: true, bubbles: true, cancelable: true,
+    })))
+    expect(setPinned).toHaveBeenLastCalledWith(true, true)
+    expect(pin().getAttribute('aria-pressed')).toBe('true')
+    await mounted.unmount()
+    core.destroy()
+  })
+
   it('leaves Ctrl+T to shortcut recording and ignores it outside settings', async () => {
     installMatchMedia(false)
     const { core, emit } = await startedCore(settingsFixture)
