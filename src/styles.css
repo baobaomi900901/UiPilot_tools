@@ -2656,7 +2656,7 @@ label,
 }
 
 .find-surface .file-category:focus-visible {
-  outline-offset: -1px;
+  outline: none;
 }
 
 .find-surface .file-category.is-selected {
