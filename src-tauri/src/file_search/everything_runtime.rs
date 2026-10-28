@@ -338,6 +338,7 @@ pub(crate) trait ReadyClientProvider: Send + Sync {
 }
 
 pub(crate) trait OwnedRuntimeProcess: Send {
+    fn request_database_save(&mut self);
     fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason>;
     fn shutdown(&mut self);
 }
@@ -454,6 +455,10 @@ struct OwnedRuntimeSession<P: OwnedRuntimeProcess, G: Send> {
 }
 
 impl<P: OwnedRuntimeProcess, G: Send> OwnedRuntimeProcess for OwnedRuntimeSession<P, G> {
+    fn request_database_save(&mut self) {
+        self.process.request_database_save();
+    }
+
     fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
         self.process.poll_exited()
     }
@@ -985,12 +990,34 @@ fn await_readiness(
     Ok(())
 }
 
+const DATABASE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+struct DatabaseCheckpoint {
+    next: Instant,
+}
+
+impl DatabaseCheckpoint {
+    fn new(now: Instant) -> Self {
+        Self { next: now }
+    }
+
+    fn request_if_due(&mut self, process: &mut dyn OwnedRuntimeProcess, now: Instant) {
+        if now >= self.next {
+            // Throttle attempts even when a best-effort request fails. Search
+            // availability must not depend on successfully writing the cache.
+            self.next = now + DATABASE_CHECKPOINT_INTERVAL;
+            process.request_database_save();
+        }
+    }
+}
+
 fn monitor_runtime(
     inner: &RuntimeInner,
     runtime: &mut StartedRuntime,
     generation: u64,
     poll_interval: Duration,
 ) -> MonitorOutcome {
+    let mut checkpoint = DatabaseCheckpoint::new(Instant::now());
     loop {
         {
             let mut state = inner.state.lock().expect("runtime state poisoned");
@@ -1045,6 +1072,13 @@ fn monitor_runtime(
                 }
                 return MonitorOutcome::Terminal(reason);
             }
+        }
+        let can_checkpoint = {
+            let state = inner.state.lock().expect("runtime state poisoned");
+            !state.shutdown && state.restart_requested != Some(generation)
+        };
+        if can_checkpoint {
+            checkpoint.request_if_due(runtime.process.as_mut(), Instant::now());
         }
         let state = inner.state.lock().expect("runtime state poisoned");
         let _ = inner
@@ -1168,6 +1202,10 @@ mod windows_runtime {
     unsafe impl Send for RuntimeMutex {}
 
     impl OwnedRuntimeProcess for EverythingProcess {
+        fn request_database_save(&mut self) {
+            EverythingProcess::request_database_save(self);
+        }
+
         fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
             EverythingProcess::poll_exited(self)
                 .map_err(|_| RuntimeUnavailableReason::ProcessWaitFailed)
@@ -1903,10 +1941,11 @@ mod tests {
 
     use super::{
         build_runtime_launch, managed_ini_bytes, parse_reviewed_lock, start_runtime_with,
-        EverythingRuntimeClient, EverythingRuntimeStatus, EverythingRuntimeSupervisor,
-        ExpectedService, OwnedRuntimeProcess, ReadyClientProvider, RuntimeBackend, RuntimeLaunch,
-        RuntimeResourcePaths, RuntimeSystem, RuntimeUnavailableReason, StartedRuntime,
-        VerifiedResources, INSTANCE_NAME, PIPE_NAME, REVIEWED_LOCK_BYTES,
+        DatabaseCheckpoint, EverythingRuntimeClient, EverythingRuntimeStatus,
+        EverythingRuntimeSupervisor, ExpectedService, OwnedRuntimeProcess, OwnedRuntimeSession,
+        ReadyClientProvider, RuntimeBackend, RuntimeLaunch, RuntimeResourcePaths, RuntimeSystem,
+        RuntimeUnavailableReason, StartedRuntime, VerifiedResources, DATABASE_CHECKPOINT_INTERVAL,
+        INSTANCE_NAME, PIPE_NAME, REVIEWED_LOCK_BYTES,
     };
 
     const WAIT_LIMIT: Duration = Duration::from_secs(2);
@@ -1952,6 +1991,7 @@ mod tests {
 
     #[derive(Default)]
     struct ProcessControl {
+        saves: AtomicUsize,
         exited: AtomicBool,
         shutdowns: AtomicUsize,
     }
@@ -1965,6 +2005,9 @@ mod tests {
     struct FakeProcess(Arc<ProcessControl>);
 
     impl OwnedRuntimeProcess for FakeProcess {
+        fn request_database_save(&mut self) {
+            self.0.saves.fetch_add(1, Ordering::AcqRel);
+        }
         fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
             Ok(self.0.exited.load(Ordering::Acquire))
         }
@@ -2047,6 +2090,7 @@ mod tests {
     }
 
     impl OwnedRuntimeProcess for EventProcess {
+        fn request_database_save(&mut self) {}
         fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
             Ok(false)
         }
@@ -2070,6 +2114,7 @@ mod tests {
     }
 
     impl OwnedRuntimeProcess for BarrierPollProcess {
+        fn request_database_save(&mut self) {}
         fn poll_exited(&mut self) -> Result<bool, RuntimeUnavailableReason> {
             self.poll_count += 1;
             if self.poll_count <= 2 {
@@ -2333,6 +2378,54 @@ mod tests {
             assert_eq!(process.shutdowns.load(Ordering::Acquire), 1);
             assert_eq!(backend.starts.load(Ordering::Acquire), 1);
         }
+    }
+
+    #[test]
+    fn checkpoint_attempts_are_throttled_and_session_forwards_to_owned_process() {
+        let control = Arc::new(ProcessControl::default());
+        let mut session = OwnedRuntimeSession {
+            process: FakeProcess(Arc::clone(&control)),
+            _guard: (),
+        };
+        let now = Instant::now();
+        let mut checkpoint = DatabaseCheckpoint::new(now);
+        checkpoint.request_if_due(&mut session, now);
+        checkpoint.request_if_due(
+            &mut session,
+            now + DATABASE_CHECKPOINT_INTERVAL - Duration::from_millis(1),
+        );
+        assert_eq!(control.saves.load(Ordering::Acquire), 1);
+        checkpoint.request_if_due(&mut session, now + DATABASE_CHECKPOINT_INTERVAL);
+        assert_eq!(control.saves.load(Ordering::Acquire), 2);
+        checkpoint.request_if_due(&mut session, now + DATABASE_CHECKPOINT_INTERVAL * 20);
+        assert_eq!(control.saves.load(Ordering::Acquire), 3);
+        checkpoint.request_if_due(&mut session, now + DATABASE_CHECKPOINT_INTERVAL * 20);
+        assert_eq!(control.saves.load(Ordering::Acquire), 3);
+        DatabaseCheckpoint::new(now).request_if_due(&mut session, now);
+        assert_eq!(control.saves.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn ready_index_is_checkpointed_but_preparing_index_is_not() {
+        let client = Arc::new(IndexingClient {
+            loaded: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let process = Arc::new(ProcessControl::default());
+        let backend = FakeBackend::new(vec![StartPlan::Ready {
+            client: Arc::clone(&client) as Arc<dyn EverythingRuntimeClient>,
+            process: Box::new(FakeProcess(Arc::clone(&process))),
+        }]);
+        let runtime = supervisor(backend as Arc<dyn RuntimeBackend>);
+        runtime.start_async();
+        wait_until(|| client.calls.load(Ordering::Acquire) >= 2);
+        assert_eq!(process.saves.load(Ordering::Acquire), 0);
+        client.loaded.store(true, Ordering::Release);
+        wait_until(|| process.saves.load(Ordering::Acquire) > 0);
+        assert_eq!(runtime.snapshot().status, EverythingRuntimeStatus::Ready);
+        runtime.shutdown();
+        assert_eq!(process.saves.load(Ordering::Acquire), 1);
     }
 
     #[test]

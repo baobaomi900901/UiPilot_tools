@@ -91,6 +91,7 @@ pub(crate) trait ProcessLaunchApi: Send + 'static {
     ) -> Result<ProcessHandleSet<Self::Handle>, ProcessLaunchError>;
     fn resume_thread(&mut self, thread: Self::Handle) -> Result<(), ProcessLaunchError>;
     fn request_graceful_exit(&mut self, pid: u32);
+    fn request_database_save(&mut self, pid: u32);
     fn terminate_process(&mut self, process: Self::Handle);
     fn wait_process(
         &mut self,
@@ -118,6 +119,12 @@ impl<A: ProcessLaunchApi> OwnedEverythingProcess<A> {
         self.api
             .wait_process(self.process, Duration::ZERO)
             .map(|outcome| outcome == WaitOutcome::Exited)
+    }
+
+    pub(crate) fn request_database_save(&mut self) {
+        if !self.closed && matches!(self.poll_exited(), Ok(false)) {
+            self.api.request_database_save(self.pid);
+        }
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -352,28 +359,13 @@ mod platform {
         }
 
         fn request_graceful_exit(&mut self, pid: u32) {
-            let class = wide(OsStr::new(PRIVATE_EVERYTHING_WINDOW_CLASS));
-            let Ok(window) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) })
-            else {
-                return;
-            };
-            let mut actual_pid = 0;
-            if unsafe { GetWindowThreadProcessId(window, Some(&mut actual_pid)) } == 0
-                || actual_pid != pid
-            {
-                return;
-            }
-            let _ = unsafe {
-                SendMessageTimeoutW(
-                    window,
-                    WM_USER,
-                    windows::Win32::Foundation::WPARAM(4),
-                    windows::Win32::Foundation::LPARAM(0),
-                    SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-                    1_000,
-                    None,
-                )
-            };
+            send_owned_command(pid, 4);
+        }
+
+        fn request_database_save(&mut self, pid: u32) {
+            // Everything 1.4.1 SDK: EVERYTHING_IPC_SAVE_DB. This acknowledges
+            // a save request; it does not prove that disk writes have finished.
+            send_owned_command(pid, 407);
         }
 
         fn terminate_process(&mut self, process: WindowsHandle) {
@@ -397,6 +389,30 @@ mod platform {
         fn close_handle(&mut self, handle: WindowsHandle) {
             let _ = unsafe { CloseHandle(handle.0) };
         }
+    }
+
+    fn send_owned_command(pid: u32, command: usize) {
+        let class = wide(OsStr::new(PRIVATE_EVERYTHING_WINDOW_CLASS));
+        let Ok(window) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
+            return;
+        };
+        let mut actual_pid = 0;
+        if unsafe { GetWindowThreadProcessId(window, Some(&mut actual_pid)) } == 0
+            || actual_pid != pid
+        {
+            return;
+        }
+        let _ = unsafe {
+            SendMessageTimeoutW(
+                window,
+                WM_USER,
+                windows::Win32::Foundation::WPARAM(command),
+                windows::Win32::Foundation::LPARAM(0),
+                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                1_000,
+                None,
+            )
+        };
     }
 
     fn wide(value: &OsStr) -> Vec<u16> {
@@ -600,6 +616,10 @@ mod tests {
             self.event(format!("graceful:{pid}"));
         }
 
+        fn request_database_save(&mut self, pid: u32) {
+            self.event(format!("save:{pid}"));
+        }
+
         fn terminate_process(&mut self, process: Self::Handle) {
             self.event(format!("terminate:{process}"));
             self.state.lock().unwrap().child_alive = false;
@@ -657,6 +677,25 @@ mod tests {
             process.job
         ));
         process.shutdown();
+    }
+
+    #[test]
+    fn checkpoints_only_target_a_live_owned_process_and_stop_after_close() {
+        let (api, state) = FakeApi::new(None);
+        let mut process = launch_suspended_in_job_with(api, &command()).unwrap();
+        state.lock().unwrap().events.clear();
+        process.request_database_save();
+        assert_eq!(state.lock().unwrap().events, ["wait:30:0", "save:32"]);
+        state.lock().unwrap().child_alive = false;
+        process.request_database_save();
+        assert_eq!(
+            state.lock().unwrap().events,
+            ["wait:30:0", "save:32", "wait:30:0"]
+        );
+        process.shutdown();
+        let before = state.lock().unwrap().events.len();
+        process.request_database_save();
+        assert_eq!(state.lock().unwrap().events.len(), before);
     }
 
     #[test]
