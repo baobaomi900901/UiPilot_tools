@@ -1,11 +1,11 @@
 :root {
   --note-canvas: var(--uipilot-color-background, #f7f7f8);
   --note-surface: var(--uipilot-color-surface, #ffffff);
-  --note-elevated: color-mix(in srgb, var(--uipilot-color-text, #171719) 4%, var(--note-canvas));
-  --note-card: color-mix(in srgb, var(--uipilot-color-text, #171719) 7%, var(--note-canvas));
-  --note-selection-surface: color-mix(in srgb, var(--uipilot-color-text, #171719) 13%, var(--note-canvas));
-  --note-selection-border: color-mix(in srgb, var(--uipilot-color-text, #171719) 22%, transparent);
-  --note-border-strong: color-mix(in srgb, var(--uipilot-color-text, #171719) 24%, var(--uipilot-color-border, #d9d9dc));
+  --note-elevated: var(--note-surface);
+  --note-card: var(--note-surface);
+  --note-selection-surface: var(--note-surface);
+  --note-selection-border: var(--uipilot-color-text);
+  --note-border-strong: var(--uipilot-color-text);
   color: var(--uipilot-color-text);
   background: var(--note-canvas);
   font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
@@ -15,6 +15,17 @@
   --note-radius-sm: 6px;
   --note-transition: 120ms ease;
   --note-item-height: 48px;
+  font-size: 14px;
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  :root {
+    --note-elevated: color-mix(in srgb, var(--uipilot-color-text, #171719) 4%, var(--note-canvas));
+    --note-card: color-mix(in srgb, var(--uipilot-color-text, #171719) 7%, var(--note-canvas));
+    --note-selection-surface: color-mix(in srgb, var(--uipilot-color-text, #171719) 13%, var(--note-canvas));
+    --note-selection-border: color-mix(in srgb, var(--uipilot-color-text, #171719) 22%, transparent);
+    --note-border-strong: color-mix(in srgb, var(--uipilot-color-text, #171719) 24%, var(--uipilot-color-border, #d9d9dc));
+  }
 }
 
 * {
@@ -40,12 +51,7 @@ button {
     background-color var(--note-transition),
     border-color var(--note-transition),
     color var(--note-transition),
-    opacity var(--note-transition),
-    transform var(--note-transition);
-}
-
-button:not(:disabled):not([aria-disabled='true']):active {
-  transform: translateY(1px);
+    opacity var(--note-transition);
 }
 
 .app {
@@ -90,8 +96,9 @@ button:not(:disabled):not([aria-disabled='true']):active {
   flex: 0 0 auto;
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
   padding: 0;
   color: var(--note-canvas);
   background: var(--uipilot-color-accent);
@@ -111,7 +118,7 @@ button:not(:disabled):not([aria-disabled='true']):active {
   color: var(--uipilot-color-text);
   background: var(--note-elevated);
   border: 1px solid var(--uipilot-color-border);
-  border-radius: var(--note-radius-sm);
+  border-radius: 8px;
   transition:
     border-color var(--note-transition),
     box-shadow var(--note-transition);
@@ -133,9 +140,10 @@ button:not(:disabled):not([aria-disabled='true']):active {
   min-height: 32px;
   padding: 6px 12px;
   color: var(--uipilot-color-text);
-  background: var(--uipilot-color-background);
+  background: var(--note-elevated);
   border: 1px solid var(--uipilot-color-border);
-  border-radius: var(--note-radius-sm);
+  border-radius: 8px;
+  font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
 }
@@ -170,8 +178,8 @@ button:not(:disabled):not([aria-disabled='true']):active {
 }
 
 .btn-danger {
-  color: var(--uipilot-color-background);
-  background: var(--uipilot-color-danger);
+  color: var(--uipilot-color-danger);
+  background: transparent;
   border-color: var(--uipilot-color-danger);
 }
 
@@ -201,16 +209,12 @@ button:not(:disabled):not([aria-disabled='true']):active {
 
 html[data-theme='light'] {
   --note-scrollbar-thumb: rgba(115, 115, 115, 0.42);
-  --note-selection-surface: #e9e9ec;
-  --note-selection-border: rgba(23, 23, 25, 0.2);
   --note-success: #168c59;
   --note-success-surface: rgba(22, 140, 89, 0.12);
 }
 
 html[data-theme='dark'] {
   --note-scrollbar-thumb: rgba(163, 163, 163, 0.48);
-  --note-selection-surface: #1b1c1e;
-  --note-selection-border: rgba(255, 255, 255, 0.17);
   --note-success: #59d499;
   --note-success-surface: rgba(89, 212, 153, 0.15);
 }
@@ -297,7 +301,7 @@ html[data-theme='dark'] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
   line-height: 1.3;
 }
@@ -306,7 +310,7 @@ html[data-theme='dark'] {
   display: block;
   overflow: hidden;
   color: var(--uipilot-color-text-muted);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 400;
   line-height: 1.3;
   text-overflow: ellipsis;
@@ -369,7 +373,7 @@ html[data-theme='dark'] {
   text-align: left;
   background: transparent;
   border: 0;
-  border-radius: 4px;
+  border-radius: 6px;
   cursor: pointer;
 }
 
@@ -425,7 +429,7 @@ html[data-theme='dark'] {
 
 .empty-title {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
 }
 
@@ -464,7 +468,7 @@ html[data-theme='dark'] {
 
 .editor-title {
   overflow: hidden;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
   line-height: 16px;
   text-overflow: ellipsis;
@@ -474,7 +478,7 @@ html[data-theme='dark'] {
 .editor-time {
   overflow: hidden;
   color: var(--uipilot-color-text-muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -486,7 +490,7 @@ html[data-theme='dark'] {
   align-items: center;
   gap: 5px;
   color: var(--note-success);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .editor-save-state.is-dirty {
@@ -602,6 +606,7 @@ html[data-theme='dark'] {
 .editor-scrollbar-thumb.is-dragging,
 .note-list-scrollbar-thumb:hover,
 .note-list-scrollbar-thumb.is-dragging {
+  background: var(--uipilot-color-text-muted);
   background: color-mix(in srgb, var(--uipilot-color-text-muted) 72%, transparent);
 }
 
@@ -611,8 +616,8 @@ html[data-theme='dark'] {
   bottom: 10px;
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   color: var(--uipilot-color-text-muted);
   background: var(--note-elevated);
@@ -653,10 +658,9 @@ html[data-theme='dark'] {
   pointer-events: none;
   visibility: hidden;
   opacity: 0;
-  transform: translate(-50%, -4px);
+  transform: translate(-50%, 0);
   transition:
     opacity var(--note-transition),
-    transform var(--note-transition),
     visibility var(--note-transition);
 }
 
@@ -673,13 +677,16 @@ html[data-theme='dark'] {
 
 .editor-status[data-tone='success'] {
   color: var(--note-success);
+  border-color: var(--uipilot-color-border);
   border-color: color-mix(in srgb, var(--note-success) 35%, var(--uipilot-color-border));
   background: var(--note-success-surface);
 }
 
 .editor-status[data-tone='error'] {
   color: var(--uipilot-color-danger);
+  border-color: var(--uipilot-color-border);
   border-color: color-mix(in srgb, var(--uipilot-color-danger) 35%, var(--uipilot-color-border));
+  background: var(--uipilot-color-surface);
   background: color-mix(in srgb, var(--uipilot-color-danger) 10%, var(--uipilot-color-surface));
 }
 
@@ -701,12 +708,12 @@ html[data-theme='dark'] {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 22px 22px 18px;
+  padding: 16px;
 }
 
 .dialog-title {
   margin: 0;
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 500;
 }
 
@@ -749,3 +756,12 @@ html[data-theme='dark'] {
     background: ButtonText;
   }
 }
+
+.btn:focus-visible { outline: 2px solid var(--note-border-strong); outline-offset: 1px; }
+.text-input::placeholder { color: var(--uipilot-color-text-muted); opacity: 1; }
+
+button, input, select { font-size: 13px; }
+
+.dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dialog-heading .dialog-title { min-width: 0; overflow-wrap: anywhere; }
+.btn.dialog-close { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; min-height: 28px; padding: 4px; border-radius: 6px; }

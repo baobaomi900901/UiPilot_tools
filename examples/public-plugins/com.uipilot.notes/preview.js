@@ -47,7 +47,7 @@ function installTheme(theme) {
   const root = document.documentElement
   const tokens = theme === 'dark'
     ? ['#07080a', '#0d0d0d', '#f4f4f6', '#9c9c9d', '#242728', '#ffffff', '#ff6161']
-    : ['#f7f7f8', '#ffffff', '#171719', '#6f6f74', '#d9d9dc', '#18191a', '#dc4343']
+    : ['#f7f7f8', '#ffffff', '#171719', '#6f6f74', '#d9d9dc', '#18191a', '#c62828']
   const names = ['background', 'surface', 'text', 'text-muted', 'border', 'accent', 'danger']
   names.forEach((name, index) => root.style.setProperty(`--uipilot-color-${name}`, tokens[index]))
   root.style.setProperty('--uipilot-font-family', 'Inter, Microsoft YaHei UI, system-ui, sans-serif')

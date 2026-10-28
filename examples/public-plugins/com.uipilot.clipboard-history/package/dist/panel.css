@@ -2,11 +2,11 @@
   --clipboard-scrollbar-thumb: rgba(115, 115, 115, 0.42);
   --panel-canvas: var(--uipilot-color-background, #f7f7f8);
   --panel-surface: var(--uipilot-color-surface, #ffffff);
-  --panel-elevated: color-mix(in srgb, var(--uipilot-color-text, #171719) 4%, var(--panel-canvas));
-  --panel-card: color-mix(in srgb, var(--uipilot-color-text, #171719) 7%, var(--panel-canvas));
-  --panel-selection-surface: #e9e9ec;
-  --panel-selection-border: rgba(23, 23, 25, 0.2);
-  --panel-border-strong: color-mix(in srgb, var(--uipilot-color-text, #171719) 24%, var(--uipilot-color-border, #d9d9dc));
+  --panel-elevated: var(--panel-surface);
+  --panel-card: var(--panel-surface);
+  --panel-selection-surface: var(--panel-surface);
+  --panel-selection-border: var(--uipilot-color-text);
+  --panel-border-strong: var(--uipilot-color-text);
   --panel-blue: #168cff;
   --panel-blue-soft: rgba(22, 140, 255, 0.12);
   --panel-yellow: #a36b00;
@@ -17,6 +17,17 @@
   color: var(--uipilot-color-text, #171719);
   background: var(--panel-canvas);
   letter-spacing: 0;
+  font-size: 14px;
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  :root {
+    --panel-elevated: color-mix(in srgb, var(--uipilot-color-text, #171719) 4%, var(--panel-canvas));
+    --panel-card: color-mix(in srgb, var(--uipilot-color-text, #171719) 7%, var(--panel-canvas));
+    --panel-border-strong: color-mix(in srgb, var(--uipilot-color-text, #171719) 24%, var(--uipilot-color-border, #d9d9dc));
+    --panel-selection-surface: color-mix(in srgb, var(--uipilot-color-text) 13%, var(--panel-canvas));
+    --panel-selection-border: color-mix(in srgb, var(--uipilot-color-text) 22%, transparent);
+  }
 }
 
 :root[data-theme='dark'] {
@@ -25,8 +36,6 @@
   --panel-blue-soft: rgba(87, 193, 255, 0.15);
   --panel-yellow: #ffc533;
   --panel-yellow-soft: rgba(255, 197, 51, 0.15);
-  --panel-selection-surface: #1b1c1e;
-  --panel-selection-border: rgba(255, 255, 255, 0.17);
   color-scheme: dark;
 }
 
@@ -135,7 +144,7 @@ button {
   min-width: 18px;
   padding-left: 6px;
   color: var(--uipilot-color-text-muted, #6f6f74);
-  font-size: 11px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
@@ -173,7 +182,7 @@ h1 {
 .history-count {
   margin: 1px 0 0;
   color: var(--uipilot-color-text-muted, #6f6f74);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 14px;
 }
 
@@ -181,7 +190,7 @@ h1 {
   display: inline-grid;
   place-items: center;
   width: 30px;
-  height: 30px;
+  height: 28px;
   flex: 0 0 30px;
   padding: 0;
   border: 1px solid transparent;
@@ -217,7 +226,7 @@ h1 {
   padding: 6px 10px;
   overflow: hidden;
   color: var(--uipilot-color-text-muted, #6f6f74);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -289,6 +298,7 @@ h1 {
 
 .history-list-scrollbar-thumb:hover,
 .history-list-scrollbar-thumb.is-dragging {
+  background: var(--uipilot-color-text-muted);
   background: color-mix(in srgb, var(--uipilot-color-text-muted, #6f6f74) 72%, transparent);
 }
 
@@ -298,6 +308,7 @@ h1 {
   align-items: stretch;
   min-width: 0;
   min-height: 55px;
+  border-bottom: 1px solid var(--uipilot-color-border);
   border-bottom: 1px solid color-mix(in srgb, var(--uipilot-color-border, #d9d9dc) 72%, transparent);
   border-radius: 6px;
 }
@@ -333,7 +344,7 @@ h1 {
   width: 32px;
   height: 32px;
   border: 1px solid var(--uipilot-color-border, #d9d9dc);
-  border-radius: 7px;
+  border-radius: 8px;
   background: var(--panel-surface);
   object-fit: cover;
 }
@@ -345,7 +356,7 @@ h1 {
   width: 32px;
   height: 32px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   color: var(--panel-blue);
   background: var(--panel-blue-soft);
 }
@@ -383,13 +394,13 @@ h1 {
 .entry-title {
   display: -webkit-box;
   min-width: 0;
-  max-height: 34px;
+  max-height: 36px;
   margin: 0;
   overflow: hidden;
   color: var(--uipilot-color-text, #171719);
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
-  line-height: 17px;
+  line-height: 18px;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -408,7 +419,7 @@ h1 {
   margin: 0;
   overflow: hidden;
   color: var(--uipilot-color-text-muted, #6f6f74);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -474,7 +485,7 @@ h1 {
 .empty-title {
   margin: 0;
   color: var(--uipilot-color-text, #171719);
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
   line-height: 1.4;
 }
@@ -510,3 +521,5 @@ h1 {
     height: 32px;
   }
 }
+
+button, input, select { font-size: 13px; }

@@ -2,7 +2,7 @@
   display: grid; grid-template-columns: minmax(140px, 220px) minmax(0, 1fr); height: 100%;
   border-top: 1px solid var(--uipilot-color-border); color: var(--uipilot-color-text); background: var(--uipilot-color-background);
   font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
-  font-feature-settings: 'calt', 'kern', 'liga', 'ss03'; letter-spacing: 0;
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03'; letter-spacing: 0; font-size: 14px;
 }
 .uipilot-ui-sidebar { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--uipilot-color-surface); border-right: 1px solid var(--uipilot-color-border); }
 .uipilot-ui-toolbar { height: 48px; flex: 0 0 48px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--uipilot-color-border); }
@@ -17,7 +17,7 @@
   display: block; width: 100%; margin: 2px 0; padding: 8px 10px; min-height: 42px;
   text-align: left; background: transparent; border: 1px solid transparent; border-radius: 6px;
   color: var(--uipilot-color-text); font: inherit; font-size: 14px; font-weight: 500;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: pointer;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease;
 }
 .uipilot-ui-list > .uipilot-ui-list-item:not(:disabled):not([aria-current='true']):hover { background: var(--uipilot-ui-list-hover); }
 .uipilot-ui-list > .uipilot-ui-list-item[aria-current='true'] { background: var(--uipilot-ui-list-selected); border-color: var(--uipilot-color-border); }

@@ -72,6 +72,7 @@
           <div class="editor-surface">
             <textarea
               id="editor-content"
+              aria-label="笔记正文"
               class="editor-content"
               spellcheck="false"
               placeholder="在此记录笔记或代码片段…"
@@ -103,9 +104,14 @@
       <button class="note-action note-action-danger" type="button" role="menuitem" data-note-action="delete">删除</button>
     </div>
 
-    <dialog id="new-dialog" class="dialog">
+    <dialog id="new-dialog" class="dialog" aria-labelledby="new-heading">
       <form id="new-form" method="dialog" class="dialog-body">
-        <h3 class="dialog-title">新建笔记</h3>
+        <div class="dialog-heading">
+          <h3 id="new-heading" class="dialog-title">新建笔记</h3>
+          <button id="new-close-btn" class="btn btn-ghost dialog-close" type="button" aria-label="关闭" title="关闭">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12" /></svg>
+          </button>
+        </div>
         <input
           id="new-title-input"
           class="text-input"
@@ -115,15 +121,20 @@
           autocomplete="off"
         />
         <div class="dialog-actions">
-          <button id="new-save-btn" class="btn btn-primary" type="submit" aria-disabled="true">保存</button>
           <button id="new-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+          <button id="new-save-btn" class="btn btn-primary" type="submit" aria-disabled="true">保存</button>
         </div>
       </form>
     </dialog>
 
-    <dialog id="rename-dialog" class="dialog">
+    <dialog id="rename-dialog" class="dialog" aria-labelledby="rename-heading">
       <form id="rename-form" method="dialog" class="dialog-body">
-        <h3 class="dialog-title">重命名目录</h3>
+        <div class="dialog-heading">
+          <h3 id="rename-heading" class="dialog-title">重命名目录</h3>
+          <button id="rename-close-btn" class="btn btn-ghost dialog-close" type="button" aria-label="关闭" title="关闭">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12" /></svg>
+          </button>
+        </div>
         <input
           id="rename-title-input"
           class="text-input"
@@ -132,15 +143,20 @@
           autocomplete="off"
         />
         <div class="dialog-actions">
-          <button id="rename-save-btn" class="btn btn-primary" type="submit" aria-disabled="true">保存</button>
           <button id="rename-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+          <button id="rename-save-btn" class="btn btn-primary" type="submit" aria-disabled="true">保存</button>
         </div>
       </form>
     </dialog>
 
-    <dialog id="delete-dialog" class="dialog">
+    <dialog id="delete-dialog" class="dialog" aria-labelledby="delete-heading" aria-describedby="delete-message">
       <form id="delete-form" method="dialog" class="dialog-body">
-        <h3 class="dialog-title">确认删除</h3>
+        <div class="dialog-heading">
+          <h3 id="delete-heading" class="dialog-title">确认删除</h3>
+          <button id="delete-close-btn" class="btn btn-ghost dialog-close" type="button" aria-label="关闭" title="关闭">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12" /></svg>
+          </button>
+        </div>
         <p id="delete-message" class="dialog-message"></p>
         <div class="dialog-actions">
           <button id="delete-cancel-btn" class="btn btn-ghost" type="button">取消</button>
@@ -149,10 +165,15 @@
       </form>
     </dialog>
 
-    <dialog id="unsaved-dialog" class="dialog">
+    <dialog id="unsaved-dialog" class="dialog" aria-labelledby="unsaved-heading" aria-describedby="unsaved-message">
       <form id="unsaved-form" method="dialog" class="dialog-body">
-        <h3 class="dialog-title">未保存的更改</h3>
-        <p class="dialog-message">当前笔记有未保存的更改，是否保存？</p>
+        <div class="dialog-heading">
+          <h3 id="unsaved-heading" class="dialog-title">未保存的更改</h3>
+          <button id="unsaved-close-btn" class="btn btn-ghost dialog-close" type="button" aria-label="关闭" title="关闭">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12" /></svg>
+          </button>
+        </div>
+        <p id="unsaved-message" class="dialog-message">当前笔记有未保存的更改，是否保存？</p>
         <div class="dialog-actions">
           <button id="unsaved-discard-btn" class="btn btn-ghost" type="button">不保存</button>
           <button id="unsaved-cancel-btn" class="btn btn-ghost" type="button">取消</button>

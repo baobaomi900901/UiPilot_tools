@@ -1193,6 +1193,16 @@ copyBtn.addEventListener('click', () => {
   copyEditorContent()
 })
 
+// Keep header dismissal on the same cancellation path as the footer controls.
+for (const [id, cancelButton] of [
+  ['new', newCancelBtn],
+  ['rename', renameCancelBtn],
+  ['delete', deleteCancelBtn],
+  ['unsaved', unsavedCancelBtn],
+]) {
+  document.querySelector('#' + id + '-close-btn').addEventListener('click', () => cancelButton.click())
+}
+
 window.uipilotPluginPanel.onUpdate(async (update) => {
   document.documentElement.dataset.theme = update.theme
   sessionToken += 1

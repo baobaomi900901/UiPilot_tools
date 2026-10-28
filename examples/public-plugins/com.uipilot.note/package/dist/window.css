@@ -1,11 +1,27 @@
 :root {
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-background);
-  font-family: var(--uipilot-font-family);
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
+  letter-spacing: 0;
+  --note-elevated: var(--uipilot-color-surface);
+  --note-hover: var(--uipilot-color-surface);
+  --note-selected: var(--uipilot-color-surface);
+  --note-strong: var(--uipilot-color-text);
   --note-radius: 10px;
   --note-radius-sm: 8px;
-  --note-transition: 160ms ease;
+  --note-transition: 120ms ease;
   --note-item-height: 52px;
+  font-size: 14px;
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  :root {
+    --note-elevated: color-mix(in srgb, var(--uipilot-color-text) 4%, var(--uipilot-color-background));
+    --note-hover: color-mix(in srgb, var(--uipilot-color-text) 7%, var(--uipilot-color-background));
+    --note-selected: color-mix(in srgb, var(--uipilot-color-text) 13%, var(--uipilot-color-background));
+    --note-strong: color-mix(in srgb, var(--uipilot-color-text) 24%, var(--uipilot-color-border));
+  }
 }
 
 * {
@@ -29,12 +45,7 @@ button {
     background-color var(--note-transition),
     border-color var(--note-transition),
     color var(--note-transition),
-    opacity var(--note-transition),
-    transform var(--note-transition);
-}
-
-button:not(:disabled):active {
-  transform: translateY(1px);
+    opacity var(--note-transition);
 }
 
 .app {
@@ -44,7 +55,8 @@ button:not(:disabled):active {
 }
 
 .sidebar {
-  flex: 3 1 0;
+  flex: 0 0 220px;
+  width: 220px;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -55,9 +67,11 @@ button:not(:disabled):active {
 
 .toolbar {
   display: flex;
-  gap: 10px;
-  padding: 12px;
-  flex: 0 0 auto;
+  gap: 8px;
+  align-items: center;
+  height: 48px;
+  padding: 6px 12px;
+  flex: 0 0 48px;
   border-bottom: 1px solid var(--uipilot-color-border);
 }
 
@@ -84,7 +98,7 @@ button:not(:disabled):active {
 .editor-content {
   width: 100%;
   color: var(--uipilot-color-text);
-  background: var(--uipilot-color-background);
+  background: var(--note-elevated);
   border: 1px solid var(--uipilot-color-border);
   border-radius: var(--note-radius-sm);
   transition:
@@ -93,25 +107,29 @@ button:not(:disabled):active {
 }
 
 .search-input {
-  padding: 9px 10px 9px 30px;
+  height: 36px;
+  padding: 6px 10px 6px 30px;
 }
 
 .text-input {
-  padding: 10px 12px;
+  height: 36px;
+  padding: 6px 10px;
 }
 
 .search-input:focus,
 .text-input:focus,
 .editor-content:focus {
   outline: none;
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 70%, var(--uipilot-color-border));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--uipilot-color-accent) 18%, transparent);
+  border-color: var(--note-strong);
+  box-shadow: none;
 }
 
 .btn {
-  padding: 9px 14px;
+  height: 32px;
+  padding: 4px 12px;
+  font-weight: 500;
   color: var(--uipilot-color-text);
-  background: var(--uipilot-color-background);
+  background: var(--note-elevated);
   border: 1px solid var(--uipilot-color-border);
   border-radius: var(--note-radius-sm);
   cursor: pointer;
@@ -124,7 +142,8 @@ button:not(:disabled):active {
 }
 
 .btn:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 45%, var(--uipilot-color-border));
+  border-color: var(--note-strong);
+  background: var(--note-hover);
 }
 
 .btn-primary {
@@ -134,7 +153,7 @@ button:not(:disabled):active {
 }
 
 .btn-primary:not(:disabled):hover {
-  filter: brightness(1.06);
+  background: var(--uipilot-color-accent);
   border-color: var(--uipilot-color-accent);
 }
 
@@ -143,17 +162,17 @@ button:not(:disabled):active {
 }
 
 .btn-ghost:not(:disabled):hover {
-  background: color-mix(in srgb, var(--uipilot-color-text) 6%, transparent);
+  background: var(--note-hover);
 }
 
 .btn-danger {
-  color: var(--uipilot-color-background);
-  background: var(--uipilot-color-danger);
+  color: var(--uipilot-color-danger);
+  background: transparent;
   border-color: var(--uipilot-color-danger);
 }
 
 .btn-danger:not(:disabled):hover {
-  filter: brightness(1.06);
+  background: var(--note-hover);
   border-color: var(--uipilot-color-danger);
 }
 
@@ -164,7 +183,7 @@ button:not(:disabled):active {
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
-  padding: 4px 10px 12px;
+  padding: 4px 14px 12px 6px;
   outline: none;
   scrollbar-width: thin;
   scrollbar-color: var(--note-scrollbar-thumb) transparent;
@@ -251,9 +270,9 @@ html[data-theme='dark'] {
   width: 100%;
   height: 100%;
   color: var(--uipilot-color-text);
-  background: var(--uipilot-color-background);
-  border: 1px solid var(--uipilot-color-border);
-  border-radius: var(--note-radius-sm);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
 }
 
 .note-card::before {
@@ -269,17 +288,17 @@ html[data-theme='dark'] {
 }
 
 .note-card:hover {
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 35%, var(--uipilot-color-border));
-  background: color-mix(in srgb, var(--uipilot-color-accent) 4%, var(--uipilot-color-background));
+  border-color: var(--uipilot-color-border);
+  background: var(--note-hover);
 }
 
 .note-card.is-active {
-  border-color: color-mix(in srgb, var(--uipilot-color-accent) 55%, var(--uipilot-color-border));
-  background: color-mix(in srgb, var(--uipilot-color-accent) 8%, var(--uipilot-color-background));
+  border-color: var(--note-strong);
+  background: var(--note-selected);
 }
 
 .note-card.is-active::before {
-  background: var(--uipilot-color-accent);
+  background: transparent;
 }
 
 .note-select {
@@ -307,7 +326,7 @@ html[data-theme='dark'] {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 14px;
-  font-weight: 560;
+  font-weight: 500;
   line-height: 1.3;
 }
 
@@ -332,7 +351,7 @@ html[data-theme='dark'] {
 
 .note-delete:not(:disabled):hover {
   color: var(--uipilot-color-danger);
-  background: color-mix(in srgb, var(--uipilot-color-danger) 8%, transparent);
+  background: var(--note-hover);
 }
 
 .editor {
@@ -366,14 +385,14 @@ html[data-theme='dark'] {
   place-items: center;
   color: var(--uipilot-color-text-muted);
   font-size: 22px;
-  border: 1px dashed var(--uipilot-color-border);
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--uipilot-color-surface) 80%, transparent);
+  border: 1px solid var(--uipilot-color-border);
+  border-radius: 10px;
+  background: var(--note-elevated);
 }
 
 .empty-title {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
 }
 
@@ -389,7 +408,7 @@ html[data-theme='dark'] {
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
-  padding: 18px 20px 16px;
+  padding: 12px 16px 16px;
   gap: 12px;
 }
 
@@ -445,9 +464,10 @@ html[data-theme='dark'] {
 
 .editor-status:not(:empty) {
   padding: 4px 10px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--uipilot-color-accent) 10%, transparent);
-  color: color-mix(in srgb, var(--uipilot-color-accent) 85%, var(--uipilot-color-text));
+  border-radius: 6px;
+  border: 1px solid var(--uipilot-color-border);
+  background: var(--note-elevated);
+  color: var(--uipilot-color-text);
 }
 
 .dialog {
@@ -456,26 +476,25 @@ html[data-theme='dark'] {
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-surface);
   border: 1px solid var(--uipilot-color-border);
-  border-radius: 14px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  border-radius: 10px;
+  box-shadow: none;
 }
 
 .dialog::backdrop {
   background: rgba(0, 0, 0, 0.42);
-  backdrop-filter: blur(2px);
 }
 
 .dialog-body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 22px 22px 18px;
+  padding: 16px;
 }
 
 .dialog-title {
   margin: 0;
-  font-size: 17px;
-  font-weight: 650;
+  font-size: 16px;
+  font-weight: 500;
 }
 
 .dialog-hint,
@@ -487,8 +506,8 @@ html[data-theme='dark'] {
 }
 
 .field-label {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--uipilot-color-text-muted);
 }
 
@@ -515,7 +534,7 @@ html[data-theme='dark'] {
   text-align: center;
   border: 1px dashed var(--uipilot-color-border);
   border-radius: var(--note-radius-sm);
-  background: color-mix(in srgb, var(--uipilot-color-background) 70%, transparent);
+  background: transparent;
 }
 
 @media (forced-colors: active) {
@@ -527,3 +546,15 @@ html[data-theme='dark'] {
     background: ButtonText;
   }
 }
+
+.btn:focus-visible, .note-select:focus-visible, .note-delete:focus-visible { outline: 2px solid var(--note-strong); outline-offset: -2px; }
+.editor-surface:focus-within { border-color: var(--note-strong); }
+.search-input::placeholder, .text-input::placeholder, .editor-content::placeholder { color: var(--uipilot-color-text-muted); opacity: 1; }
+@media (max-width: 560px) { .sidebar { flex-basis: 32%; width: 32%; min-width: 140px; } }
+@media (forced-colors: active) { .btn-primary { color: ButtonText; background: ButtonFace; border-color: ButtonText; } .btn:focus-visible, .note-select:focus-visible, .note-delete:focus-visible { outline-color: Highlight; } }
+
+button, input, select { font-size: 13px; }
+
+.dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dialog-heading .dialog-title { min-width: 0; overflow-wrap: anywhere; }
+.btn.dialog-close { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; min-height: 28px; padding: 4px; border-radius: 6px; }

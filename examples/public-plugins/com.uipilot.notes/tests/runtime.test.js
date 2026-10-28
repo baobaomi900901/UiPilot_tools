@@ -385,8 +385,8 @@ test('panel shell separates from the host and uses a distinct directory selectio
 
   const css = await readFile(new URL('../package/dist/panel.css', import.meta.url), 'utf8')
   assert.match(css, /\.app\s*\{[^}]*border-top:\s*1px solid var\(--uipilot-color-border\);/s)
-  assert.match(css, /html\[data-theme='light'\]\s*\{[^}]*--note-selection-surface:\s*#e9e9ec;/s)
-  assert.match(css, /html\[data-theme='dark'\]\s*\{[^}]*--note-selection-surface:\s*#1b1c1e;/s)
+  assert.match(css, /:root\s*\{[^}]*--note-selection-surface:\s*var\(--note-surface\);/s)
+  assert.match(css, /@supports[^}]*--note-selection-surface:\s*color-mix\(in srgb, var\(--uipilot-color-text[^)]*\) 13%, var\(--note-canvas\)\);/s)
   assert.match(css, /\.note-card\.is-active\s*\{[^}]*background:\s*var\(--note-selection-surface\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--note-selection-border\);/s)
   assert.match(css, /\.empty-icon svg\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px;/s)
 })
@@ -491,7 +491,7 @@ test('registers exactly one onHostKey handler and routes host keys', async (t) =
   assert.equal(panel.dialogOpen('#new-dialog'), true)
 })
 
-test('new-note dialog is concise and tabs from input to save before cancel', async (t) => {
+test('new-note dialog is concise and places cancel before save', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
   await panel.flush()
@@ -515,13 +515,13 @@ test('new-note dialog is concise and tabs from input to save before cancel', asy
   assert.equal(input.getAttribute('aria-label'), '笔记名称')
 
   const actions = [...dialog.querySelectorAll('.dialog-actions button')]
-  assert.deepEqual(actions.map((button) => button.id), ['new-save-btn', 'new-cancel-btn'])
-  assert.equal(actions[0].disabled, false)
-  assert.equal(actions[0].getAttribute('aria-disabled'), 'true')
+  assert.deepEqual(actions.map((button) => button.id), ['new-cancel-btn', 'new-save-btn'])
+  assert.equal(actions[1].disabled, false)
+  assert.equal(actions[1].getAttribute('aria-disabled'), 'true')
 
   input.value = 'Meeting notes'
   input.dispatchEvent(new panel.window.Event('input', { bubbles: true }))
-  assert.equal(actions[0].getAttribute('aria-disabled'), 'false')
+  assert.equal(actions[1].getAttribute('aria-disabled'), 'false')
 })
 
 test('note item menu renames, pins newest-first, and requires delete confirmation', async (t) => {
@@ -907,4 +907,50 @@ test('Ctrl+S in the editor saves and restores the selected list item context', a
 
   assert.equal(panel.document.activeElement?.id, 'note-list')
   assert.equal(noteList.getAttribute('aria-activedescendant'), 'note-option-2')
+})
+
+
+test('dialog close buttons follow cancellation without mutating notes or discarding the editor draft', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  const node = (id) => panel.document.querySelector('#' + id)
+  const close = async (id) => {
+    const button = node(id + '-close-btn')
+    assert.ok(button)
+    assert.equal(button.type, 'button')
+    assert.equal(button.getAttribute('aria-label'), '关闭')
+    button.click()
+    await panel.flush()
+    assert.equal(node(id + '-dialog').open, false)
+  }
+  node('new-btn').click()
+  node('new-title-input').value = 'Cancelled new note'
+  await close('new')
+  assert.equal(node('new-title-input').value, '')
+  const openAction = (action) => {
+    panel.document.querySelector('[data-note-id="1"].note-more').click()
+    panel.document.querySelector('[data-note-action="' + action + '"]').click()
+  }
+  openAction('rename')
+  node('rename-title-input').value = 'Cancelled rename'
+  assert.deepEqual([...node('rename-dialog').querySelectorAll('.dialog-actions button')].map((button) => button.id), ['rename-cancel-btn', 'rename-save-btn'])
+  await close('rename')
+  assert.equal(node('rename-title-input').value, '')
+  openAction('delete')
+  await close('delete')
+  panel.document.querySelector('[data-note-id="1"].note-select').click()
+  await panel.flush()
+  panel.editor().value = 'Keep this unsaved draft'
+  panel.editor().dispatchEvent(new panel.window.Event('input', { bubbles: true }))
+  panel.document.querySelector('[data-note-id="2"].note-select').click()
+  await panel.flush()
+  assert.equal(node('unsaved-dialog').open, true)
+  await close('unsaved')
+  assert.equal(panel.selectedId(), '1')
+  assert.equal(panel.editor().value, 'Keep this unsaved draft')
+  assert.deepEqual(panel.storedNotes(), sampleNotes)
+  panel.editor().value = sampleNotes[0].content
+  panel.document.querySelector('[data-note-id="2"].note-select').click()
+  await panel.flush()
+  assert.equal(panel.selectedId(), '2')
 })

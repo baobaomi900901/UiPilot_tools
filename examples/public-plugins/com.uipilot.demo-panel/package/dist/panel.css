@@ -1,14 +1,15 @@
 :root {
   color-scheme: light;
-  font-family: Inter, Arial, sans-serif;
-  color: #171717;
-  background: #ffffff;
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
+  letter-spacing: 0;
+  color: var(--uipilot-color-text);
+  background: var(--uipilot-color-background);
+  font-size: 14px;
 }
 
 :root[data-theme='dark'] {
   color-scheme: dark;
-  color: #f5f5f5;
-  background: #171717;
 }
 
 * {
@@ -32,13 +33,14 @@ main {
 
 h1 {
   margin: 0 0 14px;
-  font-size: 18px;
+  font-size: 16px;
+  font-weight: 500;
 }
 
 h2 {
   margin: 0;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 dl {
@@ -50,11 +52,11 @@ dl > div {
   grid-template-columns: 96px minmax(0, 1fr);
   gap: 12px;
   padding: 9px 0;
-  border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-top: 1px solid var(--uipilot-color-border);
 }
 
 dt {
-  opacity: 0.68;
+  color: var(--uipilot-color-text-muted);
 }
 
 dd {
@@ -79,7 +81,7 @@ dd {
   height: 8px;
   flex: 0 0 8px;
   border-radius: 50%;
-  background: #737373;
+  background: var(--uipilot-color-text-muted);
   content: '';
 }
 
@@ -89,7 +91,7 @@ dd {
 
 .key-history {
   padding-top: 12px;
-  border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-top: 1px solid var(--uipilot-color-border);
 }
 
 #key-history {
@@ -109,5 +111,7 @@ dd {
 }
 
 .key-history-empty {
-  opacity: 0.58;
+  color: var(--uipilot-color-text-muted);
 }
+
+button, input, select { font-size: 13px; }

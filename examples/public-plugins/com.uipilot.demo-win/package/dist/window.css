@@ -1,7 +1,10 @@
 :root {
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-background);
-  font-family: var(--uipilot-font-family);
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
+  letter-spacing: 0;
+  font-size: 14px;
 }
 
 * {
@@ -15,13 +18,13 @@ body {
 main {
   max-width: 680px;
   margin: 0 auto;
-  padding: 28px;
+  padding: 16px;
 }
 
 h1 {
-  margin: 0 0 24px;
-  font-size: 20px;
-  font-weight: 600;
+  margin: 0 0 16px;
+  font-size: 16px;
+  font-weight: 500;
 }
 
 dl {
@@ -34,7 +37,7 @@ dl {
 dl > div {
   display: grid;
   grid-template-columns: minmax(112px, 0.35fr) minmax(0, 1fr);
-  gap: 18px;
+  gap: 16px;
   padding: 12px 0;
   border-bottom: 1px solid var(--uipilot-color-border);
 }
@@ -48,3 +51,5 @@ dd {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+button, input, select { font-size: 13px; }

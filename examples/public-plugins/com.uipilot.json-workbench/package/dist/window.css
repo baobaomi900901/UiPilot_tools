@@ -11,7 +11,7 @@
   background: var(--canvas);
   font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
   font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
-  font-size: 13px;
+  font-size: 14px;
   letter-spacing: 0;
 }
 @supports (color: color-mix(in srgb, black, white)) {
@@ -30,7 +30,7 @@ main { display: flex; flex-direction: column; gap: 8px; width: 100%; height: 100
 #byte-count { flex-shrink: 0; }
 .actions, .confirm-actions { display: flex; gap: 8px; flex-shrink: 0; }
 button, textarea { font: inherit; color: inherit; }
-button { min-height: 30px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--elevated); font-weight: 500; white-space: nowrap; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
+button { min-height: 32px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--elevated); font-weight: 500; white-space: nowrap; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
 button:not(:disabled):hover { background: var(--hover); border-color: var(--strong); }
 button:disabled { opacity: .5; cursor: default; }
 button.primary { background: var(--uipilot-color-accent); color: var(--canvas); border-color: var(--uipilot-color-accent); }
@@ -39,7 +39,7 @@ button:focus-visible { outline: 2px solid var(--strong); outline-offset: 1px; }
 .editors { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; flex: 1; min-height: 0; }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; min-height: 0; }
 label { font-weight: 500; }
-textarea { display: block; flex: 1; width: 100%; min-height: 0; padding: 8px; resize: none; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--elevated); font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.5; tab-size: 2; scrollbar-gutter: stable; }
+textarea { display: block; flex: 1; width: 100%; min-height: 0; padding: 8px; resize: none; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--elevated); font-family: ui-monospace, Consolas, monospace; font-size: 13px; line-height: 1.5; tab-size: 2; scrollbar-gutter: stable; }
 textarea:focus { outline: none; border-color: var(--strong); }
 textarea::placeholder { color: var(--muted); opacity: 1; }
 textarea:disabled { color: var(--muted); }
@@ -48,8 +48,8 @@ textarea:disabled { color: var(--muted); }
 .discard { width: min(420px, calc(100% - 24px)); max-height: calc(100% - 24px); margin: auto; padding: 16px; overflow: auto; color: var(--text); border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: none; }
 .discard::backdrop { background: rgba(0, 0, 0, .42); }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-.dialog-heading h2 { margin: 0; font-size: 14px; font-weight: 500; }
-#discard-close { display: grid; place-items: center; flex-shrink: 0; width: 30px; padding: 4px; background: transparent; }
+.dialog-heading h2 { margin: 0; font-size: 16px; font-weight: 500; }
+#discard-close { display: grid; place-items: center; flex-shrink: 0; width: 28px; min-height: 28px; padding: 4px; background: transparent; }
 .discard p { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .confirm-actions { justify-content: flex-end; flex-wrap: wrap; }
 #discard-confirm { color: var(--uipilot-color-danger); border-color: var(--uipilot-color-danger); background: transparent; }
@@ -60,3 +60,5 @@ textarea:disabled { color: var(--muted); }
   button:disabled { opacity: 1; color: GrayText; }
   #status[data-tone='error'], #discard-confirm { color: CanvasText; }
 }
+
+button, input, select { font-size: 13px; }

@@ -11,7 +11,7 @@
   background: var(--canvas);
   font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
   font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
-  font-size: 13px;
+  font-size: 14px;
   letter-spacing: 0;
 }
 @supports (color: color-mix(in srgb, black, white)) {
@@ -26,10 +26,10 @@
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
 button, input, textarea { font: inherit; color: inherit; }
 button {
-  min-height: 30px;
+  min-height: 32px;
   padding: 5px 10px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--elevated);
   font-weight: 500;
   white-space: nowrap;
@@ -38,7 +38,7 @@ button {
 }
 button:not(:disabled):hover { background: var(--selected); border-color: var(--strong); }
 button:disabled { opacity: .5; cursor: default; }
-button:focus-visible, input:focus-visible, textarea:focus-visible {
+button:focus-visible {
   outline: 2px solid var(--strong);
   outline-offset: 1px;
 }
@@ -51,10 +51,10 @@ h1, h2 { margin: 0; font-size: 14px; font-weight: 500; }
 .empty strong { font-size: 14px; font-weight: 500; }
 .empty p { color: var(--muted); line-height: 1.6; }
 .editor { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 8px; }
-label { display: block; font-weight: 500; }
+label { display: block; font-size: 13px; font-weight: 500; }
 label span { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 6px; }
 input, textarea { width: 100%; background: var(--elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
-input { min-height: 34px; }
+input { min-height: 36px; }
 textarea { display: block; flex-shrink: 0; resize: vertical; line-height: 1.6; min-height: 76px; }
 textarea::placeholder, input::placeholder { color: var(--muted); opacity: 1; }
 #body, #output { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
@@ -63,20 +63,24 @@ fieldset { padding: 8px 0; margin: 0; border: 0; min-width: 0; }
 legend { padding: 0; font-weight: 500; }
 .hint { margin: 0 0 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .variables { display: grid; gap: 8px; }
-.variable label { font-size: 12px; margin-bottom: 4px; overflow-wrap: anywhere; }
+.variable label { font-size: 13px; margin-bottom: 4px; overflow-wrap: anywhere; }
 .variable input { min-width: 0; }
 .status-bar { flex: 0 0 auto; min-height: 38px; padding: 7px 12px; border-top: 1px solid var(--border); background: var(--surface); }
 #status { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
 #status[data-tone='error'] { color: var(--uipilot-color-danger); }
 #reload { margin-top: 6px; }
-dialog { max-width: min(400px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; padding: 18px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+dialog { box-shadow: none; max-width: min(400px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; padding: 18px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
 dialog::backdrop { background: rgb(0 0 0 / .4); }
 dialog p { color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.dialog-heading h2 { min-width: 0; overflow-wrap: anywhere; }
-#discard-close, #actions-close { display: grid; place-items: center; flex-shrink: 0; width: 30px; padding: 4px; background: transparent; }
+.dialog-heading h2 { min-width: 0; font-size: 16px; overflow-wrap: anywhere; }
+input:focus, textarea:focus { outline: none; border-color: var(--strong); }
+#discard-close, #actions-close { display: grid; place-items: center; flex-shrink: 0; width: 28px; min-height: 28px; padding: 4px; background: transparent; }
 .dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 @media (forced-colors: active) {
   button.primary { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
   button:focus-visible, input:focus-visible, textarea:focus-visible { outline-color: Highlight; }
+  input:focus, textarea:focus { outline: 1px solid Highlight; }
 }
+
+button, input, select { font-size: 13px; }

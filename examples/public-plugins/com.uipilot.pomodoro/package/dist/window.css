@@ -1,7 +1,10 @@
 :root {
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-background);
-  font-family: var(--uipilot-font-family);
+  font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif);
+  font-feature-settings: 'calt', 'kern', 'liga', 'ss03';
+  letter-spacing: 0;
+  font-size: 14px;
 }
 
 * {
@@ -18,7 +21,7 @@ main {
   min-height: 316px;
   place-content: center;
   justify-items: center;
-  padding: 28px;
+  padding: 16px;
 }
 
 .duration-picker {
@@ -33,13 +36,15 @@ main {
 
 .duration-picker select {
   width: 108px;
-  height: 34px;
+  height: 36px;
   border: 1px solid var(--uipilot-color-border);
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 0 28px 0 10px;
   color: var(--uipilot-color-text);
   background: var(--uipilot-color-surface);
   font: inherit;
+  font-weight: 500;
+  transition: background-color 120ms ease, border-color 120ms ease;
   cursor: pointer;
 }
 
@@ -58,7 +63,7 @@ main {
   min-width: 5ch;
   font-size: 64px;
   font-variant-numeric: tabular-nums;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1;
   text-align: center;
 }
@@ -76,10 +81,10 @@ main {
 }
 
 button {
-  height: 36px;
+  height: 32px;
   border: 1px solid var(--uipilot-color-accent);
   border-radius: 6px;
-  color: #fff;
+  color: var(--uipilot-color-background);
   background: var(--uipilot-color-accent);
   font: inherit;
   cursor: pointer;
@@ -109,3 +114,10 @@ button:disabled {
     width: 100%;
   }
 }
+
+button:not(:disabled):hover { border-color: var(--uipilot-color-text); }
+button.secondary:not(:disabled):hover { background: var(--uipilot-color-background); }
+button:focus-visible, select:focus-visible { outline: 2px solid var(--uipilot-color-text); outline-offset: 1px; }
+@media (forced-colors: active) { button { color: ButtonText; background: ButtonFace; border-color: ButtonText; } button:focus-visible, select:focus-visible { outline-color: Highlight; } }
+
+button, input, select { font-size: 13px; }
