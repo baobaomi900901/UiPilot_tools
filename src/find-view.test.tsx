@@ -174,7 +174,7 @@ describe('FindView', () => {
     expect(footer.querySelector('.status-region')).not.toBeNull()
     expect(host.querySelector('.find-surface > .status-region')).toBeNull()
     expect(stylesSource).toMatch(
-      /\.find-surface\s*\{[^}]*grid-template-rows:\s*48px minmax\(0,\s*1fr\) 44px;/s,
+      /\.find-surface\s*\{[^}]*grid-template-rows:\s*48px 48px minmax\(0,\s*1fr\) 44px;/s,
     )
     expect(stylesSource).toMatch(/\.find-footer\s*\{[^}]*height:\s*28px;/s)
   })
@@ -197,7 +197,7 @@ describe('FindView', () => {
     expect(preview.getAttribute('aria-hidden')).toBe('true')
     expect(preview.childElementCount).toBeGreaterThan(0)
     expect(stylesSource).toMatch(
-      /\.find-surface\.is-preview-collapsed\s*\{[^}]*grid-template-columns:\s*112px minmax\(280px,\s*1fr\) 0px;/s,
+      /\.find-surface\.is-preview-collapsed\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\) 0px;/s,
     )
     expect(stylesSource).toMatch(/\.find-preview-region\s*\{[^}]*transition:[^}]*opacity 160ms ease/s)
     expect(stylesSource).toMatch(
@@ -208,7 +208,7 @@ describe('FindView', () => {
   it('keeps preview contents at a stable width while the drawer wrapper collapses', () => {
     expect(stylesSource).toMatch(/\.find-surface\s*\{[^}]*overflow:\s*hidden;/s)
     expect(stylesSource).toMatch(
-      /\.find-preview-region\s*\{[^}]*position:\s*relative;[^}]*overflow:\s*visible;/s,
+      /\.find-preview-region\s*\{[^}]*position:\s*relative;[^}]*overflow:\s*hidden;/s,
     )
     expect(stylesSource).toMatch(
       /\.find-preview-region > \.find-preview\s*\{[^}]*position:\s*absolute;[^}]*top:\s*0;[^}]*left:\s*0;[^}]*width:\s*200px;[^}]*min-width:\s*200px;/s,
@@ -221,9 +221,9 @@ describe('FindView', () => {
     )
   })
 
-  it('separates the three panes with consistent dividers instead of a preview outline', () => {
+  it('separates the category row and preview pane with consistent dividers', () => {
     expect(stylesSource).toMatch(
-      /\.find-categories-region\s*\{[^}]*border-right:\s*1px solid var\(--uipilot-ui-border\);/s,
+      /\.find-categories-region\s*\{[^}]*border-top:\s*1px solid var\(--uipilot-ui-border\);/s,
     )
     expect(stylesSource).toMatch(/\.find-surface \.result-list\s*\{[^}]*border:\s*0;/s)
     expect(stylesSource).toMatch(
