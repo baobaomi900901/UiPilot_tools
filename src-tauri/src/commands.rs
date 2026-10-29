@@ -1591,7 +1591,7 @@ fn builtin_feature_views(settings: &Settings) -> Vec<BuiltinFeatureView> {
                     "快捷链接",
                     "/quicklinks",
                     "管理快捷链接，使用自定义命令打开链接。",
-                    vec!["/quicklinks", "/quicklinks add"],
+                    vec!["/quicklinks"],
                 ),
                 ManagedBuiltinFeature::WebSearch => (
                     "网页搜索",
@@ -8293,6 +8293,7 @@ mod tests {
             value.iter().map(|item| item.command).collect::<Vec<_>>(),
             ["/screenshot", "/quicklinks", "/web-search"]
         );
+        assert_eq!(value[1].examples, vec!["/quicklinks"]);
         assert!(value.iter().all(|item| item.enabled
             && !item.examples.is_empty()
             && item.version == env!("CARGO_PKG_VERSION")));
