@@ -92,6 +92,14 @@ impl SelectionState {
             self.candidate = rect.filter(|r| r.dimensions().is_ok() && r.contains(point));
         }
     }
+    pub fn set_probe_candidate(
+        &mut self,
+        point: PhysicalPoint,
+        element: Option<PhysicalRect>,
+        window: Option<PhysicalRect>,
+    ) {
+        self.set_candidate(point, element.or(window));
+    }
     pub fn hovering(&self) -> bool {
         self.mode == ScreenshotMode::Region && self.anchor.is_none()
     }
@@ -116,7 +124,7 @@ impl SelectionState {
             .filter(|r| r.dimensions().is_ok())
     }
     fn update_pointer(&mut self, p: PhysicalPoint) {
-        if self.cursor != p && self.hovering() {
+        if self.cursor != p && self.hovering() && !self.candidate.is_some_and(|r| r.contains(p)) {
             self.candidate = None;
         }
         self.cursor = p;
@@ -136,11 +144,7 @@ impl SelectionState {
             SelectionInput::Move(p) => self.update_pointer(p),
             SelectionInput::PointerDown(p) => {
                 // Lock only the candidate actually displayed at mouse-down.
-                let locked = if self.cursor == p {
-                    self.candidate
-                } else {
-                    None
-                };
+                let locked = self.candidate.filter(|rect| rect.contains(p));
                 self.update_pointer(p);
                 if self.mode == ScreenshotMode::Region {
                     self.anchor = Some(p);
@@ -197,6 +201,7 @@ impl SelectionState {
                         });
                     }
                 } else {
+                    self.candidate = None;
                     let step = if shift { 10 } else { 1 };
                     let mut point = self.cursor;
                     match direction {
@@ -229,6 +234,61 @@ impl SelectionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_element_keeps_a_clickable_window_until_probe_refines_it() {
+        let point = PhysicalPoint { x: 50, y: 50 };
+        let window = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 200,
+        };
+        let element = PhysicalRect {
+            left: 40,
+            top: 40,
+            right: 80,
+            bottom: 80,
+        };
+        let mut state = SelectionState::new(ScreenshotMode::Region, point, vec![]);
+        state.set_probe_candidate(point, None, Some(window));
+        assert_eq!(state.highlight(), Some(window));
+        state.set_probe_candidate(point, Some(element), Some(window));
+        assert_eq!(state.highlight(), Some(element));
+        state.reduce(SelectionInput::PointerDown(point));
+        state.set_probe_candidate(point, None, Some(window));
+        assert_eq!(
+            state.reduce(SelectionInput::PointerUp(point)),
+            SelectionOutcome::Selected(element)
+        );
+        state.set_probe_candidate(point, None, Some(window));
+        state.reduce(SelectionInput::PointerDown(point));
+        assert_eq!(
+            state.reduce(SelectionInput::PointerUp(point)),
+            SelectionOutcome::Selected(window)
+        );
+    }
+
+    #[test]
+    fn hover_within_presented_element_stays_visible_and_down_locks_inside_it() {
+        let point = PhysicalPoint { x: 50, y: 50 };
+        let element = PhysicalRect {
+            left: 40,
+            top: 40,
+            right: 80,
+            bottom: 80,
+        };
+        let mut state = SelectionState::new(ScreenshotMode::Region, point, vec![]);
+        state.set_candidate(point, Some(element));
+        state.reduce(SelectionInput::Move(PhysicalPoint { x: 51, y: 50 }));
+        assert_eq!(state.highlight(), Some(element));
+        let down = PhysicalPoint { x: 52, y: 50 };
+        state.reduce(SelectionInput::PointerDown(down));
+        assert_eq!(
+            state.reduce(SelectionInput::PointerUp(down)),
+            SelectionOutcome::Selected(element)
+        );
+    }
 
     #[test]
     fn native_refresh_never_commits_old_moved_or_resized_rectangle() {
@@ -424,9 +484,10 @@ mod smart_tests {
     fn cursor_move_and_no_hit_clear_old_candidate() {
         let mut s = SelectionState::new(ScreenshotMode::Region, p(0, 0), vec![]);
         s.set_candidate(p(0, 0), Some(r()));
-        s.reduce(SelectionInput::Move(p(-1, -1)));
+        s.reduce(SelectionInput::Move(p(-11, -11)));
         s.set_candidate(p(0, 0), Some(r()));
         assert!(s.highlight().is_none());
+        s.reduce(SelectionInput::Move(p(-1, -1)));
         s.set_candidate(p(-1, -1), Some(r()));
         s.set_candidate(p(-1, -1), None);
         assert!(s.highlight().is_none());

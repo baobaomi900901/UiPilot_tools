@@ -28,13 +28,16 @@ enum Event {
     Cancel(CancelReason),
     CaptureLost,
     Tick,
+    ProbeReady,
     PaintFailed,
 }
+const WM_PROBE_READY: u32 = WM_APP + 19;
 struct State {
     desktop: capture::Desktop,
+    budget: PixelBudget,
     selection: RefCell<SelectionState>,
     palette: OverlayPalette,
-    frozen: RefCell<Option<capture::Desktop>>,
+    locked: Cell<bool>,
     fallback: Cell<bool>,
     target: Cell<Option<crate::screenshot::probe::ProbeTarget>>,
     presented_at: Cell<Option<u32>>,
@@ -42,6 +45,7 @@ struct State {
         Option<(
             Option<PhysicalRect>,
             Option<crate::screenshot::probe::ProbeTarget>,
+            bool,
         )>,
     >,
     events: RefCell<VecDeque<Event>>,
@@ -131,9 +135,11 @@ struct MotionHistory {
     gestures: VecDeque<ObservedGesture>,
     held: bool,
     overflowed: bool,
+    next_id: u64,
 }
 struct ObservedGesture {
-    time: u32,
+    id: u64,
+    claimed: bool,
     anchor: PhysicalPoint,
     extent: MotionExtent,
     completed: bool,
@@ -146,7 +152,7 @@ struct MotionExtent {
     max_y: i64,
 }
 impl MotionHistory {
-    fn record(&mut self, message: u32, time: u32, point: PhysicalPoint) {
+    fn record(&mut self, message: u32, _time: u32, point: PhysicalPoint) {
         if message == WM_LBUTTONDOWN {
             // Bounded storage; one native gesture is consumed well before 128
             // new clicks can arrive during a desktop capture.
@@ -155,10 +161,15 @@ impl MotionHistory {
                 self.overflowed = true;
             }
             self.gestures.push_back(ObservedGesture {
-                time,
+                id: self.next_id,
+                claimed: false,
                 anchor: point,
                 extent: MotionExtent::default(),
                 completed: false,
+            });
+            self.next_id = self.next_id.checked_add(1).unwrap_or_else(|| {
+                self.overflowed = true;
+                0
             });
             self.held = true;
         } else if self.held && matches!(message, WM_MOUSEMOVE | WM_LBUTTONUP) {
@@ -178,23 +189,54 @@ impl MotionHistory {
             }
         }
     }
-    fn distance(&self, time: u32) -> Option<MotionExtent> {
+    fn distance(&self, id: u64) -> Option<MotionExtent> {
         self.gestures
             .iter()
             .rev()
-            .find(|g| g.time == time)
+            .find(|g| g.id == id)
             .map(|g| g.extent)
+    }
+    fn claim(&mut self, point: PhysicalPoint) -> Option<u64> {
+        // The hook completes before Windows dispatches the corresponding button
+        // message. Pair in native event order, not by two queues' timestamps.
+        let gesture = self.gestures.iter_mut().find(|g| !g.claimed)?;
+        if gesture.anchor != point {
+            return None;
+        }
+        gesture.claimed = true;
+        Some(gesture.id)
+    }
+    fn completed(&mut self, id: u64) -> Option<MotionExtent> {
+        let index = self.gestures.iter().position(|g| g.id == id)?;
+        let gesture = self.gestures.remove(index)?;
+        gesture.completed.then_some(gesture.extent)
     }
 }
 thread_local! {
-    static MOUSE_HISTORY: RefCell<Option<std::sync::Arc<std::sync::Mutex<MotionHistory>>>> = const { RefCell::new(None) };
+    static MOUSE_HISTORY: RefCell<Option<MouseHistoryContext>> = const { RefCell::new(None) };
+}
+struct MouseHistoryContext {
+    history: std::sync::Arc<std::sync::Mutex<MotionHistory>>,
+    owner_thread: u32,
+    windows: Vec<isize>,
 }
 unsafe extern "system" fn observe_mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let event = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         MOUSE_HISTORY.with(|slot| {
-            if let Some(history) = slot.borrow().as_ref() {
-                if let Ok(mut history) = history.lock() {
+            if let Some(context) = slot.borrow().as_ref() {
+                if wparam.0 as u32 == WM_LBUTTONDOWN {
+                    let mut info = GUITHREADINFO {
+                        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetGUIThreadInfo(context.owner_thread, &mut info).is_err()
+                        || !context.windows.contains(&(info.hwndCapture.0 as isize))
+                    {
+                        return;
+                    }
+                }
+                if let Ok(mut history) = context.history.lock() {
                     history.record(
                         wparam.0 as u32,
                         event.time,
@@ -215,7 +257,8 @@ struct MouseObserver {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl MouseObserver {
-    fn start() -> Result<Self, NativeError> {
+    fn start(windows: Vec<isize>) -> Result<Self, NativeError> {
+        let owner_thread = unsafe { GetCurrentThreadId() };
         let history = std::sync::Arc::new(std::sync::Mutex::new(MotionHistory::default()));
         let worker_history = history.clone();
         let (ready, receiver) = std::sync::mpsc::sync_channel(1);
@@ -225,7 +268,13 @@ impl MouseObserver {
                 let _dpi = DpiContext::enter();
                 let mut message = MSG::default();
                 let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
-                MOUSE_HISTORY.with(|slot| *slot.borrow_mut() = Some(worker_history));
+                MOUSE_HISTORY.with(|slot| {
+                    *slot.borrow_mut() = Some(MouseHistoryContext {
+                        history: worker_history,
+                        owner_thread,
+                        windows,
+                    })
+                });
                 let instance = GetModuleHandleW(None).ok().map(|m| HINSTANCE(m.0));
                 let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(observe_mouse), instance, 0);
                 match hook {
@@ -252,14 +301,14 @@ impl MouseObserver {
             thread: Some(thread),
         })
     }
-    fn distance(&self, time: u32) -> Option<MotionExtent> {
-        self.history.lock().ok()?.distance(time)
+    fn claim(&self, point: PhysicalPoint) -> Option<u64> {
+        self.history.lock().ok()?.claim(point)
     }
-    fn finish(&self, time: u32) -> Option<MotionExtent> {
-        let mut history = self.history.lock().ok()?;
-        let index = history.gestures.iter().position(|g| g.time == time)?;
-        let gesture = history.gestures.remove(index)?;
-        gesture.completed.then_some(gesture.extent)
+    fn distance(&self, id: u64) -> Option<MotionExtent> {
+        self.history.lock().ok()?.distance(id)
+    }
+    fn finish(&self, id: u64) -> Option<MotionExtent> {
+        self.history.lock().ok()?.completed(id)
     }
 }
 impl Drop for MouseObserver {
@@ -380,7 +429,7 @@ unsafe extern "system" fn window_proc(
         WM_MOUSEMOVE => message_point(hwnd, lparam)
             .map(|point| Event::Input(SelectionInput::Move(pointer_point(point, state)))),
         WM_LBUTTONDOWN => message_point(hwnd, lparam)
-            .map(|point| Event::Down(hwnd, pointer_point(point, state), GetMessageTime() as u32)),
+            .map(|point| Event::Down(hwnd, point, GetMessageTime() as u32)),
         WM_LBUTTONUP => {
             message_point(hwnd, lparam).map(|point| Event::Up(pointer_point(point, state)))
         }
@@ -410,9 +459,18 @@ unsafe extern "system" fn window_proc(
             };
             input.map(Event::Input)
         }
-        WM_CAPTURECHANGED => Some(Event::CaptureLost),
-        WM_CANCELMODE => Some(Event::Cancel(CancelReason::LostCapture)),
-        WM_ACTIVATEAPP if wparam.0 == 0 => Some(Event::Cancel(CancelReason::LostCapture)),
+        WM_CAPTURECHANGED => {
+            crate::screenshot::probe::trace(format!("native capture changed to {}", lparam.0));
+            Some(Event::CaptureLost)
+        }
+        WM_CANCELMODE => {
+            crate::screenshot::probe::trace("native WM_CANCELMODE");
+            Some(Event::Cancel(CancelReason::LostCapture))
+        }
+        WM_ACTIVATEAPP if wparam.0 == 0 => {
+            crate::screenshot::probe::trace("native app deactivated");
+            Some(Event::Cancel(CancelReason::LostCapture))
+        }
         WM_DISPLAYCHANGE | WM_DPICHANGED => Some(Event::Cancel(CancelReason::DisplayChanged)),
         WM_WTSSESSION_CHANGE => Some(Event::Cancel(CancelReason::SessionChanged)),
         WM_CLOSE | WM_QUERYENDSESSION | WM_ENDSESSION => {
@@ -446,6 +504,7 @@ pub(super) fn run(
     provider: Option<std::path::PathBuf>,
     cancellation: &Cancellation,
 ) -> Result<SelectionResult, NativeError> {
+    crate::screenshot::probe::trace(format!("selection starting mode={mode:?}"));
     let _dpi = DpiContext::enter()?;
     if let Some(reason) = cancellation.reason() {
         return Ok(SelectionResult::Cancelled(reason));
@@ -492,7 +551,7 @@ pub(super) fn run(
     {
         return Err(NativeError::CaptureFailed);
     }
-    let captured = capture::live_desktop(excluded);
+    let captured = capture::desktop(excluded, budget, cancellation);
     if let Some(reason) = cancellation.reason() {
         return Ok(SelectionResult::Cancelled(reason));
     }
@@ -512,11 +571,12 @@ pub(super) fn run(
     let point = bounded_cursor(cursor()?, desktop.bounds);
     let selection = SelectionState::new(mode, point, desktop.candidates.clone());
     let state = Box::new(State {
+        budget: budget.clone(),
         desktop,
         selection: RefCell::new(selection),
         palette,
-        frozen: RefCell::new(None),
-        fallback: Cell::new(provider.is_none()),
+        locked: Cell::new(false),
+        fallback: Cell::new(true),
         target: Cell::new(None),
         presented_at: Cell::new(None),
         presented_candidate: Cell::new(None),
@@ -532,7 +592,7 @@ pub(super) fn run(
             cancellation,
         });
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class.name.as_ptr()),
             w!("UiPilot 截图选择"),
             WS_POPUP,
@@ -558,17 +618,22 @@ pub(super) fn run(
     })?;
     let mut probe_excluded = excluded.to_vec();
     probe_excluded.extend(windows.iter().map(|w| w.hwnd.0 as isize));
-    let mut probe = provider
-        .map(|path| crate::screenshot::probe::ProbeWorker::start(path, probe_excluded.clone()));
+    let mut probe_disabled = provider.is_none();
+    let overlay_thread = unsafe { GetCurrentThreadId() };
+    let mut probe = provider.map(|path| {
+        crate::screenshot::probe::ProbeWorker::start(path, probe_excluded.clone(), move || unsafe {
+            let _ = PostThreadMessageW(overlay_thread, WM_PROBE_READY, WPARAM(0), LPARAM(0));
+        })
+    });
     let mut pending_probe: Option<(u64, PhysicalPoint)> = None;
-    let observer = MouseObserver::start()?;
-    let mut gesture_time = None;
+    let mut applied_sequence = 0;
+    let observer = MouseObserver::start(windows.iter().map(|w| w.hwnd.0 as isize).collect())?;
+    let mut gesture_id = None;
     // Nothing is visible until the full monitor set exists. Any earlier error
     // unwinds every previously created HWND while contexts and frames still live.
     let mut capture = MouseCapture::new(NativeCapture);
     let result = (|| {
         unsafe {
-            live_style(&windows)?;
             for window in &windows {
                 let _ = ShowWindow(window.hwnd, SW_SHOW);
                 let _ = UpdateWindow(window.hwnd);
@@ -590,6 +655,10 @@ pub(super) fn run(
             if SetTimer(Some(active.hwnd), 1, 50, None) == 0 {
                 return Err(NativeError::OverlayFailed);
             }
+        }
+        present(&state, &windows, &probe_excluded)?;
+        if let Some(worker) = probe.as_ref().filter(|_| mode == ScreenshotMode::Region) {
+            pending_probe = Some((worker.request(point), point));
         }
         loop {
             if let Some(reason) = cancellation.reason() {
@@ -619,52 +688,52 @@ pub(super) fn run(
                         }
                         continue;
                     }
-                    Event::Tick => {
+                    Event::Tick | Event::ProbeReady => {
                         if !capture::layout().is_ok_and(|current| current == state.desktop.monitors)
                         {
                             return Ok(SelectionResult::Cancelled(CancelReason::DisplayChanged));
                         }
-                        if state.frozen.borrow().is_none() {
-                            let before = (state.selection.borrow().highlight(), state.target.get());
-                            if state.fallback.get() || mode == ScreenshotMode::Window {
-                                let fresh = capture::window_snapshot(
-                                    &probe_excluded,
-                                    state.desktop.bounds,
-                                )?;
-                                state.selection.borrow_mut().refresh_windows(fresh);
-                            }
+                        if !state.locked.get() {
+                            let before = (
+                                state.selection.borrow().highlight(),
+                                state.target.get(),
+                                state.fallback.get(),
+                            );
                             let point = state.selection.borrow().cursor;
                             if mode == ScreenshotMode::Region {
                                 if let Some(worker) = probe.as_mut() {
                                     while let Some(reply) = worker.poll() {
                                         if reply.unavailable {
+                                            probe_disabled = true;
                                             state.fallback.set(true);
                                         }
-                                        if pending_probe == Some((reply.sequence, reply.point))
-                                            && reply.point == point
-                                        {
-                                            let rect = if reply.unavailable {
-                                                state
-                                                    .selection
-                                                    .borrow()
-                                                    .selected_window()
-                                                    .map(|w| w.rect)
-                                            } else {
-                                                reply.rect
-                                            };
+                                        if reply_applies(
+                                            pending_probe,
+                                            applied_sequence,
+                                            reply.sequence,
+                                            reply.point,
+                                            reply.rect,
+                                            point,
+                                        ) {
+                                            let rect = reply.rect;
+                                            state.fallback.set(rect.is_none());
                                             state.target.set(reply.target);
                                             state.selection.borrow_mut().set_candidate(point, rect);
-                                            pending_probe = None;
+                                            applied_sequence = reply.sequence;
+                                            if pending_probe == Some((reply.sequence, reply.point))
+                                            {
+                                                pending_probe = None;
+                                            }
                                         }
                                     }
-                                    if !state.fallback.get()
+                                    if !probe_disabled
                                         && pending_probe.is_none_or(|(_, p)| p != point)
                                     {
                                         pending_probe = Some((worker.request(point), point));
                                     }
                                 }
                             }
-                            if state.fallback.get() || mode == ScreenshotMode::Window {
+                            if mode == ScreenshotMode::Window {
                                 let selected = state.selection.borrow().selected_window().cloned();
                                 let target = selected.as_ref().and_then(|w| {
                                     current_window_target(w, &probe_excluded, state.desktop.bounds)
@@ -673,7 +742,12 @@ pub(super) fn run(
                                 let rect = selected.filter(|_| target.is_some()).map(|w| w.rect);
                                 state.selection.borrow_mut().set_candidate(point, rect);
                             }
-                            let after = (state.selection.borrow().highlight(), state.target.get());
+                            refresh_window_fallback(&state, &probe_excluded)?;
+                            let after = (
+                                state.selection.borrow().highlight(),
+                                state.target.get(),
+                                state.fallback.get(),
+                            );
                             if before != after || state.presented_at.get().is_none() {
                                 present(&state, &windows, &probe_excluded)?;
                             }
@@ -681,7 +755,21 @@ pub(super) fn run(
                         continue;
                     }
                     Event::Down(_hwnd, point, time) => {
-                        pending_probe = None;
+                        gesture_id = observer.claim(point);
+                        if gesture_id.is_none() {
+                            crate::screenshot::probe::trace(
+                                "mouse observer missing ordered gesture",
+                            );
+                            return Ok(SelectionResult::Cancelled(CancelReason::LostCapture));
+                        }
+                        let point = pointer_point(point, &state);
+                        crate::screenshot::probe::trace(format!(
+                            "pointer down highlight={:?}",
+                            state.selection.borrow().highlight()
+                        ));
+                        if let Some((sequence, _)) = pending_probe.take() {
+                            applied_sequence = applied_sequence.max(sequence);
+                        }
                         if mode == ScreenshotMode::Window {
                             state
                                 .selection
@@ -713,7 +801,6 @@ pub(super) fn run(
                             return Ok(SelectionResult::Cancelled(CancelReason::User));
                         }
                         validate_candidate(&state);
-                        gesture_time = Some(time);
                         let dpi = state
                             .desktop
                             .monitors
@@ -747,8 +834,11 @@ pub(super) fn run(
                         if !capture.active {
                             continue;
                         }
-                        if let Some(time) = gesture_time.take() {
-                            let Some(extent) = observer.finish(time) else {
+                        if let Some(id) = gesture_id.take() {
+                            let Some(extent) = observer.finish(id) else {
+                                crate::screenshot::probe::trace(format!(
+                                    "mouse observer missing completed gesture id={id}"
+                                ));
                                 return Ok(SelectionResult::Cancelled(CancelReason::LostCapture));
                             };
                             observe_extent(&state, extent);
@@ -756,18 +846,27 @@ pub(super) fn run(
                         SelectionInput::PointerUp(point)
                     }
                     Event::Input(input) => {
-                        if let Some(time) = gesture_time {
-                            if let Some(extent) = observer.distance(time) {
+                        if let Some(id) = gesture_id {
+                            if let Some(extent) = observer.distance(id) {
                                 observe_extent(&state, extent);
                             }
                         }
                         if invalidates_live_probe(
                             input,
                             state.selection.borrow().cursor,
-                            state.frozen.borrow().is_some(),
+                            state.locked.get(),
                         ) {
+                            if !matches!(input, SelectionInput::Move(_)) {
+                                if let Some((sequence, _)) = pending_probe {
+                                    applied_sequence = applied_sequence.max(sequence);
+                                }
+                            }
                             pending_probe = None;
-                            state.target.set(None);
+                            if !matches!(input, SelectionInput::Move(p)
+                                if state.selection.borrow().highlight().is_some_and(|r| r.contains(p)))
+                            {
+                                state.target.set(None);
+                            }
                         }
                         if input == SelectionInput::Enter
                             && mode == ScreenshotMode::Window
@@ -797,7 +896,7 @@ pub(super) fn run(
                     input,
                     SelectionInput::PointerDown(_) | SelectionInput::Space
                 ) {
-                    freeze(&state, &windows, excluded, budget, cancellation)?;
+                    state.locked.set(true);
                 }
                 match outcome {
                     Err(reason) => return Ok(SelectionResult::Cancelled(reason)),
@@ -812,16 +911,13 @@ pub(super) fn run(
                             .iter()
                             .any(|window| window.hwnd == unsafe { GetForegroundWindow() })
                         {
+                            crate::screenshot::probe::trace(
+                                "foreground lost before frame composition",
+                            );
                             return Ok(SelectionResult::Cancelled(CancelReason::LostCapture));
                         }
-                        freeze(&state, &windows, excluded, budget, cancellation)?;
-                        let frozen = state.frozen.borrow();
                         let image = crate::screenshot::geometry::compose(
-                            frozen
-                                .as_ref()
-                                .ok_or(NativeError::CaptureFailed)?
-                                .frames
-                                .frames(),
+                            state.desktop.frames.frames(),
                             rect,
                             budget,
                         )?;
@@ -836,23 +932,30 @@ pub(super) fn run(
                     }
                     Ok(None) => {}
                 }
-                if state.selection.borrow().hovering() && state.frozen.borrow().is_some() {
-                    state.frozen.borrow_mut().take();
-                    unsafe {
-                        live_style(&windows)?;
-                    }
+                if state.selection.borrow().hovering() && state.locked.get() {
+                    state.locked.set(false);
+                    state.presented_candidate.set(None);
                     pending_probe = None;
                 }
                 {
                     let mut selection = state.selection.borrow_mut();
                     selection.cursor = bounded_cursor(selection.cursor, state.desktop.bounds);
                 }
-                if state.frozen.borrow().is_none() {
+                if !state.locked.get() {
+                    if state.selection.borrow().hovering() && !probe_disabled {
+                        let point = state.selection.borrow().cursor;
+                        if let Some(worker) = &probe {
+                            if pending_probe.is_none_or(|(_, requested)| requested != point) {
+                                pending_probe = Some((worker.request(point), point));
+                            }
+                        }
+                    }
                     present(&state, &windows, &probe_excluded)?;
-                }
-                unsafe {
-                    for window in &windows {
-                        let _ = InvalidateRect(Some(window.hwnd), None, false);
+                } else {
+                    unsafe {
+                        for window in &windows {
+                            let _ = InvalidateRect(Some(window.hwnd), None, false);
+                        }
                     }
                 }
             }
@@ -878,6 +981,10 @@ pub(super) fn run(
                 // Dispatch one message then process the resulting event before
                 // reading more, keeping capture/selection order deterministic.
                 if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    if message.message == WM_PROBE_READY {
+                        state.events.borrow_mut().push_back(Event::ProbeReady);
+                        continue;
+                    }
                     if message.message == WM_QUIT {
                         return Ok(SelectionResult::Cancelled(CancelReason::Shutdown));
                     }
@@ -896,6 +1003,15 @@ pub(super) fn run(
             .iter()
             .any(|window| window.hwnd == unsafe { GetForegroundWindow() }),
     );
+    match &result {
+        Ok(SelectionResult::Selected { rect, .. }) => {
+            crate::screenshot::probe::trace(format!("selection captured {rect:?}"))
+        }
+        Ok(SelectionResult::Cancelled(reason)) => {
+            crate::screenshot::probe::trace(format!("selection cancelled {reason:?}"))
+        }
+        Err(error) => crate::screenshot::probe::trace(format!("selection failed {error:?}")),
+    }
     state.closing.set(true);
     capture.release();
     drop(windows);
@@ -919,50 +1035,6 @@ fn validate_candidate(state: &State) {
         state.selection.borrow_mut().set_candidate(point, None);
         state.target.set(None);
     }
-}
-
-unsafe fn live_style(windows: &[OwnedWindow]) -> Result<(), NativeError> {
-    for window in windows {
-        SetLayeredWindowAttributes(window.hwnd, color(0xff00ff), 128, LWA_ALPHA | LWA_COLORKEY)
-            .map_err(|_| NativeError::OverlayFailed)?;
-    }
-    Ok(())
-}
-fn freeze(
-    state: &State,
-    windows: &[OwnedWindow],
-    excluded: &[isize],
-    budget: &PixelBudget,
-    cancellation: &Cancellation,
-) -> Result<(), NativeError> {
-    if state.frozen.borrow().is_some() {
-        return Ok(());
-    }
-    // Keep every HWND visible and continuously captured while alpha zero removes
-    // decorations. Queued input remains owned through the compositor barrier.
-    unsafe {
-        for window in windows {
-            SetLayeredWindowAttributes(window.hwnd, COLORREF(0), 0, LWA_ALPHA)
-                .map_err(|_| NativeError::OverlayFailed)?;
-        }
-    }
-    let mut ignored = excluded.to_vec();
-    ignored.extend(windows.iter().map(|w| w.hwnd.0 as isize));
-    let desktop = capture::desktop(&ignored, budget, cancellation)?;
-    if desktop.monitors != state.desktop.monitors {
-        cancellation.cancel(CancelReason::DisplayChanged);
-        return Err(NativeError::CaptureFailed);
-    }
-    *state.frozen.borrow_mut() = Some(desktop);
-    unsafe {
-        for window in windows {
-            SetLayeredWindowAttributes(window.hwnd, COLORREF(0), 255, LWA_ALPHA)
-                .map_err(|_| NativeError::OverlayFailed)?;
-            let _ = InvalidateRect(Some(window.hwnd), None, false);
-            let _ = UpdateWindow(window.hwnd);
-        }
-    }
-    Ok(())
 }
 
 fn finalize_ownership(
@@ -1070,6 +1142,64 @@ impl Drop for GdiObject {
         }
     }
 }
+// Draw the frame, shade, hole and border off-screen, then publish one complete
+// image. Painting these layers directly exposes a bright desktop between them.
+struct BackBuffer {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    _reservation: crate::screenshot::geometry::BudgetReservation,
+}
+impl BackBuffer {
+    unsafe fn new(
+        screen: HDC,
+        width: u32,
+        height: u32,
+        budget: &PixelBudget,
+    ) -> Result<Self, NativeError> {
+        let reservation = budget.reserve(crate::screenshot::geometry::rgba_len(width, height)?)?;
+        let dc = CreateCompatibleDC(Some(screen));
+        if dc.0.is_null() {
+            return Err(NativeError::OverlayFailed);
+        }
+        let mut bits = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(
+            Some(screen),
+            &capture::bitmap_info(width as i32, height as i32),
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        ) {
+            Ok(bitmap) => bitmap,
+            Err(_) => {
+                let _ = DeleteDC(dc);
+                return Err(NativeError::OverlayFailed);
+            }
+        };
+        let previous = SelectObject(dc, HGDIOBJ(bitmap.0));
+        if previous.0.is_null() || previous.0 as isize == -1 {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(dc);
+            return Err(NativeError::OverlayFailed);
+        }
+        Ok(Self {
+            dc,
+            bitmap,
+            previous,
+            _reservation: reservation,
+        })
+    }
+}
+impl Drop for BackBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
 struct SavedDc(HDC, i32);
 impl SavedDc {
     unsafe fn new(dc: HDC) -> Result<Self, NativeError> {
@@ -1143,6 +1273,22 @@ unsafe fn frozen(dc: HDC, frame: &MonitorFrame) -> Result<(), NativeError> {
 fn presentation_changed<T: PartialEq>(previous: Option<T>, current: T) -> bool {
     previous.as_ref() != Some(&current)
 }
+fn reply_applies(
+    pending: Option<(u64, PhysicalPoint)>,
+    applied: u64,
+    sequence: u64,
+    point: PhysicalPoint,
+    rect: Option<PhysicalRect>,
+    cursor: PhysicalPoint,
+) -> bool {
+    let Some((latest, _)) = pending else {
+        return false;
+    };
+    sequence > applied
+        && sequence <= latest
+        && (rect.is_some_and(|rect| rect.contains(cursor))
+            || (sequence == latest && point == cursor))
+}
 fn presented_window_target<T>(
     selection: &SelectionState,
     snapshot: impl FnOnce(&WindowCandidate) -> Option<T>,
@@ -1154,22 +1300,15 @@ fn invalidates_live_probe(input: SelectionInput, cursor: PhysicalPoint, frozen: 
         && (matches!(input, SelectionInput::Arrow { .. } | SelectionInput::Space)
             || matches!(input, SelectionInput::Move(p) if p != cursor))
 }
-fn live_background(rect: Option<PhysicalRect>) -> u32 {
-    if rect.is_some() {
-        0
-    } else {
-        0xff00ff
-    }
-}
 fn guard_presented_down(
     selection: &mut SelectionState,
-    point: PhysicalPoint,
+    _point: PhysicalPoint,
     time: u32,
     presented: Option<u32>,
 ) -> bool {
     let accepted = input_after_presentation(time, presented);
     if !accepted {
-        selection.set_candidate(point, None);
+        selection.set_candidate(selection.cursor, None);
     }
     accepted
 }
@@ -1193,20 +1332,84 @@ fn current_window_target(
         None
     }
 }
+fn refresh_window_fallback(state: &State, excluded: &[isize]) -> Result<(), NativeError> {
+    if state.locked.get() || !state.selection.borrow().hovering() {
+        return Ok(());
+    }
+    let fresh = capture::window_snapshot(excluded, state.desktop.bounds)?;
+    let point = state.selection.borrow().cursor;
+    if !same_visible_window(&state.desktop.candidates, &fresh, point) {
+        state.selection.borrow_mut().set_candidate(point, None);
+        state.target.set(None);
+        state.fallback.set(true);
+        return Ok(());
+    }
+    let candidate = state.selection.borrow().selected_window().cloned();
+    if !state.fallback.get()
+        && state.selection.borrow().highlight().is_some()
+        && state.target.get().is_some_and(|target| {
+            candidate
+                .as_ref()
+                .is_some_and(|window| window.id == target.hwnd)
+                && crate::screenshot::probe::target_is_current(target)
+        })
+    {
+        return Ok(());
+    }
+    let target = candidate
+        .as_ref()
+        .and_then(|window| current_window_target(window, excluded, state.desktop.bounds));
+    let rect = candidate.filter(|_| target.is_some()).map(|w| w.rect);
+    state.target.set(target);
+    state.fallback.set(true);
+    let point = state.selection.borrow().cursor;
+    state
+        .selection
+        .borrow_mut()
+        .set_probe_candidate(point, None, rect);
+    Ok(())
+}
+fn same_visible_window(
+    captured: &[WindowCandidate],
+    current: &[WindowCandidate],
+    point: PhysicalPoint,
+) -> bool {
+    let top = |windows: &[WindowCandidate]| {
+        windows
+            .iter()
+            .filter(|w| w.rect.contains(point))
+            .min_by_key(|w| w.z_order)
+            .map(|w| (w.id, w.rect))
+    };
+    top(captured).is_some() && top(captured) == top(current)
+}
 fn present(state: &State, windows: &[OwnedWindow], excluded: &[isize]) -> Result<(), NativeError> {
+    refresh_window_fallback(state, excluded)?;
     // Keyboard cycling and live pointer movement publish identity with geometry,
     // without waiting for a subsequent 50ms hover tick. Frozen locks stay owned.
-    if state.frozen.borrow().is_none() && state.selection.borrow().mode == ScreenshotMode::Window {
+    if !state.locked.get() && state.selection.borrow().mode == ScreenshotMode::Window {
         state
             .target
             .set(presented_window_target(&state.selection.borrow(), |w| {
                 current_window_target(w, excluded, state.desktop.bounds)
             }));
     }
-    let candidate = (state.selection.borrow().highlight(), state.target.get());
+    let candidate = (
+        state.selection.borrow().highlight(),
+        state.target.get(),
+        state.fallback.get(),
+    );
     let changed = presentation_changed(state.presented_candidate.get(), candidate);
+    if !changed {
+        return Ok(());
+    }
     if changed {
         state.presented_at.set(None);
+        crate::screenshot::probe::trace(format!(
+            "present candidate={:?} window_fallback={}",
+            candidate.0,
+            state.fallback.get()
+        ));
     }
     unsafe {
         for window in windows {
@@ -1225,14 +1428,14 @@ fn present(state: &State, windows: &[OwnedWindow], excluded: &[isize]) -> Result
 }
 unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeError> {
     let paint = Paint::begin(hwnd)?;
-    let dc = paint.dc;
     let monitor = state.desktop.monitors[index];
-    let frozen_desktop = state.frozen.borrow();
-    let frame = frozen_desktop.as_ref().map(|d| &d.frames.frames()[index]);
+    let frame = &state.desktop.frames.frames()[index];
     let selection = state.selection.borrow();
     let (width, height) = monitor.rect.dimensions()?;
-    if let Some(frame) = frame {
-        frozen(dc, frame)?;
+    let buffer = BackBuffer::new(paint.dc, width, height, &state.budget)?;
+    let dc = buffer.dc;
+    frozen(dc, frame)?;
+    if selection.highlight().is_some() || state.locked.get() {
         capture::shade(
             dc,
             RECT {
@@ -1243,17 +1446,6 @@ unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeErr
             },
             0,
             128,
-        )?;
-    } else {
-        fill(
-            dc,
-            RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
-            },
-            live_background(selection.highlight()),
         )?;
     }
     let selected = selection.highlight();
@@ -1267,11 +1459,7 @@ unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeErr
         {
             let _saved = SavedDc::new(dc)?;
             IntersectClipRect(dc, local.left, local.top, local.right, local.bottom);
-            if let Some(frame) = frame {
-                frozen(dc, frame)?;
-            } else {
-                fill(dc, local, 0xff00ff)?;
-            }
+            frozen(dc, frame)?;
         }
         let border = brush(state.palette.selection_border)?;
         if FrameRect(dc, &local, HBRUSH(border.0 .0)) == 0 {
@@ -1355,7 +1543,7 @@ unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeErr
         ),
         None => match selection.mode {
             ScreenshotMode::Region if state.fallback.get() => {
-                "元素识别不可用 · 拖动选择 · Esc 取消".into()
+                "移动选择窗口或元素 · 拖动框选 · Esc 取消".into()
             }
             ScreenshotMode::Region => "单击元素 / 拖动选择 · Space 起点 · Esc 取消".into(),
             ScreenshotMode::Window => "选择窗口 · 方向键切换 · Esc 取消".into(),
@@ -1394,6 +1582,18 @@ unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeErr
         &mut label,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
+    BitBlt(
+        paint.dc,
+        0,
+        0,
+        width as i32,
+        height as i32,
+        Some(dc),
+        0,
+        0,
+        SRCCOPY,
+    )
+    .map_err(|_| NativeError::OverlayFailed)?;
     Ok(())
 }
 
@@ -1401,6 +1601,97 @@ unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeErr
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+    #[test]
+    fn moving_within_completed_hit_does_not_wait_for_an_exact_stationary_point() {
+        let queried = PhysicalPoint { x: 20, y: 20 };
+        let cursor = PhysicalPoint { x: 24, y: 22 };
+        let rect = PhysicalRect {
+            left: 10,
+            top: 10,
+            right: 30,
+            bottom: 30,
+        };
+        assert!(reply_applies(
+            Some((3, cursor)),
+            1,
+            2,
+            queried,
+            Some(rect),
+            cursor
+        ));
+        assert!(!reply_applies(
+            Some((3, cursor)),
+            2,
+            2,
+            queried,
+            Some(rect),
+            cursor
+        ));
+        assert!(!reply_applies(
+            Some((3, cursor)),
+            1,
+            2,
+            queried,
+            None,
+            cursor
+        ));
+        assert!(!reply_applies(None, 1, 2, queried, Some(rect), cursor));
+        assert!(!reply_applies(
+            Some((3, cursor)),
+            1,
+            4,
+            queried,
+            Some(rect),
+            cursor
+        ));
+        let outside = PhysicalPoint { x: 30, y: 22 };
+        assert!(!reply_applies(
+            Some((3, outside)),
+            1,
+            2,
+            queried,
+            Some(rect),
+            outside
+        ));
+        assert!(reply_applies(Some((3, cursor)), 2, 3, cursor, None, cursor));
+    }
+    #[test]
+    fn captured_candidates_reject_live_movement_and_changed_occlusion() {
+        let point = PhysicalPoint { x: 20, y: 20 };
+        let rect = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let original = vec![WindowCandidate {
+            id: 1,
+            rect,
+            z_order: 0,
+        }];
+        assert!(same_visible_window(&original, &original, point));
+        let moved = vec![WindowCandidate {
+            id: 1,
+            rect: PhysicalRect { left: 10, ..rect },
+            z_order: 0,
+        }];
+        assert!(!same_visible_window(&original, &moved, point));
+        let popup = vec![
+            WindowCandidate {
+                id: 2,
+                rect,
+                z_order: 0,
+            },
+            WindowCandidate {
+                id: 1,
+                rect,
+                z_order: 1,
+            },
+        ];
+        assert!(!same_visible_window(&original, &popup, point));
+        assert!(!same_visible_window(&popup, &original, point));
+        assert!(!same_visible_window(&original, &[], point));
+    }
     #[test]
     fn unchanged_presentation_keeps_seen_candidate_selectable_during_repaint() {
         let a = (Some(42), Some((0, 0, 100, 100)));
@@ -1494,10 +1785,6 @@ mod tests {
             selection.reduce(SelectionInput::PointerUp(PhysicalPoint { x: 21, y: 20 })),
             SelectionOutcome::Selected(r)
         );
-    }
-    #[test]
-    fn live_no_hit_clears_mask() {
-        assert_eq!(live_background(None), 0xff00ff);
     }
     #[test]
     fn queued_down_before_candidate_presentation_cannot_lock_it() {
@@ -1630,6 +1917,29 @@ mod tests {
 mod motion_tests {
     use super::*;
     #[test]
+    fn claim_native_gesture_without_relying_on_message_timestamp() {
+        let mut h = MotionHistory::default();
+        let p = PhysicalPoint { x: 10, y: 20 };
+        h.record(WM_LBUTTONDOWN, 100, p);
+        h.record(WM_MOUSEMOVE, 101, PhysicalPoint { x: 30, y: 20 });
+        h.record(WM_LBUTTONUP, 102, p);
+        let id = h.claim(p).expect("queued down claims native gesture");
+        assert_eq!(h.completed(id).unwrap().max_x, 20);
+        h.record(WM_LBUTTONDOWN, 100, p);
+        h.record(WM_LBUTTONUP, 103, p);
+        let next = h.claim(p).unwrap();
+        assert_ne!(id, next);
+        assert!(h.completed(next).is_some());
+    }
+    #[test]
+    fn claim_never_skips_an_unmatched_native_press() {
+        let mut h = MotionHistory::default();
+        h.record(WM_LBUTTONDOWN, 100, PhysicalPoint { x: 10, y: 20 });
+        assert!(h.claim(PhysicalPoint { x: 11, y: 20 }).is_none());
+        let id = h.claim(PhysicalPoint { x: 10, y: 20 }).unwrap();
+        assert!(h.completed(id).is_none());
+    }
+    #[test]
     fn separate_native_history_preserves_excursion_and_original_down() {
         let mut h = MotionHistory::default();
         let p = PhysicalPoint { x: -100, y: -100 };
@@ -1638,8 +1948,10 @@ mod motion_tests {
         h.record(WM_MOUSEMOVE, 12, p);
         h.record(WM_LBUTTONUP, 13, p);
         h.record(WM_LBUTTONDOWN, 14, PhysicalPoint { x: 100, y: 100 });
+        let first = h.claim(p).unwrap();
+        let second = h.claim(PhysicalPoint { x: 100, y: 100 }).unwrap();
         assert_eq!(
-            h.distance(10),
+            h.distance(first),
             Some(MotionExtent {
                 min_x: 0,
                 max_x: 20,
@@ -1647,7 +1959,7 @@ mod motion_tests {
                 max_y: 0
             })
         );
-        assert_eq!(h.distance(14), Some(MotionExtent::default()));
+        assert_eq!(h.distance(second), Some(MotionExtent::default()));
     }
     #[test]
     fn history_overflow_cancels_instead_of_reverting_to_click() {
@@ -1672,7 +1984,7 @@ mod native_observer_tests {
     use super::*;
     #[test]
     fn observer_native_pump_starts_and_releases_hook_without_input_synthesis() {
-        let observer = MouseObserver::start().expect("native observer should install");
+        let observer = MouseObserver::start(vec![]).expect("native observer should install");
         assert_ne!(observer.thread_id, 0);
         assert!(observer.history.lock().is_ok());
         drop(observer);
