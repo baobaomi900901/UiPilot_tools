@@ -18,6 +18,8 @@ python D:\code\.tools\dev-uipilot.py --root D:\code\UiPilot_tools --rust-uia D:\
 
 既有 Everything 服务要求、动态开发端口及 UI 依赖保持生效。开发版通过当前进程环境中的 `UIPILOT_SCREENSHOT_PROVIDER_EXE` 使用本次独立暂存资产；不得把该路径写进正式包。
 
+控制台会实时显示 Provider 准备、Tauri/前端启动和 Cargo 编译日志。`Provider 已就绪` 仅表示截图依赖准备完成；`主程序进程已启动（PID …），正在初始化…` 表示主程序开始执行；`主程序已就绪：主窗口前端已连接，设置已加载，可使用启动器。` 才是初始化完成提示。后两项仅用于 debug 开发版，退出时脚本会显示退出码。更新开发脚本后，请 Ctrl+C 停止旧会话并重新运行，原有子进程的控制台连接不会自动修复。
+
 ## 构建 Setup
 
 ```powershell

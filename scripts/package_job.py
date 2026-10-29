@@ -90,8 +90,12 @@ class OwnedWorker:
                     os.set_handle_inheritable(msvcrt.get_osfhandle(fd),True)
                     setattr(startup,name,msvcrt.get_osfhandle(fd))
             command = c.create_unicode_buffer(subprocess.list2cmdline(args))
+            # Node/libuv needs the parent's console attachment, not only valid
+            # duplicated console handles. CREATE_NO_WINDOW silently loses its
+            # console output even though redirected pipe output still works.
+            flags = 0x4 if inherit_stdio else 0x08000004  # CREATE_SUSPENDED
             checked(self.api.CreateProcessW(args[0], command, None, None, inherit_stdio,
-                                            0x08000004, None, str(cwd),
+                                            flags, None, str(cwd),
                                             c.byref(startup), c.byref(info)))
             self.process = info.process
             checked(self.api.AssignProcessToJobObject(self.job, self.process))

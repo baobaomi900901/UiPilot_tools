@@ -5348,6 +5348,13 @@ pub(crate) fn load_settings(
     view.screenshot_hotkey_status = coordinator
         .screenshot_hotkeys
         .status(view.screenshot_hotkey.as_deref());
+    #[cfg(debug_assertions)]
+    {
+        static READY_LOG: std::sync::Once = std::sync::Once::new();
+        READY_LOG.call_once(|| {
+            eprintln!("[UiPilot dev] 主程序已就绪：主窗口前端已连接，设置已加载，可使用启动器。");
+        });
+    }
     Ok(view)
 }
 
