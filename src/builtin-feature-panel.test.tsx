@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from 'react'
+import { act, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PublicPluginPanel } from './public-plugin-panel'
@@ -13,9 +13,13 @@ const features: readonly BuiltinFeatureView[] = [
 ]
 function fixture() {
   let current = features.map((item) => ({ ...item }))
+  const listeners = new Set<() => void>()
   return {
     listBuiltinFeatures: vi.fn(async () => current),
     setBuiltinFeatureEnabled: vi.fn(async ({ feature, enabled }) => { current = current.map((item) => item.feature === feature ? { ...item, enabled } : item); return current }),
+    listenBuiltinFeaturesChanged: vi.fn(async (handler: () => void) => { listeners.add(handler); return () => { listeners.delete(handler) } }),
+    setCurrent(items: readonly BuiltinFeatureView[]) { current = items.map((item) => ({ ...item })) },
+    emitChanged() { for (const listener of listeners) listener() },
     listPublicPlugins: vi.fn(async () => ({ revision: '1', hotkeyRevision: '1', items: [] })),
     uninstallPublicPlugin: vi.fn(),
   }
@@ -96,5 +100,29 @@ describe('managed builtin settings', () => {
     expect(api.listBuiltinFeatures).toHaveBeenCalledTimes(2)
     expect(container.querySelector('[role="switch"]')?.getAttribute('aria-checked')).toBe('true')
     expect(container.querySelector('[role="switch"]')?.hasAttribute('disabled')).toBe(false)
+  })
+
+  it('refreshes the list when a detail toggle completes after returning', async () => {
+    const api = fixture()
+    let resolve!: (items: readonly BuiltinFeatureView[]) => void
+    api.setBuiltinFeatureEnabled.mockImplementationOnce(() => new Promise((accept) => { resolve = accept }) as never)
+    function Flow() {
+      const [detail, setDetail] = useState(true)
+      return <><button onClick={() => setDetail(false)}>返回列表</button>{detail
+        ? <BuiltinFeatureDetail client={api as unknown as LauncherClient} feature={features[0]!} />
+        : <PublicPluginPanel client={api as unknown as LauncherClient} />}</>
+    }
+    const container = await render(<Flow />)
+    await vi.waitFor(() => expect(container.querySelector('.public-plugin-detail [role="switch"]')).not.toBeNull())
+    click(container.querySelector('.public-plugin-detail [role="switch"]'))
+    click(container.querySelector('button'))
+    await vi.waitFor(() => expect(container.querySelector('[data-builtin-feature="screenshot"] [role="switch"]')?.getAttribute('aria-checked')).toBe('true'))
+    const updated = features.map((item) => item.feature === 'screenshot' ? { ...item, enabled: false } : item)
+    await act(async () => {
+      api.setCurrent(updated)
+      api.emitChanged()
+      resolve(updated)
+    })
+    await vi.waitFor(() => expect(container.querySelector('[data-builtin-feature="screenshot"] [role="switch"]')?.getAttribute('aria-checked')).toBe('false'))
   })
 })

@@ -24,9 +24,19 @@ export function useBuiltinFeatures(client: LauncherClient) {
     }
   }, [client, publish])
   useEffect(() => {
-    void reload()
-    return () => { epoch.current++ }
-  }, [reload])
+    let active = true
+    let unlisten: (() => void) | undefined
+    void (async () => {
+      try {
+        unlisten = await client.listenBuiltinFeaturesChanged?.(() => { void reload() })
+      } catch {
+        // The initial read still provides the current state if event delivery is unavailable.
+      }
+      if (!active) { unlisten?.(); return }
+      void reload()
+    })()
+    return () => { active = false; epoch.current++; unlisten?.() }
+  }, [client, reload])
   const toggle = async (feature: ManagedBuiltinFeature, enabled: boolean) => {
     if (pending.current) return
     pending.current = true
