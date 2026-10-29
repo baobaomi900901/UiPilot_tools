@@ -286,13 +286,12 @@ impl ScreenshotHost {
                     return;
                 };
                 excluded.push(hwnd.0 as isize);
-                if window.hide().is_err()
-                    || unsafe {
-                        ::windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(
-                            ::windows::Win32::Foundation::HWND(hwnd.0),
-                        )
-                    }
-                    .as_bool()
+                if windows::hide_for_capture(hwnd.0 as isize, || {
+                    window
+                        .hide()
+                        .map_err(|_| windows::NativeError::CaptureFailed)
+                })
+                .is_err()
                 {
                     self.complete(app, ticket, true, Err("captureFailed".into()));
                     return;

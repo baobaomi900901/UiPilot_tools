@@ -101,8 +101,9 @@ pub(super) fn desktop(
     budget: &PixelBudget,
     cancellation: &Cancellation,
 ) -> Result<Desktop, NativeError> {
-    // Caller has already hidden and checked its owned windows. Flush is a DWM
-    // synchronization barrier; a fixed delay cannot establish this ordering.
+    // The host disabled exit transitions while hiding its windows and waited
+    // for that change to be presented. Flush again at the actual read boundary;
+    // a flush alone cannot finish an ongoing window exit animation.
     unsafe {
         DwmFlush().map_err(|_| NativeError::CaptureFailed)?;
     }

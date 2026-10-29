@@ -1,6 +1,8 @@
 mod capture;
 mod overlay;
+mod prepare;
 pub(crate) use overlay::pin::PinManager;
+pub(crate) use prepare::hide_for_capture;
 
 use super::{
     geometry::{BudgetedImage, PixelBudget},
