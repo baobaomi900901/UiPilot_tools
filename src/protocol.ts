@@ -429,6 +429,7 @@ export interface LauncherClient {
   validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
   listenHidden(handler: () => void): Promise<() => void>
+  listenBuiltinFeaturesChanged?(handler: () => void): Promise<() => void>
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelError(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelReset(handler: (payload: unknown) => void): Promise<() => void>

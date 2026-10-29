@@ -929,6 +929,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let started = false
   let unlisten: (() => void) | undefined
   let unlistenHidden: (() => void) | undefined
+  let unlistenBuiltinFeaturesChanged: (() => void) | undefined
   let unlistenScreenshotError: (() => void) | undefined
   let unlistenPanelError: (() => void) | undefined
   let unlistenPanelReset: (() => void) | undefined
@@ -2488,6 +2489,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     cancelMinuteRefresh()
     invalidateFavoriteInteraction()
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
+    const restoreSettingsQuery = source === 'local' && model.view === 'settings' && nextView === 'launcher'
     const nextSettingsTab: SettingsTabKey =
       target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
     messageCenter.leave()
@@ -2533,8 +2535,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.shownNotice = REFUSED_NOTICE
     }
     if (nextView === 'launcher') {
-      model.query = ''
-      model.queryControlValue = ''
+      if (!restoreSettingsQuery) model.query = ''
+      model.queryControlValue = model.query
       model.querySequence = source === 'native' ? 1 : model.querySequence + 1
       deferCurrentSearch(!preserveDefaultLauncherResults)
     } else {
@@ -2545,6 +2547,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       void drainSettingsLoad()
     }
     if (target === 'messages') void messageCenter.enter()
+  }
+
+  function builtinFeaturesChanged(): void {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'applications' || !model.invocationId) return
+    cancelSlashSearch()
+    clearResults()
+    model.searchPending = false
+    model.status = ''
+    if (advanceApplicationSequence()) deferCurrentSearch(false)
+    publish(true)
   }
 
   function consumeHotkeyRecording(entry?: CommandHotkeyEntry): boolean {
@@ -4147,12 +4159,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     let registered: (() => void) | undefined
     let hiddenRegistered: (() => void) | undefined
+    let builtinFeaturesChangedRegistered: (() => void) | undefined
     let panelErrorsRegistered: (() => void) | undefined
     let panelResetsRegistered: (() => void) | undefined
     let screenshotErrorsRegistered: (() => void) | undefined
     try {
       registered = await client.listenShown(shown)
       hiddenRegistered = await client.listenHidden(hidden)
+      builtinFeaturesChangedRegistered = await client.listenBuiltinFeaturesChanged?.(builtinFeaturesChanged)
       panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
       panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
       screenshotErrorsRegistered = await client.listenScreenshotError((payload) => {
@@ -4166,6 +4180,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     } catch {
       registered?.()
       hiddenRegistered?.()
+      builtinFeaturesChangedRegistered?.()
       panelErrorsRegistered?.()
       panelResetsRegistered?.()
       screenshotErrorsRegistered?.()
@@ -4177,6 +4192,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) {
       registered()
       hiddenRegistered()
+      builtinFeaturesChangedRegistered?.()
       panelErrorsRegistered()
       panelResetsRegistered()
       screenshotErrorsRegistered()
@@ -4184,6 +4200,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     unlisten = registered
     unlistenHidden = hiddenRegistered
+    unlistenBuiltinFeaturesChanged = builtinFeaturesChangedRegistered
     unlistenPanelError = panelErrorsRegistered
     unlistenPanelReset = panelResetsRegistered
     unlistenScreenshotError = screenshotErrorsRegistered
@@ -4244,6 +4261,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlisten = undefined
     unlistenHidden?.()
     unlistenHidden = undefined
+    unlistenBuiltinFeaturesChanged?.()
+    unlistenBuiltinFeaturesChanged = undefined
     unlistenScreenshotError?.()
     unlistenScreenshotError = undefined
     unlistenPanelError?.()

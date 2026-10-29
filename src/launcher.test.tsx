@@ -366,6 +366,7 @@ type TestLauncherClient = LauncherClient & {
 function fakeClient() {
   let shownHandler: ((payload: unknown) => void) | undefined
   let hiddenHandler: (() => void) | undefined
+  let builtinFeaturesChangedHandler: (() => void) | undefined
   let messageStateHandler: ((payload: unknown) => void) | undefined
   let panelErrorHandler: ((payload: unknown) => void) | undefined
   let panelResetHandler: ((payload: unknown) => void) | undefined
@@ -379,6 +380,10 @@ function fakeClient() {
     }),
     listenHidden: vi.fn(async (handler) => {
       hiddenHandler = handler
+      return vi.fn()
+    }),
+    listenBuiltinFeaturesChanged: vi.fn(async (handler) => {
+      builtinFeaturesChangedHandler = handler
       return vi.fn()
     }),
     listenMessageStateChanged: vi.fn(async (handler) => {
@@ -481,6 +486,10 @@ function fakeClient() {
     emitHidden() {
       if (!hiddenHandler) throw new Error('hidden listener is not installed')
       hiddenHandler()
+    },
+    emitBuiltinFeaturesChanged() {
+      if (!builtinFeaturesChangedHandler) throw new Error('builtin feature listener is not installed')
+      builtinFeaturesChangedHandler()
     },
     emitScreenshotError(payload: unknown) {
       screenshotErrorHandler?.(payload)
@@ -11172,5 +11181,21 @@ describe('builtin settings query preservation', () => {
       await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
       expect(document.activeElement).toBe(mounted.host.querySelector('input[id^="launcher-query-"]'))
     } finally { await mounted.unmount(); core.destroy() }
+  })
+
+  it('invalidates visible results and reruns the same query after a builtin state event', async () => {
+    const fake = fakeClient()
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    try {
+      fake.emit(shown('builtin-event'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/screenshot', inputType: 'insertText' })
+      await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
+      vi.mocked(fake.client.searchApps).mockClear()
+      fake.emitBuiltinFeaturesChanged()
+      expect(core.getSnapshot().query).toBe('/screenshot')
+      expect(core.getSnapshot().results).toEqual([])
+      await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
+    } finally { core.destroy() }
   })
 })
