@@ -1605,6 +1605,9 @@ impl LifecycleCoordinator {
         let replacement = saved
             .screenshot_hotkey
             .as_deref()
+            .filter(|_| {
+                saved.builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::Screenshot)
+            })
             .map(crate::hotkey::command_chord)
             .transpose()?;
         if replacement.is_some_and(|s| crate::screenshot::hotkey::conflicts(&saved, &s.to_string()))

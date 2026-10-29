@@ -267,6 +267,19 @@ impl SettingsStore {
         self.persist(&mut state, candidate)
     }
 
+    // Execute only the admission/side effect here; do not reenter SettingsStore.
+    pub(crate) fn with_enabled_builtin<T>(
+        &self,
+        feature: ManagedBuiltinFeature,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        if !state.value.builtin_feature_enabled(feature) {
+            return Err(());
+        }
+        Ok(action())
+    }
+
     pub(crate) fn set_builtin_feature_enabled(
         &self,
         feature: ManagedBuiltinFeature,
@@ -589,6 +602,72 @@ fn valid_app_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_admission_and_disable_have_one_order_and_keep_existing_session() {
+        use crate::screenshot::{
+            model::ScreenshotMode,
+            service::{Begin, Origin, ScreenshotService},
+        };
+        use std::sync::{Arc, Barrier};
+        let dir = TestDir::new("builtin-admission-order");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let service = Arc::new(ScreenshotService::default());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_store = store.clone();
+        let worker_service = service.clone();
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let start = std::thread::spawn(move || {
+            worker_store
+                .with_enabled_builtin(ManagedBuiltinFeature::Screenshot, || {
+                    worker_entered.wait();
+                    worker_release.wait();
+                    worker_service
+                        .begin(ScreenshotMode::Region, Origin::Launcher)
+                        .unwrap()
+                })
+                .unwrap()
+        });
+        entered.wait();
+        let disable_store = store.clone();
+        let disable = std::thread::spawn(move || {
+            disable_store
+                .set_builtin_feature_enabled(ManagedBuiltinFeature::Screenshot, false)
+                .unwrap()
+        });
+        release.wait();
+        let Begin::Capture(ticket) = start.join().unwrap() else {
+            panic!("capture must be admitted first")
+        };
+        disable.join().unwrap();
+        assert_eq!(service.current_ticket(), Some(ticket));
+        for origin in [Origin::Launcher, Origin::Hotkey] {
+            assert!(store
+                .with_enabled_builtin(ManagedBuiltinFeature::Screenshot, || service
+                    .begin(ScreenshotMode::Region, origin))
+                .is_err());
+        }
+        assert_eq!(service.current_ticket(), Some(ticket));
+    }
+
+    #[test]
+    fn disabled_builtin_rejects_stale_actions() {
+        let dir = TestDir::new("builtin-action-gate");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let admitted = std::cell::Cell::new(0);
+        for feature in ManagedBuiltinFeature::ALL {
+            store
+                .with_enabled_builtin(feature, || admitted.set(admitted.get() + 1))
+                .unwrap();
+            store.set_builtin_feature_enabled(feature, false).unwrap();
+            assert!(store
+                .with_enabled_builtin(feature, || admitted.set(admitted.get() + 100))
+                .is_err());
+        }
+        assert_eq!(admitted.get(), 3);
+    }
+
     #[test]
     fn screenshot_directory_missing_field_migrates_and_custom_and_default_survive_restart() {
         let dir = TestDir::new("screenshot-directory");

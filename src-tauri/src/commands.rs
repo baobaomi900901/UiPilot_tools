@@ -1414,6 +1414,31 @@ fn load_screenshot_directory_settings(app: &AppHandle) -> ScreenshotSaveDirector
     ScreenshotSaveDirectoryView { directory, path }
 }
 
+fn edit_screenshot_hotkey_with(
+    settings: &SettingsStore,
+    keys: &crate::screenshot::hotkey::ScreenshotHotkeys,
+    replacement: Option<tauri_plugin_global_shortcut::Shortcut>,
+    register: &mut impl FnMut(tauri_plugin_global_shortcut::Shortcut) -> Result<(), ()>,
+    unregister: &mut impl FnMut(tauri_plugin_global_shortcut::Shortcut) -> Result<(), ()>,
+) -> Result<(), CommandError> {
+    let canonical = replacement.map(|s| s.to_string());
+    if canonical
+        .as_deref()
+        .is_some_and(|s| crate::screenshot::hotkey::conflicts(&settings.snapshot(), s))
+    {
+        return Err(CommandError::hotkey_conflict());
+    }
+    let desired = replacement.filter(|_| {
+        settings
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Screenshot)
+    });
+    keys.edit(desired, register, unregister, || {
+        settings.set_screenshot_hotkey(canonical).map_err(|_| ())
+    })
+    .map_err(|_| CommandError::settings_failed())
+}
+
 #[tauri::command]
 pub(crate) async fn set_screenshot_hotkey(
     window: WebviewWindow,
@@ -1435,23 +1460,14 @@ pub(crate) async fn set_screenshot_hotkey(
             .lock_hotkey_operation()
             .map_err(|_| CommandError::settings_failed())?;
         let settings = app.state::<SettingsStore>();
-        let canonical = replacement.map(|s| s.to_string());
-        if canonical
-            .as_deref()
-            .is_some_and(|s| crate::screenshot::hotkey::conflicts(&settings.snapshot(), s))
-        {
-            return Err(CommandError::hotkey_conflict());
-        }
         let native = app.global_shortcut();
-        coordinator
-            .screenshot_hotkeys
-            .edit(
-                replacement,
-                &mut |s| native.register(s).map_err(|_| ()),
-                &mut |s| native.unregister(s).map_err(|_| ()),
-                || settings.set_screenshot_hotkey(canonical).map_err(|_| ()),
-            )
-            .map_err(|_| CommandError::settings_failed())
+        edit_screenshot_hotkey_with(
+            &settings,
+            &coordinator.screenshot_hotkeys,
+            replacement,
+            &mut |s| native.register(s).map_err(|_| ()),
+            &mut |s| native.unregister(s).map_err(|_| ()),
+        )
     })
     .await
     .map_err(|_| CommandError::settings_failed())?
@@ -1635,19 +1651,73 @@ pub(crate) fn list_builtin_features(
     Ok(builtin_feature_views(&settings.snapshot()))
 }
 
+fn set_builtin_enabled_with(
+    settings: &SettingsStore,
+    keys: &crate::screenshot::hotkey::ScreenshotHotkeys,
+    feature: ManagedBuiltinFeature,
+    enabled: bool,
+    register: &mut impl FnMut(tauri_plugin_global_shortcut::Shortcut) -> Result<(), ()>,
+    unregister: &mut impl FnMut(tauri_plugin_global_shortcut::Shortcut) -> Result<(), ()>,
+) -> Result<(), CommandError> {
+    let saved = settings.snapshot();
+    if saved.builtin_feature_enabled(feature) == enabled {
+        return Ok(());
+    }
+    if feature != ManagedBuiltinFeature::Screenshot {
+        return settings
+            .set_builtin_feature_enabled(feature, enabled)
+            .map_err(|_| CommandError::settings_failed());
+    }
+    let desired = saved
+        .screenshot_hotkey
+        .as_deref()
+        .filter(|_| enabled)
+        .map(crate::hotkey::command_chord)
+        .transpose()
+        .map_err(|_| CommandError::settings_failed())?;
+    if desired.is_some_and(|s| crate::screenshot::hotkey::conflicts(&saved, &s.to_string())) {
+        return Err(CommandError::hotkey_conflict());
+    }
+    keys.edit(desired, register, unregister, || {
+        settings
+            .set_builtin_feature_enabled(feature, enabled)
+            .map_err(|_| ())
+    })
+    .map_err(|_| CommandError::settings_failed())
+}
+
 #[tauri::command]
-pub(crate) fn set_builtin_feature_enabled(
+pub(crate) async fn set_builtin_feature_enabled(
     window: WebviewWindow,
     feature: String,
     enabled: bool,
 ) -> Result<Vec<BuiltinFeatureView>, CommandError> {
-    with_managed_builtin(window.label(), &feature, |feature| {
-        let settings = window.app_handle().state::<SettingsStore>();
-        settings
-            .set_builtin_feature_enabled(feature, enabled)
+    let feature = with_managed_builtin(window.label(), &feature, Ok)?;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+        let _critical = coordinator
+            .reserve_critical()
             .map_err(|_| CommandError::settings_failed())?;
-        Ok(builtin_feature_views(&settings.snapshot()))
+        let _operation = coordinator
+            .lock_hotkey_operation()
+            .map_err(|_| CommandError::settings_failed())?;
+        let settings = app.state::<SettingsStore>();
+        let native = app.global_shortcut();
+        set_builtin_enabled_with(
+            &settings,
+            &coordinator.screenshot_hotkeys,
+            feature,
+            enabled,
+            &mut |s| native.register(s).map_err(|_| ()),
+            &mut |s| native.unregister(s).map_err(|_| ()),
+        )?;
+        let views = builtin_feature_views(&settings.snapshot());
+        let _ = app.emit_to("main", "builtin-features://changed", ());
+        Ok(views)
     })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
 }
 
 #[tauri::command]
@@ -1685,7 +1755,11 @@ pub(crate) fn list_quicklinks(
     store: State<'_, Arc<QuicklinksStore>>,
 ) -> Result<QuicklinkListResponse, CommandError> {
     require_main_window(&window)?;
-    Ok(store.list())
+    window
+        .app_handle()
+        .state::<SettingsStore>()
+        .with_enabled_builtin(ManagedBuiltinFeature::Quicklinks, || store.list())
+        .map_err(|_| CommandError::plugin_query_failed())
 }
 
 #[tauri::command]
@@ -1698,8 +1772,13 @@ pub(crate) fn save_quicklink(
     require_main_window(&window)?;
     let manager = service.manager()?;
     let public_commands = manager.installed_command_names()?;
-    let saved = store
-        .save_with_external_conflicts(input, &public_commands)
+    let saved = window
+        .app_handle()
+        .state::<SettingsStore>()
+        .with_enabled_builtin(ManagedBuiltinFeature::Quicklinks, || {
+            store.save_with_external_conflicts(input, &public_commands)
+        })
+        .map_err(|_| CommandError::plugin_query_failed())?
         .map_err(CommandError::quicklink)?;
     manager.replace_external_reserved_names(store.commands())?;
     Ok(saved)
@@ -1713,7 +1792,12 @@ pub(crate) fn delete_quicklink(
     id: String,
 ) -> Result<(), CommandError> {
     require_main_window(&window)?;
-    store.delete(&id).map_err(CommandError::quicklink)?;
+    window
+        .app_handle()
+        .state::<SettingsStore>()
+        .with_enabled_builtin(ManagedBuiltinFeature::Quicklinks, || store.delete(&id))
+        .map_err(|_| CommandError::plugin_query_failed())?
+        .map_err(CommandError::quicklink)?;
     service
         .manager()?
         .replace_external_reserved_names(store.commands())?;
@@ -1728,6 +1812,9 @@ pub(crate) async fn choose_quicklink_icon(
     store: State<'_, Arc<QuicklinksStore>>,
 ) -> Result<Option<QuicklinkIconCandidate>, CommandError> {
     require_main_window(&window)?;
+    app.state::<SettingsStore>()
+        .with_enabled_builtin(ManagedBuiltinFeature::Quicklinks, || ())
+        .map_err(|_| CommandError::plugin_query_failed())?;
     let _focus = coordinator
         .suppress_transient_focus_loss()
         .map_err(|_| CommandError::quicklink(QuicklinkErrorCode::InvalidIcon))?;
@@ -1744,7 +1831,13 @@ pub(crate) async fn choose_quicklink_icon(
             .and_then(|path| path.into_path().ok());
         selected
             .as_deref()
-            .map(|path| picker_store.create_icon_candidate_from_path(path))
+            .map(|path| {
+                app.state::<SettingsStore>()
+                    .with_enabled_builtin(ManagedBuiltinFeature::Quicklinks, || {
+                        picker_store.create_icon_candidate_from_path(path)
+                    })
+                    .map_err(|_| QuicklinkErrorCode::InvalidIcon)?
+            })
             .transpose()
     })
     .await
@@ -3973,6 +4066,7 @@ pub(crate) async fn search_apps(
                 submit,
                 web_search_engine,
                 favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                disabled_builtin_features: &settings_snapshot.disabled_builtin_features,
                 quicklinks: &quicklink_items,
             },
             |plain_query| public.manager()?.launcher_command_suggestions(plain_query),
@@ -3998,6 +4092,7 @@ pub(crate) async fn search_apps(
                 submit,
                 web_search_engine,
                 favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                disabled_builtin_features: &settings_snapshot.disabled_builtin_features,
                 quicklinks: &quicklink_items,
             },
             |_| Ok(Vec::new()),
@@ -4018,6 +4113,7 @@ pub(crate) async fn search_apps(
                 submit,
                 web_search_engine,
                 favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                disabled_builtin_features: &settings_snapshot.disabled_builtin_features,
                 quicklinks: &quicklink_items,
             },
             |prefix| public.manager()?.command_suggestions(prefix),
@@ -4240,6 +4336,7 @@ pub(crate) async fn search_apps(
             submit,
             web_search_engine,
             favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+            disabled_builtin_features: &settings_snapshot.disabled_builtin_features,
             quicklinks: &quicklink_items,
         },
         |_| Ok(Vec::new()),
@@ -4488,6 +4585,9 @@ where
     publish().map_err(|_| CommandError::plugin_query_failed())
 }
 
+#[cfg(test)]
+static EMPTY_DISABLED_BUILTINS: BTreeSet<ManagedBuiltinFeature> = BTreeSet::new();
+
 #[derive(Clone, Copy)]
 struct CatalogSearchRequest<'a> {
     query: &'a str,
@@ -4496,6 +4596,7 @@ struct CatalogSearchRequest<'a> {
     submit: bool,
     web_search_engine: WebSearchEngine,
     favorite_builtin_features: &'a BTreeSet<BuiltinFeature>,
+    disabled_builtin_features: &'a BTreeSet<ManagedBuiltinFeature>,
     quicklinks: &'a [QuicklinkView],
 }
 
@@ -4582,6 +4683,7 @@ where
             submit: false,
             web_search_engine,
             favorite_builtin_features: &favorite_builtin_features,
+            disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
             quicklinks: &[],
         },
         |_| Ok(Vec::new()),
@@ -5346,6 +5448,26 @@ where
                 right_favorite.cmp(&left_favorite)
             });
         }
+    }
+
+    // Filter before publishing so disabled entries never acquire executable result IDs.
+    // Saved child command names still resolve above, keeping their names reserved.
+    let disabled = |feature| request.disabled_builtin_features.contains(&feature);
+    entries.retain(|(item, _)| match item.icon_kind {
+        Some(ResultIconKind::Screenshot) => !disabled(ManagedBuiltinFeature::Screenshot),
+        Some(ResultIconKind::Quicklinks) => !disabled(ManagedBuiltinFeature::Quicklinks),
+        Some(ResultIconKind::WebSearch) => !disabled(ManagedBuiltinFeature::WebSearch),
+        _ => {
+            !disabled(ManagedBuiltinFeature::Quicklinks)
+                || !request
+                    .quicklinks
+                    .iter()
+                    .any(|link| item.title == format!("/{}", link.command))
+        }
+    });
+    if entries.is_empty() {
+        command_hint = None;
+        auto_execute_first_result = false;
     }
 
     registry.publish_if_latest(
@@ -6279,8 +6401,16 @@ pub(crate) async fn execute_result(
                     .map_err(|_| CommandError::file_open_failed())?
                 }
             },
-            open_web_search: crate::web_search::open_search,
-            open_quicklink: crate::browser_open::open_url,
+            open_web_search: |engine: WebSearchEngine, query: &str| {
+                open_builtin_with(&settings, ManagedBuiltinFeature::WebSearch, || {
+                    crate::web_search::open_search(engine, query)
+                })
+            },
+            open_quicklink: |url| {
+                open_builtin_with(&settings, ManagedBuiltinFeature::Quicklinks, || {
+                    crate::browser_open::open_url(url)
+                })
+            },
             copy_builtin: |text: &str| app.clipboard().write_text(text.to_owned()).map_err(|_| ()),
             copy_plugin: |plugin_id: &str,
                           command_id: Option<&str>,
@@ -6547,6 +6677,18 @@ fn outcome_parts(outcome: apps::ApplicationActionOutcome) -> ExecuteOutcome {
     }
 }
 
+// This is the final action admission, after resolving the current result handle.
+// The admission linearizes against settings commits; native shell IO must run
+// outside the settings lock, and an already-admitted open may finish normally.
+fn open_builtin_with(
+    settings: &SettingsStore,
+    feature: ManagedBuiltinFeature,
+    open: impl FnOnce() -> Result<(), ()>,
+) -> Result<(), ()> {
+    settings.with_enabled_builtin(feature, || ())?;
+    open()
+}
+
 fn execute_web_search_with<O, H>(
     engine: WebSearchEngine,
     query: &str,
@@ -6696,6 +6838,190 @@ where
 #[cfg(test)]
 mod tests {
     #[test]
+    fn screenshot_toggle_save_failure_restores_registration_and_enabled_state() {
+        let dir = TestDir::new();
+        let settings = settings_store(&dir);
+        settings
+            .set_screenshot_hotkey(Some("Ctrl+P".into()))
+            .unwrap();
+        let keys = crate::screenshot::hotkey::ScreenshotHotkeys::default();
+        let chord = crate::hotkey::command_chord("Ctrl+P").unwrap();
+        keys.edit(Some(chord), &mut |_| Ok(()), &mut |_| Ok(()), || Ok(()))
+            .unwrap();
+        fs::remove_file(dir.path().join("settings.json")).unwrap();
+        fs::create_dir(dir.path().join("settings.json")).unwrap();
+        let registered = Cell::new(true);
+        assert!(super::set_builtin_enabled_with(
+            &settings,
+            &keys,
+            ManagedBuiltinFeature::Screenshot,
+            false,
+            &mut |_| {
+                registered.set(true);
+                Ok(())
+            },
+            &mut |_| {
+                registered.set(false);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert!(registered.get());
+        assert!(keys.candidate(chord.id()).is_some());
+        assert!(settings
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Screenshot));
+        assert_eq!(
+            settings.snapshot().screenshot_hotkey.as_deref(),
+            Some("Ctrl+P")
+        );
+    }
+
+    #[test]
+    fn editing_screenshot_hotkey_while_disabled_only_saves_configuration() {
+        let dir = TestDir::new();
+        let settings = settings_store(&dir);
+        settings
+            .set_builtin_feature_enabled(ManagedBuiltinFeature::Screenshot, false)
+            .unwrap();
+        let keys = crate::screenshot::hotkey::ScreenshotHotkeys::default();
+        super::edit_screenshot_hotkey_with(
+            &settings,
+            &keys,
+            Some(crate::hotkey::command_chord("Ctrl+P").unwrap()),
+            &mut |_| panic!("disabled hotkey must not register"),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.snapshot().screenshot_hotkey.as_deref(),
+            Some(
+                crate::hotkey::command_chord("Ctrl+P")
+                    .unwrap()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert!(keys.registrations().is_empty());
+        super::edit_screenshot_hotkey_with(
+            &settings,
+            &keys,
+            None,
+            &mut |_| panic!("disabled hotkey must not register"),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(settings.snapshot().screenshot_hotkey.is_none());
+    }
+
+    #[test]
+    fn screenshot_toggle_restores_saved_chord_and_rolls_back_conflicts() {
+        let dir = TestDir::new();
+        let settings = settings_store(&dir);
+        settings
+            .set_screenshot_hotkey(Some("Ctrl+P".into()))
+            .unwrap();
+        let keys = crate::screenshot::hotkey::ScreenshotHotkeys::default();
+        let chord = crate::hotkey::command_chord("Ctrl+P").unwrap();
+        keys.edit(Some(chord), &mut |_| Ok(()), &mut |_| Ok(()), || Ok(()))
+            .unwrap();
+        super::set_builtin_enabled_with(
+            &settings,
+            &keys,
+            ManagedBuiltinFeature::Screenshot,
+            false,
+            &mut |_| panic!("disable must not register"),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(keys.registrations().is_empty());
+        assert_eq!(
+            settings.snapshot().screenshot_hotkey.as_deref(),
+            Some("Ctrl+P")
+        );
+        assert!(super::set_builtin_enabled_with(
+            &settings,
+            &keys,
+            ManagedBuiltinFeature::Screenshot,
+            true,
+            &mut |_| Err(()),
+            &mut |_| Ok(())
+        )
+        .is_err());
+        assert!(!settings
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Screenshot));
+        assert_eq!(
+            settings.snapshot().screenshot_hotkey.as_deref(),
+            Some("Ctrl+P")
+        );
+        super::set_builtin_enabled_with(
+            &settings,
+            &keys,
+            ManagedBuiltinFeature::Screenshot,
+            true,
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(keys.candidate(chord.id()).is_some());
+    }
+
+    #[test]
+    fn disabled_builtins_are_absent_from_all_catalog_routes() {
+        for query in [
+            "",
+            "/",
+            "/screenshot",
+            "screenshot",
+            "/quicklinks",
+            "/qu",
+            "/web-search",
+            "/web-search hello",
+            "ordinary query",
+            "/jd hello",
+        ] {
+            let registry = ready_registry("disabled");
+            let quicklinks = vec![QuicklinkView {
+                id: "1".into(),
+                name: "JD".into(),
+                command: "jd".into(),
+                template: "https://example.com/?q={query}".into(),
+                icon_data_url: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            }];
+            let response = search_apps_with_catalog(
+                &registry,
+                CatalogSearchRequest {
+                    query,
+                    invocation_id: "disabled",
+                    query_sequence: 1,
+                    submit: true,
+                    web_search_engine: WebSearchEngine::Bing,
+                    favorite_builtin_features: &BTreeSet::new(),
+                    disabled_builtin_features: &BTreeSet::from(ManagedBuiltinFeature::ALL),
+                    quicklinks: &quicklinks,
+                },
+                |_| Ok(Vec::new()),
+                Vec::new,
+                |_| {},
+            )
+            .unwrap();
+            assert!(
+                response
+                    .items
+                    .iter()
+                    .all(|item| item.icon_kind == Some(crate::model::ResultIconKind::Find)),
+                "disabled entries for {query}: {:?}",
+                response.items
+            );
+            assert!(response.auto_execute_result_id.is_none());
+            assert!(response.command_hint.is_none());
+        }
+    }
+
+    #[test]
     fn screenshot_directory_authorization_precedes_picker_and_mutation_and_cancel_does_not_save() {
         for invalid in [
             serde_json::json!({}),
@@ -6789,7 +7115,7 @@ mod tests {
         with_managed_builtin, CatalogSearchRequest, CommandError, CompletionOriginInput,
         CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome,
         HostInputFocusStart, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
-        ThemePreferenceUpdate, UserSettingsUpdate,
+        ThemePreferenceUpdate, UserSettingsUpdate, EMPTY_DISABLED_BUILTINS,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -7263,6 +7589,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| Ok(Vec::new()),
@@ -7301,6 +7628,7 @@ mod tests {
                     submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &favorites,
+                    disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                     quicklinks: &[],
                 },
                 |_| Ok(Vec::new()),
@@ -7642,6 +7970,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| {
@@ -7713,6 +8042,7 @@ mod tests {
                     submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &favorites,
+                    disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                     quicklinks: &[],
                 },
                 |_| panic!("reserved builtin command must not read plugin inventory"),
@@ -7747,6 +8077,7 @@ mod tests {
                 submit: true,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &quicklinks,
             },
             |_| panic!("reserved quicklinks command must not read plugin inventory"),
@@ -7782,6 +8113,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &quicklinks,
             },
             |_| panic!("quicklink exact command must win before plugin inventory"),
@@ -7812,6 +8144,7 @@ mod tests {
                 submit: true,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &quicklinks,
             },
             |_| panic!("quicklink exact command must win before plugin inventory"),
@@ -7845,6 +8178,7 @@ mod tests {
                 submit: true,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("web-search command must not read plugin inventory"),
@@ -7871,6 +8205,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("web-search command must not read plugin inventory"),
@@ -7895,6 +8230,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &favorites,
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| {
@@ -7943,6 +8279,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |query| {
@@ -7983,6 +8320,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Google,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |query| {
@@ -8069,6 +8407,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| Err(crate::public_plugins::PublicPluginManagementError::Unavailable),
@@ -8094,6 +8433,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("reserved web command must not read plugin inventory"),
@@ -8116,6 +8456,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Baidu,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("reserved web hint must not read plugin inventory"),
@@ -9564,6 +9905,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &favorites,
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("recognized currency must not read plugins"),
@@ -9631,7 +9973,7 @@ mod tests {
         for deferred in [
             "app.state::<Arc<AppCache>>()",
             "app.state::<SettingsStore>()",
-            "app.state::<Arc<PublicPluginService>>()",
+            "let public = app.state::<Arc<PublicPluginService>>()",
             "app.state::<Arc<QuicklinksStore>>()",
             "settings.snapshot()",
             "quicklinks.list()",
@@ -9656,6 +9998,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &favorites,
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("recognized currency must not read plugins"),
@@ -9696,6 +10039,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &favorites,
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| Ok(Vec::new()),
@@ -9733,6 +10077,7 @@ mod tests {
                     submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &favorites,
+                    disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                     quicklinks: &[],
                 },
                 |_| panic!("owned malformed currency must not read plugins"),
@@ -9784,6 +10129,7 @@ mod tests {
                     submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &favorites,
+                    disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                     quicklinks: &[],
                 },
                 |_| Ok(Vec::new()),
@@ -9822,6 +10168,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &favorites,
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |_| panic!("recognized currency must not read plugins"),
@@ -9885,6 +10232,7 @@ mod tests {
                     submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &favorites,
+                    disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                     quicklinks: &[],
                 },
                 |_| panic!("recognized currency must not read plugins"),
@@ -10111,6 +10459,7 @@ mod tests {
                     submit: false,
                     web_search_engine: WebSearchEngine::Bing,
                     favorite_builtin_features: &BTreeSet::new(),
+                    disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                     quicklinks: &[],
                 },
                 |_| Ok(vec![command_suggestion("demo")]),
@@ -10411,6 +10760,7 @@ mod tests {
                 submit: false,
                 web_search_engine: WebSearchEngine::Bing,
                 favorite_builtin_features: &BTreeSet::new(),
+                disabled_builtin_features: &EMPTY_DISABLED_BUILTINS,
                 quicklinks: &[],
             },
             |query| {
@@ -11642,6 +11992,81 @@ mod tests",
         use super::super::{execute_result_with_clipboard, ClipboardExecution};
         use super::*;
         use crate::plugins::PluginCopyError;
+
+        #[test]
+        fn stale_builtin_results_are_denied_and_reenable_preserves_their_data() {
+            let dir = TestDir::new();
+            let settings = settings_store(&dir);
+            for (feature, action) in [
+                (
+                    ManagedBuiltinFeature::WebSearch,
+                    ResultAction::OpenWebSearch {
+                        engine: WebSearchEngine::Bing,
+                        query: "saved query".into(),
+                    },
+                ),
+                (
+                    ManagedBuiltinFeature::Quicklinks,
+                    ResultAction::OpenQuicklink {
+                        id: "saved-link".into(),
+                        url: "https://example.com/saved".into(),
+                    },
+                ),
+            ] {
+                let registry = ready_registry("stale-builtin");
+                let token = registry
+                    .begin_query(QueryDomain::Application, "stale-builtin", 1)
+                    .unwrap();
+                let (request, result) = registry
+                    .publish_if_latest(
+                        token,
+                        vec![((), action)],
+                        || true,
+                        |request, items| (request, items[0].0.clone()),
+                    )
+                    .unwrap();
+                settings
+                    .set_builtin_feature_enabled(feature, false)
+                    .unwrap();
+                let opened = Cell::new(0);
+                for enabled in [false, true] {
+                    if enabled {
+                        settings.set_builtin_feature_enabled(feature, true).unwrap();
+                    }
+                    let result = tauri::async_runtime::block_on(execute_result_with_clipboard(
+                        (&request, &result),
+                        ClipboardExecution {
+                            resolve: |request: &str, result: &str| {
+                                registry.resolve(request, result)
+                            },
+                            execute: |_: &ResultAction| unreachable!(),
+                            execute_file: no_file_execution,
+                            open_web_search: |_: WebSearchEngine, _: &str| {
+                                super::super::open_builtin_with(&settings, feature, || {
+                                    // A settings read here also proves native IO is outside the settings lock.
+                                    assert!(settings.snapshot().builtin_feature_enabled(feature));
+                                    opened.set(opened.get() + 1);
+                                    Ok(())
+                                })
+                            },
+                            open_quicklink: |_: url::Url| {
+                                super::super::open_builtin_with(&settings, feature, || {
+                                    assert!(settings.snapshot().builtin_feature_enabled(feature));
+                                    opened.set(opened.get() + 1);
+                                    Ok(())
+                                })
+                            },
+                            copy_builtin: |_: &str| unreachable!(),
+                            copy_plugin: |_: &str, _: Option<&str>, _: u64, _: &str| unreachable!(),
+                            clear_and_hide: || Ok(()),
+                            increment: |_: &str| unreachable!(),
+                        },
+                    ));
+                    assert_eq!(result.is_ok(), enabled);
+                    assert_eq!(opened.get(), usize::from(enabled));
+                }
+            }
+        }
 
         #[test]
         fn management_effects_invalidate_real_copy_handles_and_inflight_query_before_return() {

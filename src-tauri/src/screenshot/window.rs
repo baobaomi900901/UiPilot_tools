@@ -190,11 +190,15 @@ impl ScreenshotHost {
         source: Option<(String, u64)>,
     ) -> Result<(), String> {
         let mut launcher_origin = self.launcher_origin.lock().map_err(|_| "unavailable")?;
-        match self
-            .service
-            .begin(mode, origin)
-            .map_err(|e| format!("{e:?}"))?
-        {
+        // Admission and the pure in-memory session transition share the settings
+        // commit lock. Capture/window work below runs after releasing that lock.
+        let admission = app
+            .state::<crate::settings::SettingsStore>()
+            .with_enabled_builtin(crate::settings::ManagedBuiltinFeature::Screenshot, || {
+                self.service.begin(mode, origin)
+            })
+            .map_err(|_| "disabled".to_string())?;
+        match admission.map_err(|e| format!("{e:?}"))? {
             Begin::Busy => Err("busy".into()),
             Begin::FocusPreview => {
                 let instance = self.preview.lock().ok().and_then(|mut p| {
