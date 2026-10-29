@@ -1,5 +1,7 @@
 # 截图元素探测实施计划
 
+> 历史计划，已被用户“恢复rust_uia初始状态，仅使用原有编译物和能力”的要求替代。不得继续执行其中新增外部接口的任务；当前实施见 [原版Provider接入计划](2026-10-29-screenshot-original-provider.md)。
+
 目标：独立rust_uia编译物提供按点探测，UiPilot实现实时50%遮罩镂空、单击元素和防抖自由拖框，并贯通dev与Setup。
 
 架构：Provider JSON-RPC + 宿主后台管道客户端 + 原生选择状态机；复用现有预览与输出。设计合同见 ../specs/2026-10-29-screenshot-element-probe-design.md。
