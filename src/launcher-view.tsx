@@ -1,3 +1,4 @@
+import { BuiltinFeatureDetail } from './builtin-feature-panel'
 import {
   App,
   Badge,
@@ -42,6 +43,7 @@ import type {
   FileResultKind,
   PluginPanelBounds,
   PublicPluginInventoryItem,
+  BuiltinFeatureView,
   QuicklinksSnapshot,
   ResultFavoriteTarget,
   ResultIconKind,
@@ -302,6 +304,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
+  const [builtinFeatureDetail, setBuiltinFeatureDetail] = useState<BuiltinFeatureView | null>(null)
   const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string; hotkeyRevision: string; session: number } | null>(null)
   const detailSession = useRef(0)
   const detailReload = useRef(0)
@@ -430,23 +433,24 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       detailReloadPending.current?.resolve()
       detailReloadPending.current = null
       setPublicPluginDetail(null)
+      setBuiltinFeatureDetail(null)
     }
   }, [snapshot.view])
 
   const selectedPublicPluginId = selectedPublicPlugin?.pluginId
   useLayoutEffect(() => {
-    if (snapshot.view !== 'settings' || !selectedPublicPluginId) return
+    if (snapshot.view !== 'settings' || (!selectedPublicPluginId && !builtinFeatureDetail)) return
     publicPluginDetailRef.current?.focus()
-  }, [selectedPublicPluginId, snapshot.view])
+  }, [selectedPublicPluginId, builtinFeatureDetail, snapshot.view])
 
   useLayoutEffect(() => {
     if (!restoreSettingsTabFocus.current) return
-    if (snapshot.view !== 'settings' || selectedPublicPlugin) return
+    if (snapshot.view !== 'settings' || selectedPublicPlugin || builtinFeatureDetail) return
     restoreSettingsTabFocus.current = false
     settingsTabsRef.current
       ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
       ?.focus()
-  }, [activeSettingsTab, selectedPublicPlugin, snapshot.view])
+  }, [activeSettingsTab, selectedPublicPlugin, builtinFeatureDetail, snapshot.view])
 
   const reportReady = useCallback(() => {
     if (ready.current) return
@@ -2062,11 +2066,12 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     detailReloadPending.current = null
     restoreSettingsTabFocus.current = true
     setPublicPluginDetail(null)
+    setBuiltinFeatureDetail(null)
   }
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} onOpenDetails={(plugin, revision, hotkeyRevision) => setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current })} />
+        <PublicPluginPanel client={core.client} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current })} />
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2194,11 +2199,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       onClear={() => void core.clearMessages()}
     />
   )
-  const publicPluginDetailView = selectedPublicPlugin ? (
+  const publicPluginDetailView = selectedPublicPlugin || builtinFeatureDetail ? (
     <section
       ref={publicPluginDetailRef}
       className="settings-view public-plugin-detail-view"
-      aria-label={`${selectedPublicPlugin.name} 插件详情`}
+      aria-label={`${selectedPublicPlugin?.name ?? builtinFeatureDetail!.name} ${builtinFeatureDetail ? '内置功能' : '插件'}详情`}
       tabIndex={-1}
       onKeyDown={(event) => {
         if (event.key !== 'Escape' || composing(event) || !event.currentTarget.contains(event.target as Node)) return
@@ -2218,13 +2223,13 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 type="text"
               />
             </Tooltip>
-            <h1 id="public-plugin-detail-title" className="public-plugin-detail-title">{selectedPublicPlugin.name}</h1>
+            <h1 id="public-plugin-detail-title" className="public-plugin-detail-title">{selectedPublicPlugin?.name ?? builtinFeatureDetail!.name}</h1>
           </div>
         </header>
       </div>
       <OverlayScrollbarsComponent className="settings-detail-panel" options={settingsScrollbarOptions}>
         <div className="settings-scroll-content">
-          <PublicPluginDetail
+          {builtinFeatureDetail ? <BuiltinFeatureDetail key={builtinFeatureDetail.feature} client={core.client} feature={builtinFeatureDetail} /> : selectedPublicPlugin ? <PublicPluginDetail
             client={core.client}
             key={`${selectedPublicPlugin.pluginId}:${publicPluginDetail!.session}`}
             plugin={selectedPublicPlugin}
@@ -2265,7 +2270,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               })()
               await entry.promise
             }}
-          />
+          /> : null}
         </div>
       </OverlayScrollbarsComponent>
     </section>

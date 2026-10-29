@@ -443,6 +443,8 @@ function fakeClient() {
     acknowledgePluginPanelFocusHostInput: vi.fn(async () => undefined),
     resolvePublicPluginCommandEntry: vi.fn(async () => ({ pluginId: 'com.example.hotkey', commandId: 'default', commandLabel: 'hotkey', outputMode: 'mainResult', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })),
     setPublicPluginCommandHotkey: vi.fn(async () => undefined),
+    listBuiltinFeatures: vi.fn(async () => []),
+    setBuiltinFeatureEnabled: vi.fn(async () => []),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', hotkeyRevision: '0', items: [] })),
     selectPublicPluginArchive: vi.fn(async () => null),
     selectPublicPluginDirectory: vi.fn(async () => null),
@@ -11108,5 +11110,67 @@ describe('command hotkey entry', () => {
     expect(fake.client.resolvePublicPluginCommandEntry).not.toHaveBeenCalled()
     window.removeEventListener('uipilot-hotkey-recording-current', consume)
     core.destroy()
+  })
+})
+
+
+describe('builtin feature detail navigation', () => {
+  it.each(['light', 'dark'] as const)('uses the existing detail shell, Back and Escape in %s theme', async (colorScheme) => {
+    installMatchMedia(colorScheme === 'dark')
+    const fake = fakeClient()
+    vi.mocked(fake.client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: colorScheme })
+    const feature = { feature: 'screenshot' as const, name: '截图', command: '/screenshot', description: '屏幕区域截图', examples: ['/screenshot'], version: '0.14.0', enabled: true }
+    vi.mocked(fake.client.listBuiltinFeatures).mockResolvedValue([feature])
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => fake.emit(shown('builtin-settings', 'settings')))
+      await activateSettingsTab(mounted.host, '插件')
+      const open = async () => {
+        await vi.waitFor(() => expect(mounted.host.querySelector('[data-builtin-feature="screenshot"]')).not.toBeNull())
+        await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="查看 截图 详情"]')!.click())
+        await vi.waitFor(() => expect(mounted.host.querySelector('[aria-label="截图 内置功能详情"]')).not.toBeNull())
+        expect(document.activeElement).toBe(mounted.host.querySelector('.public-plugin-detail-view'))
+        expect(mounted.host.querySelector('.settings-detail-panel')).not.toBeNull()
+        expect(mounted.host.querySelector('.public-plugin-detail')!.textContent).toContain('/screenshot')
+        expect(mounted.host.querySelector('[aria-label="卸载插件"]')).toBeNull()
+      }
+      await open()
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="返回插件列表"]')!.click())
+      await vi.waitFor(() => expect(document.activeElement).toBe(mounted.host.querySelector('[role="tab"][aria-selected="true"]')))
+      await open()
+      await act(async () => mounted.host.querySelector<HTMLElement>('.public-plugin-detail-view')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+      await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-detail-view')).toBeNull())
+      expect(fake.client.uninstallPublicPlugin).not.toHaveBeenCalled()
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+})
+
+describe('builtin settings query preservation', () => {
+  it('keeps the current query and refreshes results after a settings toggle and local return', async () => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    const feature = { feature: 'screenshot' as const, name: '截图', command: '/screenshot', description: '屏幕区域截图', examples: ['/screenshot'], version: '0.14.0', enabled: true }
+    vi.mocked(fake.client.listBuiltinFeatures).mockResolvedValue([feature])
+    vi.mocked(fake.client.setBuiltinFeatureEnabled).mockResolvedValue([{ ...feature, enabled: false }])
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => fake.emit(shown('builtin-query')))
+      await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/screenshot', inputType: 'insertText' }))
+      await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+      await act(async () => core.navigate('settings'))
+      await activateSettingsTab(mounted.host, '插件')
+      await vi.waitFor(() => expect(mounted.host.querySelector('[data-builtin-feature="screenshot"]')).not.toBeNull())
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="启用 截图"]')!.click())
+      await vi.waitFor(() => expect(mounted.host.querySelector('[aria-label="启用 截图"]')!.getAttribute('aria-checked')).toBe('false'))
+      vi.mocked(fake.client.searchApps).mockClear()
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="返回主界面"]')!.click())
+      expect(core.getSnapshot().query).toBe('/screenshot')
+      await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
+      expect(document.activeElement).toBe(mounted.host.querySelector('input[id^="launcher-query-"]'))
+    } finally { await mounted.unmount(); core.destroy() }
   })
 })

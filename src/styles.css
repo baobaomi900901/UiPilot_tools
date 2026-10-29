@@ -2884,3 +2884,16 @@ label,
   gap: 8px;
   margin-top: 8px;
 }
+
+.builtin-feature-icon {
+  color: var(--uipilot-ui-icon-blue);
+  background: var(--uipilot-ui-surface-card);
+  border-radius: 8px;
+}
+.builtin-feature-label {
+  color: var(--uipilot-ui-muted-foreground);
+  border: 1px solid var(--uipilot-ui-border);
+  border-radius: 6px;
+  padding: 0 4px;
+  font-size: 12px;
+}

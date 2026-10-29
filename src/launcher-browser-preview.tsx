@@ -5,6 +5,7 @@ import { LauncherView } from './launcher-view'
 import {
   parseU64Decimal,
   type LauncherClient,
+  type BuiltinFeatureView,
   type PluginInventorySnapshot,
   type PublicPluginInventory,
   type PublicPluginInventoryItem,
@@ -316,7 +317,18 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
 
 const noMessages = { revision: '0', unreadCount: 0, messages: [] }
 
+let previewBuiltinFeatures: readonly BuiltinFeatureView[] = [
+  { feature: 'screenshot', name: '截图', command: '/screenshot', description: '截取屏幕区域，编辑、复制、保存或贴图。', examples: ['/screenshot'], version: '0.14.0', enabled: true },
+  { feature: 'quicklinks', name: '快捷链接', command: '/quicklinks', description: '管理快捷链接，使用自定义命令打开链接。', examples: ['/quicklinks'], version: '0.14.0', enabled: true },
+  { feature: 'webSearch', name: '网页搜索', command: '/web-search', description: '使用默认搜索引擎搜索网页。', examples: ['/web-search UiPilot'], version: '0.14.0', enabled: true },
+]
+
 const client: LauncherClient = {
+  listBuiltinFeatures: async () => previewBuiltinFeatures,
+  setBuiltinFeatureEnabled: async ({ feature, enabled }) => {
+    previewBuiltinFeatures = previewBuiltinFeatures.map((item) => item.feature === feature ? { ...item, enabled } : item)
+    return previewBuiltinFeatures
+  },
   validateYoudaoTranslation: async () => ({ valid: false, message: 'Preview mode' }),
   listenShown: async (handler) => {
     queueMicrotask(() => handler({

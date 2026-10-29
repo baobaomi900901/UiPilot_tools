@@ -1,3 +1,4 @@
+import { BuiltinFeatureRow, useBuiltinFeatures } from './builtin-feature-panel'
 import { HotkeyRecorderInput } from './hotkey-recorder-input'
 import type { HotkeyRecordingPhase } from './launcher-core'
 import { Button, Input, Modal, Popconfirm, Spin, Switch, Tooltip } from 'antd'
@@ -9,6 +10,7 @@ import { PluginIcon } from './plugin-icon'
 import { PublicPluginSettings } from './public-plugin-settings'
 import type {
   LauncherClient,
+  BuiltinFeatureView,
   PublicPermission,
   PublicPluginInventory,
   PluginNetworkCredential,
@@ -20,6 +22,7 @@ import type {
 
 interface PublicPluginPanelProps {
   client: LauncherClient
+  onOpenBuiltinDetails?: (feature: BuiltinFeatureView) => void
   onOpenDetails?: (plugin: PublicPluginInventoryItem, revision: string, hotkeyRevision: string) => void
 }
 
@@ -786,7 +789,8 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
   )
 }
 
-export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelProps) {
+export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails }: PublicPluginPanelProps) {
+  const builtins = useBuiltinFeatures(client)
   const epoch = useRef(0)
   const [inventory, setInventory] = useState<PublicPluginInventory | null>(null)
   const [loading, setLoading] = useState(true)
@@ -898,13 +902,15 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
     mutationPending.current = false; setBusy(false)
   }
   const filteredPlugins = pluginFilter && inventory
-    ? inventory.items.filter((plugin) => plugin.name.toLocaleLowerCase().includes(pluginFilter))
+    ? inventory.items.filter((plugin) => [plugin.name, plugin.description, ...plugin.commands.map((command) => `/${command.effectiveName}`)].join(' ').toLocaleLowerCase().includes(pluginFilter))
     : inventory?.items ?? []
+
+  const filteredBuiltins = builtins.items.filter((item) => !pluginFilter || [item.name, item.command, item.description].join(' ').toLocaleLowerCase().includes(pluginFilter))
 
   return (
     <section className="public-plugin-inventory" aria-labelledby="public-plugin-title">
       <div className="plugin-inventory-header">
-        <h2 id="public-plugin-title">公开插件</h2>
+        <h2 id="public-plugin-title">插件</h2>
         <div className="public-install-actions">
           <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)}>选择插件包</Button></Tooltip>
           <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)}>选择开发目录</Button></Tooltip>
@@ -912,8 +918,8 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
             <Button
               aria-label="刷新"
               icon={<RefreshCw aria-hidden size={16} strokeWidth={1.8} />}
-              disabled={busy || loading}
-              onClick={() => void reload().catch(() => {})}
+              disabled={busy || loading || builtins.busy}
+              onClick={() => { void reload().catch(() => {}); void builtins.reload() }}
             />
           </Tooltip>
         </div>
@@ -935,7 +941,9 @@ export function PublicPluginPanel({ client, onOpenDetails }: PublicPluginPanelPr
       {notice ? <div className="plugin-list-state" role="status">{notice}</div> : null}
       {loading && !inventory ? <div className="plugin-list-state"><Spin size="small" /></div> : null}
       {inventory?.items.length === 0 ? <div className="plugin-list-state">未安装公开插件</div> : null}
-      {inventory && inventory.items.length > 0 && filteredPlugins.length === 0 ? <div className="plugin-list-state">未找到匹配插件</div> : null}
+      {inventory && (inventory.items.length > 0 || builtins.items.length > 0) && filteredBuiltins.length === 0 && filteredPlugins.length === 0 ? <div className="plugin-list-state">未找到匹配插件</div> : null}
+      {builtins.error ? <div className="plugin-list-state plugin-list-error" role="alert">{builtins.error}</div> : null}
+      {filteredBuiltins.map((item) => <BuiltinFeatureRow key={item.feature} item={item} busy={builtins.busy} onToggle={(enabled) => void builtins.toggle(item.feature, enabled)} onDetails={() => onOpenBuiltinDetails?.(item)} />)}
       {filteredPlugins.map((plugin) => (
         <PublicPluginRow
           key={`${plugin.pluginId}:${plugin.generation}`}
