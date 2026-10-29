@@ -1,8 +1,12 @@
 use super::*;
+#[path = "annotation_ui.rs"]
+mod annotation_ui;
 #[path = "editor.rs"]
 mod editor;
 #[path = "pin.rs"]
 pub(super) mod pin;
+#[path = "text_input.rs"]
+mod text_input;
 #[path = "toolbar.rs"]
 mod toolbar;
 use crate::screenshot::desktop_output::{self, OutputGate, OutputKind, OutputSuccess};
@@ -44,6 +48,12 @@ enum Event {
     Button(editor::Button),
     ButtonFocused(editor::Button),
     OutputReady,
+    KeyUp(u16),
+    Property(toolbar::Property),
+    PropertyFocused(usize),
+    TextSubmit,
+    TextCancel,
+    Refresh,
 }
 const WM_PROBE_READY: u32 = WM_APP + 19;
 const WM_OUTPUT_READY: u32 = WM_APP + 20;
@@ -52,6 +62,7 @@ struct State {
     budget: PixelBudget,
     selection: RefCell<SelectionState>,
     editor: RefCell<Option<editor::Editor>>,
+    text: RefCell<Option<ActiveText>>,
     palette: OverlayPalette,
     locked: Cell<bool>,
     fallback: Cell<bool>,
@@ -68,6 +79,10 @@ struct State {
     >,
     events: RefCell<VecDeque<Event>>,
     closing: Cell<bool>,
+}
+struct ActiveText {
+    input: text_input::TextInput,
+    index: Option<usize>,
 }
 struct WindowContext {
     state: *const State,
@@ -440,6 +455,48 @@ unsafe extern "system" fn window_proc(
     }
     let state = &*context.state;
     let event = match message {
+        WM_CTLCOLOREDIT => {
+            if let Some(brush) = state.text.borrow().as_ref().and_then(|t| {
+                t.input
+                    .control_colors(HWND(lparam.0 as *mut _), HDC(wparam.0 as *mut _))
+            }) {
+                return LRESULT(brush.0 as isize);
+            }
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+        WM_COMMAND
+            if toolbar::Property::from_id(wparam.0 & 0xffff).is_some()
+                && (wparam.0 >> 16) & 0xffff == BN_SETFOCUS as usize =>
+        {
+            Some(Event::PropertyFocused((wparam.0 & 0xffff) - 200))
+        }
+        WM_COMMAND
+            if toolbar::Property::from_id(wparam.0 & 0xffff).is_some()
+                && (wparam.0 >> 16) & 0xffff == BN_CLICKED as usize =>
+        {
+            Some(Event::Property(
+                toolbar::Property::from_id(wparam.0 & 0xffff).unwrap(),
+            ))
+        }
+        WM_DRAWITEM if toolbar::Property::from_id(wparam.0).is_some() => {
+            let property = toolbar::Property::from_id(wparam.0).unwrap();
+            let selected = state
+                .editor
+                .borrow()
+                .as_ref()
+                .is_some_and(|e| property.selected(e));
+            if toolbar::draw_property(
+                state.palette,
+                property,
+                selected,
+                &*(lparam.0 as *const DRAWITEMSTRUCT),
+            )
+            .is_err()
+            {
+                state.events.borrow_mut().push_back(Event::PaintFailed);
+            }
+            return LRESULT(1);
+        }
         WM_COMMAND
             if toolbar::from_id(wparam.0 & 0xffff).is_some()
                 && (wparam.0 >> 16) & 0xffff == BN_CLICKED as usize =>
@@ -461,14 +518,22 @@ unsafe extern "system" fn window_proc(
                 .borrow()
                 .as_ref()
                 .is_some_and(|e| e.keyboard_focus);
-            if toolbar::draw(
-                state.palette,
-                outputting,
-                keyboard_focus,
-                &*(lparam.0 as *const DRAWITEMSTRUCT),
-            )
-            .is_err()
-            {
+            let mut item = *(lparam.0 as *const DRAWITEMSTRUCT);
+            if let Some(e) = state.editor.borrow().as_ref() {
+                let b = toolbar::from_id(wparam.0).unwrap();
+                if !e.enabled(b) {
+                    item.itemState.0 |= windows::Win32::UI::Controls::ODS_DISABLED.0;
+                }
+                if matches!(
+                    (b, e.tool),
+                    (editor::Button::Mosaic, Some(editor::Tool::Mosaic))
+                        | (editor::Button::Text, Some(editor::Tool::Text))
+                        | (editor::Button::Rectangle, Some(editor::Tool::Rectangle))
+                ) {
+                    item.itemState.0 |= windows::Win32::UI::Controls::ODS_SELECTED.0;
+                }
+            }
+            if toolbar::draw(state.palette, outputting, keyboard_focus, &item).is_err() {
                 state.events.borrow_mut().push_back(Event::PaintFailed);
             }
             return LRESULT(1);
@@ -581,7 +646,7 @@ unsafe fn update_editor_cursor(state: &State, point: PhysicalPoint) {
     let Some(editor) = editor.as_ref() else {
         return;
     };
-    let handle = if editor.outputting {
+    let handle = if editor.outputting || editor.tool.is_some() {
         None
     } else {
         editor.geometry.active_handle().or_else(|| {
@@ -606,69 +671,103 @@ fn sync_editor(
     buttons: &[toolbar::Toolbar],
     focus: bool,
 ) -> Result<(), NativeError> {
-    let (rect, hidden, outputting, focused) = {
-        let editor = state.editor.borrow();
-        let Some(editor) = editor.as_ref() else {
+    let normalize = state
+        .editor
+        .borrow_mut()
+        .as_mut()
+        .is_some_and(|e| e.normalize_focus());
+    let focus = focus || normalize;
+    let (rect, hidden, outputting, focused, tool, enabled) = {
+        let ed = state.editor.borrow();
+        let Some(e) = ed.as_ref() else {
             return Ok(());
         };
         (
-            editing::save_button_rect(editor.geometry.rect(), &editor_monitors(state), 112, 28),
-            editor.geometry.resizing(),
-            editor.outputting,
-            editor.focus,
+            e.geometry.rect(),
+            e.dragging(),
+            e.outputting,
+            e.focus,
+            e.tool,
+            editor::Button::ALL.map(|b| e.enabled(b)),
         )
     };
+    let monitors = editor_monitors(state);
+    let target = annotation_ui::monitor_for(rect, &monitors);
+    let visible_properties = toolbar::Property::ALL
+        .into_iter()
+        .filter(|p| p.visible(tool))
+        .collect::<Vec<_>>();
+    let avoid = state.text.borrow().as_ref().map(|t| t.input.bounds());
+    let layout = annotation_ui::layout(
+        rect,
+        monitors[target].0,
+        monitors[target].1,
+        visible_properties.len(),
+        avoid,
+    );
     unsafe {
-        for (index, toolbar) in buttons.iter().enumerate() {
-            let monitor = state.desktop.monitors[index];
-            let visible = !hidden
-                && monitor.rect.contains(PhysicalPoint {
-                    x: rect.left,
-                    y: rect.top,
-                });
-            for (button_index, button) in toolbar.buttons.iter().enumerate() {
-                if visible {
-                    button.theme(state.palette);
-                    let _ = EnableWindow(button.hwnd, !outputting);
-                    let left = rect.left + (rect.right - rect.left) * button_index as i32 / 4;
-                    let right =
-                        rect.left + (rect.right - rect.left) * (button_index + 1) as i32 / 4;
+        for (index, t) in buttons.iter().enumerate() {
+            let monitor = monitors[index].0;
+            for (i, b) in t.buttons.iter().enumerate() {
+                if index == target && !hidden {
+                    let c = layout.cells[i];
+                    b.theme(state.palette);
+                    let _ = EnableWindow(b.hwnd, enabled[i]);
                     SetWindowPos(
-                        button.hwnd,
+                        b.hwnd,
                         None,
-                        left - monitor.rect.left,
-                        rect.top - monitor.rect.top,
-                        right - left,
-                        rect.bottom - rect.top,
+                        c.left - monitor.left,
+                        c.top - monitor.top,
+                        c.right - c.left,
+                        c.bottom - c.top,
                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     )
                     .map_err(|_| NativeError::OverlayFailed)?;
                     if focus
                         && !outputting
-                        && focused == editor::Focus::Button(editor::Button::ALL[button_index])
+                        && state.text.borrow().is_none()
+                        && focused == editor::Focus::Button(editor::Button::ALL[i])
                     {
-                        let _ = SetFocus(Some(button.hwnd));
+                        let _ = SetFocus(Some(b.hwnd));
                     }
-                    let _ = InvalidateRect(Some(button.hwnd), None, false);
+                    let _ = InvalidateRect(Some(b.hwnd), None, false);
                 } else {
-                    let _ = ShowWindow(button.hwnd, SW_HIDE);
+                    let _ = ShowWindow(b.hwnd, SW_HIDE);
                 }
             }
-            if focus && !outputting {
-                if let editor::Focus::Handle(handle) = focused {
-                    let center =
-                        handle.center(state.editor.borrow().as_ref().unwrap().geometry.rect());
-                    if monitor.rect.contains(PhysicalPoint {
-                        x: center.x.clamp(monitor.rect.left, monitor.rect.right - 1),
-                        y: center.y.clamp(monitor.rect.top, monitor.rect.bottom - 1),
-                    }) && (monitor.rect.contains(center)
-                        || index == 0
-                            && !state
-                                .desktop
-                                .monitors
-                                .iter()
-                                .any(|m| m.rect.contains(center)))
-                    {
+            for (i, p) in toolbar::Property::ALL.into_iter().enumerate() {
+                let b = &t.properties[i];
+                if index == target && !hidden {
+                    if let Some(pi) = visible_properties.iter().position(|v| *v == p) {
+                        let c = layout.cells[9 + pi];
+                        b.theme(state.palette);
+                        let _ = EnableWindow(b.hwnd, !outputting);
+                        SetWindowPos(
+                            b.hwnd,
+                            None,
+                            c.left - monitor.left,
+                            c.top - monitor.top,
+                            c.right - c.left,
+                            c.bottom - c.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                        )
+                        .map_err(|_| NativeError::OverlayFailed)?;
+                        if focus
+                            && !outputting
+                            && focused == editor::Focus::Property(i)
+                            && state.text.borrow().is_none()
+                        {
+                            let _ = SetFocus(Some(b.hwnd));
+                        }
+                        let _ = InvalidateRect(Some(b.hwnd), None, false);
+                        continue;
+                    }
+                }
+                let _ = ShowWindow(b.hwnd, SW_HIDE);
+            }
+            if focus && !outputting && state.text.borrow().is_none() {
+                if let editor::Focus::Handle(h) = focused {
+                    if index == target || monitor.contains(h.center(rect)) {
                         let _ = SetFocus(Some(windows[index].hwnd));
                     }
                 }
@@ -679,7 +778,175 @@ fn sync_editor(
     }
     Ok(())
 }
-
+fn commit_text(state: &State) -> bool {
+    let text = state.text.borrow_mut().take();
+    let Some(text) = text else {
+        return true;
+    };
+    if text.input.is_composing() {
+        *state.text.borrow_mut() = Some(text);
+        refocus_text(state);
+        return false;
+    }
+    let result = (|| {
+        let content = text.input.content()?;
+        if content.trim().is_empty() {
+            return Ok(false);
+        }
+        let raster = text.input.rasterize(&state.budget)?;
+        let annotation = crate::screenshot::annotations::TextAnnotation {
+            origin: text.input.origin(),
+            clip: text.input.clip(),
+            content,
+            font_size_dip: text.input.font_size_dip(),
+            color: text.input.color(),
+            raster,
+        };
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .commit_text(
+                annotation,
+                text.index,
+                state.desktop.frames.frames(),
+                &state.budget,
+            )
+            .map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        state.editor.borrow_mut().as_mut().unwrap().failed(&error);
+        *state.text.borrow_mut() = Some(text);
+        refocus_text(state);
+        return false;
+    }
+    true
+}
+fn refocus_text(state: &State) {
+    if let Some(text) = state.text.borrow().as_ref() {
+        text.input.focus();
+    }
+    state.events.borrow_mut().push_back(Event::Refresh);
+}
+fn button_action(state: &State, button: editor::Button) -> editor::Action {
+    if button == editor::Button::Cancel {
+        return editor::Action::Terminate;
+    }
+    if !commit_text(state) {
+        return editor::Action::None;
+    }
+    state.editor.borrow_mut().as_mut().unwrap().activate(button)
+}
+fn terminate(state: &State, cancellation: &Cancellation) {
+    state.text.borrow_mut().take();
+    cancellation.cancel(CancelReason::User);
+}
+fn begin_text(state: &State, parents: &[HWND], point: PhysicalPoint) -> bool {
+    if !commit_text(state) {
+        return false;
+    }
+    if !state
+        .editor
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .geometry
+        .rect()
+        .contains(point)
+    {
+        return true;
+    }
+    let result = (|| -> Result<ActiveText, String> {
+        let mut ed = state.editor.borrow_mut();
+        let e = ed.as_mut().unwrap();
+        let snapshot = e.history.snapshot();
+        if !e.geometry.rect().contains(point) {
+            return Err("InvalidGeometry".into());
+        }
+        let existing = snapshot.hit_text(point).map(|(i, t)| (i, t.clone()));
+        let (origin, clip, size, color, initial, index) = if let Some((i, t)) = existing {
+            (
+                t.origin,
+                t.clip,
+                t.font_size_dip,
+                t.color,
+                t.content,
+                Some(i),
+            )
+        } else {
+            (
+                point,
+                e.geometry.rect(),
+                e.font_size,
+                e.color,
+                String::new(),
+                None,
+            )
+        };
+        let background = if let Some(i) = index {
+            Arc::new(
+                snapshot
+                    .compose_preview(
+                        state.desktop.frames.frames(),
+                        &state.budget,
+                        None,
+                        None,
+                        Some(i),
+                    )
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            if e.preview.is_none() {
+                e.preview_dirty = true;
+            }
+            e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                .map_err(|e| e.to_string())?;
+            e.preview.as_ref().unwrap().clone()
+        };
+        let origin_monitor = state
+            .desktop
+            .monitors
+            .iter()
+            .position(|m| m.rect.contains(origin))
+            .unwrap_or(0);
+        let dpi = state.desktop.monitors[origin_monitor].dpi_x;
+        let hwnd = parents[origin_monitor];
+        let background_rect = e.geometry.rect();
+        drop(ed);
+        let input = text_input::TextInput::create(
+            hwnd,
+            origin,
+            clip,
+            dpi,
+            size,
+            color,
+            &initial,
+            background,
+            background_rect,
+        )?;
+        Ok(ActiveText { input, index })
+    })();
+    match result {
+        Ok(text) => {
+            *state.text.borrow_mut() = Some(text);
+            true
+        }
+        Err(e) => {
+            state.editor.borrow_mut().as_mut().unwrap().failed(&e);
+            refocus_text(state);
+            false
+        }
+    }
+}
+fn edit_error(state: &State, error: ScreenshotError) {
+    state
+        .editor
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .failed(&error.to_string());
+}
 struct OutputFlight {
     gate: Arc<OutputGate>,
     result: std::sync::mpsc::Receiver<Result<OutputSuccess, String>>,
@@ -691,7 +958,10 @@ fn start_output(
     action: editor::Action,
     pins: Arc<pin::PinManager>,
 ) -> Result<Option<OutputFlight>, NativeError> {
-    let rect = {
+    if !commit_text(state) {
+        return Ok(None);
+    }
+    let (rect, snapshot) = {
         let mut editor = state.editor.borrow_mut();
         let Some(editor) = editor.as_mut() else {
             return Ok(None);
@@ -699,7 +969,13 @@ fn start_output(
         if !editor.begin_output(action) {
             return Ok(None);
         }
-        editor.geometry.rect()
+        if let Err(error) =
+            editor.finish_selection_rendered(state.desktop.frames.frames(), &state.budget)
+        {
+            editor.failed(&error.to_string());
+            return Ok(None);
+        }
+        (editor.geometry.rect(), editor.history.snapshot())
     };
     let gate = Arc::new(OutputGate::new());
     cancellation.register_output(gate.clone());
@@ -715,9 +991,9 @@ fn start_output(
                 if worker_gate.is_cancelled() {
                     return Err("Cancelled".into());
                 }
-                let image =
-                    crate::screenshot::geometry::compose(desktop.frames.frames(), rect, &budget)
-                        .map_err(|e| e.to_string())?;
+                let image = snapshot
+                    .compose(desktop.frames.frames(), &budget)
+                    .map_err(|e| e.to_string())?;
                 if action == editor::Action::Pin {
                     return pins
                         .publish(image, rect, &budget, worker_gate)
@@ -834,6 +1110,7 @@ pub(super) fn run(
         desktop: Arc::new(desktop),
         selection: RefCell::new(selection),
         editor: RefCell::new(None),
+        text: RefCell::new(None),
         palette,
         locked: Cell::new(false),
         fallback: Cell::new(true),
@@ -1000,32 +1277,77 @@ pub(super) fn run(
                             if !windows
                                 .iter()
                                 .any(|w| w.hwnd == unsafe { GetForegroundWindow() })
+                                && !state.text.borrow().as_ref().is_some_and(|t| {
+                                    t.input.owns_foreground(unsafe { GetForegroundWindow() })
+                                })
                             {
                                 cancellation.cancel(CancelReason::LostCapture);
                             }
                         }
                         Event::ProbeReady | Event::OutputReady => {}
                         Event::Down(hwnd, point, _) => {
-                            changed = state
-                                .editor
-                                .borrow_mut()
-                                .as_mut()
-                                .unwrap()
-                                .down(point, &editor_monitors(&state));
-                            if changed {
-                                // Editing releases persistent capture so the
-                                // accessible child BUTTON can receive a click.
-                                // Dragging alone reacquires overlay capture.
-                                unsafe {
-                                    let _ = SetFocus(Some(hwnd));
+                            if state
+                                .text
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|t| t.input.contains_screen_point(point))
+                            {
+                                continue;
+                            }
+                            let text_tool = state.editor.borrow().as_ref().is_some_and(|e| {
+                                e.tool == Some(editor::Tool::Text) && !e.outputting
+                            });
+                            if text_tool {
+                                let parents = windows.iter().map(|w| w.hwnd).collect::<Vec<_>>();
+                                changed = begin_text(&state, &parents, point);
+                                focus = changed && state.text.borrow().is_none();
+                            } else if commit_text(&state) {
+                                let dpi = state
+                                    .desktop
+                                    .monitors
+                                    .iter()
+                                    .find(|m| m.rect.contains(point))
+                                    .map(|m| m.dpi_x)
+                                    .unwrap_or(96);
+                                state.editor.borrow_mut().as_mut().unwrap().drag_tolerance =
+                                    Some(unsafe {
+                                        (
+                                            GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1),
+                                            GetSystemMetricsForDpi(SM_CYDRAG, dpi).max(1),
+                                        )
+                                    });
+                                changed = state
+                                    .editor
+                                    .borrow_mut()
+                                    .as_mut()
+                                    .unwrap()
+                                    .down(point, &editor_monitors(&state));
+                                if changed {
+                                    unsafe {
+                                        let _ = SetFocus(Some(hwnd));
+                                    }
+                                    capture.acquire(hwnd.0 as usize)?;
+                                    focus = true;
                                 }
-                                capture.acquire(hwnd.0 as usize)?;
-                                focus = true;
                             }
                         }
                         Event::Up(point) => {
                             changed = state.editor.borrow_mut().as_mut().unwrap().up(point);
                             capture.release();
+                            let result = {
+                                let mut ed = state.editor.borrow_mut();
+                                let e = ed.as_mut().unwrap();
+                                e.commit_pending(state.desktop.frames.frames(), &state.budget)
+                                    .and_then(|_| {
+                                        e.finish_selection_rendered(
+                                            state.desktop.frames.frames(),
+                                            &state.budget,
+                                        )
+                                    })
+                            };
+                            if let Err(error) = result {
+                                edit_error(&state, error);
+                            }
                             focus = changed;
                             unsafe {
                                 update_editor_cursor(&state, point);
@@ -1048,7 +1370,54 @@ pub(super) fn run(
                                 .key(key, shift, ctrl);
                             focus = true;
                         }
-                        Event::Button(button) => action = button.action(),
+                        Event::Button(button) => {
+                            action = button_action(&state, button);
+                        }
+                        Event::Refresh => {
+                            changed = true;
+                        }
+                        Event::PropertyFocused(i) => {
+                            state.editor.borrow_mut().as_mut().unwrap().focus =
+                                editor::Focus::Property(i);
+                            changed = true;
+                        }
+                        Event::Property(p) => {
+                            if commit_text(&state) {
+                                let mut ed = state.editor.borrow_mut();
+                                let e = ed.as_mut().unwrap();
+                                if !e.outputting && !e.dragging() {
+                                    p.apply(e);
+                                    changed = true;
+                                }
+                            }
+                        }
+                        Event::KeyUp(key) => {
+                            if (37..=40).contains(&key) {
+                                let result = state
+                                    .editor
+                                    .borrow_mut()
+                                    .as_mut()
+                                    .unwrap()
+                                    .finish_selection_rendered(
+                                        state.desktop.frames.frames(),
+                                        &state.budget,
+                                    );
+                                if let Err(error) = result {
+                                    edit_error(&state, error);
+                                }
+                                changed = true;
+                            }
+                        }
+                        Event::TextSubmit => {
+                            changed = commit_text(&state);
+                            focus = changed;
+                        }
+                        Event::TextCancel => {
+                            state.text.borrow_mut().take();
+                            changed = true;
+                            focus = true;
+                        }
+
                         Event::ButtonFocused(button) => {
                             state
                                 .editor
@@ -1062,7 +1431,47 @@ pub(super) fn run(
                         Event::Input(_) => {}
                     }
                     match action {
-                        editor::Action::Cancel => cancellation.cancel(CancelReason::User),
+                        editor::Action::Terminate => terminate(&state, cancellation),
+                        editor::Action::Cancel => {
+                            if state.text.borrow().is_some() {
+                                state.text.borrow_mut().take();
+                                changed = true;
+                                focus = true;
+                            } else if state.editor.borrow().as_ref().unwrap().dragging() {
+                                state.editor.borrow_mut().as_mut().unwrap().cancel_drag();
+                                capture.release();
+                                changed = true;
+                            } else {
+                                cancellation.cancel(CancelReason::User);
+                            }
+                        }
+                        editor::Action::Tool(tool) => {
+                            if commit_text(&state) {
+                                let button = match tool {
+                                    editor::Tool::Mosaic => editor::Button::Mosaic,
+                                    editor::Tool::Text => editor::Button::Text,
+                                    editor::Tool::Rectangle => editor::Button::Rectangle,
+                                };
+                                state.editor.borrow_mut().as_mut().unwrap().activate(button);
+                                changed = true;
+                            }
+                        }
+                        editor::Action::Undo | editor::Action::Redo => {
+                            if commit_text(&state) {
+                                let result = state.editor.borrow_mut().as_mut().unwrap().travel(
+                                    action == editor::Action::Redo,
+                                    state.desktop.frames.frames(),
+                                    &state.budget,
+                                );
+                                match result {
+                                    Ok(v) => changed = v,
+                                    Err(error) => {
+                                        edit_error(&state, error);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
                         editor::Action::Save | editor::Action::Copy | editor::Action::Pin => {
                             if cancellation.reason().is_none() {
                                 if !capture::layout()
@@ -1084,6 +1493,22 @@ pub(super) fn run(
                         editor::Action::Changed => changed = true,
                         editor::Action::None => {}
                     }
+                    if changed {
+                        let result = {
+                            let mut ed = state.editor.borrow_mut();
+                            let e = ed.as_mut().unwrap();
+                            if !e.geometry.resizing() {
+                                e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        if let Err(error) = result {
+                            state.editor.borrow_mut().as_mut().unwrap().cancel_drag();
+                            capture.release();
+                            edit_error(&state, error);
+                        }
+                    }
                     if changed && sync_editor(&state, &windows, &buttons, focus).is_err() {
                         // Once a job owns commit authorization, only its actual
                         // mailbox result may decide success. UI failure requests
@@ -1096,7 +1521,13 @@ pub(super) fn run(
                     Event::Key(_, _, _)
                     | Event::Button(_)
                     | Event::ButtonFocused(_)
-                    | Event::OutputReady => continue,
+                    | Event::OutputReady
+                    | Event::KeyUp(_)
+                    | Event::PropertyFocused(_)
+                    | Event::Property(_)
+                    | Event::TextSubmit
+                    | Event::TextCancel
+                    | Event::Refresh => continue,
                     Event::Cancel(reason) => return Ok(SelectionResult::Cancelled(reason)),
                     Event::PaintFailed => return Err(NativeError::OverlayFailed),
                     Event::CaptureLost => {
@@ -1454,6 +1885,51 @@ pub(super) fn run(
                         cancellation.cancel(CancelReason::Shutdown);
                         continue;
                     }
+                    let text_owns = state
+                        .text
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|t| t.input.owns_message(message.hwnd));
+                    if text_owns {
+                        let route = state.text.borrow().as_ref().unwrap().input.route_key(
+                            message.message,
+                            message.wParam.0 as u16,
+                            GetKeyState(VK_CONTROL.0 as i32) < 0,
+                        );
+                        match route {
+                            text_input::KeyRoute::Submit => {
+                                state.events.borrow_mut().push_back(Event::TextSubmit);
+                                continue;
+                            }
+                            text_input::KeyRoute::Cancel => {
+                                state.events.borrow_mut().push_back(Event::TextCancel);
+                                continue;
+                            }
+                            text_input::KeyRoute::Native => {
+                                let _ = TranslateMessage(&message);
+                                DispatchMessageW(&message);
+                                continue;
+                            }
+                        }
+                    }
+                    if message.message == WM_KEYUP && state.editor.borrow().is_some() {
+                        state
+                            .events
+                            .borrow_mut()
+                            .push_back(Event::KeyUp(message.wParam.0 as u16));
+                    }
+                    let is_property =
+                        toolbar::Property::from_id(GetDlgCtrlID(message.hwnd) as usize).is_some();
+                    if is_property
+                        && message.message == WM_KEYDOWN
+                        && matches!(message.wParam.0 as u16, 13 | 32)
+                    {
+                        state.events.borrow_mut().push_back(Event::Property(
+                            toolbar::Property::from_id(GetDlgCtrlID(message.hwnd) as usize)
+                                .unwrap(),
+                        ));
+                        continue;
+                    }
                     // Child BUTTON focus retains the editor keyboard contract.
                     // Do not translate Tab/Enter into button-specific behavior.
                     if message.message == WM_KEYDOWN && state.editor.borrow().is_some() {
@@ -1481,7 +1957,12 @@ pub(super) fn run(
         result,
         windows
             .iter()
-            .any(|window| window.hwnd == unsafe { GetForegroundWindow() }),
+            .any(|window| window.hwnd == unsafe { GetForegroundWindow() })
+            || state
+                .text
+                .borrow()
+                .as_ref()
+                .is_some_and(|t| t.input.owns_foreground(unsafe { GetForegroundWindow() })),
     );
     match &result {
         Ok(SelectionResult::Completed { output }) => {
@@ -1497,6 +1978,7 @@ pub(super) fn run(
     }
     state.closing.set(true);
     capture.release();
+    state.text.borrow_mut().take();
     drop(buttons);
     drop(windows);
     result
@@ -2010,6 +2492,11 @@ unsafe fn render_overlay(
             let _saved = SavedDc::new(dc)?;
             IntersectClipRect(dc, local.left, local.top, local.right, local.bottom);
             frozen(dc, frame)?;
+            if let Some(e) = editor {
+                if let Some(image) = e.preview.as_ref() {
+                    draw_annotation_preview(dc, image, e.preview_rect, monitor.rect)?;
+                }
+            }
         }
         let border = brush(state.palette.selection_border)?;
         if FrameRect(dc, &local, HBRUSH(border.0 .0)) == 0 {
@@ -2159,9 +2646,98 @@ unsafe fn render_overlay(
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
     if let Some(editor) = editor {
-        draw_handles(dc, state, editor, monitor.rect)?;
+        if editor.tool.is_none() {
+            draw_handles(dc, state, editor, monitor.rect)?;
+        }
+        if editor.tool == Some(editor::Tool::Mosaic) {
+            if let Some(point) = editor
+                .cursor
+                .filter(|p| editor.geometry.rect().contains(*p))
+            {
+                let pen = CreatePen(PS_SOLID, 1, color(state.palette.primary));
+                if pen.0.is_null() {
+                    return Err(NativeError::OverlayFailed);
+                }
+                let pen = GdiObject(HGDIOBJ(pen.0));
+                let _saved = SavedDc::new(dc)?;
+                let r = editor.geometry.rect();
+                IntersectClipRect(
+                    dc,
+                    r.left - monitor.rect.left,
+                    r.top - monitor.rect.top,
+                    r.right - monitor.rect.left,
+                    r.bottom - monitor.rect.top,
+                );
+                let pointer_dpi = state
+                    .desktop
+                    .monitors
+                    .iter()
+                    .find(|m| m.rect.contains(point))
+                    .map(|m| m.dpi_x)
+                    .unwrap_or(96);
+                let radius = editor.brush_radius(pointer_dpi) as i32;
+                let x = point.x - monitor.rect.left;
+                let y = point.y - monitor.rect.top;
+                SelectObject(dc, pen.0);
+                SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+                let _ = Ellipse(dc, x - radius, y - radius, x + radius + 1, y + radius + 1);
+            }
+        }
     }
     Ok(buffer)
+}
+
+unsafe fn draw_annotation_preview(
+    dc: HDC,
+    image: &BudgetedImage,
+    rect: PhysicalRect,
+    monitor: PhysicalRect,
+) -> Result<(), NativeError> {
+    let visible = RECT {
+        left: rect.left - monitor.left,
+        top: rect.top - monitor.top,
+        right: rect.right - monitor.left,
+        bottom: rect.bottom - monitor.top,
+    };
+    if !RectVisible(dc, &visible).as_bool() {
+        return Ok(());
+    }
+    #[repr(C)]
+    struct RgbaInfo {
+        header: BITMAPINFOHEADER,
+        masks: [u32; 3],
+    }
+    let info = RgbaInfo {
+        header: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: image.width() as i32,
+            biHeight: -(image.height() as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_BITFIELDS.0,
+            ..Default::default()
+        },
+        masks: [0xff, 0xff00, 0xff0000],
+    };
+    if StretchDIBits(
+        dc,
+        rect.left - monitor.left,
+        rect.top - monitor.top,
+        image.width() as i32,
+        image.height() as i32,
+        0,
+        0,
+        image.width() as i32,
+        image.height() as i32,
+        Some(image.image().pixels.as_ptr().cast()),
+        &*(&info as *const _ as *const BITMAPINFO),
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    ) == 0
+    {
+        return Err(NativeError::OverlayFailed);
+    }
+    Ok(())
 }
 
 unsafe fn draw_handles(
@@ -2289,6 +2865,7 @@ mod tests {
                 },
                 bounds,
             )),
+            text: RefCell::new(None),
             palette: OverlayPalette {
                 foreground: 0xffffff,
                 surface: 0x202020,
@@ -2450,130 +3027,368 @@ mod tests {
             400
         );
         *state.editor.borrow_mut() = editor::Editor::new(original_rect, bounds);
-        for (name, foreground, surface, primary, primary_foreground, selection_border) in [
-            ("light", 0x18191a, 0xf8f8f9, 0x000000, 0xffffff, 0x18191a),
-            ("dark", 0xffffff, 0x171919, 0xffffff, 0x000000, 0xffffff),
-        ] {
-            state.palette = OverlayPalette {
-                foreground,
-                surface,
-                primary,
-                primary_foreground,
-                selection_border,
-                mask: 0,
-                mask_opacity: 128,
-                destructive: 0xc62828,
+        // Keep annotations below the 192 DPI header while testing a compact monitor.
+        *state.editor.borrow_mut() = editor::Editor::new(
+            PhysicalRect {
+                left: 50,
+                top: 100,
+                right: 350,
+                bottom: 280,
+            },
+            bounds,
+        );
+        // The controlled invisible HWND exercises the real EDIT -> shared raster -> document path.
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .activate(editor::Button::Text);
+        assert!(begin_text(&state, &[hwnd], PhysicalPoint { x: 60, y: 140 }));
+        let input = state.text.borrow().as_ref().unwrap().input.hwnd();
+        unsafe {
+            SendMessageW(
+                input,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("中文标注\r\n第二行").as_ptr() as isize)),
+            );
+        }
+        assert!(commit_text(&state));
+        let original_clip = state
+            .editor
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .history
+            .snapshot()
+            .annotations()[0]
+            .clip();
+        assert!(begin_text(&state, &[hwnd], PhysicalPoint { x: 62, y: 142 }));
+        let input = state.text.borrow().as_ref().unwrap().input.hwnd();
+        unsafe {
+            SendMessageW(
+                input,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("中文修改\r\n第二行").as_ptr() as isize)),
+            );
+        }
+        assert!(commit_text(&state));
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            assert_eq!(e.history.snapshot().annotations().len(), 1);
+            assert_eq!(e.history.snapshot().annotations()[0].clip(), original_clip);
+            e.travel(false, state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            let snapshot = e.history.snapshot();
+            let crate::screenshot::annotations::Annotation::Text(text) =
+                snapshot.annotations()[0].as_ref()
+            else {
+                panic!("text layer")
             };
-            unsafe {
-                let buffer = render_overlay(HDC::default(), &state, 0).unwrap();
-                let editor = state.editor.borrow();
-                let editor = editor.as_ref().unwrap();
-                for handle in Handle::ALL {
-                    let center = handle.center(editor.geometry.rect());
-                    assert_eq!(
-                        GetPixel(buffer.dc, center.x, center.y),
-                        color(primary_foreground),
-                        "all eight native handle centers are visible in {name}"
-                    );
-                }
-                let button_rect = editing::save_button_rect(
-                    editor.geometry.rect(),
-                    &editor_monitors(&state),
-                    112,
-                    28,
-                );
-                for (index, button) in toolbar.buttons.iter().enumerate() {
-                    let left = button_rect.left + 28 * index as i32;
-                    let item = DRAWITEMSTRUCT {
-                        CtlID: toolbar::id(editor::Button::ALL[index]) as u32,
-                        hwndItem: button.hwnd,
-                        hDC: buffer.dc,
-                        itemState: windows::Win32::UI::Controls::ODS_FOCUS,
-                        rcItem: RECT {
-                            left,
-                            top: button_rect.top,
-                            right: left + 28,
-                            bottom: button_rect.bottom,
-                        },
-                        ..Default::default()
-                    };
-                    toolbar::draw(state.palette, false, true, &item).unwrap();
-                    let background = primary_foreground;
-                    assert_eq!(
-                        GetPixel(buffer.dc, left + 3, button_rect.top + 14),
-                        color(background),
-                        "every action uses the same monochrome background in {name}"
-                    );
-                    for y in button_rect.top..button_rect.bottom {
-                        for x in left..left + 28 {
-                            let rgb = GetPixel(buffer.dc, x, y).0;
-                            assert_eq!(rgb & 255, (rgb >> 8) & 255, "no colored action in {name}");
-                            assert_eq!(rgb & 255, (rgb >> 16) & 255, "no colored action in {name}");
-                        }
+            assert_eq!(text.content, "中文标注\n第二行");
+            e.travel(true, state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            e.activate(editor::Button::Rectangle);
+            e.down(PhysicalPoint { x: 140, y: 110 }, &editor_monitors(&state));
+            e.up(PhysicalPoint { x: 190, y: 130 });
+            e.commit_pending(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            e.activate(editor::Button::Mosaic);
+            e.down(PhysicalPoint { x: 70, y: 150 }, &editor_monitors(&state));
+            e.moved(PhysicalPoint { x: 170, y: 150 });
+            e.up(PhysicalPoint { x: 180, y: 150 });
+            e.commit_pending(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            e.activate(editor::Button::Mosaic);
+            assert_eq!(
+                e.preview.as_ref().unwrap().image().pixels,
+                e.history
+                    .snapshot()
+                    .compose(state.desktop.frames.frames(), &state.budget)
+                    .unwrap()
+                    .image()
+                    .pixels
+            );
+        }
+        // An outside canvas Down commits text without inventing an invalid new input/error.
+        assert!(begin_text(
+            &state,
+            &[hwnd],
+            PhysicalPoint { x: 300, y: 220 }
+        ));
+        let text_hwnd = state.text.borrow().as_ref().unwrap().input.hwnd();
+        unsafe {
+            SendMessageW(
+                text_hwnd,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("框外提交").as_ptr() as isize)),
+            );
+        }
+        assert!(begin_text(&state, &[hwnd], PhysicalPoint { x: 10, y: 290 }));
+        assert!(state.text.borrow().is_none());
+        assert!(state.editor.borrow().as_ref().unwrap().error.is_none());
+        assert_eq!(
+            state
+                .editor
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .history
+                .snapshot()
+                .annotations()
+                .len(),
+            4
+        );
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .travel(false, state.desktop.frames.frames(), &state.budget)
+            .unwrap();
+        for fixture_dpi in [96, 144, 192] {
+            Arc::get_mut(&mut state.desktop).unwrap().monitors[0].dpi_x = fixture_dpi;
+            for (name, foreground, surface, primary, primary_foreground, selection_border) in [
+                ("light", 0x18191a, 0xf8f8f9, 0x000000, 0xffffff, 0x18191a),
+                ("dark", 0xffffff, 0x171919, 0xffffff, 0x000000, 0xffffff),
+            ] {
+                state.palette = OverlayPalette {
+                    foreground,
+                    surface,
+                    primary,
+                    primary_foreground,
+                    selection_border,
+                    mask: 0,
+                    mask_opacity: 128,
+                    destructive: 0xc62828,
+                };
+                unsafe {
+                    let buffer = render_overlay(HDC::default(), &state, 0).unwrap();
+                    let editor = state.editor.borrow();
+                    let editor = editor.as_ref().unwrap();
+                    for handle in Handle::ALL {
+                        let center = handle.center(editor.geometry.rect());
+                        assert_eq!(
+                            GetPixel(buffer.dc, center.x, center.y),
+                            color(primary_foreground),
+                            "all eight native handle centers are visible in {name}"
+                        );
                     }
-                    assert_eq!(
-                        GetPixel(buffer.dc, left + 14, button_rect.top),
-                        color(background),
-                        "toolbar icons must not have an enclosing focus frame in {name}"
-                    );
-                    assert_eq!(
-                        GetPixel(buffer.dc, left + 14, button_rect.bottom - 2),
-                        color(primary),
-                        "keyboard focus uses a short underline in {name}"
-                    );
-                    let mut different = 0;
-                    for y in button_rect.top + 6..button_rect.bottom - 6 {
-                        for x in left + 6..left + 22 {
-                            if GetPixel(buffer.dc, x, y) != color(background) {
-                                different += 1;
+                    let layout =
+                        annotation_ui::layout(editor.geometry.rect(), bounds, fixture_dpi, 0, None);
+                    for (index, button) in toolbar.buttons.iter().enumerate() {
+                        let c = layout.cells[index];
+                        let left = c.left;
+                        let top = c.top;
+                        let right = c.right;
+                        let bottom = c.bottom;
+                        let center = (left + right) / 2;
+                        let scale = |v: i32| (v * fixture_dpi as i32 + 48) / 96;
+                        let focus_y = bottom - scale(2);
+                        let item = DRAWITEMSTRUCT {
+                            CtlID: toolbar::id(editor::Button::ALL[index]) as u32,
+                            hwndItem: button.hwnd,
+                            hDC: buffer.dc,
+                            itemState: windows::Win32::UI::Controls::ODS_FOCUS,
+                            rcItem: RECT {
+                                left,
+                                top,
+                                right,
+                                bottom,
+                            },
+                            ..Default::default()
+                        };
+                        let mut item = item;
+                        if !editor.enabled(editor::Button::ALL[index]) {
+                            item.itemState.0 |= windows::Win32::UI::Controls::ODS_DISABLED.0;
+                        }
+                        toolbar::draw_at_dpi(state.palette, false, true, &item, fixture_dpi)
+                            .unwrap();
+                        let background = primary_foreground;
+                        assert_eq!(
+                            GetPixel(buffer.dc, left + scale(3), (top + bottom) / 2),
+                            color(background),
+                            "every action uses the same monochrome background in {name}"
+                        );
+                        for y in top..bottom {
+                            for x in left..right {
+                                let rgb = GetPixel(buffer.dc, x, y).0;
+                                assert_eq!(
+                                    rgb & 255,
+                                    (rgb >> 8) & 255,
+                                    "no colored action in {name}"
+                                );
+                                assert_eq!(
+                                    rgb & 255,
+                                    (rgb >> 16) & 255,
+                                    "no colored action in {name}"
+                                );
                             }
                         }
+                        assert_eq!(
+                            GetPixel(buffer.dc, center, top),
+                            color(background),
+                            "toolbar icons must not have an enclosing focus frame in {name}"
+                        );
+                        assert_eq!(
+                            GetPixel(buffer.dc, center, focus_y),
+                            color(primary),
+                            "keyboard focus uses a short underline in {name}"
+                        );
+                        let mut different = 0;
+                        for y in top + scale(6)..bottom - scale(6) {
+                            for x in left + scale(6)..right - scale(6) {
+                                if GetPixel(buffer.dc, x, y) != color(background) {
+                                    different += 1;
+                                }
+                            }
+                        }
+                        assert!(
+                            different > 15,
+                            "canonical icon must be actually painted for action {index} in {name}"
+                        );
+                        let item = DRAWITEMSTRUCT {
+                            itemState: if index == 2 {
+                                windows::Win32::UI::Controls::ODS_FOCUS
+                            } else {
+                                windows::Win32::UI::Controls::ODS_DEFAULT
+                            },
+                            ..item
+                        };
+                        toolbar::draw_at_dpi(state.palette, false, false, &item, fixture_dpi)
+                            .unwrap();
+                        assert_eq!(
+                            GetPixel(buffer.dc, center, focus_y),
+                            color(background),
+                            "initial or mouse focus must not decorate the icon in {name}"
+                        );
                     }
-                    assert!(
-                        different > 15,
-                        "canonical icon must be actually painted for action {index} in {name}"
+                    // Bright selection and shaded outside are composed from the
+                    // fixture's frozen frame, using the production native renderer.
+                    assert_eq!(GetPixel(buffer.dc, 100, 240), color(0x91beb4));
+                    assert_ne!(GetPixel(buffer.dc, 350, 250), color(0xcf_c1_b4));
+                    let _ = GdiFlush();
+                    let mut bitmap = BITMAP::default();
+                    assert_ne!(
+                        GetObjectW(
+                            HGDIOBJ(buffer.bitmap.0),
+                            std::mem::size_of::<BITMAP>() as i32,
+                            Some((&mut bitmap as *mut BITMAP).cast())
+                        ),
+                        0
                     );
-                    let item = DRAWITEMSTRUCT {
-                        itemState: if index == 2 {
-                            windows::Win32::UI::Controls::ODS_FOCUS
-                        } else {
-                            windows::Win32::UI::Controls::ODS_DEFAULT
-                        },
-                        ..item
-                    };
-                    toolbar::draw(state.palette, false, false, &item).unwrap();
-                    assert_eq!(
-                        GetPixel(buffer.dc, left + 14, button_rect.bottom - 2),
-                        color(background),
-                        "initial or mouse focus must not decorate the icon in {name}"
-                    );
+                    let bits =
+                        std::slice::from_raw_parts(bitmap.bmBits.cast::<u8>(), 400 * 300 * 4);
+                    let mut rgba = bits.to_vec();
+                    for pixel in rgba.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                        pixel[3] = 255;
+                    }
+                    let png = crate::screenshot::output::encode_png(400, 300, &rgba).unwrap();
+                    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                        "../.superpowers/sdd/toolbar-pin/native-editor-{name}-{fixture_dpi}.png"
+                    ));
+                    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+                    std::fs::write(artifact, png).unwrap();
                 }
-                // Bright selection and shaded outside are composed from the
-                // fixture's frozen frame, using the production native renderer.
-                assert_eq!(GetPixel(buffer.dc, 100, 100), color(0x918fb4));
-                assert_ne!(GetPixel(buffer.dc, 350, 250), color(0xcf_c1_b4));
-                let _ = GdiFlush();
-                let mut bitmap = BITMAP::default();
-                assert_ne!(
+                {
+                    let mut ed = state.editor.borrow_mut();
+                    let e = ed.as_mut().unwrap();
+                    e.tool = Some(editor::Tool::Mosaic);
+                    e.cursor = Some(PhysicalPoint { x: 260, y: 220 });
+                }
+                unsafe {
+                    let buffer = render_overlay(HDC::default(), &state, 0).unwrap();
+                    let ed = state.editor.borrow();
+                    let e = ed.as_ref().unwrap();
+                    let properties = toolbar::Property::ALL
+                        .into_iter()
+                        .filter(|p| p.visible(e.tool))
+                        .collect::<Vec<_>>();
+                    let layout = annotation_ui::layout(
+                        e.geometry.rect(),
+                        bounds,
+                        fixture_dpi,
+                        properties.len(),
+                        None,
+                    );
+                    for (index, button) in toolbar.buttons.iter().enumerate() {
+                        let c = layout.cells[index];
+                        let mut item = DRAWITEMSTRUCT {
+                            CtlID: toolbar::id(editor::Button::ALL[index]) as u32,
+                            hwndItem: button.hwnd,
+                            hDC: buffer.dc,
+                            rcItem: RECT {
+                                left: c.left,
+                                top: c.top,
+                                right: c.right,
+                                bottom: c.bottom,
+                            },
+                            ..Default::default()
+                        };
+                        if !e.enabled(editor::Button::ALL[index]) {
+                            item.itemState.0 |= windows::Win32::UI::Controls::ODS_DISABLED.0;
+                        }
+                        if index == 0 {
+                            item.itemState.0 |= windows::Win32::UI::Controls::ODS_SELECTED.0;
+                        }
+                        toolbar::draw_at_dpi(state.palette, false, false, &item, fixture_dpi)
+                            .unwrap();
+                        if index == 0 {
+                            let face = GetPixel(buffer.dc, c.left + 2, c.top + 2).0;
+                            assert_ne!(
+                                face,
+                                color(state.palette.primary_foreground).0,
+                                "active tool differs visibly from idle"
+                            );
+                            assert_eq!(face & 255, (face >> 8) & 255);
+                            assert_eq!(face & 255, (face >> 16) & 255);
+                        }
+                    }
+                    for (i, p) in properties.into_iter().enumerate() {
+                        let c = layout.cells[9 + i];
+                        let item = DRAWITEMSTRUCT {
+                            hDC: buffer.dc,
+                            rcItem: RECT {
+                                left: c.left,
+                                top: c.top,
+                                right: c.right,
+                                bottom: c.bottom,
+                            },
+                            ..Default::default()
+                        };
+                        toolbar::draw_property_at_dpi(
+                            state.palette,
+                            p,
+                            p.selected(e),
+                            &item,
+                            fixture_dpi,
+                        )
+                        .unwrap();
+                    }
+                    let mut bitmap = BITMAP::default();
                     GetObjectW(
                         HGDIOBJ(buffer.bitmap.0),
                         std::mem::size_of::<BITMAP>() as i32,
-                        Some((&mut bitmap as *mut BITMAP).cast())
-                    ),
-                    0
-                );
-                let bits = std::slice::from_raw_parts(bitmap.bmBits.cast::<u8>(), 400 * 300 * 4);
-                let mut rgba = bits.to_vec();
-                for pixel in rgba.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                    pixel[3] = 255;
+                        Some((&mut bitmap as *mut BITMAP).cast()),
+                    );
+                    let _ = GdiFlush();
+                    let mut rgba =
+                        std::slice::from_raw_parts(bitmap.bmBits.cast::<u8>(), 400 * 300 * 4)
+                            .to_vec();
+                    for pixel in rgba.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                        pixel[3] = 255;
+                    }
+                    let png = crate::screenshot::output::encode_png(400, 300, &rgba).unwrap();
+                    let artifact=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../.superpowers/sdd/toolbar-pin/native-annotations-{name}-{fixture_dpi}.png"));
+                    std::fs::write(artifact, png).unwrap();
                 }
-                let png = crate::screenshot::output::encode_png(400, 300, &rgba).unwrap();
-                let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                    "../.superpowers/sdd/toolbar-pin/native-editor-{name}.png"
-                ));
-                std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-                std::fs::write(artifact, png).unwrap();
+                state.editor.borrow_mut().as_mut().unwrap().tool = None;
             }
         }
         let temporary = std::env::temp_dir().join(format!(
@@ -2582,6 +3397,34 @@ mod tests {
             unsafe { GetCurrentThreadId() }
         ));
         std::fs::create_dir_all(&temporary).unwrap();
+        let failed = start_output(
+            &state,
+            &cancellation,
+            Some(temporary.join("missing")),
+            editor::Action::Save,
+            Arc::new(pin::PinManager::default()),
+        )
+        .unwrap()
+        .unwrap();
+        let error = failed
+            .result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        state.editor.borrow_mut().as_mut().unwrap().failed(&error);
+        assert_eq!(
+            state
+                .editor
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .history
+                .snapshot()
+                .annotations()
+                .len(),
+            3
+        );
+        assert!(state.editor.borrow().as_ref().unwrap().history.can_undo());
         let output = start_output(
             &state,
             &cancellation,
@@ -2599,15 +3442,185 @@ mod tests {
         let OutputSuccess::Saved(path) = success else {
             panic!("save fixture should publish a PNG")
         };
-        let expected = crate::screenshot::geometry::compose(
-            state.desktop.frames.frames(),
-            state.editor.borrow().as_ref().unwrap().geometry.rect(),
-            &state.budget,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(),crate::screenshot::output::encode_png(expected.width(),expected.height(),&expected.image().pixels).unwrap(),"output contains frozen pixels only, excluding handles, status label and real child button");
+        let expected = state
+            .editor
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .history
+            .snapshot()
+            .compose(state.desktop.frames.frames(), &state.budget)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(),crate::screenshot::output::encode_png(expected.width(),expected.height(),&expected.image().pixels).unwrap(),"output contains exactly the shared annotated pixels, excluding handles, status label and real child buttons");
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(temporary).unwrap();
+        drop(expected);
+        // A new input can fail before HWND creation when its composed background is over budget.
+        // Exercise that exact text-start path independently of the retained-input submission case.
+        let prior = state
+            .editor
+            .borrow_mut()
+            .replace(
+                editor::Editor::new(
+                    PhysicalRect {
+                        left: 50,
+                        top: 100,
+                        right: 350,
+                        bottom: 280,
+                    },
+                    bounds,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let startup_budget = state
+            .budget
+            .reserve(16 * 1024 * 1024 - state.budget.used())
+            .unwrap();
+        state.events.borrow_mut().clear();
+        assert!(!begin_text(
+            &state,
+            &[hwnd],
+            PhysicalPoint { x: 300, y: 220 }
+        ));
+        assert!(state.text.borrow().is_none());
+        assert!(state.editor.borrow().as_ref().unwrap().error.is_some());
+        assert!(
+            state
+                .events
+                .borrow_mut()
+                .drain(..)
+                .any(|e| matches!(e, Event::Refresh)),
+            "failed text startup schedules the error hint"
+        );
+        assert!(state
+            .editor
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .history
+            .snapshot()
+            .annotations()
+            .is_empty());
+        drop(startup_budget);
+        *state.editor.borrow_mut() = Some(prior);
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.failed("ClipboardBusy");
+            e.error = None;
+        }
+        assert!(begin_text(
+            &state,
+            &[hwnd],
+            PhysicalPoint { x: 300, y: 220 }
+        ));
+        let text_hwnd = state.text.borrow().as_ref().unwrap().input.hwnd();
+        unsafe {
+            SendMessageW(
+                text_hwnd,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("待提交中文").as_ptr() as isize)),
+            );
+        }
+        let _exhausted = state
+            .budget
+            .reserve(16 * 1024 * 1024 - state.budget.used())
+            .unwrap();
+        state.events.borrow_mut().clear();
+        let save_index = editor::Button::ALL
+            .iter()
+            .position(|b| *b == editor::Button::Save)
+            .unwrap();
+        unsafe {
+            SendMessageW(toolbar.buttons[save_index].hwnd, BM_CLICK, None, None);
+        }
+        let button = state
+            .events
+            .borrow_mut()
+            .drain(..)
+            .find_map(|event| {
+                if let Event::Button(b) = event {
+                    Some(b)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(button_action(&state, button), editor::Action::None);
+        assert_eq!(
+            state.text.borrow().as_ref().unwrap().input.hwnd(),
+            text_hwnd,
+            "failed toolbar submit retains the original input"
+        );
+        assert!(state.editor.borrow().as_ref().unwrap().error.is_some());
+        assert!(
+            state
+                .events
+                .borrow_mut()
+                .drain(..)
+                .any(|e| matches!(e, Event::Refresh)),
+            "failed button submit schedules error repaint"
+        );
+        assert_eq!(
+            state
+                .text
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .input
+                .route_key(WM_KEYDOWN, 13, true),
+            text_input::KeyRoute::Submit
+        );
+        assert!(!commit_text(&state));
+        assert!(
+            state
+                .events
+                .borrow_mut()
+                .drain(..)
+                .any(|e| matches!(e, Event::Refresh)),
+            "Ctrl+Enter failure schedules error repaint"
+        );
+        assert_eq!(
+            state
+                .editor
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .history
+                .snapshot()
+                .annotations()
+                .len(),
+            3
+        );
+        let cancel_index = editor::Button::ALL
+            .iter()
+            .position(|b| *b == editor::Button::Cancel)
+            .unwrap();
+        unsafe {
+            SendMessageW(toolbar.buttons[cancel_index].hwnd, BM_CLICK, None, None);
+        }
+        let button = state
+            .events
+            .borrow_mut()
+            .drain(..)
+            .find_map(|event| {
+                if let Event::Button(b) = event {
+                    Some(b)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            button_action(&state, button),
+            editor::Action::Terminate,
+            "explicit cancel bypasses failed text rendering"
+        );
+        terminate(&state, &cancellation);
+        assert_eq!(cancellation.reason(), Some(CancelReason::User));
+        assert!(state.text.borrow().is_none());
         state.closing.set(true);
         drop(toolbar);
         drop(window);

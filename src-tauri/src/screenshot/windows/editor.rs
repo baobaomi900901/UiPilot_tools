@@ -1,26 +1,50 @@
 use crate::screenshot::{
+    annotations::{Annotation, AnnotationHistory, MosaicStroke, TextAnnotation},
     editing::{hit_handle_on_monitors, EditingSelection, Handle},
-    model::{PhysicalPoint, PhysicalRect},
+    geometry::{BudgetedImage, PixelBudget},
+    model::{MonitorFrame, PhysicalPoint, PhysicalRect, ScreenshotError},
 };
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Focus {
     Handle(Handle),
     Button(Button),
+    Property(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Button {
+    Mosaic,
+    Text,
+    Rectangle,
+    Undo,
+    Redo,
     Cancel,
     Pin,
     Save,
     Copy,
 }
 impl Button {
-    pub const ALL: [Self; 4] = [Self::Cancel, Self::Pin, Self::Save, Self::Copy];
+    pub const ALL: [Self; 9] = [
+        Self::Mosaic,
+        Self::Text,
+        Self::Rectangle,
+        Self::Undo,
+        Self::Redo,
+        Self::Cancel,
+        Self::Pin,
+        Self::Save,
+        Self::Copy,
+    ];
     pub fn action(self) -> Action {
         match self {
-            Self::Cancel => Action::Cancel,
+            Self::Mosaic => Action::Tool(Tool::Mosaic),
+            Self::Text => Action::Tool(Tool::Text),
+            Self::Rectangle => Action::Tool(Tool::Rectangle),
+            Self::Undo => Action::Undo,
+            Self::Redo => Action::Redo,
+            Self::Cancel => Action::Terminate,
             Self::Pin => Action::Pin,
             Self::Save => Action::Save,
             Self::Copy => Action::Copy,
@@ -29,7 +53,18 @@ impl Button {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tool {
+    Mosaic,
+    Text,
+    Rectangle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
+    Terminate,
+    Tool(Tool),
+    Undo,
+    Redo,
     None,
     Changed,
     Save,
@@ -54,7 +89,31 @@ fn drag_endpoint(mut point: PhysicalPoint, bounds: PhysicalRect) -> PhysicalPoin
     point
 }
 
+enum Gesture {
+    Mosaic(MosaicStroke),
+    Rectangle {
+        start: PhysicalPoint,
+        end: PhysicalPoint,
+        clip: PhysicalRect,
+        color: [u8; 4],
+        tolerance: (i32, i32),
+    },
+}
 pub(super) struct Editor {
+    pub history: AnnotationHistory,
+    pub tool: Option<Tool>,
+    pub color: [u8; 4],
+    pub font_size: u32,
+    pub brush_size: u32,
+    pub cursor: Option<PhysicalPoint>,
+    pub pending: Option<Annotation>,
+    gesture: Option<Gesture>,
+    pub preview: Option<Arc<BudgetedImage>>,
+    pub preview_rect: PhysicalRect,
+    pub committed_preview: Option<Arc<BudgetedImage>>,
+    pub preview_dirty: bool,
+    nudge_active: bool,
+    pub drag_tolerance: Option<(i32, i32)>,
     pub geometry: EditingSelection,
     bounds: PhysicalRect,
     pub focus: Focus,
@@ -71,6 +130,20 @@ impl Editor {
     pub fn new(rect: PhysicalRect, bounds: PhysicalRect) -> Option<Self> {
         EditingSelection::new(rect, bounds).map(|geometry| Self {
             geometry,
+            history: AnnotationHistory::new(rect).expect("validated selection"),
+            tool: None,
+            color: [239, 68, 68, 255],
+            font_size: 20,
+            brush_size: 24,
+            cursor: None,
+            pending: None,
+            gesture: None,
+            preview: None,
+            committed_preview: None,
+            preview_rect: rect,
+            preview_dirty: true,
+            nudge_active: false,
+            drag_tolerance: None,
             bounds,
             focus: Focus::Button(Button::Save),
             keyboard_focus: false,
@@ -91,8 +164,47 @@ impl Editor {
     }
     pub fn down(&mut self, point: PhysicalPoint, monitors: &[(PhysicalRect, u32)]) -> bool {
         self.keyboard_focus = false;
-        if self.outputting {
+        if self.outputting || self.gesture.is_some() {
             return false;
+        }
+        let _ = self.finish_nudge();
+        if let Some(tool) = self.tool {
+            if !self.geometry.rect().contains(point) {
+                return false;
+            }
+            self.cursor = Some(point);
+            let dpi = monitors
+                .iter()
+                .find(|(r, _)| r.contains(point))
+                .map(|(_, d)| *d)
+                .unwrap_or(96);
+            self.gesture = match tool {
+                Tool::Mosaic => {
+                    let Ok(mut stroke) = MosaicStroke::new(
+                        self.geometry.rect(),
+                        (self.brush_size * dpi / 96).max(1),
+                        (8 * dpi / 96).max(1),
+                    ) else {
+                        return false;
+                    };
+                    if stroke.push(point).is_err() {
+                        return false;
+                    }
+                    Some(Gesture::Mosaic(stroke))
+                }
+                Tool::Rectangle => Some(Gesture::Rectangle {
+                    start: point,
+                    end: point,
+                    clip: self.geometry.rect(),
+                    color: self.color,
+                    tolerance: self
+                        .drag_tolerance
+                        .unwrap_or(((4 * dpi / 96).max(1) as i32, (4 * dpi / 96).max(1) as i32)),
+                }),
+                Tool::Text => return false,
+            };
+            self.update_pending();
+            return true;
         }
         let Some(handle) = hit_handle_on_monitors(self.geometry.rect(), point, monitors) else {
             return false;
@@ -110,6 +222,24 @@ impl Editor {
         true
     }
     pub fn moved(&mut self, point: PhysicalPoint) -> bool {
+        let cursor_changed = self.cursor != Some(point);
+        self.cursor = Some(point);
+        if let Some(g) = self.gesture.as_mut() {
+            match g {
+                Gesture::Mosaic(s) => {
+                    if s.push(point).is_err() {
+                        self.error = Some("标注过多，请结束当前笔画");
+                    }
+                }
+                Gesture::Rectangle { end, .. } => *end = point,
+            }
+            self.update_pending();
+            return true;
+        }
+        if self.tool.is_some() {
+            return cursor_changed;
+        }
+
         let Some(handle) = self.geometry.drag_to(self.pointer_point(point)) else {
             return false;
         };
@@ -119,6 +249,7 @@ impl Editor {
     pub fn up(&mut self, point: PhysicalPoint) -> bool {
         let changed = self.moved(point);
         self.geometry.end_resize();
+        self.gesture = None;
         changed
     }
     /// Windows virtual-key values are kept here as integers so the complete
@@ -127,23 +258,34 @@ impl Editor {
         if key == 27 {
             return Action::Cancel;
         }
-        if self.outputting || self.geometry.resizing() {
+        if self.outputting || self.dragging() {
             return Action::None;
         }
         match key {
             9 => {
                 self.keyboard_focus = true;
-                let index = match self.focus {
-                    Focus::Button(button) => {
-                        8 + Button::ALL.iter().position(|v| *v == button).unwrap()
+                let mut stops = Vec::with_capacity(28);
+                if self.tool.is_none() {
+                    stops.extend(Handle::ALL.into_iter().map(Focus::Handle));
+                }
+                stops.extend(
+                    Button::ALL
+                        .into_iter()
+                        .filter(|b| self.enabled(*b))
+                        .map(Focus::Button),
+                );
+                stops.extend(self.property_indices().into_iter().map(Focus::Property));
+                self.focus = match stops.iter().position(|v| *v == self.focus) {
+                    Some(index) => {
+                        stops[(index + if shift { stops.len() - 1 } else { 1 }) % stops.len()]
                     }
-                    Focus::Handle(h) => Handle::ALL.iter().position(|v| *v == h).unwrap(),
-                };
-                let next = (index + if shift { 11 } else { 1 }) % 12;
-                self.focus = if next >= 8 {
-                    Focus::Button(Button::ALL[next - 8])
-                } else {
-                    Focus::Handle(Handle::ALL[next])
+                    None => {
+                        if shift {
+                            *stops.last().unwrap()
+                        } else {
+                            stops[0]
+                        }
+                    }
                 };
                 Action::Changed
             }
@@ -156,7 +298,12 @@ impl Editor {
                 _ => Action::None,
             },
             67 if ctrl => Action::Copy,
-            37..=40 => {
+            83 if ctrl => Action::Save,
+            90 if ctrl && shift => Action::Redo,
+            90 if ctrl => Action::Undo,
+            89 if ctrl => Action::Redo,
+            37..=40 if self.tool.is_none() => {
+                self.nudge_active = true;
                 let Focus::Handle(handle) = self.focus else {
                     return Action::None;
                 };
@@ -173,8 +320,300 @@ impl Editor {
             _ => Action::None,
         }
     }
+    pub fn brush_radius(&self, pointer_dpi: u32) -> u32 {
+        match self.gesture.as_ref() {
+            Some(Gesture::Mosaic(s)) => s.radius,
+            _ => (self.brush_size * pointer_dpi / 96).max(1),
+        }
+    }
+    pub fn normalize_focus(&mut self) -> bool {
+        if self.outputting || self.dragging() {
+            return false;
+        }
+        let next = match self.focus {
+            Focus::Button(b) if !self.enabled(b) => {
+                let index = Button::ALL.iter().position(|v| *v == b).unwrap();
+                (1..=Button::ALL.len())
+                    .map(|n| Button::ALL[(index + n) % Button::ALL.len()])
+                    .find(|b| self.enabled(*b))
+                    .map(Focus::Button)
+            }
+            Focus::Property(i) if !self.property_indices().contains(&i) => {
+                Some(Focus::Button(Button::Save))
+            }
+            Focus::Handle(_) if self.tool.is_some() => {
+                Some(Focus::Button(match self.tool.unwrap() {
+                    Tool::Mosaic => Button::Mosaic,
+                    Tool::Text => Button::Text,
+                    Tool::Rectangle => Button::Rectangle,
+                }))
+            }
+            _ => None,
+        };
+        if let Some(next) = next {
+            self.focus = next;
+            return true;
+        }
+        false
+    }
+    pub fn property_indices(&self) -> Vec<usize> {
+        match self.tool {
+            Some(Tool::Mosaic) => vec![0, 1, 2],
+            Some(Tool::Text) => vec![3, 4, 5, 6, 7, 8, 9, 10],
+            Some(Tool::Rectangle) => vec![6, 7, 8, 9, 10],
+            None => vec![],
+        }
+    }
+    pub fn finish_selection_rendered(
+        &mut self,
+        frames: &[MonitorFrame],
+        budget: &PixelBudget,
+    ) -> Result<bool, ScreenshotError> {
+        self.nudge_active = false;
+        if self.history.snapshot().selection() == self.geometry.rect() {
+            return Ok(false);
+        }
+        let snapshot = self.history.snapshot();
+        let image = if snapshot.annotations().is_empty() {
+            Ok(None)
+        } else {
+            snapshot
+                .compose_preview(frames, budget, Some(self.geometry.rect()), None, None)
+                .map(|i| Some(Arc::new(i)))
+        };
+        match image {
+            Ok(image) => {
+                let result = self.history.set_selection(self.geometry.rect());
+                if result.is_err() {
+                    self.restore_geometry();
+                    return result;
+                }
+                self.preview = image;
+                self.committed_preview = self.preview.clone();
+                self.preview_rect = self.geometry.rect();
+                self.preview_dirty = self.preview.is_none();
+                result
+            }
+            Err(e) => {
+                self.restore_geometry();
+                Err(e)
+            }
+        }
+    }
+    pub fn activate(&mut self, button: Button) -> Action {
+        if self.outputting || self.dragging() {
+            return Action::None;
+        }
+        let action = button.action();
+        if let Action::Tool(tool) = action {
+            self.tool = if self.tool == Some(tool) {
+                None
+            } else {
+                Some(tool)
+            };
+            self.cursor = None;
+            return Action::Changed;
+        }
+        action
+    }
+    pub fn dragging(&self) -> bool {
+        self.geometry.resizing() || self.gesture.is_some()
+    }
+    pub fn enabled(&self, button: Button) -> bool {
+        !self.outputting
+            && !self.dragging()
+            && match button {
+                Button::Undo => self.history.can_undo(),
+                Button::Redo => self.history.can_redo(),
+                _ => true,
+            }
+    }
+    fn update_pending(&mut self) {
+        self.pending = match self.gesture.as_ref() {
+            Some(Gesture::Mosaic(s)) => Some(Annotation::Mosaic(s.clone())),
+            Some(Gesture::Rectangle {
+                start,
+                end,
+                clip,
+                color,
+                tolerance,
+            }) => {
+                if (i64::from(start.x) - i64::from(end.x)).abs() < i64::from(tolerance.0)
+                    && (i64::from(start.y) - i64::from(end.y)).abs() < i64::from(tolerance.1)
+                {
+                    None
+                } else {
+                    PhysicalRect {
+                        left: start.x.min(end.x),
+                        right: start.x.max(end.x),
+                        top: start.y.min(end.y),
+                        bottom: start.y.max(end.y),
+                    }
+                    .intersection(*clip)
+                    .map(|rect| Annotation::Rectangle {
+                        rect,
+                        clip: *clip,
+                        color: *color,
+                    })
+                }
+            }
+            None => None,
+        };
+        self.preview_dirty = true;
+    }
+    pub fn cancel_drag(&mut self) {
+        self.gesture = None;
+        self.pending = None;
+        if self.geometry.resizing() {
+            self.restore_geometry();
+        }
+        self.preview = self.committed_preview.clone();
+        self.preview_dirty = false;
+    }
+    fn restore_geometry(&mut self) {
+        self.geometry =
+            EditingSelection::new(self.history.snapshot().selection(), self.bounds).unwrap();
+    }
+    pub fn finish_selection(&mut self) -> Result<bool, ScreenshotError> {
+        let result = self.history.set_selection(self.geometry.rect());
+        if matches!(result, Ok(true)) {
+            self.committed_preview = None;
+            self.preview = None;
+            self.preview_dirty = true;
+        }
+        result
+    }
+    pub fn finish_nudge(&mut self) -> Result<bool, ScreenshotError> {
+        if !std::mem::replace(&mut self.nudge_active, false) {
+            return Ok(false);
+        }
+        self.finish_selection()
+    }
+    pub fn refresh_preview(
+        &mut self,
+        frames: &[MonitorFrame],
+        budget: &PixelBudget,
+    ) -> Result<(), ScreenshotError> {
+        if !self.preview_dirty {
+            return Ok(());
+        }
+        let snapshot = self.history.snapshot();
+        if self.committed_preview.is_none() || self.preview_rect != self.geometry.rect() {
+            let image =
+                snapshot.compose_preview(frames, budget, Some(self.geometry.rect()), None, None)?;
+            self.committed_preview = Some(Arc::new(image));
+            self.preview_rect = self.geometry.rect();
+        }
+        let image = if let Some(pending) = self.pending.as_ref() {
+            crate::screenshot::annotations::compose_pending(
+                self.committed_preview.as_ref().unwrap(),
+                self.geometry.rect(),
+                pending,
+                budget,
+            )?
+        } else {
+            self.preview = self.committed_preview.clone();
+            self.preview_dirty = false;
+            return Ok(());
+        };
+        self.preview = Some(Arc::new(image));
+        self.preview_rect = self.geometry.rect();
+        if self.pending.is_none() {
+            self.committed_preview = self.preview.clone();
+        }
+        self.preview_dirty = false;
+        Ok(())
+    }
+    pub fn commit_pending(
+        &mut self,
+        frames: &[MonitorFrame],
+        budget: &PixelBudget,
+    ) -> Result<bool, ScreenshotError> {
+        if self.pending.is_none() {
+            return Ok(false);
+        }
+        if let Err(e) = self.refresh_preview(frames, budget) {
+            self.cancel_drag();
+            return Err(e);
+        }
+        let result = self.history.append(self.pending.take().unwrap());
+        if result.is_ok() {
+            self.error = None;
+            self.committed_preview = self.preview.clone();
+        } else {
+            self.cancel_drag();
+        }
+        result
+    }
+    pub fn commit_text(
+        &mut self,
+        text: TextAnnotation,
+        index: Option<usize>,
+        frames: &[MonitorFrame],
+        budget: &PixelBudget,
+    ) -> Result<bool, ScreenshotError> {
+        if text.content.trim().is_empty() {
+            return Ok(false);
+        }
+        let snapshot = self.history.snapshot();
+        let pending = Annotation::Text(text.clone());
+        let image = snapshot.compose_preview(frames, budget, None, Some(&pending), index)?;
+        let changed = if let Some(i) = index {
+            self.history.replace_text(i, text)?
+        } else {
+            self.history.append(pending)?
+        };
+        if changed {
+            self.error = None;
+            self.preview = Some(Arc::new(image));
+            self.committed_preview = self.preview.clone();
+            self.preview_rect = self.geometry.rect();
+            self.preview_dirty = false;
+        }
+        Ok(changed)
+    }
+    pub fn travel(
+        &mut self,
+        redo: bool,
+        frames: &[MonitorFrame],
+        budget: &PixelBudget,
+    ) -> Result<bool, ScreenshotError> {
+        self.finish_nudge()?;
+        let changed = if redo {
+            self.history.redo()
+        } else {
+            self.history.undo()
+        };
+        if !changed {
+            return Ok(false);
+        }
+        let snapshot = self.history.snapshot();
+        let image = if snapshot.annotations().is_empty() {
+            Ok(None)
+        } else {
+            snapshot.compose(frames, budget).map(|i| Some(Arc::new(i)))
+        };
+        match image {
+            Ok(image) => {
+                self.restore_geometry();
+                self.preview = image;
+                self.committed_preview = self.preview.clone();
+                self.preview_rect = self.geometry.rect();
+                self.preview_dirty = false;
+                Ok(true)
+            }
+            Err(e) => {
+                if redo {
+                    self.history.undo();
+                } else {
+                    self.history.redo();
+                }
+                Err(e)
+            }
+        }
+    }
     pub fn begin_output(&mut self, action: Action) -> bool {
-        if self.outputting || self.geometry.resizing() {
+        if self.outputting || self.dragging() {
             return false;
         }
         self.outputting = true;
@@ -210,7 +649,7 @@ mod tests {
         Editor::new(r(20, 20, 80, 80), r(0, 0, 100, 100)).unwrap()
     }
     #[test]
-    fn toolbar_keyboard_focus_has_twelve_stops_and_space_activates_default_save() {
+    fn toolbar_keyboard_focus_skips_unavailable_history_and_space_activates_default_save() {
         let mut editor = editor();
         let initial = editor.focus;
         for _ in 0..9 {
@@ -220,7 +659,7 @@ mod tests {
             editor.focus, initial,
             "four actions follow the eight handles"
         );
-        for _ in 0..3 {
+        for _ in 0..6 {
             editor.key(9, false, false);
         }
         assert_eq!(editor.focus, initial);
@@ -248,7 +687,7 @@ mod tests {
     fn every_toolbar_button_enter_and_space_route_to_its_own_action() {
         let mut editor = editor();
         for (button, action) in [
-            (Button::Cancel, Action::Cancel),
+            (Button::Cancel, Action::Terminate),
             (Button::Pin, Action::Pin),
             (Button::Save, Action::Save),
             (Button::Copy, Action::Copy),
@@ -260,11 +699,15 @@ mod tests {
         editor.focus = Focus::Handle(Handle::East);
         assert_eq!(editor.key(13, false, false), Action::Save);
         assert_eq!(editor.key(32, false, false), Action::None);
-        editor.focus_button(Button::Cancel);
+        editor.focus_button(Button::Mosaic);
         editor.key(9, true, false);
         assert_eq!(editor.focus, Focus::Handle(Handle::West));
         editor.key(9, false, false);
-        for button in Button::ALL {
+        let enabled = Button::ALL
+            .into_iter()
+            .filter(|b| editor.enabled(*b))
+            .collect::<Vec<_>>();
+        for button in enabled {
             assert_eq!(editor.focus, Focus::Button(button));
             editor.key(9, false, false);
         }
@@ -312,7 +755,7 @@ mod tests {
             assert_eq!(editor.focus, Focus::Handle(handle));
         }
         editor.key(9, false, false);
-        assert_eq!(editor.focus, Focus::Button(Button::Cancel));
+        assert_eq!(editor.focus, Focus::Button(Button::Mosaic));
         editor.key(9, true, false);
         assert_eq!(editor.focus, Focus::Handle(Handle::West));
     }
@@ -400,5 +843,266 @@ mod tests {
         let up = editor.pointer_point(PhysicalPoint { x: 399, y: 115 });
         editor.up(up);
         assert_eq!(editor.geometry.rect(), r(50, 50, 400, 180));
+    }
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+    use crate::screenshot::{
+        geometry::PixelBudget,
+        model::{MonitorFrame, RgbaImage},
+    };
+    fn rect() -> PhysicalRect {
+        PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        }
+    }
+    fn point(x: i32, y: i32) -> PhysicalPoint {
+        PhysicalPoint { x, y }
+    }
+    #[test]
+    fn annotation_tools_toggle_and_pending_drag_blocks_switch_and_output() {
+        let mut e = Editor::new(rect(), rect()).unwrap();
+        assert_eq!(e.activate(Button::Rectangle), Action::Changed);
+        assert_eq!(e.tool, Some(Tool::Rectangle));
+        assert!(e.down(point(10, 10), &[(rect(), 96)]));
+        assert_eq!(e.activate(Button::Mosaic), Action::None);
+        assert!(!e.begin_output(Action::Save));
+        e.cancel_drag();
+        assert_eq!(e.activate(Button::Rectangle), Action::Changed);
+        assert_eq!(e.tool, None);
+        assert!(!e.history.can_undo());
+    }
+    #[test]
+    fn jitter_ignored_and_rectangle_preview_is_exact_output_with_creation_clip() {
+        let mut e = Editor::new(rect(), rect()).unwrap();
+        e.activate(Button::Rectangle);
+        e.down(point(20, 20), &[(rect(), 96)]);
+        e.up(point(21, 21));
+        assert!(e.pending.is_none());
+        e.down(point(20, 20), &[(rect(), 96)]);
+        e.up(point(150, 150));
+        let b = PixelBudget::new(1000000);
+        let frames = [MonitorFrame {
+            rect: rect(),
+            image: RgbaImage {
+                width: 100,
+                height: 100,
+                pixels: vec![255; 40000],
+            },
+        }];
+        assert!(e.commit_pending(&frames, &b).unwrap());
+        let preview = e.preview.as_ref().unwrap().image().pixels.clone();
+        assert_eq!(
+            preview,
+            e.history
+                .snapshot()
+                .compose(&frames, &b)
+                .unwrap()
+                .image()
+                .pixels
+        );
+        assert!(e.history.can_undo());
+        assert_eq!(e.history.snapshot().annotations()[0].clip(), rect());
+    }
+    #[test]
+    fn render_budget_rejects_pending_preserving_document_and_redo() {
+        let mut e = Editor::new(rect(), rect()).unwrap();
+        e.activate(Button::Rectangle);
+        e.down(point(10, 10), &[(rect(), 96)]);
+        e.up(point(30, 30));
+        let b = PixelBudget::new(1);
+        assert!(e.commit_pending(&[], &b).is_err());
+        assert!(!e.history.can_undo());
+        assert!(e.history.snapshot().annotations().is_empty());
+        assert!(e.pending.is_none());
+    }
+    #[test]
+    fn selection_drag_and_arrow_sequence_are_each_one_history_step() {
+        let bounds = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 200,
+        };
+        let mut e = Editor::new(rect(), bounds).unwrap();
+        e.down(point(100, 50), &[(bounds, 96)]);
+        e.moved(point(110, 50));
+        e.up(point(120, 50));
+        e.finish_selection().unwrap();
+        assert_eq!(e.history.snapshot().selection().right, 120);
+        e.focus = Focus::Handle(Handle::East);
+        e.key(39, false, false);
+        e.key(39, false, false);
+        e.key(39, false, false);
+        e.finish_nudge().unwrap();
+        assert_eq!(e.history.snapshot().selection().right, 123);
+        assert!(e.history.undo());
+        assert_eq!(e.history.snapshot().selection().right, 120);
+        assert!(e.history.undo());
+        assert_eq!(e.history.snapshot().selection().right, 100);
+    }
+}
+
+#[cfg(test)]
+mod cache_and_focus_tests {
+    use super::*;
+    fn r() -> PhysicalRect {
+        PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        }
+    }
+    #[test]
+    fn cursor_movement_keeps_cached_image_and_properties_are_keyboard_stops() {
+        let mut e = Editor::new(r(), r()).unwrap();
+        e.activate(Button::Mosaic);
+        let frames = [MonitorFrame {
+            rect: r(),
+            image: crate::screenshot::model::RgbaImage {
+                width: 100,
+                height: 100,
+                pixels: vec![255; 40000],
+            },
+        }];
+        let b = PixelBudget::new(1000000);
+        e.refresh_preview(&frames, &b).unwrap();
+        let image = e.preview.as_ref().unwrap().clone();
+        e.moved(PhysicalPoint { x: 30, y: 40 });
+        e.refresh_preview(&frames, &b).unwrap();
+        assert!(Arc::ptr_eq(&image, e.preview.as_ref().unwrap()));
+        e.focus = Focus::Button(Button::Copy);
+        e.key(9, false, false);
+        assert_eq!(e.focus, Focus::Property(0));
+        e.key(9, false, false);
+        assert_eq!(e.focus, Focus::Property(1));
+        e.key(9, true, false);
+        assert_eq!(e.focus, Focus::Property(0));
+    }
+    #[test]
+    fn failed_selection_render_preserves_history_and_geometry() {
+        let mut e = Editor::new(
+            r(),
+            PhysicalRect {
+                right: 200,
+                bottom: 200,
+                ..r()
+            },
+        )
+        .unwrap();
+        e.history
+            .append(Annotation::Rectangle {
+                rect: PhysicalRect {
+                    right: 10,
+                    bottom: 10,
+                    ..r()
+                },
+                clip: r(),
+                color: [1, 2, 3, 255],
+            })
+            .unwrap();
+        e.focus = Focus::Handle(Handle::East);
+        e.key(39, false, false);
+        assert!(e
+            .finish_selection_rendered(&[], &PixelBudget::new(1))
+            .is_err());
+        assert_eq!(e.geometry.rect(), r());
+        assert_eq!(e.history.snapshot().selection(), r());
+    }
+}
+
+#[cfg(test)]
+mod availability_focus_tests {
+    use super::*;
+    #[test]
+    fn tab_skips_initial_undo_redo_and_disabled_redo_after_new_edit() {
+        let r = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let mut e = Editor::new(r, r).unwrap();
+        e.focus = Focus::Button(Button::Rectangle);
+        e.key(9, false, false);
+        assert_eq!(e.focus, Focus::Button(Button::Cancel));
+        e.key(9, true, false);
+        assert_eq!(e.focus, Focus::Button(Button::Rectangle));
+        e.history
+            .append(Annotation::Rectangle {
+                rect: PhysicalRect {
+                    right: 10,
+                    bottom: 10,
+                    ..r
+                },
+                clip: r,
+                color: [1, 2, 3, 255],
+            })
+            .unwrap();
+        e.focus = Focus::Button(Button::Undo);
+        e.key(9, false, false);
+        assert_eq!(e.focus, Focus::Button(Button::Cancel));
+        assert_eq!(e.key(13, false, false), Action::Terminate);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    fn r() -> PhysicalRect {
+        PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 100,
+        }
+    }
+    #[test]
+    fn last_undo_and_redo_normalize_to_enabled_keyboard_target() {
+        let mut e = Editor::new(r(), r()).unwrap();
+        e.history
+            .append(Annotation::Rectangle {
+                rect: PhysicalRect {
+                    right: 10,
+                    bottom: 10,
+                    ..r()
+                },
+                clip: r(),
+                color: [1, 2, 3, 255],
+            })
+            .unwrap();
+        e.focus = Focus::Button(Button::Undo);
+        e.history.undo();
+        assert!(e.normalize_focus());
+        assert_eq!(e.focus, Focus::Button(Button::Redo));
+        e.history.redo();
+        assert!(e.normalize_focus());
+        assert_eq!(e.focus, Focus::Button(Button::Cancel));
+    }
+    #[test]
+    fn mixed_dpi_outline_uses_gesture_radius_then_pointer_dpi_after_release() {
+        let mut e = Editor::new(r(), r()).unwrap();
+        e.activate(Button::Mosaic);
+        let monitors = [
+            (PhysicalRect { right: 100, ..r() }, 96),
+            (PhysicalRect { left: 100, ..r() }, 192),
+        ];
+        e.down(PhysicalPoint { x: 50, y: 50 }, &monitors);
+        e.moved(PhysicalPoint { x: 150, y: 50 });
+        assert_eq!(e.brush_radius(192), 24);
+        e.up(PhysicalPoint { x: 150, y: 50 });
+        assert_eq!(e.brush_radius(192), 48);
+    }
+    #[test]
+    fn explicit_cancel_action_is_distinct_from_escape_draft_cancel() {
+        let mut e = Editor::new(r(), r()).unwrap();
+        assert_eq!(Button::Cancel.action(), Action::Terminate);
+        assert_eq!(e.key(27, false, false), Action::Cancel);
     }
 }

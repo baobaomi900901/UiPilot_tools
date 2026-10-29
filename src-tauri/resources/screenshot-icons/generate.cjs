@@ -4,7 +4,7 @@ const path = require('path');
 // Pass a locally installed sharp module path if sharp is not on NODE_PATH.
 const sharp = require(process.argv[2] || 'sharp');
 (async () => {
-  for (const name of ['x', 'pin', 'save', 'copy']) {
+  for (const name of ['grid-2x2','type','square','undo-2','redo-2','x', 'pin', 'save', 'copy']) {
     const source = fs.readFileSync(path.join(__dirname, '../../../node_modules/lucide-react/dist/esm/icons', `${name}.mjs`), 'utf8');
     const match = source.match(/const __iconNode = ([\s\S]*?);\r?\nconst /);
     if (!match) throw new Error(`Missing canonical Lucide node: ${name}`);
