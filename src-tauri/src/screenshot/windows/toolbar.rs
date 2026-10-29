@@ -98,13 +98,13 @@ impl NativeButton {
         SendMessageW(
             self.tooltip,
             TTM_SETTIPBKCOLOR,
-            Some(WPARAM(color(palette.surface).0 as usize)),
+            Some(WPARAM(color(palette.primary_foreground).0 as usize)),
             None,
         );
         SendMessageW(
             self.tooltip,
             TTM_SETTIPTEXTCOLOR,
-            Some(WPARAM(color(palette.foreground).0 as usize)),
+            Some(WPARAM(color(palette.primary).0 as usize)),
             None,
         );
     }
@@ -147,20 +147,11 @@ pub(super) unsafe fn draw(
     };
     let dpi = GetDpiForWindow(item.hwndItem).max(96);
     let scale = |dip: i32| ((dip * dpi as i32 + 48) / 96).max(1);
-    let primary = button == Button::Save && !outputting;
-    let background = if primary {
-        palette.primary
-    } else {
-        palette.surface
-    };
-    let foreground = if primary {
-        palette.primary_foreground
-    } else if button == Button::Cancel {
-        palette.destructive
-    } else {
-        palette.foreground
-    };
-    fill(item.hDC, item.rcItem, palette.surface)?;
+    // All actions share the user's monochrome toolbar style. Keep focus as an
+    // outline; neither Save nor Cancel gets a different fill or icon color.
+    let background = palette.primary_foreground;
+    let foreground = palette.primary;
+    fill(item.hDC, item.rcItem, background)?;
     let region = GdiObject(HGDIOBJ(
         CreateRoundRectRgn(
             item.rcItem.left,

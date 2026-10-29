@@ -2432,7 +2432,7 @@ mod tests {
         );
         *state.editor.borrow_mut() = editor::Editor::new(original_rect, bounds);
         for (name, foreground, surface, primary, primary_foreground, selection_border) in [
-            ("light", 0x18191a, 0xf8f8f9, 0x18191a, 0xffffff, 0x18191a),
+            ("light", 0x18191a, 0xf8f8f9, 0x000000, 0xffffff, 0x18191a),
             ("dark", 0xffffff, 0x171919, 0xffffff, 0x000000, 0xffffff),
         ] {
             state.palette = OverlayPalette {
@@ -2479,7 +2479,19 @@ mod tests {
                         ..Default::default()
                     };
                     toolbar::draw(state.palette, false, &item).unwrap();
-                    let background = if index == 2 { primary } else { surface };
+                    let background = primary_foreground;
+                    assert_eq!(
+                        GetPixel(buffer.dc, left + 3, button_rect.top + 14),
+                        color(background),
+                        "every action uses the same monochrome background in {name}"
+                    );
+                    for y in button_rect.top..button_rect.bottom {
+                        for x in left..left + 28 {
+                            let rgb = GetPixel(buffer.dc, x, y).0;
+                            assert_eq!(rgb & 255, (rgb >> 8) & 255, "no colored action in {name}");
+                            assert_eq!(rgb & 255, (rgb >> 16) & 255, "no colored action in {name}");
+                        }
+                    }
                     assert_ne!(
                         GetPixel(buffer.dc, left + 14, button_rect.top),
                         color(background),
