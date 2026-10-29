@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import provider_build as p
-from test_provider_build import pe_bytes
+from test_provider_build import ORIGINAL_CAPABILITIES, pe_bytes
 
 class BuildReviewTests(unittest.TestCase):
     def test_cargo_config_cannot_select_stale_default_output(self):
@@ -22,7 +22,7 @@ class BuildReviewTests(unittest.TestCase):
                     fresh=target/p.TARGET/'release'/stale.name
                     fresh.parent.mkdir(parents=True,exist_ok=True); fresh.write_bytes(pe_bytes()+b'current')
                 return 'commit'
-            with patch.object(p,'run',side_effect=run), patch.object(p,'ping',return_value={'point_probe_v1':True}):
+            with patch.object(p,'run',side_effect=run), patch.object(p,'ping',return_value=ORIGINAL_CAPABILITIES.copy()):
                 exe=p.prepare(root,root/'stage')
             self.assertEqual(exe.read_bytes(),pe_bytes()+b'current')
             self.assertIn('--target-dir',p.validate(exe.parent)['build_args'])

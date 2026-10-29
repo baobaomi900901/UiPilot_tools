@@ -1,9 +1,12 @@
 import tempfile
+import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import provider_build as p
 import struct
+
+ORIGINAL_CAPABILITIES = {'win32_elementtree': True, 'win32_inspect_tree_v2': True}
 
 def pe_bytes(machine=0x8664):
     data=bytearray(128); data[:2]=b'MZ'; struct.pack_into('<I',data,60,64)
@@ -28,9 +31,10 @@ class ProviderTests(unittest.TestCase):
                     f=root/'target/uipilot-provider'/p.TARGET/'release/uiautoma-uiautomation-provider.exe'; f.parent.mkdir(parents=True); f.write_bytes(pe_bytes())
                     return ''
                 return 'abc' if 'rev-parse' in args else ' M src/main.rs'
-            with patch.object(p,'run',side_effect=run), patch.object(p,'ping',return_value={'point_probe_v1':True}):
+            with patch.object(p,'run',side_effect=run), patch.object(p,'ping',return_value=ORIGINAL_CAPABILITIES.copy()):
                 exe=p.prepare(root,root/'stage')
             m=p.validate(exe.parent)
+            self.assertEqual(m['capabilities'], ORIGINAL_CAPABILITIES)
             self.assertTrue(m['source']['dirty']); self.assertEqual(calls[0][:4],['cargo','build','--release','--locked'])
             exe.write_bytes(b'broken')
             with self.assertRaisesRegex(ValueError,'hash|size'): p.validate(exe.parent)
@@ -40,9 +44,55 @@ class ProviderTests(unittest.TestCase):
             built=root/'target/uipilot-provider'/p.TARGET/'release/uiautoma-uiautomation-provider.exe'
             built.parent.mkdir(parents=True); built.write_bytes(pe_bytes())
             def run(args,**kw): return ''
-            with patch.object(p,'run',side_effect=run), patch.object(p,'ping',return_value={'point_probe_v1':False}):
-                with self.assertRaisesRegex(ValueError,'point_probe_v1'): p.prepare(root,root/'stage')
-            self.assertFalse((root/'stage'/p.EXE).exists())
+            stage=root/'stage'; stage.mkdir(); (stage/p.EXE).write_bytes(b'previous')
+            for missing in ORIGINAL_CAPABILITIES:
+                with self.subTest(missing=missing):
+                    caps={key: value for key,value in ORIGINAL_CAPABILITIES.items() if key!=missing}
+                    caps['point_probe_v1']=True
+                    with patch.object(p,'run',side_effect=run), patch.object(p,'ping',return_value=caps):
+                        with self.assertRaisesRegex(ValueError,missing): p.prepare(root,stage)
+                    self.assertEqual((stage/p.EXE).read_bytes(),b'previous')
+
+    def test_ping_accepts_original_capabilities_without_point_probe(self):
+        child=Mock(pid=123)
+        reply={'id':1,'result':{'provider_pid':123,'capabilities':ORIGINAL_CAPABILITIES.copy()}}
+        result=Mock(stdout=json.dumps(reply))
+        with patch.object(p.subprocess,'Popen',return_value=child), patch.object(p.subprocess,'run',return_value=result):
+            self.assertEqual(p.ping(Path('provider.exe')),ORIGINAL_CAPABILITIES)
+        child.wait.assert_called_once_with(timeout=5)
+
+    def test_ping_rejects_missing_or_disabled_original_capability(self):
+        for capability in ORIGINAL_CAPABILITIES:
+            for invalid in (None,False,'true'):
+                with self.subTest(capability=capability,invalid=invalid):
+                    caps=ORIGINAL_CAPABILITIES.copy()
+                    if invalid is None: caps.pop(capability)
+                    else: caps[capability]=invalid
+                    caps['point_probe_v1']=True
+                    child=Mock(pid=123)
+                    reply={'id':1,'result':{'provider_pid':123,'capabilities':caps}}
+                    result=Mock(stdout=json.dumps(reply))
+                    with patch.object(p.subprocess,'Popen',return_value=child), patch.object(p.subprocess,'run',return_value=result):
+                        with self.assertRaisesRegex(ValueError,capability): p.ping(Path('provider.exe'))
+                    child.wait.assert_called_once_with(timeout=5)
+
+    def test_manifest_rejects_missing_or_disabled_original_capability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp); exe=directory/p.EXE; exe.write_bytes(pe_bytes())
+            manifest={'schema_version':1,'target':p.TARGET,'capabilities':ORIGINAL_CAPABILITIES.copy(),
+                      'artifact':{'filename':p.EXE,'size':exe.stat().st_size,'sha256':p.digest(exe)}}
+            (directory/p.MANIFEST).write_text(json.dumps(manifest))
+            self.assertEqual(p.validate(directory)['capabilities'],ORIGINAL_CAPABILITIES)
+            for capability in ORIGINAL_CAPABILITIES:
+                for invalid in (None,False,'true'):
+                    with self.subTest(capability=capability,invalid=invalid):
+                        caps=ORIGINAL_CAPABILITIES.copy()
+                        if invalid is None: caps.pop(capability)
+                        else: caps[capability]=invalid
+                        caps['point_probe_v1']=True
+                        manifest['capabilities']=caps
+                        (directory/p.MANIFEST).write_text(json.dumps(manifest))
+                        with self.assertRaises(ValueError): p.validate(directory)
 
     def test_actual_pe_machine_rejects_x86(self):
         with tempfile.TemporaryDirectory() as tmp:

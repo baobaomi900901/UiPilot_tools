@@ -19,6 +19,7 @@ TARGET = 'x86_64-pc-windows-msvc'
 EXE = 'UIAutoma.UIAutomation.Provider.exe'
 MANIFEST = 'asset-manifest.json'
 BUILD_ARGS = ['cargo', 'build', '--release', '--locked', '--target', TARGET]
+REQUIRED_CAPABILITIES = ('win32_elementtree', 'win32_inspect_tree_v2')
 
 def source_root(root=ROOT):
     config = Path(root) / '.uipilot-local.json'
@@ -118,6 +119,12 @@ def owned_cli(args, *, cwd, env):
         while worker.poll() is None: time.sleep(.1)
         return type('Result',(),{'returncode':worker.poll()})()
 
+def validate_capabilities(caps):
+    for capability in REQUIRED_CAPABILITIES:
+        if not isinstance(caps, dict) or caps.get(capability) is not True:
+            raise ValueError(f'Provider lacks {capability}')
+
+
 def ping(exe):
     """Bounded probe of our own short-lived process and unique named pipe."""
     name = 'uipilot-build-'+uuid.uuid4().hex
@@ -145,7 +152,7 @@ $t=$r.ReadLineAsync(); if(-not $t.Wait(5000)){throw 'ping timeout'}; $t.Result
         if reply.get('id')!=1 or reply.get('result',{}).get('provider_pid')!=child.pid:
             raise ValueError('Provider ping identity mismatch')
         caps=reply['result']['capabilities']
-        if caps.get('point_probe_v1') is not True: raise ValueError('Provider lacks point_probe_v1')
+        validate_capabilities(caps)
         return caps
     finally:
         if child.poll() is None: child.terminate()
@@ -157,9 +164,9 @@ def validate(directory):
     try:
         value=json.loads((directory/MANIFEST).read_text(encoding='utf-8'))
         artifact=value['artifact']; exe=directory/EXE
-        if (value['schema_version']!=1 or value['target']!=TARGET or
-            value['capabilities'].get('point_probe_v1') is not True or artifact['filename']!=EXE):
+        if (value['schema_version']!=1 or value['target']!=TARGET or artifact['filename']!=EXE):
             raise ValueError('Provider manifest contract mismatch')
+        validate_capabilities(value['capabilities'])
         if not exe.is_file() or exe.is_symlink() or artifact['size']<=0 or exe.stat().st_size!=artifact['size']:
             raise ValueError('Provider size mismatch')
         validate_pe_x64(exe)
@@ -180,7 +187,7 @@ def prepare(source, destination):
         if not built.is_file(): raise ValueError('Provider build produced no executable')
         validate_pe_x64(built)
         caps=ping(built)
-        if caps.get('point_probe_v1') is not True: raise ValueError('Provider lacks point_probe_v1')
+        validate_capabilities(caps)
         value={'schema_version':1,'generation':uuid.uuid4().hex,'source':{'commit':run(['git','rev-parse','HEAD'],cwd=source,capture=True).strip(),
                'dirty':bool(run(['git','status','--porcelain'],cwd=source,capture=True).strip())},
                'target':TARGET,'build_args':build_args,'capabilities':caps,
