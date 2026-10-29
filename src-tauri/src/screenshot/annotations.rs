@@ -417,6 +417,29 @@ impl AnnotationHistory {
         self.commit(s)
     }
 }
+/// Apply one new topmost annotation to a cached committed composite.
+/// `base` must represent `domain`; replacements require full document replay.
+/// Requiring the creation clip inside domain preserves complete mosaic cell samples.
+pub(crate) fn compose_pending(
+    base: &BudgetedImage,
+    domain: PhysicalRect,
+    pending: &Annotation,
+    budget: &PixelBudget,
+) -> Result<BudgetedImage, ScreenshotError> {
+    let (width, height) = domain.dimensions()?;
+    if (base.width(), base.height()) != (width, height) {
+        return Err(ScreenshotError::InvalidGeometry);
+    }
+    let clip = pending.clip();
+    if clip.intersection(domain) != Some(clip) || !pending.valid()? {
+        return Err(ScreenshotError::InvalidGeometry);
+    }
+    let mut result = BudgetedImage::allocate(width, height, budget)?;
+    result.pixels_mut().copy_from_slice(&base.image().pixels);
+    render(&mut result, domain, pending, budget)?;
+    Ok(result)
+}
+
 fn offset(rect: PhysicalRect, x: i32, y: i32) -> usize {
     ((i64::from(y) - i64::from(rect.top)) as usize
         * (i64::from(rect.right) - i64::from(rect.left)) as usize
@@ -766,5 +789,45 @@ mod tests {
         h.set_selection(r(-6, 1, -4, 4)).unwrap();
         let crop = h.snapshot().compose(&frames, &b).unwrap();
         assert_eq!(pixel(&crop, 0, 1), [250, 0, 0, 255]);
+    }
+    #[test]
+    fn cached_pending_matches_full_append_and_rejects_mismatched_domains() {
+        let rect = r(-7, 0, 9, 8);
+        let frames = [frame(rect)];
+        let b = PixelBudget::new(100000);
+        let mut h = AnnotationHistory::new(rect).unwrap();
+        h.append(red(r(-7, 0, 0, 8), rect)).unwrap();
+        let mut s = MosaicStroke::new(rect, 2, 4).unwrap();
+        s.push(p(-5, 3)).unwrap();
+        s.push(p(5, 3)).unwrap();
+        let mut raster = BudgetedImage::allocate(1, 1, &b).unwrap();
+        raster.pixels_mut().copy_from_slice(&[0, 200, 0, 128]);
+        let text = TextAnnotation {
+            origin: p(1, 1),
+            content: "字".into(),
+            font_size_dip: 20,
+            color: [0, 200, 0, 255],
+            clip: rect,
+            raster: Arc::new(raster),
+        };
+        for a in [
+            red(r(-1, 1, 4, 4), rect),
+            Annotation::Mosaic(s),
+            Annotation::Text(text),
+        ] {
+            let base = h.snapshot().compose(&frames, &b).unwrap();
+            let before = base.image().pixels.clone();
+            let cached = compose_pending(&base, rect, &a, &b).unwrap();
+            h.append(a).unwrap();
+            let full = h.snapshot().compose(&frames, &b).unwrap();
+            assert_eq!(cached.image(), full.image());
+            assert_eq!(base.image().pixels, before);
+        }
+        let base = h.snapshot().compose(&frames, &b).unwrap();
+        assert!(compose_pending(&base, r(-7, 0, 10, 8), &red(rect, rect), &b).is_err());
+        assert!(compose_pending(&base, rect, &red(rect, r(-8, 0, 9, 8)), &b).is_err());
+        let tiny = PixelBudget::new(1);
+        assert!(compose_pending(&base, rect, &red(rect, rect), &tiny).is_err());
+        assert_eq!(tiny.used(), 0);
     }
 }
