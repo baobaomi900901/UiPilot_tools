@@ -5,6 +5,8 @@ mod annotation_ui;
 mod editor;
 #[path = "pin.rs"]
 pub(super) mod pin;
+#[path = "render_cache.rs"]
+mod render_cache;
 #[path = "text_input.rs"]
 mod text_input;
 #[path = "toolbar.rs"]
@@ -63,6 +65,7 @@ struct State {
     selection: RefCell<SelectionState>,
     editor: RefCell<Option<editor::Editor>>,
     text: RefCell<Option<ActiveText>>,
+    presentation: RefCell<NativePresentation>,
     palette: OverlayPalette,
     locked: Cell<bool>,
     fallback: Cell<bool>,
@@ -691,6 +694,34 @@ fn sync_editor(
             editor::Button::ALL.map(|b| e.enabled(b)),
         )
     };
+    let toolbar_stamp = {
+        let e = state.editor.borrow();
+        let e = e.as_ref().unwrap();
+        ToolbarStamp {
+            rect: if hidden { state.desktop.bounds } else { rect },
+            hidden,
+            outputting,
+            focused: if hidden {
+                editor::Focus::Button(editor::Button::Save)
+            } else {
+                focused
+            },
+            keyboard: e.keyboard_focus,
+            tool,
+            brush: e.brush_size,
+            font: e.font_size,
+            color: e.color,
+            avoid: state.text.borrow().as_ref().map(|t| t.input.bounds()),
+            enabled,
+            palette: palette_key(state.palette),
+        }
+    };
+    let controls_changed = state.presentation.borrow().toolbar.as_ref() != Some(&toolbar_stamp);
+    state.presentation.borrow_mut().toolbar = Some(toolbar_stamp);
+    if !controls_changed && !focus {
+        invalidate_editor_canvas(state, windows);
+        return Ok(());
+    }
     let monitors = editor_monitors(state);
     let target = annotation_ui::monitor_for(rect, &monitors);
     let visible_properties = toolbar::Property::ALL
@@ -711,37 +742,9 @@ fn sync_editor(
             for (i, b) in t.buttons.iter().enumerate() {
                 if index == target && !hidden {
                     let c = layout.cells[i];
-                    b.theme(state.palette);
-                    let _ = EnableWindow(b.hwnd, enabled[i]);
-                    SetWindowPos(
-                        b.hwnd,
-                        None,
-                        c.left - monitor.left,
-                        c.top - monitor.top,
-                        c.right - c.left,
-                        c.bottom - c.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    )
-                    .map_err(|_| NativeError::OverlayFailed)?;
-                    if focus
-                        && !outputting
-                        && state.text.borrow().is_none()
-                        && focused == editor::Focus::Button(editor::Button::ALL[i])
-                    {
-                        let _ = SetFocus(Some(b.hwnd));
-                    }
-                    let _ = InvalidateRect(Some(b.hwnd), None, false);
-                } else {
-                    let _ = ShowWindow(b.hwnd, SW_HIDE);
-                }
-            }
-            for (i, p) in toolbar::Property::ALL.into_iter().enumerate() {
-                let b = &t.properties[i];
-                if index == target && !hidden {
-                    if let Some(pi) = visible_properties.iter().position(|v| *v == p) {
-                        let c = layout.cells[9 + pi];
+                    if controls_changed {
                         b.theme(state.palette);
-                        let _ = EnableWindow(b.hwnd, !outputting);
+                        let _ = EnableWindow(b.hwnd, enabled[i]);
                         SetWindowPos(
                             b.hwnd,
                             None,
@@ -752,6 +755,40 @@ fn sync_editor(
                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                         )
                         .map_err(|_| NativeError::OverlayFailed)?;
+                    }
+                    if focus
+                        && !outputting
+                        && state.text.borrow().is_none()
+                        && focused == editor::Focus::Button(editor::Button::ALL[i])
+                    {
+                        let _ = SetFocus(Some(b.hwnd));
+                    }
+                    if controls_changed {
+                        let _ = InvalidateRect(Some(b.hwnd), None, false);
+                    }
+                } else if controls_changed {
+                    let _ = ShowWindow(b.hwnd, SW_HIDE);
+                }
+            }
+            for (i, p) in toolbar::Property::ALL.into_iter().enumerate() {
+                let b = &t.properties[i];
+                if index == target && !hidden {
+                    if let Some(pi) = visible_properties.iter().position(|v| *v == p) {
+                        let c = layout.cells[9 + pi];
+                        if controls_changed {
+                            b.theme(state.palette);
+                            let _ = EnableWindow(b.hwnd, !outputting);
+                            SetWindowPos(
+                                b.hwnd,
+                                None,
+                                c.left - monitor.left,
+                                c.top - monitor.top,
+                                c.right - c.left,
+                                c.bottom - c.top,
+                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            )
+                            .map_err(|_| NativeError::OverlayFailed)?;
+                        }
                         if focus
                             && !outputting
                             && focused == editor::Focus::Property(i)
@@ -759,11 +796,15 @@ fn sync_editor(
                         {
                             let _ = SetFocus(Some(b.hwnd));
                         }
-                        let _ = InvalidateRect(Some(b.hwnd), None, false);
+                        if controls_changed {
+                            let _ = InvalidateRect(Some(b.hwnd), None, false);
+                        }
                         continue;
                     }
                 }
-                let _ = ShowWindow(b.hwnd, SW_HIDE);
+                if controls_changed {
+                    let _ = ShowWindow(b.hwnd, SW_HIDE);
+                }
             }
             if focus && !outputting && state.text.borrow().is_none() {
                 if let editor::Focus::Handle(h) = focused {
@@ -772,10 +813,9 @@ fn sync_editor(
                     }
                 }
             }
-            let _ = InvalidateRect(Some(windows[index].hwnd), None, false);
-            let _ = UpdateWindow(windows[index].hwnd);
         }
     }
+    invalidate_editor_canvas(state, windows);
     Ok(())
 }
 fn commit_text(state: &State) -> bool {
@@ -1111,6 +1151,7 @@ pub(super) fn run(
         selection: RefCell::new(selection),
         editor: RefCell::new(None),
         text: RefCell::new(None),
+        presentation: RefCell::new(NativePresentation::default()),
         palette,
         locked: Cell::new(false),
         fallback: Cell::new(true),
@@ -2094,6 +2135,506 @@ fn final_selection(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SceneStamp {
+    selected: Option<PhysicalRect>,
+    masked: bool,
+    editor: bool,
+    tool: Option<editor::Tool>,
+    focus: Option<editor::Focus>,
+    keyboard: bool,
+    output: Option<editor::Action>,
+    outputting: bool,
+    error: Option<&'static str>,
+    preview_revision: u64,
+    preview_rect: Option<PhysicalRect>,
+    cursor: Option<PhysicalPoint>,
+    fallback: bool,
+    mode: ScreenshotMode,
+    palette: [u32; 8],
+    dpi: u32,
+}
+impl SceneStamp {
+    fn read(state: &State, index: usize) -> Self {
+        let e = state.editor.borrow();
+        let e = e.as_ref();
+        let s = state.selection.borrow();
+        Self {
+            selected: e.map(|e| e.geometry.rect()).or_else(|| s.highlight()),
+            masked: e.is_some() || s.highlight().is_some() || state.locked.get(),
+            editor: e.is_some(),
+            tool: e.and_then(|e| e.tool),
+            focus: e.map(|e| e.focus),
+            keyboard: e.is_some_and(|e| e.keyboard_focus),
+            output: e.and_then(|e| e.output_action),
+            outputting: e.is_some_and(|e| e.outputting),
+            error: e.and_then(|e| e.error),
+            preview_revision: e.map_or(0, |e| e.preview_revision),
+            preview_rect: e.and_then(|e| e.preview.as_ref().map(|_| e.preview_rect)),
+            cursor: (e.is_none() && s.mode == ScreenshotMode::Region && !s.hovering())
+                .then_some(s.cursor),
+            fallback: state.fallback.get(),
+            mode: s.mode,
+            palette: palette_key(state.palette),
+            dpi: state.desktop.monitors[index].dpi_x,
+        }
+    }
+}
+fn palette_key(p: OverlayPalette) -> [u32; 8] {
+    [
+        p.foreground,
+        p.surface,
+        p.selection_border,
+        p.mask,
+        p.mask_opacity as u32,
+        p.primary,
+        p.primary_foreground,
+        p.destructive,
+    ]
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolbarStamp {
+    rect: PhysicalRect,
+    hidden: bool,
+    outputting: bool,
+    focused: editor::Focus,
+    keyboard: bool,
+    tool: Option<editor::Tool>,
+    brush: u32,
+    font: u32,
+    color: [u8; 4],
+    avoid: Option<PhysicalRect>,
+    enabled: [bool; 9],
+    palette: [u32; 8],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrushVisual {
+    point: PhysicalPoint,
+    radius: i32,
+    clip: PhysicalRect,
+}
+impl BrushVisual {
+    fn bounds(self) -> PhysicalRect {
+        PhysicalRect {
+            left: self.point.x.saturating_sub(self.radius + 2),
+            top: self.point.y.saturating_sub(self.radius + 2),
+            right: self.point.x.saturating_add(self.radius + 3),
+            bottom: self.point.y.saturating_add(self.radius + 3),
+        }
+    }
+}
+#[derive(Default)]
+struct NativePresentation {
+    monitors: Vec<Option<NativeMonitor>>,
+    toolbar: Option<ToolbarStamp>,
+    cursor: Option<BrushVisual>,
+    scene_updates: u64,
+    uploaded_pixels: u64,
+}
+struct NativeMonitor {
+    bright: BackBuffer,
+    scene: std::rc::Rc<BackBuffer>,
+    stamp: Option<SceneStamp>,
+    preview_revision: u64,
+    preview_rect: Option<PhysicalRect>,
+    pending_rectangle: Option<PhysicalRect>,
+}
+fn current_brush(state: &State) -> Option<BrushVisual> {
+    let ed = state.editor.borrow();
+    let e = ed.as_ref()?;
+    if e.tool != Some(editor::Tool::Mosaic) {
+        return None;
+    }
+    let point = e.cursor.filter(|p| e.geometry.rect().contains(*p))?;
+    let dpi = state
+        .desktop
+        .monitors
+        .iter()
+        .find(|m| m.rect.contains(point))
+        .map(|m| m.dpi_x)
+        .unwrap_or(96);
+    Some(BrushVisual {
+        point,
+        radius: e.brush_radius(dpi) as i32,
+        clip: e.geometry.rect(),
+    })
+}
+fn expand_rect(rect: PhysicalRect, n: i32) -> PhysicalRect {
+    PhysicalRect {
+        left: rect.left.saturating_sub(n),
+        top: rect.top.saturating_sub(n),
+        right: rect.right.saturating_add(n),
+        bottom: rect.bottom.saturating_add(n),
+    }
+}
+fn frame_damage(rect: PhysicalRect) -> Vec<PhysicalRect> {
+    let outer = expand_rect(rect, 2);
+    let inner = PhysicalRect {
+        left: rect.left.saturating_add(2),
+        top: rect.top.saturating_add(2),
+        right: rect.right.saturating_sub(2),
+        bottom: rect.bottom.saturating_sub(2),
+    };
+    if inner.dimensions().is_ok() {
+        render_cache::subtract(outer, inner)
+    } else {
+        vec![outer]
+    }
+}
+fn scene_damage(
+    state: &State,
+    index: usize,
+    old: Option<&SceneStamp>,
+    new: &SceneStamp,
+) -> Vec<PhysicalRect> {
+    let monitor = state.desktop.monitors[index].rect;
+    let Some(old) = old else {
+        return vec![monitor];
+    };
+    if old == new {
+        return vec![];
+    }
+    if old.palette != new.palette
+        || old.masked != new.masked
+        || old.editor != new.editor
+        || old.dpi != new.dpi
+    {
+        return vec![monitor];
+    }
+    let mut dirty = render_cache::selection_delta(
+        old.selected.and_then(|r| r.intersection(monitor)),
+        new.selected.and_then(|r| r.intersection(monitor)),
+    );
+    for stamp in [old, new] {
+        if let Some(rect) = stamp.selected {
+            dirty.extend(frame_damage(rect));
+            if stamp.editor && stamp.tool.is_none() {
+                let dpi = state
+                    .desktop
+                    .monitors
+                    .iter()
+                    .map(|m| m.dpi_x)
+                    .max()
+                    .unwrap_or(96);
+                for h in Handle::ALL {
+                    dirty.push(expand_rect(
+                        h.visual_rect(rect, dpi),
+                        ((4 * dpi + 48) / 96) as i32,
+                    ));
+                }
+            }
+        }
+        if let Some(p) = stamp.cursor {
+            dirty.push(PhysicalRect {
+                left: p.x.saturating_sub(10),
+                top: p.y.saturating_sub(10),
+                right: p.x.saturating_add(11),
+                bottom: p.y.saturating_add(11),
+            });
+        }
+    }
+    if old.preview_revision != new.preview_revision {
+        let ed = state.editor.borrow();
+        let damage = ed.as_ref().and_then(|e| e.preview_damage);
+        if old.preview_rect != new.preview_rect {
+            dirty.extend(old.preview_rect);
+            dirty.extend(new.preview_rect);
+        }
+        if let Some(damage) = damage {
+            dirty.push(damage);
+        } else {
+            dirty.extend(old.preview_rect);
+            dirty.extend(new.preview_rect);
+        }
+    }
+    let px = |d: i32| ((d * new.dpi as i32 + 48) / 96).max(1);
+    dirty.push(PhysicalRect {
+        left: monitor.left + px(12),
+        top: monitor.top + px(12),
+        right: (monitor.left + px(540)).min(monitor.right),
+        bottom: (monitor.top + px(44)).min(monitor.bottom),
+    });
+    dirty
+        .into_iter()
+        .filter_map(|r| r.intersection(monitor))
+        .collect()
+}
+unsafe fn damage_region(
+    damage: &[PhysicalRect],
+    monitor: PhysicalRect,
+) -> Result<GdiObject, NativeError> {
+    let region = CreateRectRgn(0, 0, 0, 0);
+    if region.0.is_null() {
+        return Err(NativeError::OverlayFailed);
+    }
+    let region = GdiObject(HGDIOBJ(region.0));
+    for r in damage.iter().filter_map(|r| r.intersection(monitor)) {
+        let part = CreateRectRgn(
+            r.left - monitor.left,
+            r.top - monitor.top,
+            r.right - monitor.left,
+            r.bottom - monitor.top,
+        );
+        if part.0.is_null() {
+            return Err(NativeError::OverlayFailed);
+        }
+        let part = GdiObject(HGDIOBJ(part.0));
+        CombineRgn(
+            Some(HRGN(region.0 .0)),
+            Some(HRGN(region.0 .0)),
+            Some(HRGN(part.0 .0)),
+            RGN_OR,
+        );
+    }
+    Ok(region)
+}
+unsafe fn upload_rgba_patch(
+    dc: HDC,
+    source: PhysicalRect,
+    pixels: &[u8],
+    monitor: PhysicalRect,
+    damage: PhysicalRect,
+) -> Result<u64, NativeError> {
+    let Some(p) = render_cache::upload_patch(source, monitor, damage) else {
+        return Ok(0);
+    };
+    let (w, h) = source.dimensions()?;
+    let rw = p.desktop.right - p.desktop.left;
+    let rh = p.desktop.bottom - p.desktop.top;
+    let header = BITMAPV4HEADER {
+        bV4Size: std::mem::size_of::<BITMAPV4HEADER>() as u32,
+        bV4Width: w as i32,
+        bV4Height: -(h as i32),
+        bV4Planes: 1,
+        bV4BitCount: 32,
+        bV4V4Compression: BI_BITFIELDS,
+        bV4RedMask: 0xff,
+        bV4GreenMask: 0xff00,
+        bV4BlueMask: 0xff0000,
+        bV4AlphaMask: 0xff000000,
+        ..Default::default()
+    };
+    if StretchDIBits(
+        dc,
+        p.dest_x,
+        p.dest_y,
+        rw,
+        rh,
+        p.source_x,
+        // StretchDIBits addresses a cropped source from the bottom even for
+        // a top-down DIB; the full-image upload used zero and hid this rule.
+        h as i32 - p.source_y - rh,
+        rw,
+        rh,
+        Some(pixels.as_ptr().cast()),
+        &*(&header as *const _ as *const BITMAPINFO),
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    ) == 0
+    {
+        return Err(NativeError::OverlayFailed);
+    }
+    Ok(rw as u64 * rh as u64)
+}
+unsafe fn render_cached_scene(
+    reference: HDC,
+    state: &State,
+    index: usize,
+) -> Result<std::rc::Rc<BackBuffer>, NativeError> {
+    let monitor = state.desktop.monitors[index];
+    let (w, h) = monitor.rect.dimensions()?;
+    let stamp = SceneStamp::read(state, index);
+    let mut presentation = state.presentation.borrow_mut();
+    while presentation.monitors.len() <= index {
+        presentation.monitors.push(None);
+    }
+    let mut cache = match presentation.monitors[index].take() {
+        Some(c) => c,
+        None => {
+            let bright = BackBuffer::new(reference, w, h, &state.budget)?;
+            frozen(bright.dc, &state.desktop.frames.frames()[index])?;
+            NativeMonitor {
+                bright,
+                scene: std::rc::Rc::new(BackBuffer::new(reference, w, h, &state.budget)?),
+                stamp: None,
+                preview_revision: u64::MAX,
+                preview_rect: None,
+                pending_rectangle: None,
+            }
+        }
+    };
+    let mut dirty = scene_damage(state, index, cache.stamp.as_ref(), &stamp);
+    let effective = stamp
+        .preview_rect
+        .and_then(|r| stamp.selected.and_then(|s| r.intersection(s)));
+    let revision_changed = cache.preview_revision != stamp.preview_revision;
+    let mut rectangle_handled = false;
+    if revision_changed && cache.stamp.is_some() {
+        let ed = state.editor.borrow();
+        if let Some(e) = ed.as_ref() {
+            if e.preview_damage != Some(e.geometry.rect()) {
+                if let (
+                    Some(crate::screenshot::annotations::Annotation::Rectangle {
+                        rect,
+                        clip,
+                        color,
+                    }),
+                    Some(base),
+                ) = (e.pending.as_ref(), e.committed_preview.as_ref())
+                {
+                    if let Some(rect) = rect
+                        .intersection(*clip)
+                        .and_then(|r| r.intersection(e.geometry.rect()))
+                    {
+                        if let Some(old) = cache.pending_rectangle {
+                            for restore in render_cache::subtract(old, rect) {
+                                presentation.uploaded_pixels += upload_rgba_patch(
+                                    cache.bright.dc,
+                                    e.preview_rect,
+                                    &base.image().pixels,
+                                    monitor.rect,
+                                    restore,
+                                )?;
+                                dirty.push(restore);
+                            }
+                        }
+                        if let Some(local) = rect.intersection(monitor.rect) {
+                            fill(
+                                cache.bright.dc,
+                                RECT {
+                                    left: local.left - monitor.rect.left,
+                                    top: local.top - monitor.rect.top,
+                                    right: local.right - monitor.rect.left,
+                                    bottom: local.bottom - monitor.rect.top,
+                                },
+                                (u32::from(color[0]) << 16)
+                                    | (u32::from(color[1]) << 8)
+                                    | u32::from(color[2]),
+                            )?;
+                        }
+                        cache.pending_rectangle = Some(rect);
+                        cache.preview_rect = effective;
+                        cache.preview_revision = stamp.preview_revision;
+                        rectangle_handled = true;
+                    }
+                }
+            }
+        }
+    }
+    if !rectangle_handled && (revision_changed || cache.preview_rect != effective) {
+        cache.pending_rectangle = None;
+
+        if let Some(old_rect) = cache.preview_rect {
+            let restore = if let Some(new) = effective {
+                render_cache::subtract(old_rect, new)
+            } else {
+                vec![old_rect]
+            };
+            for r in restore {
+                presentation.uploaded_pixels += upload_rgba_patch(
+                    cache.bright.dc,
+                    monitor.rect,
+                    &state.desktop.frames.frames()[index].image.pixels,
+                    monitor.rect,
+                    r,
+                )?;
+                dirty.push(r);
+            }
+        }
+        let ed = state.editor.borrow();
+        if let Some(e) = ed.as_ref() {
+            if let (Some(image), Some(new_rect)) = (e.preview.as_ref(), effective) {
+                let patches = if revision_changed {
+                    let damage = if cache.stamp.is_none() || cache.preview_rect != effective {
+                        new_rect
+                    } else {
+                        e.preview_damage.unwrap_or(new_rect)
+                    };
+                    damage
+                        .intersection(new_rect)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else if let Some(old) = cache.preview_rect {
+                    render_cache::subtract(new_rect, old)
+                } else {
+                    vec![new_rect]
+                };
+                for damage in patches {
+                    presentation.uploaded_pixels += upload_rgba_patch(
+                        cache.bright.dc,
+                        e.preview_rect,
+                        &image.image().pixels,
+                        monitor.rect,
+                        damage,
+                    )?;
+                    dirty.push(damage);
+                }
+            }
+        }
+        cache.preview_rect = effective;
+        cache.preview_revision = stamp.preview_revision;
+    }
+    if !dirty.is_empty() {
+        draw_scene(cache.scene.dc, state, index, Some(cache.bright.dc), &dirty)?;
+        presentation.scene_updates += 1;
+    }
+    cache.stamp = Some(stamp);
+    let scene = cache.scene.clone();
+    presentation.monitors[index] = Some(cache);
+    Ok(scene)
+}
+fn acknowledge_native_preview(state: &State) {
+    let revision = state.editor.borrow().as_ref().map(|e| e.preview_revision);
+    if let Some(revision) = revision {
+        let uploaded = state
+            .presentation
+            .borrow()
+            .monitors
+            .iter()
+            .flatten()
+            .all(|c| c.preview_revision == revision);
+        if uploaded {
+            if let Some(e) = state.editor.borrow_mut().as_mut() {
+                e.acknowledge_preview(revision);
+            }
+        }
+    }
+}
+fn invalidate_editor_canvas(state: &State, windows: &[OwnedWindow]) {
+    let cursor = current_brush(state);
+    let mut presentation = state.presentation.borrow_mut();
+    let previous = presentation.cursor;
+    for (index, window) in windows.iter().enumerate() {
+        let stamp = SceneStamp::read(state, index);
+        let old = presentation
+            .monitors
+            .get(index)
+            .and_then(|m| m.as_ref())
+            .and_then(|m| m.stamp.as_ref());
+        let mut damage = scene_damage(state, index, old, &stamp);
+        if cursor != previous {
+            for c in [previous, cursor].into_iter().flatten() {
+                if let Some(r) = c.bounds().intersection(c.clip) {
+                    damage.push(r);
+                }
+            }
+        }
+        let monitor = state.desktop.monitors[index].rect;
+        unsafe {
+            for r in damage.into_iter().filter_map(|r| r.intersection(monitor)) {
+                let rect = RECT {
+                    left: r.left - monitor.left,
+                    top: r.top - monitor.top,
+                    right: r.right - monitor.left,
+                    bottom: r.bottom - monitor.top,
+                };
+                let _ = InvalidateRect(Some(window.hwnd), Some(&rect), false);
+            }
+        }
+    }
+    presentation.cursor = cursor;
+}
+
 struct Paint {
     hwnd: HWND,
     dc: HDC,
@@ -2432,20 +2973,31 @@ fn present(state: &State, windows: &[OwnedWindow], excluded: &[isize]) -> Result
 }
 unsafe fn paint(hwnd: HWND, state: &State, index: usize) -> Result<(), NativeError> {
     let paint = Paint::begin(hwnd)?;
-    let buffer = render_overlay(paint.dc, state, index)?;
-    let (width, height) = state.desktop.monitors[index].rect.dimensions()?;
-    BitBlt(
-        paint.dc,
-        0,
-        0,
-        width as i32,
-        height as i32,
-        Some(buffer.dc),
-        0,
-        0,
-        SRCCOPY,
-    )
-    .map_err(|_| NativeError::OverlayFailed)?;
+    present_cached_scene(paint.dc, state, index, paint.paint.rcPaint)
+}
+unsafe fn present_cached_scene(
+    dc: HDC,
+    state: &State,
+    index: usize,
+    dirty: RECT,
+) -> Result<(), NativeError> {
+    let buffer = render_cached_scene(dc, state, index)?;
+    if dirty.right > dirty.left && dirty.bottom > dirty.top {
+        BitBlt(
+            dc,
+            dirty.left,
+            dirty.top,
+            dirty.right - dirty.left,
+            dirty.bottom - dirty.top,
+            Some(buffer.dc),
+            dirty.left,
+            dirty.top,
+            SRCCOPY,
+        )
+        .map_err(|_| NativeError::OverlayFailed)?;
+    }
+    draw_brush_cursor(dc, state, index)?;
+    acknowledge_native_preview(state);
     Ok(())
 }
 
@@ -2456,31 +3008,98 @@ unsafe fn render_overlay(
     state: &State,
     index: usize,
 ) -> Result<BackBuffer, NativeError> {
+    let (width, height) = state.desktop.monitors[index].rect.dimensions()?;
+    let buffer = BackBuffer::new(reference_dc, width, height, &state.budget)?;
+    draw_scene(
+        buffer.dc,
+        state,
+        index,
+        None,
+        &[state.desktop.monitors[index].rect],
+    )?;
+    draw_brush_cursor(buffer.dc, state, index)?;
+    Ok(buffer)
+}
+unsafe fn draw_scene(
+    dc: HDC,
+    state: &State,
+    index: usize,
+    bright: Option<HDC>,
+    damage: &[PhysicalRect],
+) -> Result<(), NativeError> {
     let monitor = state.desktop.monitors[index];
     let frame = &state.desktop.frames.frames()[index];
     let selection = state.selection.borrow();
     let editor = state.editor.borrow();
     let editor = editor.as_ref();
     let (width, height) = monitor.rect.dimensions()?;
-    let buffer = BackBuffer::new(reference_dc, width, height, &state.budget)?;
-    let dc = buffer.dc;
-    frozen(dc, frame)?;
-    if editor.is_some() || selection.highlight().is_some() || state.locked.get() {
-        capture::shade(
-            dc,
-            RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
-            },
-            0,
-            204, // 80% black; keep the selected area at its original brightness.
-        )?;
+    let _whole_clip = SavedDc::new(dc)?;
+    if bright.is_some() {
+        let region = damage_region(damage, monitor.rect)?;
+        SelectClipRgn(dc, Some(HRGN(region.0 .0)));
     }
     let selected = editor
         .map(|editor| editor.geometry.rect())
         .or_else(|| selection.highlight());
+    let masked = editor.is_some() || selection.highlight().is_some() || state.locked.get();
+    if let Some(bright) = bright {
+        let _clip = SavedDc::new(dc)?;
+        let region = damage_region(damage, monitor.rect)?;
+        SelectClipRgn(dc, Some(HRGN(region.0 .0)));
+        let outside = if masked {
+            if let Some(sel) = selected.and_then(|s| s.intersection(monitor.rect)) {
+                render_cache::subtract(monitor.rect, sel)
+            } else {
+                vec![monitor.rect]
+            }
+        } else {
+            vec![]
+        };
+        for dirty in damage.iter().filter_map(|d| d.intersection(monitor.rect)) {
+            let x = dirty.left - monitor.rect.left;
+            let y = dirty.top - monitor.rect.top;
+            BitBlt(
+                dc,
+                x,
+                y,
+                dirty.right - dirty.left,
+                dirty.bottom - dirty.top,
+                Some(bright),
+                x,
+                y,
+                SRCCOPY,
+            )
+            .map_err(|_| NativeError::OverlayFailed)?;
+            for shade in outside.iter().filter_map(|r| r.intersection(dirty)) {
+                capture::shade(
+                    dc,
+                    RECT {
+                        left: shade.left - monitor.rect.left,
+                        top: shade.top - monitor.rect.top,
+                        right: shade.right - monitor.rect.left,
+                        bottom: shade.bottom - monitor.rect.top,
+                    },
+                    0,
+                    204,
+                )?;
+            }
+        }
+    } else {
+        frozen(dc, frame)?;
+        if masked {
+            capture::shade(
+                dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                },
+                0,
+                204,
+            )?;
+        }
+    }
     if let Some(selected) = selected.and_then(|selected| selected.intersection(monitor.rect)) {
         let local = RECT {
             left: selected.left - monitor.rect.left,
@@ -2491,10 +3110,12 @@ unsafe fn render_overlay(
         {
             let _saved = SavedDc::new(dc)?;
             IntersectClipRect(dc, local.left, local.top, local.right, local.bottom);
-            frozen(dc, frame)?;
-            if let Some(e) = editor {
-                if let Some(image) = e.preview.as_ref() {
-                    draw_annotation_preview(dc, image, e.preview_rect, monitor.rect)?;
+            if bright.is_none() {
+                frozen(dc, frame)?;
+                if let Some(e) = editor {
+                    if let Some(image) = e.preview.as_ref() {
+                        draw_annotation_preview(dc, image, e.preview_rect, monitor.rect)?;
+                    }
                 }
             }
         }
@@ -2649,42 +3270,50 @@ unsafe fn render_overlay(
         if editor.tool.is_none() {
             draw_handles(dc, state, editor, monitor.rect)?;
         }
-        if editor.tool == Some(editor::Tool::Mosaic) {
-            if let Some(point) = editor
-                .cursor
-                .filter(|p| editor.geometry.rect().contains(*p))
-            {
-                let pen = CreatePen(PS_SOLID, 1, color(state.palette.primary));
-                if pen.0.is_null() {
-                    return Err(NativeError::OverlayFailed);
-                }
-                let pen = GdiObject(HGDIOBJ(pen.0));
-                let _saved = SavedDc::new(dc)?;
-                let r = editor.geometry.rect();
-                IntersectClipRect(
-                    dc,
-                    r.left - monitor.rect.left,
-                    r.top - monitor.rect.top,
-                    r.right - monitor.rect.left,
-                    r.bottom - monitor.rect.top,
-                );
-                let pointer_dpi = state
-                    .desktop
-                    .monitors
-                    .iter()
-                    .find(|m| m.rect.contains(point))
-                    .map(|m| m.dpi_x)
-                    .unwrap_or(96);
-                let radius = editor.brush_radius(pointer_dpi) as i32;
-                let x = point.x - monitor.rect.left;
-                let y = point.y - monitor.rect.top;
-                SelectObject(dc, pen.0);
-                SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-                let _ = Ellipse(dc, x - radius, y - radius, x + radius + 1, y + radius + 1);
+    }
+    Ok(())
+}
+unsafe fn draw_brush_cursor(dc: HDC, state: &State, index: usize) -> Result<(), NativeError> {
+    let monitor = state.desktop.monitors[index];
+    let editor = state.editor.borrow();
+    let Some(editor) = editor.as_ref() else {
+        return Ok(());
+    };
+    if editor.tool == Some(editor::Tool::Mosaic) {
+        if let Some(point) = editor
+            .cursor
+            .filter(|p| editor.geometry.rect().contains(*p))
+        {
+            let pen = CreatePen(PS_SOLID, 1, color(state.palette.primary));
+            if pen.0.is_null() {
+                return Err(NativeError::OverlayFailed);
             }
+            let pen = GdiObject(HGDIOBJ(pen.0));
+            let _saved = SavedDc::new(dc)?;
+            let r = editor.geometry.rect();
+            IntersectClipRect(
+                dc,
+                r.left - monitor.rect.left,
+                r.top - monitor.rect.top,
+                r.right - monitor.rect.left,
+                r.bottom - monitor.rect.top,
+            );
+            let pointer_dpi = state
+                .desktop
+                .monitors
+                .iter()
+                .find(|m| m.rect.contains(point))
+                .map(|m| m.dpi_x)
+                .unwrap_or(96);
+            let radius = editor.brush_radius(pointer_dpi) as i32;
+            let x = point.x - monitor.rect.left;
+            let y = point.y - monitor.rect.top;
+            SelectObject(dc, pen.0);
+            SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            let _ = Ellipse(dc, x - radius, y - radius, x + radius + 1, y + radius + 1);
         }
     }
-    Ok(buffer)
+    Ok(())
 }
 
 unsafe fn draw_annotation_preview(
@@ -2866,6 +3495,7 @@ mod tests {
                 bounds,
             )),
             text: RefCell::new(None),
+            presentation: RefCell::new(NativePresentation::default()),
             palette: OverlayPalette {
                 foreground: 0xffffff,
                 surface: 0x202020,
@@ -4086,5 +4716,669 @@ mod native_observer_tests {
         assert_ne!(observer.thread_id, 0);
         assert!(observer.history.lock().is_ok());
         drop(observer);
+    }
+}
+#[cfg(test)]
+mod native_perf {
+    use super::*;
+    fn state(width: u32, height: u32) -> Box<State> {
+        state_at(width, height, 0, 0)
+    }
+    fn state_at(width: u32, height: u32, left: i32, top: i32) -> Box<State> {
+        let rect = PhysicalRect {
+            left,
+            top,
+            right: left + width as i32,
+            bottom: top + height as i32,
+        };
+        let budget = PixelBudget::default();
+        let mut image = BudgetedImage::allocate(width, height, &budget).unwrap();
+        for (i, p) in image.pixels_mut().chunks_exact_mut(4).enumerate() {
+            let x = i % width as usize;
+            let y = i / width as usize;
+            p.copy_from_slice(&[(x % 200) as u8, (y % 200) as u8, 150, 255]);
+        }
+        let frames = crate::screenshot::geometry::FrameSet::new(vec![(rect, image)]).unwrap();
+        let mut editor = editor::Editor::new(
+            PhysicalRect {
+                left: left + 80,
+                top: top + 80,
+                right: rect.right - 80,
+                bottom: rect.bottom - 80,
+            },
+            rect,
+        )
+        .unwrap();
+        editor.activate(editor::Button::Mosaic);
+        editor.cursor = Some(PhysicalPoint { x: 200, y: 200 });
+        Box::new(State {
+            desktop: Arc::new(capture::Desktop {
+                monitors: vec![capture::Monitor {
+                    rect,
+                    dpi_x: 96,
+                    dpi_y: 96,
+                }],
+                frames,
+                candidates: vec![],
+                bounds: rect,
+            }),
+            budget,
+            selection: RefCell::new(SelectionState::new(
+                ScreenshotMode::Region,
+                PhysicalPoint { x: 0, y: 0 },
+                vec![],
+            )),
+            editor: RefCell::new(Some(editor)),
+            text: RefCell::new(None),
+            presentation: RefCell::new(NativePresentation::default()),
+            palette: OverlayPalette {
+                foreground: 0xffffff,
+                surface: 0x202020,
+                selection_border: 0xffffff,
+                mask: 0,
+                mask_opacity: 204,
+                primary: 0xffffff,
+                primary_foreground: 0,
+                destructive: 0xff0000,
+            },
+            locked: Cell::new(true),
+            fallback: Cell::new(false),
+            target: Cell::new(None),
+            scope: Cell::new(None),
+            presented_at: Cell::new(None),
+            presented_candidate: Cell::new(None),
+            events: RefCell::new(VecDeque::new()),
+            closing: Cell::new(false),
+        })
+    }
+    #[test]
+    #[ignore = "controlled hidden native performance fixture; explicitly run with --ignored --nocapture"]
+    fn native_mouse_frame_benchmark() {
+        let _dpi = DpiContext::enter().unwrap();
+        for (width, height) in [(1920, 1080), (3840, 2160)] {
+            let state = state(width, height);
+            let cancellation = Cancellation::default();
+            let class = WindowClass::register().unwrap();
+            let context = Box::new(WindowContext {
+                state: &*state,
+                index: 0,
+                cancellation: &cancellation,
+            });
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(class.name.as_ptr()),
+                    w!("hidden native performance fixture"),
+                    WS_POPUP | WS_CLIPCHILDREN,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    None,
+                    None,
+                    Some(class.instance),
+                    Some(&*context as *const _ as *const _),
+                )
+                .unwrap()
+            };
+            let window = OwnedWindow {
+                hwnd,
+                _context: context,
+                session_notifications: false,
+            };
+            let toolbar = unsafe { toolbar::Toolbar::new(hwnd).unwrap() };
+            let n = 8;
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                unsafe {
+                    let _frame = render_overlay(HDC::default(), &state, 0).unwrap();
+                    let _ = GdiFlush();
+                }
+            }
+            let render = start.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+            let back =
+                unsafe { BackBuffer::new(HDC::default(), width, height, &state.budget).unwrap() };
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                unsafe {
+                    frozen(back.dc, &state.desktop.frames.frames()[0]).unwrap();
+                    let _ = GdiFlush();
+                }
+            }
+            let upload = start.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                capture::shade(
+                    back.dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: height as i32,
+                    },
+                    0,
+                    204,
+                )
+                .unwrap();
+                unsafe {
+                    let _ = GdiFlush();
+                }
+            }
+            let shade = start.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+            let start = std::time::Instant::now();
+            for i in 0..n {
+                state
+                    .editor
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .moved(PhysicalPoint {
+                        x: 200 + i as i32,
+                        y: 200,
+                    });
+                sync_editor(
+                    &state,
+                    std::slice::from_ref(&window),
+                    std::slice::from_ref(&toolbar),
+                    false,
+                )
+                .unwrap();
+                unsafe {
+                    let _ = GdiFlush();
+                }
+            }
+            let sync = start.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+            println!("native {width}x{height} debug={} render={render:.3}ms upload={upload:.3}ms shade={shade:.3}ms cursor_sync={sync:.3}ms budget={}MiB",cfg!(debug_assertions),state.budget.used()/1024/1024);
+            assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+            state.closing.set(true);
+            drop(toolbar);
+            drop(window);
+        }
+    }
+    unsafe fn assert_cached_matches_reference(state: &State, index: usize) {
+        let monitor = state.desktop.monitors[index];
+        let (w, h) = monitor.rect.dimensions().unwrap();
+        let actual = BackBuffer::new(HDC::default(), w, h, &state.budget).unwrap();
+        present_cached_scene(
+            actual.dc,
+            state,
+            index,
+            RECT {
+                left: 0,
+                top: 0,
+                right: w as i32,
+                bottom: h as i32,
+            },
+        )
+        .unwrap();
+        let expected = render_overlay(HDC::default(), state, index).unwrap();
+        let _ = GdiFlush();
+        let pixels = |b: &BackBuffer| {
+            let mut bitmap = BITMAP::default();
+            assert_ne!(
+                GetObjectW(
+                    HGDIOBJ(b.bitmap.0),
+                    std::mem::size_of::<BITMAP>() as i32,
+                    Some((&mut bitmap as *mut BITMAP).cast())
+                ),
+                0
+            );
+            std::slice::from_raw_parts(bitmap.bmBits.cast::<u32>(), (w * h) as usize)
+                .iter()
+                .map(|p| p & 0xffffff)
+                .collect::<Vec<_>>()
+        };
+        let a = pixels(&actual);
+        let b = pixels(&expected);
+        if let Some(i) = a.iter().zip(&b).position(|(a, b)| a != b) {
+            panic!(
+                "cached pixel mismatch monitor{index} ({},{}) actual={:x} reference={:x}",
+                i % w as usize,
+                i / w as usize,
+                a[i],
+                b[i]
+            );
+        }
+    }
+    #[test]
+    fn native_cache_reuses_cursor_scene_and_matches_reference_after_partial_edits_and_resize() {
+        let _dpi = DpiContext::enter().unwrap();
+        let state = state_at(400, 300, -400, -100);
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        let updates = state.presentation.borrow().scene_updates;
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .moved(PhysicalPoint { x: -240, y: 30 });
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        assert_eq!(
+            state.presentation.borrow().scene_updates,
+            updates,
+            "idle brush must reuse the native scene"
+        );
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.activate(editor::Button::Rectangle);
+            e.down(PhysicalPoint { x: -290, y: 5 }, &editor_monitors(&state));
+            e.up(PhysicalPoint { x: -180, y: 85 });
+            e.commit_pending(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+        }
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.activate(editor::Button::Mosaic);
+            e.down(PhysicalPoint { x: -270, y: 35 }, &editor_monitors(&state));
+            e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+        }
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        let pixels = state.presentation.borrow().uploaded_pixels;
+        for point in [
+            PhysicalPoint { x: -260, y: 40 },
+            PhysicalPoint { x: -400, y: -100 },
+            PhysicalPoint { x: -200, y: 50 },
+        ] {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.moved(point);
+            e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            drop(ed);
+            unsafe {
+                assert_cached_matches_reference(&state, 0);
+            }
+        }
+        assert!(
+            state.presentation.borrow().uploaded_pixels - pixels < 30_000,
+            "small stroke updates cannot upload full frames"
+        );
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.up(PhysicalPoint { x: -200, y: 50 });
+            e.commit_pending(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            e.activate(editor::Button::Mosaic);
+            e.geometry = editing::EditingSelection::new(
+                PhysicalRect {
+                    left: -250,
+                    top: 10,
+                    right: -90,
+                    bottom: 100,
+                },
+                state.desktop.bounds,
+            )
+            .unwrap();
+        }
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .finish_selection_rendered(state.desktop.frames.frames(), &state.budget)
+            .unwrap();
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .travel(false, state.desktop.frames.frames(), &state.budget)
+            .unwrap();
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        state
+            .editor
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .travel(true, state.desktop.frames.frames(), &state.budget)
+            .unwrap();
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+    }
+    #[test]
+    fn native_cache_damage_ack_waits_for_two_initialized_monitors() {
+        let _dpi = DpiContext::enter().unwrap();
+        let mut state = state_at(800, 300, -400, -100);
+        let mut frames = vec![];
+        let mut monitors = vec![];
+        for left in [-400, 0] {
+            let r = PhysicalRect {
+                left,
+                top: -100,
+                right: left + 400,
+                bottom: 200,
+            };
+            let mut image = BudgetedImage::allocate(400, 300, &state.budget).unwrap();
+            for (i, p) in image.pixels_mut().chunks_exact_mut(4).enumerate() {
+                p.copy_from_slice(&[(i % 197) as u8, (i / 400 % 193) as u8, 80, 255]);
+            }
+            frames.push((r, image));
+            monitors.push(capture::Monitor {
+                rect: r,
+                dpi_x: 96,
+                dpi_y: 96,
+            });
+        }
+        let desktop = Arc::get_mut(&mut state.desktop).unwrap();
+        desktop.frames = crate::screenshot::geometry::FrameSet::new(frames).unwrap();
+        desktop.monitors = monitors;
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+            assert_cached_matches_reference(&state, 1);
+        }
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.down(PhysicalPoint { x: -20, y: 40 }, &editor_monitors(&state));
+            e.moved(PhysicalPoint { x: 20, y: 50 });
+            e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+        }
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        assert!(
+            state
+                .editor
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .preview_damage
+                .is_some(),
+            "second initialized cache still needs this damage"
+        );
+        unsafe {
+            assert_cached_matches_reference(&state, 1);
+        }
+        assert!(state
+            .editor
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .preview_damage
+            .is_none());
+    }
+    #[test]
+    #[ignore = "controlled hidden cached renderer timings; run explicitly"]
+    fn native_cached_movement_resize_and_paint_benchmark() {
+        let _dpi = DpiContext::enter().unwrap();
+        for (w, h) in [(1920, 1080), (3840, 2160)] {
+            let state = state(w, h);
+            let target = unsafe { BackBuffer::new(HDC::default(), w, h, &state.budget).unwrap() };
+            let full = RECT {
+                left: 0,
+                top: 0,
+                right: w as i32,
+                bottom: h as i32,
+            };
+            unsafe {
+                present_cached_scene(target.dc, &state, 0, full).unwrap();
+            }
+            let n = 32;
+            let mut samples = vec![];
+            for i in 0..n {
+                let t = std::time::Instant::now();
+                state
+                    .editor
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .moved(PhysicalPoint { x: 200 + i, y: 200 });
+                unsafe {
+                    present_cached_scene(
+                        target.dc,
+                        &state,
+                        0,
+                        RECT {
+                            left: 170,
+                            top: 170,
+                            right: 270,
+                            bottom: 230,
+                        },
+                    )
+                    .unwrap();
+                    let _ = GdiFlush();
+                }
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "cached {w}x{h} cursor p50={:.3}ms p95={:.3}ms",
+                samples[n as usize / 2],
+                samples[n as usize * 95 / 100]
+            );
+            state
+                .editor
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .activate(editor::Button::Mosaic);
+            let mut samples = vec![];
+            for i in 0..n {
+                let t = std::time::Instant::now();
+                state.editor.borrow_mut().as_mut().unwrap().geometry =
+                    editing::EditingSelection::new(
+                        PhysicalRect {
+                            left: 80,
+                            top: 80,
+                            right: w as i32 - 80 + i,
+                            bottom: h as i32 - 80 + i,
+                        },
+                        state.desktop.bounds,
+                    )
+                    .unwrap();
+                unsafe {
+                    present_cached_scene(target.dc, &state, 0, full).unwrap();
+                    let _ = GdiFlush();
+                }
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "cached {w}x{h} resize p50={:.3}ms p95={:.3}ms",
+                samples[n as usize / 2],
+                samples[n as usize * 95 / 100]
+            );
+            state
+                .editor
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .finish_selection_rendered(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            {
+                let mut ed = state.editor.borrow_mut();
+                let e = ed.as_mut().unwrap();
+                e.activate(editor::Button::Mosaic);
+                e.down(PhysicalPoint { x: 200, y: 200 }, &editor_monitors(&state));
+                e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                    .unwrap();
+            }
+            unsafe {
+                present_cached_scene(target.dc, &state, 0, full).unwrap();
+            }
+            let mut samples = vec![];
+            let before = state.presentation.borrow().uploaded_pixels;
+            for i in 0..n {
+                let t = std::time::Instant::now();
+                let mut ed = state.editor.borrow_mut();
+                let e = ed.as_mut().unwrap();
+                e.moved(PhysicalPoint {
+                    x: 200 + i * 8,
+                    y: 200 + i * 2,
+                });
+                e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                    .unwrap();
+                drop(ed);
+                unsafe {
+                    present_cached_scene(target.dc, &state, 0, full).unwrap();
+                    let _ = GdiFlush();
+                }
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!("cached {w}x{h} mosaicCPU+native p50={:.3}ms p95={:.3}ms uploaded_pixels={} persistent_budget_MiB={}",samples[n as usize/2],samples[n as usize*95/100],state.presentation.borrow().uploaded_pixels-before,state.budget.used()/1024/1024);
+            {
+                let mut ed = state.editor.borrow_mut();
+                let e = ed.as_mut().unwrap();
+                e.up(PhysicalPoint { x: 448, y: 262 });
+                e.commit_pending(state.desktop.frames.frames(), &state.budget)
+                    .unwrap();
+                e.activate(editor::Button::Mosaic);
+            }
+            let mut samples = vec![];
+            for i in 0..n {
+                let t = std::time::Instant::now();
+                state.editor.borrow_mut().as_mut().unwrap().geometry =
+                    editing::EditingSelection::new(
+                        PhysicalRect {
+                            left: 80,
+                            top: 80,
+                            right: w as i32 - 60 - i,
+                            bottom: h as i32 - 60 - i,
+                        },
+                        state.desktop.bounds,
+                    )
+                    .unwrap();
+                unsafe {
+                    present_cached_scene(target.dc, &state, 0, full).unwrap();
+                    let _ = GdiFlush();
+                }
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "cached {w}x{h} resizeWithAnnotations p50={:.3}ms p95={:.3}ms",
+                samples[n as usize / 2],
+                samples[n as usize * 95 / 100]
+            );
+            let release = std::time::Instant::now();
+            state
+                .editor
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .finish_selection_rendered(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            println!(
+                "cached {w}x{h} resizeReleaseCPU {:.3}ms",
+                release.elapsed().as_secs_f64() * 1000.0
+            );
+            {
+                let mut ed = state.editor.borrow_mut();
+                let e = ed.as_mut().unwrap();
+                e.activate(editor::Button::Rectangle);
+                e.down(PhysicalPoint { x: 120, y: 120 }, &editor_monitors(&state));
+                e.moved(PhysicalPoint {
+                    x: w as i32 - 200,
+                    y: h as i32 - 200,
+                });
+                e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                    .unwrap();
+            }
+            unsafe {
+                present_cached_scene(target.dc, &state, 0, full).unwrap();
+            }
+            let mut samples = vec![];
+            for i in 0..n {
+                let t = std::time::Instant::now();
+                let mut ed = state.editor.borrow_mut();
+                let e = ed.as_mut().unwrap();
+                e.moved(PhysicalPoint {
+                    x: w as i32 - 200 + i,
+                    y: h as i32 - 200 + i,
+                });
+                e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                    .unwrap();
+                drop(ed);
+                unsafe {
+                    present_cached_scene(target.dc, &state, 0, full).unwrap();
+                    let _ = GdiFlush();
+                }
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "cached {w}x{h} rectangleCPU+native p50={:.3}ms p95={:.3}ms",
+                samples[n as usize / 2],
+                samples[n as usize * 95 / 100]
+            );
+        }
+    }
+
+    #[test]
+    fn native_pending_rectangle_delta_matches_reference_in_both_directions() {
+        let _dpi = DpiContext::enter().unwrap();
+        let state = state(400, 300);
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.history
+                .append(crate::screenshot::annotations::Annotation::Rectangle {
+                    rect: PhysicalRect {
+                        left: 100,
+                        top: 100,
+                        right: 260,
+                        bottom: 200,
+                    },
+                    clip: e.geometry.rect(),
+                    color: [15, 35, 210, 255],
+                })
+                .unwrap();
+            e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+        }
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
+        {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.activate(editor::Button::Rectangle);
+            e.down(PhysicalPoint { x: 120, y: 110 }, &editor_monitors(&state));
+        }
+        for p in [
+            PhysicalPoint { x: 230, y: 190 },
+            PhysicalPoint { x: 220, y: 180 },
+            PhysicalPoint { x: 120, y: 110 },
+            PhysicalPoint { x: 90, y: 90 },
+            PhysicalPoint { x: 190, y: 170 },
+        ] {
+            let mut ed = state.editor.borrow_mut();
+            let e = ed.as_mut().unwrap();
+            e.moved(p);
+            e.refresh_preview(state.desktop.frames.frames(), &state.budget)
+                .unwrap();
+            drop(ed);
+            unsafe {
+                assert_cached_matches_reference(&state, 0);
+            }
+        }
+        state.editor.borrow_mut().as_mut().unwrap().cancel_drag();
+        unsafe {
+            assert_cached_matches_reference(&state, 0);
+        }
     }
 }
