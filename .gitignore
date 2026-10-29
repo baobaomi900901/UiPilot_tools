@@ -251,3 +251,11 @@ __marimo__/
 /src-tauri/resources/everything/Everything.db
 /src-tauri/resources/everything/Everything.ini
 /artifacts/packages/
+
+# Generated independent screenshot Provider assets
+/src-tauri/resources/provider/
+/src-tauri/resources/.provider-stage.lock
+/artifacts/provider-dev/
+/artifacts/provider-build/
+/artifacts/test-temp/
+/.uipilot-local.json

@@ -36,7 +36,13 @@ class Progress:
         self.tail.append(raw)
         if self.verbose:
             self.emit(raw)
-        if re.match(r'> \S+@\S+ build$', line):
+        if line.startswith('UIPILOT_PROVIDER_BUILD'):
+            self.set_stage('构建截图 Provider')
+        elif line.startswith('UIPILOT_PROVIDER_READY'):
+            self.set_stage('校验截图 Provider 与构建前端')
+        elif line.startswith('UIPILOT_PROVIDER_VALIDATED'):
+            self.set_stage('校验 Provider 并准备安装资源')
+        elif re.match(r'> \S+@\S+ build$', line):
             self.set_stage('构建前端（类型检查与资源生成）')
         elif re.match(r'> \S+@\S+ build:managed-everything$', line):
             self.set_stage('构建 Everything 安装助手')

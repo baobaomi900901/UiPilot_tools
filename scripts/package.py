@@ -148,6 +148,7 @@ def build(req, tools, command=run_command):
     root, directory = Path(req["root"]), Path(req["runDirectory"])
     started = time.time()
     if req["mode"] == "setup":
+        log(req, "截图 Provider：Tauri 构建钩子将从独立源码构建，打包钩子核验同一资源清单")
         candidate = setup_candidate(req)
         before = evidence(candidate)
         artifact = directory / candidate.name

@@ -6,6 +6,8 @@ Closing the job handle terminates only this worker and its descendants.
 import ctypes as c
 from ctypes import wintypes as w
 import subprocess
+import os
+import sys
 
 
 class StartupInfo(c.Structure):
@@ -65,10 +67,11 @@ def checked(value):
 
 
 class OwnedWorker:
-    def __init__(self, args: list[str], cwd):
+    def __init__(self, args: list[str], cwd, *, inherit_stdio=False):
         self.api = kernel_api()
         self.job = self.process = None
         info = ProcessInfo()
+        stdio = []
         try:
             self.job = checked(self.api.CreateJobObjectW(None, None))
             limits = ExtendedLimits()
@@ -77,8 +80,17 @@ class OwnedWorker:
             startup = StartupInfo()
             startup.cb = c.sizeof(startup)
             startup.flags = 1  # STARTF_USESHOWWINDOW, SW_HIDE
+            if inherit_stdio:
+                import msvcrt
+                startup.flags |= 0x100  # STARTF_USESTDHANDLES
+                for name, stream in [('stdin',sys.stdin),('stdout',sys.stdout),('stderr',sys.stderr)]:
+                    # Duplicate descriptors so callers retain their original inheritance flags.
+                    fd=os.dup(stream.fileno())
+                    stdio.append(fd)
+                    os.set_handle_inheritable(msvcrt.get_osfhandle(fd),True)
+                    setattr(startup,name,msvcrt.get_osfhandle(fd))
             command = c.create_unicode_buffer(subprocess.list2cmdline(args))
-            checked(self.api.CreateProcessW(args[0], command, None, None, False,
+            checked(self.api.CreateProcessW(args[0], command, None, None, inherit_stdio,
                                             0x08000004, None, str(cwd),
                                             c.byref(startup), c.byref(info)))
             self.process = info.process
@@ -91,6 +103,8 @@ class OwnedWorker:
             self.close()
             raise
         finally:
+            for fd in stdio:
+                os.close(fd)
             if info.thread:
                 self.api.CloseHandle(info.thread)
 
