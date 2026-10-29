@@ -35,4 +35,6 @@ npm run tauri -- build --bundles nsis
 
 `/screenshot` 默认进入智能截图。命中后显示50%黑遮罩和元素矩形镂空；按下锁定候选及画面，松开完成元素截图。越过系统物理拖动容差后改为跨窗口、跨屏自由框选，之后不再切回元素单击。Esc取消，重拍取消保留旧图。
 
+防抖采用按下屏幕 DPI 对应的 `SM_CXDRAG` / `SM_CYDRAG` 作为两侧容差，阈值内的移动保持单击。语义依据 [Microsoft GetSystemMetrics 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetrics) 中对应条目的定义；不能将该数值再减半。
+
 Provider启动或通信故障会退回可用的窗口/区域选择，不能阻塞截图输入循环。单个控件不支持UIA不代表屏幕图像无法截取。完整人工验收见 `docs/testing/builtin-screenshot-acceptance.md`；特别检查镂空处点击不会触发底层按钮，输出图片不带遮罩和边框。
