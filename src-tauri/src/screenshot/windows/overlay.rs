@@ -456,9 +456,15 @@ unsafe extern "system" fn window_proc(
         }
         WM_DRAWITEM if toolbar::from_id(wparam.0).is_some() => {
             let outputting = state.editor.borrow().as_ref().is_some_and(|e| e.outputting);
+            let keyboard_focus = state
+                .editor
+                .borrow()
+                .as_ref()
+                .is_some_and(|e| e.keyboard_focus);
             if toolbar::draw(
                 state.palette,
                 outputting,
+                keyboard_focus,
                 &*(lparam.0 as *const DRAWITEMSTRUCT),
             )
             .is_err()
@@ -1423,6 +1429,19 @@ pub(super) fn run(
                 // Dispatch one message then process the resulting event before
                 // reading more, keeping capture/selection order deterministic.
                 if PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    if message.message == WM_LBUTTONDOWN {
+                        let was_keyboard =
+                            state.editor.borrow_mut().as_mut().is_some_and(|editor| {
+                                std::mem::replace(&mut editor.keyboard_focus, false)
+                            });
+                        if was_keyboard {
+                            for toolbar in &buttons {
+                                for button in &toolbar.buttons {
+                                    let _ = InvalidateRect(Some(button.hwnd), None, false);
+                                }
+                            }
+                        }
+                    }
                     if message.message == WM_PROBE_READY {
                         state.events.borrow_mut().push_back(Event::ProbeReady);
                         continue;
@@ -2478,7 +2497,7 @@ mod tests {
                         },
                         ..Default::default()
                     };
-                    toolbar::draw(state.palette, false, &item).unwrap();
+                    toolbar::draw(state.palette, false, true, &item).unwrap();
                     let background = primary_foreground;
                     assert_eq!(
                         GetPixel(buffer.dc, left + 3, button_rect.top + 14),
@@ -2492,10 +2511,15 @@ mod tests {
                             assert_eq!(rgb & 255, (rgb >> 16) & 255, "no colored action in {name}");
                         }
                     }
-                    assert_ne!(
+                    assert_eq!(
                         GetPixel(buffer.dc, left + 14, button_rect.top),
                         color(background),
-                        "all action focus rings must be visible in {name}"
+                        "toolbar icons must not have an enclosing focus frame in {name}"
+                    );
+                    assert_eq!(
+                        GetPixel(buffer.dc, left + 14, button_rect.bottom - 2),
+                        color(primary),
+                        "keyboard focus uses a short underline in {name}"
                     );
                     let mut different = 0;
                     for y in button_rect.top + 6..button_rect.bottom - 6 {
@@ -2517,7 +2541,12 @@ mod tests {
                         },
                         ..item
                     };
-                    toolbar::draw(state.palette, false, &item).unwrap();
+                    toolbar::draw(state.palette, false, false, &item).unwrap();
+                    assert_eq!(
+                        GetPixel(buffer.dc, left + 14, button_rect.bottom - 2),
+                        color(background),
+                        "initial or mouse focus must not decorate the icon in {name}"
+                    );
                 }
                 // Bright selection and shaded outside are composed from the
                 // fixture's frozen frame, using the production native renderer.

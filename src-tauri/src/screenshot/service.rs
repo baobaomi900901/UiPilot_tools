@@ -271,8 +271,8 @@ impl ScreenshotService {
         }
     }
 
-    /// Finish a native editor output without creating a preview session.
-    pub fn finish_selection_output(&self, ticket: CaptureTicket) -> bool {
+    /// Finish an output or explicit cancellation without reopening any preview.
+    pub fn finish_selection_hidden(&self, ticket: CaptureTicket) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
@@ -500,11 +500,11 @@ mod tests {
             panic!()
         };
         assert!(
-            !service.finish_selection_output(ticket),
+            !service.finish_selection_hidden(ticket),
             "not selecting yet"
         );
         assert!(service.selecting(ticket));
-        assert!(service.finish_selection_output(ticket));
+        assert!(service.finish_selection_hidden(ticket));
         assert!(service.current_ticket().is_none());
         let Begin::Capture(next) = service
             .begin(ScreenshotMode::Region, Origin::Hotkey)
@@ -513,20 +513,20 @@ mod tests {
             panic!()
         };
         assert!(
-            !service.finish_selection_output(ticket),
+            !service.finish_selection_hidden(ticket),
             "old completion must not close a new session"
         );
         assert_eq!(service.current_ticket(), Some(next));
     }
 
     #[test]
-    fn successful_retake_output_releases_previous_image_but_cancel_still_preserves_it() {
+    fn hidden_retake_completion_releases_previous_image_but_interruption_preserves_it() {
         let service = ScreenshotService::default();
         let owner = ready(&service);
         assert!(service.budget.used() > 0);
         let ticket = service.retake(owner).unwrap();
         assert!(service.selecting(ticket));
-        assert!(service.finish_selection_output(ticket));
+        assert!(service.finish_selection_hidden(ticket));
         assert_eq!(service.budget.used(), 0);
         assert!(service.current_ticket().is_none());
         let owner = ready(&service);

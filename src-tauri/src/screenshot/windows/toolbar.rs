@@ -140,6 +140,7 @@ impl Toolbar {
 pub(super) unsafe fn draw(
     palette: OverlayPalette,
     outputting: bool,
+    keyboard_focus: bool,
     item: &DRAWITEMSTRUCT,
 ) -> Result<(), NativeError> {
     let Some(button) = from_id(item.CtlID as usize) else {
@@ -147,39 +148,22 @@ pub(super) unsafe fn draw(
     };
     let dpi = GetDpiForWindow(item.hwndItem).max(96);
     let scale = |dip: i32| ((dip * dpi as i32 + 48) / 96).max(1);
-    // All actions share the user's monochrome toolbar style. Keep focus as an
-    // outline; neither Save nor Cancel gets a different fill or icon color.
+    // All actions share a borderless face. Keyboard navigation alone gets a
+    // short underline, never a frame around the icon.
     let background = palette.primary_foreground;
     let foreground = palette.primary;
     fill(item.hDC, item.rcItem, background)?;
-    let region = GdiObject(HGDIOBJ(
-        CreateRoundRectRgn(
-            item.rcItem.left,
-            item.rcItem.top,
-            item.rcItem.right + 1,
-            item.rcItem.bottom + 1,
-            scale(12),
-            scale(12),
-        )
-        .0,
-    ));
-    let surface = brush(background)?;
-    if FillRgn(item.hDC, HRGN(region.0 .0), HBRUSH(surface.0 .0)).0 == 0 {
-        return Err(NativeError::OverlayFailed);
-    }
-    if item.itemState.0 & (ODS_FOCUS.0 | ODS_SELECTED.0) != 0 {
-        let border = brush(foreground)?;
-        if FrameRgn(
+    if keyboard_focus && item.itemState.0 & ODS_FOCUS.0 != 0 {
+        fill(
             item.hDC,
-            HRGN(region.0 .0),
-            HBRUSH(border.0 .0),
-            scale(2),
-            scale(2),
-        )
-        .0 == 0
-        {
-            return Err(NativeError::OverlayFailed);
-        }
+            RECT {
+                left: item.rcItem.left + scale(6),
+                right: item.rcItem.right - scale(6),
+                top: item.rcItem.bottom - scale(3),
+                bottom: item.rcItem.bottom - scale(1),
+            },
+            foreground,
+        )?;
     }
     // Preblend the antialiased canonical mask against this button's surface;
     // GDI never needs a runtime SVG parser or an unbounded image allocation.

@@ -58,6 +58,7 @@ pub(super) struct Editor {
     pub geometry: EditingSelection,
     bounds: PhysicalRect,
     pub focus: Focus,
+    pub keyboard_focus: bool,
     pub outputting: bool,
     pub output_action: Option<Action>,
     pub error: Option<&'static str>,
@@ -72,6 +73,7 @@ impl Editor {
             geometry,
             bounds,
             focus: Focus::Button(Button::Save),
+            keyboard_focus: false,
             outputting: false,
             output_action: None,
             error: None,
@@ -88,6 +90,7 @@ impl Editor {
         }
     }
     pub fn down(&mut self, point: PhysicalPoint, monitors: &[(PhysicalRect, u32)]) -> bool {
+        self.keyboard_focus = false;
         if self.outputting {
             return false;
         }
@@ -129,6 +132,7 @@ impl Editor {
         }
         match key {
             9 => {
+                self.keyboard_focus = true;
                 let index = match self.focus {
                     Focus::Button(button) => {
                         8 + Button::ALL.iter().position(|v| *v == button).unwrap()
@@ -222,6 +226,23 @@ mod tests {
         assert_eq!(editor.focus, initial);
         assert_eq!(editor.key(32, false, false), Action::Save);
         assert!(!accepts_key(32, true), "held Space cannot repeat output");
+    }
+    #[test]
+    fn toolbar_focus_hint_only_appears_after_keyboard_navigation() {
+        let mut editor = editor();
+        assert!(!editor.keyboard_focus);
+        assert_eq!(editor.key(9, false, false), Action::Changed);
+        assert!(editor.keyboard_focus);
+        editor.focus_button(Button::Copy);
+        assert!(
+            editor.keyboard_focus,
+            "native focus notification must retain keyboard mode"
+        );
+        editor.down(PhysicalPoint { x: 0, y: 0 }, &[(r(0, 0, 100, 100), 96)]);
+        assert!(
+            !editor.keyboard_focus,
+            "mouse input clears the keyboard-only hint"
+        );
     }
     #[test]
     fn every_toolbar_button_enter_and_space_route_to_its_own_action() {

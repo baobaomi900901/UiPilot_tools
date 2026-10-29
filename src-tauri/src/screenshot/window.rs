@@ -329,7 +329,7 @@ impl ScreenshotHost {
                         as isize;
                 let focus_allowed =
                     handoff_allows_focus(&result, desktop_foreground, handoff_foreground);
-                let output_completed = matches!(&result, Ok(SelectionResult::Completed { .. }));
+                let finish_hidden = selection_finishes_hidden(&result);
                 let result = match result {
                     Ok(SelectionResult::Completed { .. }) => Ok(None),
                     Ok(SelectionResult::Selected { image, .. }) => (|| {
@@ -377,8 +377,8 @@ impl ScreenshotHost {
                         unsafe { ::windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }
                             .0 as isize;
                     drop(_display);
-                    if output_completed {
-                        host.complete_output(&app, ticket);
+                    if finish_hidden {
+                        host.complete_hidden(&app, ticket);
                     } else {
                         host.complete(
                             &app,
@@ -403,13 +403,13 @@ impl ScreenshotHost {
             }
         }
     }
-    fn complete_output(&self, app: &AppHandle, ticket: CaptureTicket) {
+    fn complete_hidden(&self, app: &AppHandle, ticket: CaptureTicket) {
         let previous_preview = self
             .preview
             .lock()
             .ok()
             .and_then(|preview| preview.as_ref().map(|preview| preview.instance));
-        if !self.service.finish_selection_output(ticket) {
+        if !self.service.finish_selection_hidden(ticket) {
             return;
         }
         if let Some(instance) = previous_preview {
@@ -423,8 +423,8 @@ impl ScreenshotHost {
                 origin.take();
             }
         }
-        // Finish silently: no launcher focus transfer, message-center entry or
-        // system notification for screenshot actions.
+        // Preparation already hid the host windows. Success or explicit cancel
+        // leaves them hidden in the tray; never reopen an old retake preview.
     }
     fn complete(
         self: &Arc<Self>,
@@ -708,6 +708,12 @@ impl ScreenshotHost {
             });
     }
 }
+fn selection_finishes_hidden(result: &Result<SelectionResult, windows::NativeError>) -> bool {
+    matches!(
+        result,
+        Ok(SelectionResult::Completed { .. } | SelectionResult::Cancelled(CancelReason::User))
+    )
+}
 fn handoff_allows_focus(
     result: &Result<SelectionResult, windows::NativeError>,
     desktop: isize,
@@ -718,9 +724,7 @@ fn handoff_allows_focus(
         && matches!(
             result,
             Ok(SelectionResult::Selected { .. })
-                | Ok(SelectionResult::Cancelled(
-                    CancelReason::User | CancelReason::DisplayChanged
-                ))
+                | Ok(SelectionResult::Cancelled(CancelReason::DisplayChanged))
                 | Err(_)
         )
 }
@@ -772,11 +776,30 @@ mod tests {
             OutputSuccess::Copied,
             OutputSuccess::Pinned,
         ] {
-            assert!(!handoff_allows_focus(
-                &Ok(SelectionResult::Completed { output }),
-                10,
-                10
-            ));
+            let result = Ok(SelectionResult::Completed { output });
+            assert!(selection_finishes_hidden(&result));
+            assert!(!handoff_allows_focus(&result, 10, 10));
+        }
+    }
+    #[test]
+    fn explicit_cancel_does_not_restore_launcher_focus() {
+        assert!(selection_finishes_hidden(&Ok(SelectionResult::Cancelled(
+            CancelReason::User
+        ))));
+        assert!(!handoff_allows_focus(
+            &Ok(SelectionResult::Cancelled(CancelReason::User)),
+            10,
+            10
+        ));
+        for reason in [
+            CancelReason::DisplayChanged,
+            CancelReason::LostCapture,
+            CancelReason::Shutdown,
+        ] {
+            assert!(
+                !selection_finishes_hidden(&Ok(SelectionResult::Cancelled(reason))),
+                "non-user interruptions retain their existing recovery path"
+            );
         }
     }
     #[test]
