@@ -61,6 +61,7 @@ pub(crate) struct ProbeReply {
     pub rect: Option<PhysicalRect>,
     pub unavailable: bool,
     pub target: Option<ProbeTarget>,
+    pub scope: Option<ProbeScope>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProbeTarget {
@@ -129,6 +130,7 @@ impl Mailbox {
                 rect: None,
                 unavailable: true,
                 target: None,
+                scope: None,
             });
         } else {
             self.pending = Some(request);
@@ -144,6 +146,7 @@ impl Mailbox {
             rect: None,
             unavailable: true,
             target: None,
+            scope: None,
         });
     }
 }
@@ -338,8 +341,91 @@ fn target_at(point: PhysicalPoint, excluded: &[isize], provider_pid: u32) -> Opt
     search.target
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProbeScope {
+    top: ProbeTarget,
+    seed: ProbeTarget,
+    provider_pid: u32,
+}
+
+pub(crate) fn scope_is_current(
+    scope: ProbeScope,
+    point: PhysicalPoint,
+    excluded: &[isize],
+) -> bool {
+    scope_at(point, excluded, scope.provider_pid) == Some(scope)
+}
+
+fn scope_at(point: PhysicalPoint, excluded: &[isize], provider_pid: u32) -> Option<ProbeScope> {
+    use windows::Win32::{
+        Foundation::{GetLastError, SetLastError, ERROR_SUCCESS, HWND, POINT, RECT},
+        Graphics::Gdi::MapWindowPoints,
+        UI::WindowsAndMessaging::{
+            ChildWindowFromPointEx, GetAncestor, GetClientRect, CWP_SKIPINVISIBLE, GA_PARENT,
+            GA_ROOT,
+        },
+    };
+    let top = target_at(point, excluded, provider_pid)?;
+    let mut seed = top;
+    for _ in 0..MAX_DEPTH {
+        let hwnd = HWND(seed.hwnd as *mut _);
+        let mut client = RECT::default();
+        let mut local = POINT {
+            x: point.x,
+            y: point.y,
+        };
+        unsafe {
+            GetClientRect(hwnd, &mut client).ok()?;
+            // MapWindowPoints also handles mirrored/RTL client coordinates.
+            SetLastError(ERROR_SUCCESS);
+            if MapWindowPoints(None, Some(hwnd), std::slice::from_mut(&mut local)) == 0
+                && GetLastError() != ERROR_SUCCESS
+            {
+                return None;
+            }
+            // ChildWindowFromPointEx expects client coordinates. Nonclient areas
+            // belong to this window, not to children beneath its client surface.
+            if local.x < client.left
+                || local.x >= client.right
+                || local.y < client.top
+                || local.y >= client.bottom
+            {
+                return Some(ProbeScope {
+                    top,
+                    seed,
+                    provider_pid,
+                });
+            }
+            let child = ChildWindowFromPointEx(hwnd, local, CWP_SKIPINVISIBLE);
+            if child == hwnd {
+                return Some(ProbeScope {
+                    top,
+                    seed,
+                    provider_pid,
+                });
+            }
+            if child.0.is_null()
+                || GetAncestor(child, GA_PARENT) != hwnd
+                || GetAncestor(child, GA_ROOT).0 as isize != top.hwnd
+            {
+                return None;
+            }
+            let next = snapshot_target(child.0 as isize)?;
+            if next.pid == std::process::id()
+                || next.pid == provider_pid
+                || excluded.contains(&next.hwnd)
+                || !next.rect.contains(point)
+            {
+                return None;
+            }
+            seed = next;
+        }
+    }
+    None
+}
+
 struct GeometryCache {
-    target: ProbeTarget,
+    scope: ProbeScope,
     // Empty also records a failed/incomplete collection; never retry every mouse move.
     rectangles: Vec<PhysicalRect>,
 }
@@ -368,6 +454,7 @@ async fn collect_geometry(
     let opened = tree_rpc(pipe, id, json!({"operation":"open_session","backend":"uia",
         "interactive":false,"public_observation":true,"native_handle":target.hwnd,"collection_budget_ms":2500})).await?;
     if opened["error"] != 0 {
+        trace(format!("provider open rejected error={}", opened["error"]));
         return Ok(vec![]);
     }
     let session = opened["session_id"]
@@ -378,20 +465,35 @@ async fn collect_geometry(
         .as_i64()
         .filter(|s| *s > 0)
         .ok_or(())?;
-    let valid_root = opened["backend"] == "uia"
-        && opened["display"]["native_window_handle"].as_i64() == Some(target.hwnd as i64)
-        && opened["display"]["process_id"].as_u64() == Some(u64::from(target.pid));
-    let rectangles = if valid_root {
-        let tree = tree_rpc(
-            pipe,
-            id,
-            json!({"operation":"get_subtree","session_id":session,
+    let root = decode_root_geometry(&opened, target);
+    let rectangles = if let Ok(root) = root {
+        if opened["has_children"] == false {
+            root.into_iter().collect()
+        } else {
+            let tree = tree_rpc(
+                pipe,
+                id,
+                json!({"operation":"get_subtree","session_id":session,
             "snapshot_id":snapshot,"path_from_root":[],"public_observation":true,
             "max_nodes":MAX_NODES,"max_depth":MAX_DEPTH,"collection_budget_ms":2500}),
-        )
-        .await?;
-        decode_tree(&tree, snapshot).unwrap_or_default()
+            )
+            .await?;
+            let decoded = decode_tree(&tree, snapshot);
+            trace(format!(
+            "provider tree response error={} nodes={} parents={} truncated={} budget_exhausted={} accepted={}",
+            tree["error"], tree["count"], tree["parent_count"], tree["truncated"], tree["budget_exhausted"], decoded.is_ok()
+        ));
+            decoded
+                .map(|mut rectangles| {
+                    if let Some(root) = root.filter(|root| !rectangles.contains(root)) {
+                        rectangles.push(root);
+                    }
+                    rectangles
+                })
+                .unwrap_or_default()
+        }
     } else {
+        trace("provider open root identity rejected");
         vec![]
     };
     // No live session or element metadata survives the one-time collection.
@@ -514,30 +616,45 @@ fn run_worker(exe: PathBuf, excluded: Vec<isize>, shared: &Shared) -> Result<(),
             }
         };
         last = Instant::now();
-        let target = target_at(request.point, &excluded, child.0.id());
-        if let Some(target) = target {
-            if !cache.iter().any(|entry| entry.target == target) {
-                cache.retain(|entry| entry.target.hwnd != target.hwnd);
+        let scope = scope_at(request.point, &excluded, child.0.id());
+        if let Some(scope) = scope {
+            if !cache.iter().any(|entry| entry.scope == scope) {
+                cache.retain(|entry| entry.scope.seed.hwnd != scope.seed.hwnd);
                 if cache.len() >= MAX_CACHED_WINDOWS {
                     cache.remove(0);
                 }
+                trace(format!(
+                    "provider scope top={} seed={} native_child={} seed_rect={:?}",
+                    scope.top.hwnd,
+                    scope.seed.hwnd,
+                    scope.top.hwnd != scope.seed.hwnd,
+                    scope.seed.rect
+                ));
                 let rectangles = runtime.block_on(bounded(
                     shared,
-                    collect_geometry(&mut pipe, &mut rpc_id, target),
+                    collect_geometry(&mut pipe, &mut rpc_id, scope.seed),
                 ))?;
                 trace(format!(
                     "provider tree collected rectangles={}",
                     rectangles.len()
                 ));
-                cache.push(GeometryCache { target, rectangles });
+                cache.push(GeometryCache { scope, rectangles });
             }
         }
         // A window can move/close/change stacking while the Provider is collecting.
-        let target = target
-            .filter(|target| target_at(request.point, &excluded, child.0.id()) == Some(*target));
-        let rect = target
-            .and_then(|target| cache.iter().find(|entry| entry.target == target))
-            .and_then(|entry| smallest_at(&entry.rectangles, request.point, entry.target.rect));
+        let scope =
+            scope.filter(|scope| scope_at(request.point, &excluded, child.0.id()) == Some(*scope));
+        let rect = scope
+            .and_then(|scope| cache.iter().find(|entry| entry.scope == scope))
+            .and_then(|entry| {
+                entry
+                    .scope
+                    .seed
+                    .rect
+                    .intersection(entry.scope.top.rect)
+                    .and_then(|bounds| smallest_at(&entry.rectangles, request.point, bounds))
+            });
+        let target = scope.map(|scope| scope.top);
         let mut mailbox = shared.mailbox.lock().map_err(|_| ())?;
         if shared.cancelled.load(Ordering::Acquire) {
             return Ok(());
@@ -548,6 +665,7 @@ fn run_worker(exe: PathBuf, excluded: Vec<isize>, shared: &Shared) -> Result<(),
             rect,
             unavailable: false,
             target,
+            scope,
         });
         drop(mailbox);
         trace(format!(
@@ -597,6 +715,56 @@ async fn read_response(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Resu
             return serde_json::from_slice(&response[..end]).map_err(|_| ());
         }
     }
+}
+
+fn decode_root_geometry(opened: &Value, target: ProbeTarget) -> Result<Option<PhysicalRect>, ()> {
+    let snapshot = opened["snapshot_id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or(())?;
+    let display = &opened["display"];
+    if opened["error"] != 0
+        || opened["backend"] != "uia"
+        || opened["ref"]["snapshot_id"].as_i64() != Some(snapshot)
+        || opened["ref"]["platform"] != "win32"
+        || opened["ref"]["automation_type"] != "UIA"
+        || opened["has_children"].as_bool().is_none()
+        || display["native_window_handle"].as_i64() != Some(target.hwnd as i64)
+        || display["process_id"].as_u64() != Some(u64::from(target.pid))
+    {
+        return Err(());
+    }
+    // A logical root can have absent/stale bounds while descendants are valid.
+    // Identity gates traversal; unusable root geometry only omits that candidate.
+    if display["is_offscreen"] != false {
+        return Ok(None);
+    }
+    let geometry = || {
+        let number = |key: &str| {
+            display["position_and_shape"][key]
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+        };
+        let (x, y, w, h) = (number("x")?, number("y")?, number("w")?, number("h")?);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let rect = PhysicalRect {
+            left: x,
+            top: y,
+            right: x.checked_add(w)?,
+            bottom: y.checked_add(h)?,
+        };
+        if rect.left < target.rect.left
+            || rect.top < target.rect.top
+            || rect.right > target.rect.right
+            || rect.bottom > target.rect.bottom
+        {
+            return None;
+        }
+        Some(rect)
+    };
+    Ok(geometry())
 }
 
 // Consume the original flat parent-batch format. Reject incomplete trees rather
@@ -727,6 +895,52 @@ fn smallest_at(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn seed_root_geometry_requires_exact_identity_and_valid_contained_bounds() {
+        let target = ProbeTarget {
+            hwnd: 42,
+            pid: 12,
+            rect: PhysicalRect {
+                left: 10,
+                top: 20,
+                right: 110,
+                bottom: 60,
+            },
+        };
+        let opened = json!({"error":0,"backend":"uia","snapshot_id":1,"has_children":false,
+            "ref":{"snapshot_id":1,"platform":"win32","automation_type":"UIA"},
+            "display":{"native_window_handle":42,"process_id":12,"is_offscreen":false,
+                "position_and_shape":{"x":10,"y":20,"w":100,"h":40}}});
+        assert_eq!(decode_root_geometry(&opened, target), Ok(Some(target.rect)));
+        for (field, value) in [
+            ("native_window_handle", json!(43)),
+            ("process_id", json!(13)),
+        ] {
+            let mut invalid = opened.clone();
+            invalid["display"][field] = value;
+            assert!(decode_root_geometry(&invalid, target).is_err());
+        }
+        for (field, value) in [
+            ("x", json!(9)),
+            ("w", json!(0)),
+            ("h", json!(41)),
+            ("x", json!(i32::MAX)),
+        ] {
+            let mut invalid = opened.clone();
+            invalid["display"]["position_and_shape"][field] = value;
+            assert_eq!(decode_root_geometry(&invalid, target), Ok(None));
+        }
+        for geometry in [Value::Null, json!({"x":0,"y":0,"w":0,"h":0})] {
+            let mut parent = opened.clone();
+            parent["has_children"] = json!(true);
+            parent["display"]["position_and_shape"] = geometry;
+            assert_eq!(decode_root_geometry(&parent, target), Ok(None));
+            assert!(
+                !decode_tree(&original_tree(), 1).unwrap().is_empty(),
+                "missing parent bounds must not discard valid descendants"
+            );
+        }
+    }
     fn original_tree() -> Value {
         let item = |x, y, w, h, children| {
             json!({
@@ -917,7 +1131,8 @@ mod tests {
         use windows::{
             core::w,
             Win32::{
-                Foundation::RECT,
+                Foundation::{LPARAM, POINT, RECT, WPARAM},
+                Graphics::Gdi::ClientToScreen,
                 UI::{HiDpi::*, WindowsAndMessaging::*},
             },
         };
@@ -956,6 +1171,93 @@ mod tests {
                 None,
             )
             .unwrap();
+            let extra_children = std::env::var("UIPILOT_FIXTURE_EXTRA_CHILDREN")
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0);
+            for _ in 0..extra_children {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    w!("Unrelated fixture item"),
+                    WS_CHILD | WS_VISIBLE,
+                    200,
+                    200,
+                    100,
+                    30,
+                    Some(root),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            let listbox = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("LISTBOX"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE,
+                20,
+                100,
+                140,
+                100,
+                Some(root),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            for name in [w!("First controlled item"), w!("Second controlled item")] {
+                assert!(
+                    SendMessageW(
+                        listbox,
+                        LB_ADDSTRING,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(name.as_ptr() as isize))
+                    )
+                    .0 >= 0
+                );
+            }
+            let overlap_a = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                w!("Overlap A"),
+                WS_CHILD | WS_VISIBLE,
+                200,
+                20,
+                160,
+                100,
+                Some(root),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let overlap_b = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                w!("Overlap B"),
+                WS_CHILD | WS_VISIBLE,
+                240,
+                40,
+                80,
+                40,
+                Some(root),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetWindowPos(
+                overlap_b,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .unwrap();
             let _ = ShowWindow(root, SW_SHOWNOACTIVATE);
             let overlay = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_NOACTIVATE,
@@ -975,8 +1277,37 @@ mod tests {
             let _ = ShowWindow(overlay, SW_SHOWNOACTIVATE);
             let mut rect = RECT::default();
             GetWindowRect(button, &mut rect).unwrap();
+            let mut item = RECT::default();
+            assert_ne!(
+                SendMessageW(
+                    listbox,
+                    LB_GETITEMRECT,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(&mut item as *mut _ as isize))
+                )
+                .0,
+                LB_ERR as isize
+            );
+            let mut item_start = POINT {
+                x: item.left,
+                y: item.top,
+            };
+            let mut item_end = POINT {
+                x: item.right,
+                y: item.bottom,
+            };
+            assert!(ClientToScreen(listbox, &mut item_start).as_bool());
+            assert!(ClientToScreen(listbox, &mut item_end).as_bool());
+            let native_rect = |hwnd| {
+                let mut r = RECT::default();
+                GetWindowRect(hwnd, &mut r).unwrap();
+                json!({"left":r.left,"top":r.top,"right":r.right,"bottom":r.bottom})
+            };
             std::fs::write(&path, serde_json::to_vec(&json!({"root":(root.0 as isize).to_string(),
-                "overlay":(overlay.0 as isize).to_string(),"rect":{"left":rect.left,"top":rect.top,"right":rect.right,"bottom":rect.bottom}})).unwrap()).unwrap();
+                "overlay":(overlay.0 as isize).to_string(),"rect":{"left":rect.left,"top":rect.top,"right":rect.right,"bottom":rect.bottom},
+                "button":(button.0 as isize).to_string(),"listbox":(listbox.0 as isize).to_string(),
+                "item":{"left":item_start.x,"top":item_start.y,"right":item_end.x,"bottom":item_end.y},
+                "overlap_a":native_rect(overlap_a),"overlap_b":native_rect(overlap_b)})).unwrap()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut message = MSG::default();
             while Instant::now() < deadline {
@@ -994,6 +1325,21 @@ mod tests {
     #[test]
     #[ignore = "requires the staged original Provider; opens only the host-owned controlled fixture"]
     fn real_provider_roundtrip_hits_fixture_behind_overlay() {
+        roundtrip_fixture(0);
+    }
+
+    #[test]
+    #[ignore = "requires staged original Provider; dense host-owned native fixture"]
+    fn real_provider_finds_element_without_collecting_unrelated_siblings() {
+        roundtrip_fixture(300);
+    }
+
+    fn roundtrip_fixture(extra_children: usize) {
+        unsafe {
+            windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
         let exe =
             PathBuf::from(std::env::var_os("UIPILOT_TEST_PROVIDER_EXE").expect("provider asset"));
         let path = std::env::temp_dir().join(format!(
@@ -1010,6 +1356,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("UIPILOT_ORIGINAL_PROVIDER_FIXTURE", &path)
+                .env("UIPILOT_FIXTURE_EXTRA_CHILDREN", extra_children.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(0x08000000)
@@ -1039,7 +1386,7 @@ mod tests {
         };
         let excluded = vec![fixture["overlay"].as_str().unwrap().parse().unwrap()];
         let (notifier, notified) = std::sync::mpsc::channel();
-        let worker = ProbeWorker::start(exe, excluded, move || {
+        let worker = ProbeWorker::start(exe, excluded.clone(), move || {
             let _ = notifier.send(());
         });
         let first_started = Instant::now();
@@ -1077,6 +1424,96 @@ mod tests {
             "original Provider cached point: {} ms",
             cached_started.elapsed().as_millis()
         );
+        let number = |key: &str| fixture["item"][key].as_i64().unwrap() as i32;
+        let item = PhysicalRect {
+            left: number("left"),
+            top: number("top"),
+            right: number("right"),
+            bottom: number("bottom"),
+        };
+        let item_point = PhysicalPoint {
+            x: item.left + 5,
+            y: item.top + (item.bottom - item.top) / 2,
+        };
+        let item_started = Instant::now();
+        let sequence = worker.request(item_point);
+        notified
+            .recv_timeout(Duration::from_secs(5))
+            .expect("internal list item reply");
+        let reply = worker.poll().unwrap();
+        assert!(!reply.unavailable);
+        assert_eq!(reply.sequence, sequence);
+        assert_eq!(
+            reply.rect,
+            Some(item),
+            "must resolve internal LISTBOX item, not its native HWND rectangle"
+        );
+        assert_eq!(
+            reply.target.unwrap().hwnd.to_string(),
+            fixture["root"].as_str().unwrap()
+        );
+        eprintln!(
+            "original Provider internal LISTBOX item: {} ms",
+            item_started.elapsed().as_millis()
+        );
+        let back_started = Instant::now();
+        let sequence = worker.request(point);
+        notified
+            .recv_timeout(Duration::from_secs(2))
+            .expect("return to cached button scope");
+        let reply = worker.poll().unwrap();
+        assert_eq!(reply.sequence, sequence);
+        assert_eq!(reply.rect, Some(expected));
+        assert!(!reply.unavailable);
+        assert!(back_started.elapsed() < Duration::from_secs(1));
+        eprintln!(
+            "original Provider cached scope return: {} ms",
+            back_started.elapsed().as_millis()
+        );
+        let overlap_rect = |key: &str| {
+            let number = |edge: &str| fixture[key][edge].as_i64().unwrap() as i32;
+            PhysicalRect {
+                left: number("left"),
+                top: number("top"),
+                right: number("right"),
+                bottom: number("bottom"),
+            }
+        };
+        let a = overlap_rect("overlap_a");
+        let b = overlap_rect("overlap_b");
+        let a_point = PhysicalPoint {
+            x: a.left + 5,
+            y: a.top + 5,
+        };
+        let b_point = PhysicalPoint {
+            x: b.left + 5,
+            y: b.top + 5,
+        };
+        let sequence = worker.request(a_point);
+        notified
+            .recv_timeout(Duration::from_secs(5))
+            .expect("overlapping sibling A reply");
+        let reply = worker.poll().unwrap();
+        assert_eq!(reply.sequence, sequence);
+        assert_eq!(reply.rect, Some(a));
+        assert!(
+            a.contains(b_point),
+            "historical rectangle covers the other native scope"
+        );
+        let a_scope = reply.scope.unwrap();
+        assert!(scope_is_current(a_scope, a_point, &excluded));
+        assert!(
+            !scope_is_current(a_scope, b_point, &excluded),
+            "old A hit must not be reused at B even inside A bounds"
+        );
+        let sequence = worker.request(b_point);
+        notified
+            .recv_timeout(Duration::from_secs(5))
+            .expect("overlapping sibling B reply");
+        let reply = worker.poll().unwrap();
+        assert_eq!(reply.sequence, sequence);
+        assert_eq!(reply.rect, Some(b));
+        assert_ne!(reply.scope, Some(a_scope));
         drop(worker);
         let _ = std::fs::remove_file(path);
     }

@@ -49,3 +49,16 @@
 - [x] 提供重启完整dev和资源管理器导航树复测步骤；原版接入后的实机结果仍待用户反馈。
 
 **Verify:** 共享Provider准备工具、真实管道集成、`npm run tauri -- build --bundles nsis`。
+
+### Task 5: 修正整窗采集导致只剩窗口候选
+
+**Files:** src-tauri/src/screenshot/probe.rs、windows/overlay.rs；开发与验收文档。
+**Dependencies:** Task 3；用户反馈原版接入只能识别窗口。
+
+- [x] 用大量无关控件的受控窗口复现完整树收集失败，补充非敏感响应诊断。
+- [x] 从已验证顶层窗口向内选择原生子 HWND 采集根，保留原版 Provider 的 UIA 识别；叶子使用会话根几何。
+- [x] 按顶层和采集根身份缓存、复核归属及位置；验证覆盖层下的内部元素与跨控件缓存切换。
+- [x] 运行截图回归、原版真实管道集成及复审；记录实机仍待验证的范围。
+
+**Distinct test coverage:** 无关兄弟控件超过整窗采集预算仍可识别目标；无子节点的按钮可命中；子窗口内的无 HWND 元素仍由 Provider 识别；采集根变化不能复用旧缓存；旧坐标响应和保留候选不能跨重叠子 HWND 复用；根几何为空但身份有效时仍读取有效后代。
+**Verify:** `cargo test --lib screenshot::`；显式运行原版 Provider 受控集成。

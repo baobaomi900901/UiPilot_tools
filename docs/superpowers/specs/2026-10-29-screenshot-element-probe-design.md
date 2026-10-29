@@ -4,15 +4,15 @@
 
 ## 1. 边界
 
-rust_uia 保持独立仓库和原始源码能力；UiPilot 只通过独立命名管道调用其 EXE 原有的elementtree协议，不复制或重新实现 UIA 遍历。Provider返回元素树数据，宿主读取几何并管理遮罩、输入、桌面取帧及已有预览/输出。原生窗口枚举只用于排除截图覆盖层和确定目标窗口，不替代元素识别。会话选择原有uia后端和非交互读取，不调用元素动作、保存元素库或Provider交互选取界面。截图专用子进程通过原有UIAUTOMA_HELPER_INJECT_MAP配置（非空映射、空进程列表）关闭Helper自动准备，避免树读取触发微信/企业微信注入；不改变用户全局配置或外部源码。
+rust_uia 保持独立仓库和原始源码能力；UiPilot 只通过独立命名管道调用其 EXE 原有的elementtree协议，不复制或重新实现 UIA 遍历。Provider返回元素树数据，宿主读取几何并管理遮罩、输入、桌面取帧及已有预览/输出。原生窗口枚举只用于排除截图覆盖层、确定顶层目标及鼠标下的子 HWND 采集范围，不替代元素识别。会话选择原有uia后端和非交互读取，不调用元素动作、保存元素库或Provider交互选取界面。截图专用子进程通过原有UIAUTOMA_HELPER_INJECT_MAP配置（非空映射、空进程列表）关闭Helper自动准备，避免树读取触发微信/企业微信注入；不改变用户全局配置或外部源码。
 
 ## 2. 探测协议
 
-ping及资产清单要求原有win32_elementtree、win32_inspect_tree_v2、win32_observation_sessions三项能力。已撤掉probe.point，不再要求point_probe_v1。宿主通过elementtree.open_session语义（method为elementtree，operation为open_session）打开指定原生窗口的非交互uia观察会话，再读取有界get_subtree；完成后关闭观察会话。请求和响应使用原有session_id、snapshot_id及节点引用合同，校验JSON-RPC id、业务错误、会话和快照身份。
+ping及资产清单要求原有win32_elementtree、win32_inspect_tree_v2、win32_observation_sessions三项能力。已撤掉probe.point，不再要求point_probe_v1。宿主通过elementtree.open_session语义（method为elementtree，operation为open_session）打开指定原生窗口的非交互uia观察会话，再读取有界get_subtree；完成后关闭观察会话。先从已经确认的顶层目标向内做原生子窗口命中，选择鼠标下的子 HWND 作为采集根，避免为了识别一个按钮或导航树条目先遍历整个应用。根身份有效但根矩形缺失或不可用时，仍读取有效后代，不因父矩形丢弃子树。叶子控件没有子节点时，仍使用 Provider 返回的会话根几何；不能仅凭原生子窗口矩形冒充 UIA 命中。请求和响应使用原有session_id、snapshot_id及节点引用合同，校验JSON-RPC id、业务错误、会话和快照身份。
 
 收集上限为2048节点、64层，响应最多4MiB，初次收集总预算3秒。只有完整、未截断且未超时的树可用于元素吸附。读取原协议的display.position_and_shape物理坐标；忽略无可见矩形的节点，不能因父节点的矩形不包含鼠标就丢弃它的后代。相同矩形去重，选择包含当前鼠标的最小有效矩形；不同几何但同最小面积的竞争候选不冒充唯一命中。
 
-缓存只保留几何，限于当前截图会话及原生窗口身份、位置。排除宿主和Provider的窗口/PID后按原生Z序确定目标窗口，再请求该窗口的树，避免全局按点接口命中截图覆盖层。树未就绪、超时、不完整或窗口身份改变时仍可使用窗口候选和自由框选。不承诺视觉像素分割、动态内容原子快照或所有应用的绝对最小控件。
+缓存只保留几何，限于当前截图会话及顶层窗口、子 HWND 采集根的身份和位置。发布前重新核对子 HWND 归属、位置及鼠标命中，跨出采集范围不能复用。排除宿主和Provider的窗口/PID后按原生Z序确定目标窗口，再请求该原生采集根的树，避免全局按点接口命中截图覆盖层。树未就绪、超时、不完整或窗口身份改变时仍可使用窗口候选和自由框选。不承诺视觉像素分割、动态内容原子快照或所有应用的绝对最小控件。
 
 ## 3. 交互与取帧
 

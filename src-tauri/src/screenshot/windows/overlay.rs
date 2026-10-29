@@ -40,11 +40,13 @@ struct State {
     locked: Cell<bool>,
     fallback: Cell<bool>,
     target: Cell<Option<crate::screenshot::probe::ProbeTarget>>,
+    scope: Cell<Option<crate::screenshot::probe::ProbeScope>>,
     presented_at: Cell<Option<u32>>,
     presented_candidate: Cell<
         Option<(
             Option<PhysicalRect>,
             Option<crate::screenshot::probe::ProbeTarget>,
+            Option<crate::screenshot::probe::ProbeScope>,
             bool,
         )>,
     >,
@@ -578,6 +580,7 @@ pub(super) fn run(
         locked: Cell::new(false),
         fallback: Cell::new(true),
         target: Cell::new(None),
+        scope: Cell::new(None),
         presented_at: Cell::new(None),
         presented_candidate: Cell::new(None),
         events: RefCell::new(VecDeque::new()),
@@ -697,6 +700,7 @@ pub(super) fn run(
                             let before = (
                                 state.selection.borrow().highlight(),
                                 state.target.get(),
+                                state.scope.get(),
                                 state.fallback.get(),
                             );
                             let point = state.selection.borrow().cursor;
@@ -714,17 +718,27 @@ pub(super) fn run(
                                             reply.point,
                                             reply.rect,
                                             point,
+                                            reply.scope.is_some_and(|scope| {
+                                                crate::screenshot::probe::scope_is_current(
+                                                    scope,
+                                                    point,
+                                                    &probe_excluded,
+                                                )
+                                            }),
                                         ) {
                                             let rect = reply.rect;
                                             state.fallback.set(rect.is_none());
                                             state.target.set(reply.target);
+                                            state.scope.set(reply.scope);
                                             state.selection.borrow_mut().set_candidate(point, rect);
                                             applied_sequence = reply.sequence;
-                                            if pending_probe == Some((reply.sequence, reply.point))
-                                            {
-                                                pending_probe = None;
-                                            }
                                         }
+                                        finish_probe_request(
+                                            &mut pending_probe,
+                                            &mut applied_sequence,
+                                            reply.sequence,
+                                            reply.point,
+                                        );
                                     }
                                     if !probe_disabled
                                         && pending_probe.is_none_or(|(_, p)| p != point)
@@ -746,6 +760,7 @@ pub(super) fn run(
                             let after = (
                                 state.selection.borrow().highlight(),
                                 state.target.get(),
+                                state.scope.get(),
                                 state.fallback.get(),
                             );
                             if before != after || state.presented_at.get().is_none() {
@@ -791,6 +806,7 @@ pub(super) fn run(
                                 return Ok(SelectionResult::Cancelled(CancelReason::User));
                             }
                             state.target.set(None);
+                            state.scope.set(None);
                         }
                         if mode == ScreenshotMode::Window
                             && !state
@@ -800,7 +816,7 @@ pub(super) fn run(
                         {
                             return Ok(SelectionResult::Cancelled(CancelReason::User));
                         }
-                        validate_candidate(&state);
+                        validate_candidate(&state, point, &probe_excluded);
                         let dpi = state
                             .desktop
                             .monitors
@@ -866,6 +882,7 @@ pub(super) fn run(
                                 if state.selection.borrow().highlight().is_some_and(|r| r.contains(p)))
                             {
                                 state.target.set(None);
+                                state.scope.set(None);
                             }
                         }
                         if input == SelectionInput::Enter
@@ -880,7 +897,8 @@ pub(super) fn run(
                             return Ok(SelectionResult::Cancelled(CancelReason::User));
                         }
                         if input == SelectionInput::Enter && state.selection.borrow().hovering() {
-                            validate_candidate(&state);
+                            let point = state.selection.borrow().cursor;
+                            validate_candidate(&state, point, &probe_excluded);
                         }
                         input
                     }
@@ -1024,16 +1042,20 @@ fn observe_extent(state: &State, extent: MotionExtent) {
     selection.observe_motion(extent.max_x, extent.max_y);
 }
 
-fn validate_candidate(state: &State) {
+fn validate_candidate(state: &State, point: PhysicalPoint, excluded: &[isize]) {
     if state.selection.borrow().hovering()
-        && !state
+        && (!state
             .target
             .get()
             .is_some_and(crate::screenshot::probe::target_is_current)
+            || !state.scope.get().map_or(state.fallback.get(), |scope| {
+                crate::screenshot::probe::scope_is_current(scope, point, excluded)
+            }))
     {
         let point = state.selection.borrow().cursor;
         state.selection.borrow_mut().set_candidate(point, None);
         state.target.set(None);
+        state.scope.set(None);
     }
 }
 
@@ -1280,14 +1302,29 @@ fn reply_applies(
     point: PhysicalPoint,
     rect: Option<PhysicalRect>,
     cursor: PhysicalPoint,
+    scope_current: bool,
 ) -> bool {
     let Some((latest, _)) = pending else {
         return false;
     };
     sequence > applied
         && sequence <= latest
+        && (rect.is_none() || scope_current)
         && (rect.is_some_and(|rect| rect.contains(cursor))
             || (sequence == latest && point == cursor))
+}
+fn finish_probe_request(
+    pending: &mut Option<(u64, PhysicalPoint)>,
+    applied: &mut u64,
+    sequence: u64,
+    point: PhysicalPoint,
+) {
+    // Completion is independent of presentation acceptance: a stale-scope hit
+    // must free the latest request slot so a stationary cursor can be reprobed.
+    if *pending == Some((sequence, point)) {
+        *pending = None;
+        *applied = (*applied).max(sequence);
+    }
 }
 fn presented_window_target<T>(
     selection: &SelectionState,
@@ -1341,12 +1378,17 @@ fn refresh_window_fallback(state: &State, excluded: &[isize]) -> Result<(), Nati
     if !same_visible_window(&state.desktop.candidates, &fresh, point) {
         state.selection.borrow_mut().set_candidate(point, None);
         state.target.set(None);
+        state.scope.set(None);
         state.fallback.set(true);
         return Ok(());
     }
     let candidate = state.selection.borrow().selected_window().cloned();
     if !state.fallback.get()
         && state.selection.borrow().highlight().is_some()
+        && state
+            .scope
+            .get()
+            .is_some_and(|scope| crate::screenshot::probe::scope_is_current(scope, point, excluded))
         && state.target.get().is_some_and(|target| {
             candidate
                 .as_ref()
@@ -1361,6 +1403,7 @@ fn refresh_window_fallback(state: &State, excluded: &[isize]) -> Result<(), Nati
         .and_then(|window| current_window_target(window, excluded, state.desktop.bounds));
     let rect = candidate.filter(|_| target.is_some()).map(|w| w.rect);
     state.target.set(target);
+    state.scope.set(None);
     state.fallback.set(true);
     let point = state.selection.borrow().cursor;
     state
@@ -1397,6 +1440,7 @@ fn present(state: &State, windows: &[OwnedWindow], excluded: &[isize]) -> Result
     let candidate = (
         state.selection.borrow().highlight(),
         state.target.get(),
+        state.scope.get(),
         state.fallback.get(),
     );
     let changed = presentation_changed(state.presented_candidate.get(), candidate);
@@ -1602,6 +1646,59 @@ mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
     #[test]
+    fn rejected_latest_completion_requeues_without_consuming_a_newer_request() {
+        let point = PhysicalPoint { x: 20, y: 20 };
+        let mut pending = Some((3, point));
+        let mut applied = 1;
+        finish_probe_request(&mut pending, &mut applied, 2, point);
+        assert_eq!(pending, Some((3, point)));
+        assert_eq!(applied, 1);
+        finish_probe_request(&mut pending, &mut applied, 3, point);
+        assert!(
+            pending.is_none(),
+            "latest completion must allow a fresh request even when its hit was rejected"
+        );
+        assert_eq!(applied, 3);
+    }
+    #[test]
+    fn overlapping_native_sibling_scope_rejects_historical_hit_but_same_scope_accepts() {
+        let queried = PhysicalPoint { x: 20, y: 20 };
+        let cursor = PhysicalPoint { x: 40, y: 20 };
+        let rect = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        assert!(!reply_applies(
+            Some((3, cursor)),
+            1,
+            2,
+            queried,
+            Some(rect),
+            cursor,
+            false
+        ));
+        assert!(reply_applies(
+            Some((3, cursor)),
+            1,
+            2,
+            queried,
+            Some(rect),
+            cursor,
+            true
+        ));
+        assert!(!reply_applies(
+            Some((3, cursor)),
+            1,
+            3,
+            cursor,
+            Some(rect),
+            cursor,
+            false
+        ));
+    }
+    #[test]
     fn moving_within_completed_hit_does_not_wait_for_an_exact_stationary_point() {
         let queried = PhysicalPoint { x: 20, y: 20 };
         let cursor = PhysicalPoint { x: 24, y: 22 };
@@ -1617,7 +1714,8 @@ mod tests {
             2,
             queried,
             Some(rect),
-            cursor
+            cursor,
+            true
         ));
         assert!(!reply_applies(
             Some((3, cursor)),
@@ -1625,7 +1723,8 @@ mod tests {
             2,
             queried,
             Some(rect),
-            cursor
+            cursor,
+            true
         ));
         assert!(!reply_applies(
             Some((3, cursor)),
@@ -1633,16 +1732,26 @@ mod tests {
             2,
             queried,
             None,
-            cursor
+            cursor,
+            true
         ));
-        assert!(!reply_applies(None, 1, 2, queried, Some(rect), cursor));
+        assert!(!reply_applies(
+            None,
+            1,
+            2,
+            queried,
+            Some(rect),
+            cursor,
+            true
+        ));
         assert!(!reply_applies(
             Some((3, cursor)),
             1,
             4,
             queried,
             Some(rect),
-            cursor
+            cursor,
+            true
         ));
         let outside = PhysicalPoint { x: 30, y: 22 };
         assert!(!reply_applies(
@@ -1651,9 +1760,18 @@ mod tests {
             2,
             queried,
             Some(rect),
-            outside
+            outside,
+            true
         ));
-        assert!(reply_applies(Some((3, cursor)), 2, 3, cursor, None, cursor));
+        assert!(reply_applies(
+            Some((3, cursor)),
+            2,
+            3,
+            cursor,
+            None,
+            cursor,
+            true
+        ));
     }
     #[test]
     fn captured_candidates_reject_live_movement_and_changed_occlusion() {
