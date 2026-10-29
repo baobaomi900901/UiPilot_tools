@@ -77,6 +77,36 @@ impl MosaicStroke {
         self.points.push(value);
         Ok(())
     }
+    /// Grid-aligned bounds preserve the complete pre-stroke sample of edge cells.
+    fn affected_bounds(&self, clip: PhysicalRect) -> Option<PhysicalRect> {
+        let mut points = self.points.iter().flatten();
+        let first = points.next()?;
+        let (mut left, mut top, mut right, mut bottom) = (
+            i64::from(first.x),
+            i64::from(first.y),
+            i64::from(first.x),
+            i64::from(first.y),
+        );
+        for p in points {
+            left = left.min(i64::from(p.x));
+            top = top.min(i64::from(p.y));
+            right = right.max(i64::from(p.x));
+            bottom = bottom.max(i64::from(p.y));
+        }
+        let radius = i64::from(self.radius);
+        let block = i64::from(self.block_size);
+        left = (left - radius).div_euclid(block) * block;
+        top = (top - radius).div_euclid(block) * block;
+        right = (right + radius + block).div_euclid(block) * block;
+        bottom = (bottom + radius + block).div_euclid(block) * block;
+        let r = PhysicalRect {
+            left: left.max(i64::from(clip.left)) as i32,
+            top: top.max(i64::from(clip.top)) as i32,
+            right: right.min(i64::from(clip.right)) as i32,
+            bottom: bottom.min(i64::from(clip.bottom)) as i32,
+        };
+        r.dimensions().ok().map(|_| r)
+    }
     fn mask(
         &self,
         clip: PhysicalRect,
@@ -436,6 +466,9 @@ fn render(
             }
         }
         Annotation::Mosaic(s) => {
+            let Some(clip) = s.affected_bounds(clip) else {
+                return Ok(());
+            };
             let (mask, _lease) = s.mask(clip, budget)?;
             let mask_width = clip.dimensions()?.0 as usize;
             let block = i64::from(s.block_size);
@@ -447,6 +480,17 @@ fn render(
                 while cx < i64::from(clip.right) {
                     let left = cx.max(i64::from(clip.left)) as i32;
                     let right = (cx + block).min(i64::from(clip.right)) as i32;
+                    let touched = (top..bottom).any(|y| {
+                        let start =
+                            (y - clip.top) as usize * mask_width + (left - clip.left) as usize;
+                        mask[start..start + (right - left) as usize]
+                            .iter()
+                            .any(|v| *v != 0)
+                    });
+                    if !touched {
+                        cx += block;
+                        continue;
+                    }
                     let mut sum = [0u64; 3];
                     let mut count = 0u64;
                     // Every disjoint grid cell is sampled before any pixel in it is changed.
@@ -705,5 +749,22 @@ mod tests {
         );
         assert_eq!(b.used(), 0);
         assert_eq!(h.snapshot().annotations().len(), 1);
+    }
+    #[test]
+    fn small_stroke_only_reserves_affected_grid_and_keeps_full_boundary_cell_mean() {
+        let rect = r(-7, 0, 93, 100);
+        let b = PixelBudget::new(40_064);
+        let frames = [frame(rect)];
+        let mut h = AnnotationHistory::new(rect).unwrap();
+        let mut s = MosaicStroke::new(rect, 1, 4).unwrap();
+        s.push(p(-6, 2)).unwrap();
+        h.append(Annotation::Mosaic(s)).unwrap();
+        let full = h.snapshot().compose(&frames, &b).unwrap();
+        assert_eq!(pixel(&full, 1, 2), [250, 0, 0, 255]); // clipped cell [-7,-4) averages 249,250,251
+        assert_eq!(pixel(&full, 3, 2), [252, 0, 0, 255]); // untouched neighboring cell
+        drop(full);
+        h.set_selection(r(-6, 1, -4, 4)).unwrap();
+        let crop = h.snapshot().compose(&frames, &b).unwrap();
+        assert_eq!(pixel(&crop, 0, 1), [250, 0, 0, 255]);
     }
 }
