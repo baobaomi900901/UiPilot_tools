@@ -1315,7 +1315,7 @@ describe('shown and search ownership', () => {
     core.navigate('launcher')
     await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledTimes(3))
     expect(fake.client.searchApps).toHaveBeenLastCalledWith({
-      query: '', invocationId: 'first-native', querySequence: 3,
+      query: 'alpha', invocationId: 'first-native', querySequence: 3,
     })
 
     fake.emit(shown('second-native'))
@@ -2336,7 +2336,7 @@ describe('shown and search ownership', () => {
     expect(fake.client.executeResult).not.toHaveBeenCalled()
   })
 
-  it('navigates between launcher and settings without hiding and refreshes the empty launcher catalog', async () => {
+  it('navigates between launcher and settings without hiding and refreshes the preserved launcher query', async () => {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settingsFixture)
     vi.mocked(fake.client.searchApps).mockResolvedValue({
@@ -2382,13 +2382,13 @@ describe('shown and search ownership', () => {
       view: 'launcher',
       viewEpoch: launcherEpoch + 2,
       invocationId: 'local-navigation',
-      query: '',
-      queryControlValue: '',
+      query: 'calc',
+      queryControlValue: 'calc',
       querySequence: 3,
       searchPending: false,
     })
     await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith({
-      query: '',
+      query: 'calc',
       invocationId: 'local-navigation',
       querySequence: 3,
     }))
@@ -6892,7 +6892,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(core.getSnapshot().view).toBe('launcher'))
     const query = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')
     await vi.waitFor(() => expect(document.activeElement).toBe(query))
-    expect(query?.value).toBe('')
+    expect(query?.value).toBe('calc')
     expect(fake.client.hideLauncher).not.toHaveBeenCalled()
     expect(stylesSource).toMatch(/\.launcher-settings-button\.ant-btn\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(stylesSource).toMatch(/\.settings-title-group\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s)
@@ -9005,12 +9005,13 @@ describe('real adapter and startup', () => {
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://hidden', expect.any(Function)))
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 11)).toEqual([
+    expect(order.slice(0, 12)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
       'hotkey-recording://current',
       'command-hotkey://entry',
       'launcher://shown',
       'launcher://hidden',
+      'builtin-features://changed',
       'uipilot-plugin-panel-error',
       'uipilot-plugin-panel-reset',
       'screenshot://error',
@@ -9194,6 +9195,7 @@ describe('real adapter and startup', () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const shownUnlisten = vi.fn()
     const hiddenUnlisten = vi.fn()
+    const builtinFeaturesChangedUnlisten = vi.fn()
     const messageUnlisten = vi.fn()
     const screenshotErrorUnlisten = vi.fn()
     const panelUnlisten = vi.fn()
@@ -9223,6 +9225,7 @@ describe('real adapter and startup', () => {
         return shownUnlisten
       }
       if (event === 'launcher://hidden') return hiddenUnlisten
+      if (event === 'builtin-features://changed') return builtinFeaturesChangedUnlisten
       if (event === 'uipilot-plugin-panel-error') return panelUnlisten
       if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
       if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
@@ -9259,6 +9262,7 @@ describe('real adapter and startup', () => {
       mountedCore!.failInitialization()
       await vi.waitFor(() => expect(shownUnlisten).toHaveBeenCalledOnce())
       expect(hiddenUnlisten).toHaveBeenCalledOnce()
+      expect(builtinFeaturesChangedUnlisten).toHaveBeenCalledOnce()
       expect(messageUnlisten).toHaveBeenCalledOnce()
       expect(screenshotErrorUnlisten).toHaveBeenCalledOnce()
       expect(panelUnlisten).toHaveBeenCalledOnce()
