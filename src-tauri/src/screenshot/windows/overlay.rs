@@ -1993,7 +1993,7 @@ unsafe fn render_overlay(
                 bottom: height as i32,
             },
             0,
-            128,
+            204, // 80% black; keep the selected area at its original brightness.
         )?;
     }
     let selected = editor
