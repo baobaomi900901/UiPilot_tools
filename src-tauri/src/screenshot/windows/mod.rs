@@ -127,6 +127,7 @@ pub fn start_selection(
     budget: PixelBudget,
     palette: OverlayPalette,
     excluded_windows: Vec<isize>,
+    provider: Option<std::path::PathBuf>,
     complete: impl FnOnce(Result<SelectionResult, NativeError>) + Send + 'static,
 ) -> Result<SelectionHandle, NativeError> {
     let cancellation = Arc::new(Cancellation {
@@ -140,7 +141,14 @@ pub fn start_selection(
         .name("screenshot-selection".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                overlay::run(mode, &budget, palette, &excluded_windows, &worker_cancel)
+                overlay::run(
+                    mode,
+                    &budget,
+                    palette,
+                    &excluded_windows,
+                    provider,
+                    &worker_cancel,
+                )
             }))
             .unwrap_or(Err(NativeError::OverlayFailed));
             complete(result);

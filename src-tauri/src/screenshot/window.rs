@@ -306,6 +306,7 @@ impl ScreenshotHost {
             self.service.budget.clone(),
             palette(&theme(&app)),
             excluded,
+            super::probe::executable(&app),
             move |result| {
                 let app = callback_app;
                 let _display = display;

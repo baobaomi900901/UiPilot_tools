@@ -29,6 +29,11 @@ pub struct SelectionState {
     pub anchor: Option<PhysicalPoint>,
     candidates: Vec<WindowCandidate>,
     selected: Option<usize>,
+    candidate: Option<PhysicalRect>,
+    locked: Option<PhysicalRect>,
+    dragging: bool,
+    pointer_pressed: bool,
+    tolerance: (i32, i32),
 }
 impl SelectionState {
     pub fn new(
@@ -45,6 +50,61 @@ impl SelectionState {
             anchor: None,
             candidates,
             selected,
+            candidate: None,
+            locked: None,
+            dragging: false,
+            pointer_pressed: false,
+            tolerance: (4, 4),
+        }
+    }
+    pub fn refresh_windows(&mut self, candidates: Vec<WindowCandidate>) {
+        let selected_id = self.selected_window().map(|w| w.id);
+        self.candidates = candidates;
+        self.candidates.retain(|c| c.rect.dimensions().is_ok());
+        self.candidates.sort_by_key(|c| c.z_order);
+        self.selected = if self.mode == ScreenshotMode::Window {
+            selected_id
+                .and_then(|id| self.candidates.iter().position(|w| w.id == id))
+                .or_else(|| {
+                    self.candidates
+                        .iter()
+                        .position(|w| w.rect.contains(self.cursor))
+                })
+        } else {
+            self.candidates
+                .iter()
+                .position(|w| w.rect.contains(self.cursor))
+        };
+    }
+    /// SM_CXDRAG/SM_CYDRAG specify pixels on either side of the down point.
+    /// Keep the boundary inclusive; crossing beyond it permanently starts drag.
+    pub fn observe_motion(&mut self, dx: i64, dy: i64) {
+        let (x, y) = (i64::from(self.tolerance.0), i64::from(self.tolerance.1));
+        if self.pointer_pressed && (dx < -x || dx > x || dy < -y || dy > y) {
+            self.dragging = true;
+        }
+    }
+    pub fn set_drag_tolerance(&mut self, width: i32, height: i32) {
+        self.tolerance = (width.max(1), height.max(1));
+    }
+    pub fn set_candidate(&mut self, point: PhysicalPoint, rect: Option<PhysicalRect>) {
+        if self.hovering() && self.cursor == point {
+            self.candidate = rect.filter(|r| r.dimensions().is_ok() && r.contains(point));
+        }
+    }
+    pub fn hovering(&self) -> bool {
+        self.mode == ScreenshotMode::Region && self.anchor.is_none()
+    }
+    pub fn highlight(&self) -> Option<PhysicalRect> {
+        if self.mode == ScreenshotMode::Window {
+            return self.selected_window().map(|c| c.rect);
+        }
+        if self.pointer_pressed && !self.dragging {
+            self.locked
+        } else if self.anchor.is_some() {
+            self.region()
+        } else {
+            self.candidate
         }
     }
     pub fn selected_window(&self) -> Option<&WindowCandidate> {
@@ -56,7 +116,18 @@ impl SelectionState {
             .filter(|r| r.dimensions().is_ok())
     }
     fn update_pointer(&mut self, p: PhysicalPoint) {
+        if self.cursor != p && self.hovering() {
+            self.candidate = None;
+        }
         self.cursor = p;
+        if self.pointer_pressed {
+            if let Some(a) = self.anchor {
+                self.observe_motion(
+                    i64::from(p.x) - i64::from(a.x),
+                    i64::from(p.y) - i64::from(a.y),
+                );
+            }
+        }
         self.selected = self.candidates.iter().position(|c| c.rect.contains(p));
     }
     pub fn reduce(&mut self, input: SelectionInput) -> SelectionOutcome {
@@ -64,18 +135,48 @@ impl SelectionState {
             SelectionInput::Escape => return SelectionOutcome::Cancelled,
             SelectionInput::Move(p) => self.update_pointer(p),
             SelectionInput::PointerDown(p) => {
+                // Lock only the candidate actually displayed at mouse-down.
+                let locked = if self.cursor == p {
+                    self.candidate
+                } else {
+                    None
+                };
                 self.update_pointer(p);
                 if self.mode == ScreenshotMode::Region {
                     self.anchor = Some(p);
+                    self.locked = locked;
+                    self.pointer_pressed = true;
+                    self.dragging = false;
+                    self.candidate = None;
                 }
             }
             SelectionInput::PointerUp(p) => {
                 self.update_pointer(p);
+                if self.mode == ScreenshotMode::Region && self.pointer_pressed {
+                    let rect = if self.dragging {
+                        self.region()
+                    } else {
+                        self.locked
+                    };
+                    self.pointer_pressed = false;
+                    self.anchor = None;
+                    self.locked = None;
+                    self.dragging = false;
+                    return rect
+                        .map(SelectionOutcome::Selected)
+                        .unwrap_or(SelectionOutcome::Continue);
+                }
+                if self.mode == ScreenshotMode::Region {
+                    return SelectionOutcome::Continue;
+                }
                 return self.commit();
             }
             SelectionInput::Space => {
                 if self.mode == ScreenshotMode::Region {
                     self.anchor = Some(self.cursor);
+                    self.pointer_pressed = false;
+                    self.dragging = true;
+                    self.candidate = None;
                 }
             }
             SelectionInput::Enter => return self.commit(),
@@ -97,12 +198,14 @@ impl SelectionState {
                     }
                 } else {
                     let step = if shift { 10 } else { 1 };
+                    let mut point = self.cursor;
                     match direction {
-                        Direction::Left => self.cursor.x = self.cursor.x.saturating_sub(step),
-                        Direction::Right => self.cursor.x = self.cursor.x.saturating_add(step),
-                        Direction::Up => self.cursor.y = self.cursor.y.saturating_sub(step),
-                        Direction::Down => self.cursor.y = self.cursor.y.saturating_add(step),
+                        Direction::Left => point.x = point.x.saturating_sub(step),
+                        Direction::Right => point.x = point.x.saturating_add(step),
+                        Direction::Up => point.y = point.y.saturating_sub(step),
+                        Direction::Down => point.y = point.y.saturating_add(step),
                     }
+                    self.update_pointer(point);
                 }
             }
         }
@@ -110,7 +213,13 @@ impl SelectionState {
     }
     fn commit(&self) -> SelectionOutcome {
         match self.mode {
-            ScreenshotMode::Region => self.region(),
+            ScreenshotMode::Region => self.region().or_else(|| {
+                if self.hovering() {
+                    self.candidate
+                } else {
+                    None
+                }
+            }),
             ScreenshotMode::Window => self.selected_window().map(|c| c.rect),
         }
         .map(SelectionOutcome::Selected)
@@ -121,6 +230,43 @@ impl SelectionState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_refresh_never_commits_old_moved_or_resized_rectangle() {
+        for mode in [ScreenshotMode::Window, ScreenshotMode::Region] {
+            let old = WindowCandidate {
+                id: 42,
+                rect: PhysicalRect {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 100,
+                },
+                z_order: 0,
+            };
+            let moved = WindowCandidate {
+                id: 42,
+                rect: PhysicalRect {
+                    left: 10,
+                    top: 10,
+                    right: 200,
+                    bottom: 200,
+                },
+                z_order: 0,
+            };
+            let mut s = SelectionState::new(mode, PhysicalPoint { x: 20, y: 20 }, vec![old]);
+            s.refresh_windows(vec![moved.clone()]);
+            assert_eq!(s.selected_window().unwrap().rect, moved.rect);
+            if mode == ScreenshotMode::Region {
+                s.set_candidate(s.cursor, Some(moved.rect));
+            }
+            assert_eq!(
+                s.reduce(SelectionInput::Enter),
+                SelectionOutcome::Selected(moved.rect)
+            );
+            s.refresh_windows(vec![]);
+            assert!(s.selected_window().is_none());
+        }
+    }
     #[test]
     fn keyboard_region_uses_physical_steps_and_space_anchor() {
         let mut state = SelectionState::new(
@@ -233,5 +379,179 @@ mod gesture_tests {
                 bottom: -1
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod smart_tests {
+    use super::*;
+    fn p(x: i32, y: i32) -> PhysicalPoint {
+        PhysicalPoint { x, y }
+    }
+    fn r() -> PhysicalRect {
+        PhysicalRect {
+            left: -10,
+            top: -10,
+            right: 20,
+            bottom: 20,
+        }
+    }
+    #[test]
+    fn jitter_commits_locked_candidate_not_late_reply() {
+        let mut s = SelectionState::new(ScreenshotMode::Region, p(0, 0), vec![]);
+        s.set_candidate(p(0, 0), Some(r()));
+        s.reduce(SelectionInput::PointerDown(p(0, 0)));
+        s.set_candidate(p(0, 0), None);
+        assert_eq!(
+            s.reduce(SelectionInput::PointerUp(p(1, 1))),
+            SelectionOutcome::Selected(r())
+        );
+    }
+    #[test]
+    fn exceeded_drag_never_returns_to_click_and_empty_resumes() {
+        let mut s = SelectionState::new(ScreenshotMode::Region, p(0, 0), vec![]);
+        s.set_candidate(p(0, 0), Some(r()));
+        s.reduce(SelectionInput::PointerDown(p(0, 0)));
+        s.reduce(SelectionInput::Move(p(20, 20)));
+        assert_eq!(
+            s.reduce(SelectionInput::PointerUp(p(0, 0))),
+            SelectionOutcome::Continue
+        );
+        assert!(s.anchor.is_none());
+        assert!(s.hovering());
+    }
+    #[test]
+    fn cursor_move_and_no_hit_clear_old_candidate() {
+        let mut s = SelectionState::new(ScreenshotMode::Region, p(0, 0), vec![]);
+        s.set_candidate(p(0, 0), Some(r()));
+        s.reduce(SelectionInput::Move(p(-1, -1)));
+        s.set_candidate(p(0, 0), Some(r()));
+        assert!(s.highlight().is_none());
+        s.set_candidate(p(-1, -1), Some(r()));
+        s.set_candidate(p(-1, -1), None);
+        assert!(s.highlight().is_none());
+    }
+}
+
+#[cfg(test)]
+mod frozen_motion_tests {
+    use super::*;
+    #[test]
+    fn excursion_observed_while_frame_capture_blocks_still_becomes_drag() {
+        let p = PhysicalPoint { x: -20, y: -20 };
+        let mut s = SelectionState::new(ScreenshotMode::Region, p, vec![]);
+        let rect = PhysicalRect {
+            left: -30,
+            top: -30,
+            right: 0,
+            bottom: 0,
+        };
+        s.set_candidate(p, Some(rect));
+        s.reduce(SelectionInput::PointerDown(p));
+        s.observe_motion(20, 20);
+        assert_eq!(
+            s.reduce(SelectionInput::PointerUp(p)),
+            SelectionOutcome::Continue
+        );
+    }
+    #[test]
+    fn keyboard_hover_move_clears_candidate() {
+        let p = PhysicalPoint { x: 0, y: 0 };
+        let mut s = SelectionState::new(ScreenshotMode::Region, p, vec![]);
+        s.set_candidate(
+            p,
+            Some(PhysicalRect {
+                left: -10,
+                top: -10,
+                right: 10,
+                bottom: 10,
+            }),
+        );
+        s.reduce(SelectionInput::Arrow {
+            direction: Direction::Right,
+            shift: false,
+        });
+        assert_eq!(s.reduce(SelectionInput::Enter), SelectionOutcome::Continue);
+    }
+}
+
+#[cfg(test)]
+mod capture_input_tests {
+    use super::*;
+    #[test]
+    fn orphan_release_cannot_submit_hover_candidate() {
+        let p = PhysicalPoint { x: 0, y: 0 };
+        let mut s = SelectionState::new(ScreenshotMode::Region, p, vec![]);
+        s.set_candidate(
+            p,
+            Some(PhysicalRect {
+                left: -10,
+                top: -10,
+                right: 10,
+                bottom: 10,
+            }),
+        );
+        assert_eq!(
+            s.reduce(SelectionInput::PointerUp(p)),
+            SelectionOutcome::Continue
+        );
+    }
+    #[test]
+    fn physical_tolerance_is_inclusive_and_click_keeps_down_candidate() {
+        let p = PhysicalPoint { x: -20, y: -20 };
+        let rect = PhysicalRect {
+            left: -30,
+            top: -30,
+            right: 0,
+            bottom: 0,
+        };
+        let mut s = SelectionState::new(ScreenshotMode::Region, p, vec![]);
+        s.set_drag_tolerance(6, 10);
+        s.set_candidate(p, Some(rect));
+        s.reduce(SelectionInput::PointerDown(p));
+        assert_eq!(
+            s.reduce(SelectionInput::PointerUp(PhysicalPoint { x: -23, y: -25 })),
+            SelectionOutcome::Selected(rect)
+        );
+    }
+}
+
+#[cfg(test)]
+mod system_tolerance_tests {
+    use super::*;
+    #[test]
+    fn system_drag_metric_is_inclusive_distance_on_either_side() {
+        let p = PhysicalPoint { x: 0, y: 0 };
+        let r = PhysicalRect {
+            left: -20,
+            top: -20,
+            right: 20,
+            bottom: 20,
+        };
+        for (dx, dy, click) in [
+            (6, 0, true),
+            (-6, 0, true),
+            (0, 10, true),
+            (0, -10, true),
+            (7, 0, false),
+            (-7, 0, false),
+            (0, 11, false),
+            (0, -11, false),
+        ] {
+            let mut s = SelectionState::new(ScreenshotMode::Region, p, vec![]);
+            s.set_drag_tolerance(6, 10);
+            s.set_candidate(p, Some(r));
+            s.reduce(SelectionInput::PointerDown(p));
+            s.observe_motion(dx, dy);
+            assert_eq!(
+                s.reduce(SelectionInput::PointerUp(p)),
+                if click {
+                    SelectionOutcome::Selected(r)
+                } else {
+                    SelectionOutcome::Continue
+                },
+                "excursion {dx},{dy}"
+            );
+        }
     }
 }

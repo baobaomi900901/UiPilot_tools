@@ -96,6 +96,22 @@ pub(super) fn layout() -> Result<Vec<Monitor>, NativeError> {
     });
     Ok(state.monitors)
 }
+pub(super) fn live_desktop(excluded: &[isize]) -> Result<Desktop, NativeError> {
+    let monitors = layout()?;
+    let bounds = PhysicalRect {
+        left: monitors.iter().map(|m| m.rect.left).min().unwrap(),
+        top: monitors.iter().map(|m| m.rect.top).min().unwrap(),
+        right: monitors.iter().map(|m| m.rect.right).max().unwrap(),
+        bottom: monitors.iter().map(|m| m.rect.bottom).max().unwrap(),
+    };
+    let candidates = window_snapshot(excluded, bounds)?;
+    Ok(Desktop {
+        monitors,
+        bounds,
+        candidates,
+        frames: FrameSet::new(vec![])?,
+    })
+}
 pub(super) fn desktop(
     excluded: &[isize],
     budget: &PixelBudget,
@@ -127,7 +143,7 @@ pub(super) fn desktop(
         bounds,
     })
 }
-fn window_snapshot(
+pub(super) fn window_snapshot(
     excluded: &[isize],
     bounds: PhysicalRect,
 ) -> Result<Vec<WindowCandidate>, NativeError> {
