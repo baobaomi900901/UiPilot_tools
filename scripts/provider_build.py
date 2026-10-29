@@ -19,7 +19,11 @@ TARGET = 'x86_64-pc-windows-msvc'
 EXE = 'UIAutoma.UIAutomation.Provider.exe'
 MANIFEST = 'asset-manifest.json'
 BUILD_ARGS = ['cargo', 'build', '--release', '--locked', '--target', TARGET]
-REQUIRED_CAPABILITIES = ('win32_elementtree', 'win32_inspect_tree_v2')
+REQUIRED_CAPABILITIES = (
+    'win32_elementtree',
+    'win32_inspect_tree_v2',
+    'win32_observation_sessions',
+)
 
 def source_root(root=ROOT):
     config = Path(root) / '.uipilot-local.json'

@@ -6,7 +6,11 @@ from unittest.mock import Mock, patch
 import provider_build as p
 import struct
 
-ORIGINAL_CAPABILITIES = {'win32_elementtree': True, 'win32_inspect_tree_v2': True}
+ORIGINAL_CAPABILITIES = {
+    'win32_elementtree': True,
+    'win32_inspect_tree_v2': True,
+    'win32_observation_sessions': True,
+}
 
 def pe_bytes(machine=0x8664):
     data=bytearray(128); data[:2]=b'MZ'; struct.pack_into('<I',data,60,64)
