@@ -122,6 +122,8 @@ fn main() {
             "save_settings",
             "save_hotkey",
             "set_screenshot_hotkey",
+            "select_screenshot_save_directory",
+            "set_screenshot_save_directory",
             "set_hotkey_recording",
             "set_file_preview_preference",
             "set_theme_preference",

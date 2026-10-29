@@ -11,6 +11,8 @@
     "allow-list-public-plugins",
     "allow-set-public-plugin-command-hotkey",
     "allow-set-screenshot-hotkey",
+    "allow-select-screenshot-save-directory",
+    "allow-set-screenshot-save-directory",
     "allow-set-hotkey-recording",
     "allow-resolve-public-plugin-command-entry",
     "allow-get-public-plugin-diagnostics",

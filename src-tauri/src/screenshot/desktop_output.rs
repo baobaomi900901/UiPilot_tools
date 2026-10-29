@@ -138,7 +138,7 @@ fn perform_with(
     let _finish = FinishJob(&gate);
     let directory = match kind {
         OutputKind::SaveDesktop => {
-            let path = desktop.map_err(|_| "DesktopUnavailable".to_owned())?;
+            let path = desktop.map_err(|_| "SaveDirectoryUnavailable".to_owned())?;
             validate_directory(&path)?;
             Some(path)
         }
@@ -186,7 +186,7 @@ fn validate_directory(directory: &Path) -> Result<(), String> {
     if directory.as_os_str().is_empty()
         || !fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir())
     {
-        return Err("DesktopUnavailable".into());
+        return Err("SaveDirectoryUnavailable".into());
     }
     Ok(())
 }
@@ -413,14 +413,14 @@ mod tests {
         let missing = dir.0.join("missing");
         assert_eq!(
             save(&missing, &OutputGate::new()),
-            Err("DesktopUnavailable".into())
+            Err("SaveDirectoryUnavailable".into())
         );
         assert!(!missing.exists());
         let file = dir.0.join("file");
         fs::write(&file, b"keep").unwrap();
         assert_eq!(
             save(&file, &OutputGate::new()),
-            Err("DesktopUnavailable".into())
+            Err("SaveDirectoryUnavailable".into())
         );
         assert_eq!(dir.entries(), vec![file]);
     }
@@ -542,7 +542,7 @@ mod tests {
                 Err("platform-specific details".into()),
                 Arc::new(OutputGate::new())
             ),
-            Err("DesktopUnavailable".into())
+            Err("SaveDirectoryUnavailable".into())
         );
         assert_eq!(
             perform_with(

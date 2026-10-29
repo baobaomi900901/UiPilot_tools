@@ -337,6 +337,8 @@ function deferred<T>() {
 const emptySettings: SettingsView = {
   screenshotHotkey: null,
   screenshotHotkeyStatus: 'unset',
+  screenshotSaveDirectory: null,
+  screenshotSaveDirectoryPath: 'C:\\Users\\demo\\OneDrive\\Desktop',
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
@@ -347,6 +349,8 @@ const emptySettings: SettingsView = {
 const settingsFixture: SettingsView = {
   screenshotHotkey: null,
   screenshotHotkeyStatus: 'unset',
+  screenshotSaveDirectory: null,
+  screenshotSaveDirectoryPath: 'C:\\Users\\demo\\OneDrive\\Desktop',
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
@@ -461,6 +465,8 @@ function fakeClient() {
     saveSettings: vi.fn(async () => undefined),
     saveHotkey: vi.fn(async (input: { hotkey: { hotkey: string } }) => ({ hotkey: input.hotkey.hotkey })),
     setScreenshotHotkey: vi.fn(async () => {}),
+    selectScreenshotSaveDirectory: vi.fn(async () => null),
+    setScreenshotSaveDirectory: vi.fn(async () => ({ directory: null, path: null })),
     setHotkeyRecording: vi.fn(async () => {}),
     hideLauncher: vi.fn(async () => undefined),
   } as unknown as TestLauncherClient
@@ -5329,6 +5335,48 @@ describe('settings ownership', () => {
     expect(client.saveSettings).not.toHaveBeenCalled()
     expect(client.setPublicPluginCommandHotkey).not.toHaveBeenCalled()
   })
+  it('shows the full screenshot directory and commits picker/reset through independent preferences', async () => {
+    installMatchMedia(false)
+    const { core, client } = await settingsCore()
+    const mounted = await mountLauncherView(core)
+    expect(mounted.host.textContent).toContain('截图默认位置')
+    expect(mounted.host.querySelector<HTMLInputElement>('input[aria-label="截图默认位置"]')?.value).toBe('C:\\Users\\demo\\OneDrive\\Desktop')
+    vi.mocked(client.selectScreenshotSaveDirectory).mockResolvedValueOnce({ directory: 'D:\\Shots', path: 'D:\\Shots' })
+    await act(async () => { await core.selectScreenshotSaveDirectory() })
+    expect(core.getSnapshot().settings?.screenshotSaveDirectory).toBe('D:\\Shots')
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    vi.mocked(client.setScreenshotSaveDirectory).mockResolvedValueOnce({ directory: null, path: 'C:\\Users\\demo\\OneDrive\\Desktop' })
+    await act(async () => { await core.restoreScreenshotSaveDirectory() })
+    expect(client.setScreenshotSaveDirectory).toHaveBeenCalledWith({ input: { directory: null } })
+    expect(core.getSnapshot().settings?.screenshotSaveDirectory).toBeNull()
+    await mounted.unmount()
+  })
+  it('keeps the old screenshot directory on cancellation and persistence failure', async () => {
+    const { core, client } = await settingsCore()
+    vi.mocked(client.selectScreenshotSaveDirectory).mockResolvedValueOnce(null)
+    await core.selectScreenshotSaveDirectory()
+    expect(core.getSnapshot().settings?.screenshotSaveDirectoryPath).toBe('C:\\Users\\demo\\OneDrive\\Desktop')
+    vi.mocked(client.selectScreenshotSaveDirectory).mockRejectedValueOnce(new Error('write failed'))
+    await core.selectScreenshotSaveDirectory()
+    expect(core.getSnapshot().settings?.screenshotSaveDirectoryPath).toBe('C:\\Users\\demo\\OneDrive\\Desktop')
+    expect(core.getSnapshot().status).toContain('保存目录失败')
+    expect(core.getSnapshot().settings?.operation).toBeUndefined()
+  })
+  it('ignores the stale screenshot picker after leaving settings and reloads authoritative state', async () => {
+    const { core, client, emit } = await settingsCore()
+    const pending = deferred<{ directory: string | null; path: string | null } | null>()
+    vi.mocked(client.selectScreenshotSaveDirectory).mockReturnValueOnce(pending.promise)
+    const saving = core.selectScreenshotSaveDirectory()
+    expect(core.getSnapshot().settings?.operation).toBe('screenshotDirectory')
+    core.setAutostart(true)
+    expect(client.saveSettings).not.toHaveBeenCalled()
+    emit(shown('next-launcher', 'launcher'))
+    emit(shown('next-settings', 'settings'))
+    pending.resolve({ directory: 'D:\\stale', path: 'D:\\stale' })
+    await saving
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+    expect(core.getSnapshot().settings?.screenshotSaveDirectoryPath).toBe(settingsFixture.screenshotSaveDirectoryPath)
+  })
   async function settingsCore(settings: SettingsView = settingsFixture) {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue(settings)
@@ -7666,6 +7714,8 @@ describe('React view and accessibility', () => {
       applications: [{ appId: 'legacy', displayName: 'LiveCaptions', aliases: ['caption'] }],
       screenshotHotkey: null,
       screenshotHotkeyStatus: 'unset',
+      screenshotSaveDirectory: null,
+      screenshotSaveDirectoryPath: 'C:\\Users\\demo\\OneDrive\\Desktop',
     } as SettingsView)
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -8989,6 +9039,8 @@ describe('real adapter and startup', () => {
     await main.client.executeResultAction({ requestId: 'req-1', resultId: 'result-1', actionId: 'action-1' })
     await main.client.retireResultActions({ requestId: 'req-1' })
     await main.client.loadSettings()
+    await main.client.selectScreenshotSaveDirectory()
+    await main.client.setScreenshotSaveDirectory({ input: { directory: null } })
     await main.client.saveSettings({ settings: update })
     await main.client.setThemePreference({ preference: { theme: 'dark' } })
     await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', commandId: 'default', favorite: true })
@@ -9022,6 +9074,8 @@ describe('real adapter and startup', () => {
       ['execute_result_action', [{ request: { requestId: 'req-1', resultId: 'result-1', actionId: 'action-1' } }]],
       ['retire_result_actions', [{ request: { requestId: 'req-1' } }]],
       ['load_settings', []],
+      ['select_screenshot_save_directory', []],
+      ['set_screenshot_save_directory', [{ input: { directory: null } }]],
       ['save_settings', [{ settings: update }]],
       ['set_theme_preference', [{ preference: { theme: 'dark' } }]],
       ['set_plugin_favorite', [{ commandId: 'default', pluginId: 'com.uipilot.demo-win', favorite: true }]],

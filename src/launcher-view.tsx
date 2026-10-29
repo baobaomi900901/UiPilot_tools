@@ -1976,6 +1976,20 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               />
               <Button aria-label="清除截图快捷键" disabled={locked || settings.screenshotHotkey === null} onClick={() => void core.saveScreenshotHotkey(null)}>清除</Button>
             </Form.Item>
+            <Form.Item label="截图默认位置" htmlFor="settings-screenshot-save-directory">
+              <Input
+                id="settings-screenshot-save-directory"
+                aria-label="截图默认位置"
+                readOnly
+                value={settings.screenshotSaveDirectoryPath ?? ''}
+                title={settings.screenshotSaveDirectoryPath ?? undefined}
+                placeholder="保存目录不可用"
+              />
+              <div className="settings-screenshot-directory-actions">
+                <Button disabled={locked} loading={settings.operation === 'screenshotDirectory'} onClick={() => void core.selectScreenshotSaveDirectory()}>选择文件夹</Button>
+                <Button disabled={locked || settings.screenshotSaveDirectory === null} onClick={() => void core.restoreScreenshotSaveDirectory()}>恢复桌面</Button>
+              </div>
+            </Form.Item>
             <Checkbox
               checked={settings.autostart}
               disabled={locked}

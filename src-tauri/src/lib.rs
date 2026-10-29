@@ -584,6 +584,8 @@ pub fn run() {
             commands::save_settings,
             commands::save_hotkey,
             commands::set_screenshot_hotkey,
+            commands::select_screenshot_save_directory,
+            commands::set_screenshot_save_directory,
             commands::set_hotkey_recording,
             commands::set_file_preview_preference,
             commands::set_theme_preference,
@@ -1018,7 +1020,12 @@ mod tests {
 
     #[test]
     fn screenshot_hotkey_commands_are_main_only() {
-        for command in ["set_screenshot_hotkey", "set_hotkey_recording"] {
+        for command in [
+            "set_screenshot_hotkey",
+            "set_hotkey_recording",
+            "select_screenshot_save_directory",
+            "set_screenshot_save_directory",
+        ] {
             assert!(include_str!("../build.rs").contains(&format!("\"{command}\",")));
             let permission = command.replace('_', "-");
             assert!(

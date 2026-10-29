@@ -168,6 +168,8 @@ pub(crate) struct SettingsView {
     hotkey: String,
     screenshot_hotkey: Option<String>,
     screenshot_hotkey_status: &'static str,
+    screenshot_save_directory: Option<PathBuf>,
+    screenshot_save_directory_path: Option<PathBuf>,
     autostart: bool,
     file_preview_enabled: bool,
     theme: ThemePreference,
@@ -1312,6 +1314,104 @@ fn command_hotkey_access<T>(label: &str, protected: impl FnOnce() -> T) -> Resul
 pub(crate) struct ScreenshotHotkeyInput {
     #[serde(deserialize_with = "deserialize_nullable_hotkey")]
     hotkey: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ScreenshotSaveDirectoryInput {
+    #[serde(deserialize_with = "deserialize_nullable_hotkey")]
+    directory: Option<String>,
+}
+
+fn screenshot_directory_access<T>(
+    label: &str,
+    access: impl FnOnce() -> T,
+) -> Result<T, CommandError> {
+    require_main_label(label)?;
+    Ok(access())
+}
+
+fn select_screenshot_directory_with<T>(
+    label: &str,
+    select: impl FnOnce() -> Option<PathBuf>,
+    save: impl FnOnce(PathBuf) -> Result<T, CommandError>,
+) -> Result<Option<T>, CommandError> {
+    screenshot_directory_access(label, || select().map(save).transpose())?
+}
+
+#[tauri::command]
+pub(crate) async fn select_screenshot_save_directory(
+    window: WebviewWindow,
+) -> Result<Option<ScreenshotSaveDirectoryView>, CommandError> {
+    let app = screenshot_directory_access(window.label(), || window.app_handle().clone())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+        let _critical = coordinator
+            .reserve_critical()
+            .map_err(|_| CommandError::settings_failed())?;
+        let _focus = coordinator
+            .suppress_transient_focus_loss()
+            .map_err(|_| CommandError::settings_failed())?;
+        let selected = select_screenshot_directory_with(
+            window.label(),
+            || {
+                app.dialog()
+                    .file()
+                    .set_parent(&window)
+                    .set_title("选择截图保存文件夹")
+                    .blocking_pick_folder()
+                    .and_then(|path| path.into_path().ok())
+            },
+            |path| {
+                app.state::<SettingsStore>()
+                    .set_screenshot_save_directory(Some(path))
+                    .map_err(|_| CommandError::settings_failed())?;
+                Ok(load_screenshot_directory_settings(&app))
+            },
+        );
+        // The saved result is authoritative even if native focus restoration fails.
+        let _ = window.set_focus();
+        let _ = window.as_ref().set_focus();
+        selected
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+}
+
+#[tauri::command]
+pub(crate) async fn set_screenshot_save_directory(
+    window: WebviewWindow,
+    input: ScreenshotSaveDirectoryInput,
+) -> Result<ScreenshotSaveDirectoryView, CommandError> {
+    let app = screenshot_directory_access(window.label(), || window.app_handle().clone())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+        let _critical = coordinator
+            .reserve_critical()
+            .map_err(|_| CommandError::settings_failed())?;
+        app.state::<SettingsStore>()
+            .set_screenshot_save_directory(input.directory.map(PathBuf::from))
+            .map_err(|_| CommandError::settings_failed())?;
+        Ok(load_screenshot_directory_settings(&app))
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScreenshotSaveDirectoryView {
+    directory: Option<PathBuf>,
+    path: Option<PathBuf>,
+}
+
+fn load_screenshot_directory_settings(app: &AppHandle) -> ScreenshotSaveDirectoryView {
+    let directory = app
+        .state::<SettingsStore>()
+        .snapshot()
+        .screenshot_save_directory;
+    let path = directory.clone().or_else(|| app.path().desktop_dir().ok());
+    ScreenshotSaveDirectoryView { directory, path }
 }
 
 #[tauri::command]
@@ -5348,6 +5448,10 @@ pub(crate) fn load_settings(
     view.screenshot_hotkey_status = coordinator
         .screenshot_hotkeys
         .status(view.screenshot_hotkey.as_deref());
+    view.screenshot_save_directory_path = view
+        .screenshot_save_directory
+        .clone()
+        .or_else(|| app.path().desktop_dir().ok());
     #[cfg(debug_assertions)]
     {
         static READY_LOG: std::sync::Once = std::sync::Once::new();
@@ -5376,6 +5480,8 @@ fn load_settings_core(settings: &SettingsStore) -> SettingsView {
             "unset"
         },
         screenshot_hotkey: settings.screenshot_hotkey,
+        screenshot_save_directory_path: settings.screenshot_save_directory.clone(),
+        screenshot_save_directory: settings.screenshot_save_directory,
         hotkey: settings.hotkey,
         autostart: settings.autostart,
         file_preview_enabled: settings.file_preview_enabled,
@@ -6503,6 +6609,50 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_directory_authorization_precedes_picker_and_mutation_and_cancel_does_not_save() {
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"directory": 42}),
+            serde_json::json!({"directory": null, "extra": true}),
+        ] {
+            assert!(
+                serde_json::from_value::<super::ScreenshotSaveDirectoryInput>(invalid).is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<super::ScreenshotSaveDirectoryInput>(
+                serde_json::json!({"directory": null})
+            )
+            .is_ok()
+        );
+        for label in ["screenshot", "find", "plugin-runtime", "forged"] {
+            assert!(super::select_screenshot_directory_with(
+                label,
+                || panic!("unauthorized picker"),
+                |_| -> Result<(), super::CommandError> { panic!("unauthorized save") }
+            )
+            .is_err());
+            assert!(
+                super::screenshot_directory_access(label, || panic!("unauthorized mutation"))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            super::select_screenshot_directory_with(
+                "main",
+                || None,
+                |_| -> Result<(), super::CommandError> { panic!("cancel must not persist") }
+            )
+            .unwrap(),
+            None
+        );
+        let picked = PathBuf::from(r"C:\Screenshots");
+        assert_eq!(
+            super::select_screenshot_directory_with("main", || Some(picked.clone()), Ok).unwrap(),
+            Some(picked)
+        );
+    }
     #[test]
     fn screenshot_hotkey_input_is_exact_and_main_guard_runs_before_protected_access() {
         for invalid in [
@@ -8016,6 +8166,7 @@ mod tests {
             plugin_window_positions: BTreeMap::new(),
             public_plugin_command_hotkeys: BTreeMap::new(),
             screenshot_hotkey: None,
+            screenshot_save_directory: None,
         };
         fs::write(
             dir.path().join("settings.json"),
@@ -10425,6 +10576,8 @@ mod tests {
             serde_json::json!({
                 "screenshotHotkey": null,
                 "screenshotHotkeyStatus": "unset",
+                "screenshotSaveDirectory": null,
+                "screenshotSaveDirectoryPath": null,
                 "hotkey": "Alt+Space",
                 "autostart": false,
                 "filePreviewEnabled": true,

@@ -239,13 +239,18 @@ impl ScreenshotHost {
         }
     }
     pub fn capture(self: &Arc<Self>, app: &AppHandle, ticket: CaptureTicket) {
+        // Freeze the committed preference before dispatching work to Tauri main.
+        // Output validates this exact path; no later preference read or fallback.
+        let save_directory = app
+            .state::<crate::settings::SettingsStore>()
+            .screenshot_save_directory_with(|| app.path().desktop_dir().ok());
         let host = self.clone();
         let app = app.clone();
         let dispatch = app.clone();
         // All Tauri mutations execute on main; the native callback never waits
         // for main while a Tauri close/shutdown might wait for its native thread.
         if dispatch
-            .run_on_main_thread(move || host.prepare(&app, ticket))
+            .run_on_main_thread(move || host.prepare(&app, ticket, save_directory))
             .is_err()
         {
             let _ = self
@@ -253,7 +258,12 @@ impl ScreenshotHost {
                 .finish_capture(ticket, Err("captureFailed".into()));
         }
     }
-    fn prepare(self: &Arc<Self>, app: &AppHandle, ticket: CaptureTicket) {
+    fn prepare(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        ticket: CaptureTicket,
+        save_directory: Option<std::path::PathBuf>,
+    ) {
         if self.service.current_ticket() != Some(ticket) {
             return;
         }
@@ -307,7 +317,7 @@ impl ScreenshotHost {
             palette(&theme(&app)),
             excluded,
             super::probe::executable(&app),
-            app.path().desktop_dir().ok(),
+            save_directory,
             move |result| {
                 let app = callback_app;
                 let _display = display;

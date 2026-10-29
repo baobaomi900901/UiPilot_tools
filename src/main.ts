@@ -39,6 +39,7 @@ import {
   type QuicklinkView,
   type SearchResponse,
   type SettingsView,
+  type ScreenshotSaveDirectoryView,
 } from './protocol'
 
 export const client: LauncherClient = {
@@ -185,6 +186,8 @@ export const client: LauncherClient = {
   loadSettings: () => invoke<SettingsView>('load_settings'),
   saveSettings: (input) => invoke<void>('save_settings', input),
   saveHotkey: (input) => invoke<HotkeySettingsView>('save_hotkey', input),
+  selectScreenshotSaveDirectory: () => invoke<ScreenshotSaveDirectoryView | null>('select_screenshot_save_directory'),
+  setScreenshotSaveDirectory: (input) => invoke<ScreenshotSaveDirectoryView>('set_screenshot_save_directory', { input: { directory: input.input.directory } }),
   setScreenshotHotkey: (input) => invoke('set_screenshot_hotkey', input),
   setHotkeyRecording: (input) => invoke('set_hotkey_recording', input),
   setThemePreference: (input) =>

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     pub(crate) hotkey: String,
     #[serde(default)]
     pub(crate) screenshot_hotkey: Option<String>,
+    #[serde(default)]
+    pub(crate) screenshot_save_directory: Option<PathBuf>,
     pub(crate) autostart: bool,
     #[serde(default)]
     pub(crate) theme: ThemePreference,
@@ -105,6 +107,7 @@ pub(crate) struct SettingsStore {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettingsError {
+    InvalidDirectory,
     Storage,
     Serialize,
     UnknownApplication,
@@ -116,6 +119,7 @@ impl Default for Settings {
         Self {
             hotkey: "Shift+Space".into(),
             screenshot_hotkey: None,
+            screenshot_save_directory: None,
             autostart: false,
             theme: ThemePreference::System,
             web_search_engine: WebSearchEngine::Bing,
@@ -137,6 +141,9 @@ fn default_file_preview_enabled() -> bool {
 impl fmt::Display for SettingsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidDirectory => {
+                "screenshot save directory must be an existing absolute directory"
+            }
             Self::Storage => "settings storage failed",
             Self::Serialize => "settings serialization failed",
             Self::UnknownApplication => "settings application is unknown",
@@ -230,6 +237,29 @@ impl SettingsStore {
         let mut candidate = state.value.clone();
         candidate.screenshot_hotkey = hotkey;
         self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_screenshot_save_directory(
+        &self,
+        directory: Option<PathBuf>,
+    ) -> Result<(), SettingsError> {
+        if directory.as_ref().is_some_and(|path| {
+            !path.is_absolute() || !fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        }) {
+            return Err(SettingsError::InvalidDirectory);
+        }
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.screenshot_save_directory = directory;
+        self.persist(&mut state, candidate)
+    }
+
+    /// Resolve once at session admission. Never fall back after a custom path fails.
+    pub(crate) fn screenshot_save_directory_with(
+        &self,
+        desktop: impl FnOnce() -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        self.snapshot().screenshot_save_directory.or_else(desktop)
     }
 
     pub(crate) fn set_command_hotkey(
@@ -503,6 +533,106 @@ fn valid_app_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_directory_missing_field_migrates_and_custom_and_default_survive_restart() {
+        let dir = TestDir::new("screenshot-directory");
+        fs::write(
+            dir.path().join("settings.json"),
+            br#"{"hotkey":"Alt+Space","autostart":false}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert!(store.snapshot().screenshot_save_directory.is_none());
+        assert_eq!(
+            serde_json::to_value(store.snapshot())
+                .unwrap()
+                .get("screenshotSaveDirectory"),
+            Some(&serde_json::Value::Null)
+        );
+        store
+            .set_screenshot_save_directory(Some(dir.path().to_path_buf()))
+            .unwrap();
+        let session =
+            store.screenshot_save_directory_with(|| panic!("custom path must not resolve desktop"));
+        store
+            .update_user_settings(SettingsUpdate {
+                hotkey: "Shift+Space".into(),
+                autostart: true,
+                theme: ThemePreference::Dark,
+                web_search_engine: WebSearchEngine::Google,
+            })
+            .unwrap();
+        let restarted = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            restarted.snapshot().screenshot_save_directory.as_deref(),
+            Some(dir.path())
+        );
+        restarted.set_screenshot_save_directory(None).unwrap();
+        let restored = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            restored.screenshot_save_directory_with(|| Some(dir.path().join("redirected-desktop"))),
+            Some(dir.path().join("redirected-desktop"))
+        );
+        assert_eq!(
+            session.as_deref(),
+            Some(dir.path()),
+            "a running session retains its committed snapshot"
+        );
+    }
+
+    #[test]
+    fn screenshot_directory_rejects_relative_missing_and_file_paths_without_changing_preference() {
+        let dir = TestDir::new("screenshot-directory-invalid");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        for path in [
+            PathBuf::from("relative"),
+            PathBuf::new(),
+            dir.path().join("missing"),
+            file,
+        ] {
+            assert!(store.set_screenshot_save_directory(Some(path)).is_err());
+            assert!(store.snapshot().screenshot_save_directory.is_none());
+        }
+    }
+
+    #[test]
+    fn screenshot_directory_deleted_after_commit_remains_session_target_after_restart() {
+        let dir = TestDir::new("screenshot-directory-deleted");
+        let target = dir.path().join("shots");
+        fs::create_dir(&target).unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        store
+            .set_screenshot_save_directory(Some(target.clone()))
+            .unwrap();
+        let session = store.screenshot_save_directory_with(|| panic!("custom path"));
+        fs::remove_dir(&target).unwrap();
+        let restarted = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            restarted.screenshot_save_directory_with(|| panic!(
+                "deleted custom path must not fall back"
+            )),
+            Some(target.clone())
+        );
+        assert_eq!(session, Some(target));
+    }
+
+    #[test]
+    fn screenshot_directory_persistence_failure_retains_committed_value() {
+        let dir = TestDir::new("screenshot-directory-write-failed");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        store
+            .set_screenshot_save_directory(Some(dir.path().to_path_buf()))
+            .unwrap();
+        fs::remove_file(dir.path().join("settings.json")).unwrap();
+        fs::create_dir(dir.path().join("settings.json")).unwrap();
+        assert!(store.set_screenshot_save_directory(None).is_err());
+        assert_eq!(
+            store.snapshot().screenshot_save_directory.as_deref(),
+            Some(dir.path())
+        );
+    }
     #[test]
     fn screenshot_preference_defaults_to_null_and_survives_unrelated_saves_and_restart() {
         let dir = TestDir::new("screenshot-hotkey");
@@ -1282,6 +1412,7 @@ mod tests {
         let dir = TestDir::new("file-preview-only-field");
         let persisted = Settings {
             screenshot_hotkey: None,
+            screenshot_save_directory: None,
             hotkey: "Ctrl+Space".into(),
             autostart: true,
             theme: ThemePreference::System,

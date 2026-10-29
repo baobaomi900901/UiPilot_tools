@@ -101,6 +101,8 @@ export interface LauncherCore {
   readonly setHotkeyCanonical: (value: string) => void
   readonly commandHotkeyEntry: (payload: unknown) => void
   readonly setHotkeyRecordingPhase: (phase: HotkeyRecordingPhase) => Promise<void>
+  readonly selectScreenshotSaveDirectory: () => Promise<void>
+  readonly restoreScreenshotSaveDirectory: () => Promise<void>
   readonly saveScreenshotHotkey: (value: string | null) => Promise<void>
   readonly saveHotkeyCanonical: (value: string) => Promise<void>
   readonly clearMessages: () => Promise<void>
@@ -260,6 +262,8 @@ interface PrivateSettings {
   hotkey: TextControl
   screenshotHotkey: string | null
   screenshotHotkeyStatus: 'unset' | 'active' | 'unavailable'
+  screenshotSaveDirectory: string | null
+  screenshotSaveDirectoryPath: string | null
   autostart: boolean
   webSearchEngine: WebSearchEngine
 }
@@ -279,7 +283,7 @@ interface PreviewPreferenceOwner {
   enabled: boolean
 }
 
-type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
+type SettingsOperationKind = 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine' | 'screenshotDirectory'
 
 interface SettingsOperation {
   previous?: UserSettingsUpdate
@@ -762,6 +766,8 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         hotkey: Object.freeze({ key: model.settings.hotkey.key, value: model.settings.hotkey.draft }),
         screenshotHotkey: model.settings.screenshotHotkey,
         screenshotHotkeyStatus: model.settings.screenshotHotkeyStatus,
+        screenshotSaveDirectory: model.settings.screenshotSaveDirectory,
+        screenshotSaveDirectoryPath: model.settings.screenshotSaveDirectoryPath,
         autostart: model.settings.autostart,
         theme: model.theme,
         webSearchEngine: model.settings.webSearchEngine,
@@ -1043,6 +1049,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hotkey: newTextControl(view.hotkey),
       screenshotHotkey: view.screenshotHotkey,
       screenshotHotkeyStatus: view.screenshotHotkeyStatus,
+      screenshotSaveDirectory: view.screenshotSaveDirectory,
+      screenshotSaveDirectoryPath: view.screenshotSaveDirectoryPath,
       autostart: view.autostart,
       webSearchEngine: view.webSearchEngine,
     }
@@ -3012,6 +3020,31 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     finishSettingsMutation(operation, false)
   }
 
+  async function changeScreenshotSaveDirectory(restore: boolean): Promise<void> {
+    if (!settingsEditable() || !model.settings) return
+    const operation = startSettingsOperation('screenshotDirectory')
+    if (!operation) return
+    try {
+      const saved = restore
+        ? await client.setScreenshotSaveDirectory({ input: { directory: null } })
+        : await client.selectScreenshotSaveDirectory()
+      if (ownsSettingsView(operation) && model.settings && saved) {
+        model.settings.screenshotSaveDirectory = saved.directory
+        model.settings.screenshotSaveDirectoryPath = saved.path
+        model.status = '截图默认位置已保存'
+      }
+    } catch {
+      if (ownsSettingsView(operation)) model.status = '更新截图保存目录失败，请重试'
+    }
+    if (!ownsSettingsOperation(operation)) return
+    releaseSettingsOperation(operation)
+    publish(true)
+    void drainSettingsLoad()
+  }
+
+  const selectScreenshotSaveDirectory = () => changeScreenshotSaveDirectory(false)
+  const restoreScreenshotSaveDirectory = () => changeScreenshotSaveDirectory(true)
+
   async function saveScreenshotHotkey(value: string | null): Promise<void> {
     if (!settingsEditable() || !model.settings) return
     const operation = startSettingsOperation('hotkey')
@@ -4358,6 +4391,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     setHotkeyRecordingPhase,
     saveHotkeyCanonical,
     saveScreenshotHotkey,
+    selectScreenshotSaveDirectory,
+    restoreScreenshotSaveDirectory,
     clearMessages,
     setFileCategory,
     cycleFileCategory,

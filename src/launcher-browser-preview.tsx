@@ -19,6 +19,8 @@ const previewTheme = previewParameters.get('theme') === 'light' ? 'light' : 'dar
 const settings: SettingsView = {
   screenshotHotkey: null,
   screenshotHotkeyStatus: 'unset',
+  screenshotSaveDirectory: null,
+  screenshotSaveDirectoryPath: 'C:\\Users\\demo\\OneDrive\\Desktop',
   hotkey: 'Alt+Space',
   autostart: false,
   filePreviewEnabled: true,
@@ -455,6 +457,12 @@ const client: LauncherClient = {
   saveSettings: async () => undefined,
   saveHotkey: async ({ hotkey }) => ({ hotkey: hotkey.hotkey }),
   setScreenshotHotkey: async () => {},
+  selectScreenshotSaveDirectory: async () => null,
+  setScreenshotSaveDirectory: async () => {
+    settings.screenshotSaveDirectory = null
+    settings.screenshotSaveDirectoryPath = 'C:\\Users\\demo\\OneDrive\\Desktop'
+    return { directory: null, path: settings.screenshotSaveDirectoryPath }
+  },
   setHotkeyRecording: async () => {},
   setThemePreference: async () => undefined,
   setWebSearchEngine: async () => undefined,

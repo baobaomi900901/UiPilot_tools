@@ -152,7 +152,7 @@ impl Editor {
     pub fn failed(&mut self, error: &str) {
         self.outputting = false;
         self.error = Some(match error {
-            "DesktopUnavailable" => "桌面不可用，请检查桌面目录后重试",
+            "SaveDirectoryUnavailable" | "SaveFailed" => "保存失败，请检查保存目录后重试",
             "ClipboardBusy" | "ClipboardWriteFailed" => "复制失败，请重试 Ctrl+C",
             "ResourceLimit" | "AllocationFailed" => "截图过大，请缩小选区后重试",
             _ => "输出失败，请重试",
@@ -173,6 +173,18 @@ mod tests {
     }
     fn editor() -> Editor {
         Editor::new(r(20, 20, 80, 80), r(0, 0, 100, 100)).unwrap()
+    }
+    #[test]
+    fn deleted_or_unwritable_save_directory_keeps_selection_and_offers_retry() {
+        for code in ["SaveDirectoryUnavailable", "SaveFailed"] {
+            let mut editor = editor();
+            let rect = editor.geometry.rect();
+            assert!(editor.begin_output(false));
+            editor.failed(code);
+            assert_eq!(editor.geometry.rect(), rect);
+            assert_eq!(editor.error, Some("保存失败，请检查保存目录后重试"));
+            assert!(editor.begin_output(false));
+        }
     }
     #[test]
     fn tab_visits_all_eight_handles_then_real_save_control() {

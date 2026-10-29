@@ -151,10 +151,17 @@ export interface SettingsView {
   hotkey: string
   screenshotHotkey: string | null
   screenshotHotkeyStatus: 'unset' | 'active' | 'unavailable'
+  screenshotSaveDirectory: string | null
+  screenshotSaveDirectoryPath: string | null
   autostart: boolean
   filePreviewEnabled: boolean
   theme: ThemePreference
   webSearchEngine: WebSearchEngine
+}
+
+export interface ScreenshotSaveDirectoryView {
+  directory: string | null
+  path: string | null
 }
 
 export interface UserSettingsUpdate {
@@ -451,6 +458,8 @@ export interface LauncherClient {
   loadSettings(): Promise<SettingsView>
   saveSettings(input: { settings: UserSettingsUpdate }): Promise<void>
   saveHotkey(input: { hotkey: HotkeySettingsUpdate }): Promise<HotkeySettingsView>
+  selectScreenshotSaveDirectory(): Promise<ScreenshotSaveDirectoryView | null>
+  setScreenshotSaveDirectory(input: { input: { directory: string | null } }): Promise<ScreenshotSaveDirectoryView>
   setScreenshotHotkey(input: { input: { hotkey: string | null } }): Promise<void>
   setHotkeyRecording(input: { recording: boolean }): Promise<void>
   setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
@@ -621,12 +630,14 @@ export interface SettingsSnapshot {
   hotkey: TextControlView
   screenshotHotkey: string | null
   screenshotHotkeyStatus: 'unset' | 'active' | 'unavailable'
+  screenshotSaveDirectory: string | null
+  screenshotSaveDirectoryPath: string | null
   autostart: boolean
   theme: ThemePreference
   webSearchEngine: WebSearchEngine
   loadStatus: SettingsLoadStatus
   readOnly: boolean
-  operation?: 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine'
+  operation?: 'load' | 'save' | 'hotkey' | 'theme' | 'webSearchEngine' | 'screenshotDirectory'
   needsReload: boolean
 }
 
