@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   parseLauncherShown,
+  parseBuiltinFeatures,
   parseResultActionMetadata,
   parseResultActionOutcome,
   parsePluginTimerStartInput,
@@ -253,5 +254,15 @@ describe('command hotkey protocol', () => {
       expect(parseLauncherShown({ ...shown, commandEntry: entry })).toBeNull()
     }
     expect(parseLauncherShown({ ...shown, target: 'settings' })).toBeNull()
+  })
+})
+
+describe('managed builtins protocol', () => {
+  const items = ['screenshot', 'quicklinks', 'webSearch'].map((feature) => ({ feature, name: feature, command: '/test', description: 'Description', examples: ['/test'], version: '1.0.0', enabled: true }))
+  it('accepts the complete fixed ordered host metadata', () => {
+    expect(parseBuiltinFeatures(items)).toEqual(items)
+  })
+  it('rejects unmanaged identities, duplicates, wrong fields and malformed metadata', () => {
+    for (const value of [[], items.slice(1), [...items].reverse(), [items[0], items[0], items[2]], items.map((item, i) => i ? item : { ...item, feature: 'find' }), items.map((item, i) => i ? item : { ...item, pluginId: 'fake' }), items.map((item, i) => i ? item : { ...item, enabled: 1 }), items.map((item, i) => i ? item : { ...item, examples: [1] })]) expect(parseBuiltinFeatures(value)).toBeNull()
   })
 })

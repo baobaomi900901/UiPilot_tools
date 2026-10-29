@@ -2,6 +2,31 @@ import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export type ResultIconKind = 'find' | 'quicklinks' | 'screenshot' | 'calculator' | 'currency' | 'date' | 'timeZone' | 'unit' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'screenshot' | 'webSearch'
+export type ManagedBuiltinFeature = 'screenshot' | 'quicklinks' | 'webSearch'
+export interface BuiltinFeatureView {
+  feature: ManagedBuiltinFeature
+  name: string
+  command: string
+  description: string
+  examples: readonly string[]
+  version: string
+  enabled: boolean
+}
+
+export function parseBuiltinFeatures(value: unknown): readonly BuiltinFeatureView[] | null {
+  if (!Array.isArray(value) || !exactDenseArray(value) || value.length !== 3) return null
+  const features: readonly ManagedBuiltinFeature[] = ['screenshot', 'quicklinks', 'webSearch']
+  const items: BuiltinFeatureView[] = []
+  for (const [index, candidate] of value.entries()) {
+    const item = plainRecord(candidate)
+    if (!item || !exactKeys(item, ['command', 'description', 'enabled', 'examples', 'feature', 'name', 'version']) || item.feature !== features[index] || typeof item.enabled !== 'boolean') return null
+    if (['name', 'command', 'description', 'version'].some((key) => typeof item[key] !== 'string' || (item[key] as string).length === 0)) return null
+    if (!Array.isArray(item.examples) || !exactDenseArray(item.examples) || item.examples.length === 0 || !item.examples.every((example) => typeof example === 'string' && example.length > 0)) return null
+    items.push({ ...(item as unknown as BuiltinFeatureView), examples: [...item.examples] })
+  }
+  return items
+}
+
 export type ResultFavoriteTarget =
   | Readonly<{ kind: 'publicPlugin'; pluginId: string; commandId: string }>
   | Readonly<{ kind: 'builtin'; feature: BuiltinFeature }>
@@ -436,6 +461,8 @@ export interface LauncherClient {
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
   setPublicPluginCommandHotkey(input: { pluginId: string; commandId: string; hotkey: string | null }): Promise<void>
   resolvePublicPluginCommandEntry(input: { entry: CommandHotkeyEntry }): Promise<CommandEntryResolution>
+  listBuiltinFeatures(): Promise<readonly BuiltinFeatureView[]>
+  setBuiltinFeatureEnabled(input: { feature: ManagedBuiltinFeature; enabled: boolean }): Promise<readonly BuiltinFeatureView[]>
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
   selectPublicPluginDirectory(): Promise<string | null>

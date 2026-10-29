@@ -48,6 +48,35 @@ pub(crate) enum BuiltinFeature {
     WebSearch,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ManagedBuiltinFeature {
+    Screenshot,
+    Quicklinks,
+    WebSearch,
+}
+
+impl ManagedBuiltinFeature {
+    pub(crate) const ALL: [Self; 3] = [Self::Screenshot, Self::Quicklinks, Self::WebSearch];
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "screenshot" => Some(Self::Screenshot),
+            "quicklinks" => Some(Self::Quicklinks),
+            "webSearch" => Some(Self::WebSearch),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn favorite_feature(self) -> BuiltinFeature {
+        match self {
+            Self::Screenshot => BuiltinFeature::Screenshot,
+            Self::Quicklinks => BuiltinFeature::Quicklinks,
+            Self::WebSearch => BuiltinFeature::WebSearch,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
@@ -65,6 +94,8 @@ pub(crate) struct Settings {
     pub(crate) file_preview_enabled: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) favorite_builtin_features: BTreeSet<BuiltinFeature>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) disabled_builtin_features: BTreeSet<ManagedBuiltinFeature>,
     #[serde(default)]
     pub(crate) use_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,12 +156,19 @@ impl Default for Settings {
             web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: default_file_preview_enabled(),
             favorite_builtin_features: BTreeSet::new(),
+            disabled_builtin_features: BTreeSet::new(),
             use_counts: BTreeMap::new(),
             window_position: None,
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),
             public_plugin_command_hotkeys: BTreeMap::new(),
         }
+    }
+}
+
+impl Settings {
+    pub(crate) fn builtin_feature_enabled(&self, feature: ManagedBuiltinFeature) -> bool {
+        !self.disabled_builtin_features.contains(&feature)
     }
 }
 
@@ -226,6 +264,24 @@ impl SettingsStore {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
         candidate.hotkey = hotkey;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_builtin_feature_enabled(
+        &self,
+        feature: ManagedBuiltinFeature,
+        enabled: bool,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        if enabled {
+            candidate.disabled_builtin_features.remove(&feature);
+        } else {
+            candidate.disabled_builtin_features.insert(feature);
+        }
+        if candidate == state.value {
+            return Ok(());
+        }
         self.persist(&mut state, candidate)
     }
 
@@ -757,6 +813,61 @@ mod tests {
 
     fn read_backup(dir: &TestDir) -> Settings {
         serde_json::from_slice(&fs::read(dir.backup()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn managed_builtin_settings_default_roundtrip_and_failed_save() {
+        let dir = TestDir::new("managed-builtins");
+        fs::write(
+            dir.current(),
+            br#"{"hotkey":"Shift+Space","autostart":false}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        for feature in ManagedBuiltinFeature::ALL {
+            assert!(store.snapshot().builtin_feature_enabled(feature));
+        }
+        assert!(serde_json::from_str::<ManagedBuiltinFeature>("\"find\"").is_err());
+        store
+            .set_builtin_feature_enabled(ManagedBuiltinFeature::Screenshot, false)
+            .unwrap();
+        let reloaded = SettingsStore::load(dir.path()).unwrap();
+        assert!(!reloaded
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Screenshot));
+        assert!(reloaded
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Quicklinks));
+        reloaded
+            .set_builtin_feature_enabled(ManagedBuiltinFeature::Screenshot, true)
+            .unwrap();
+        assert!(SettingsStore::load(dir.path())
+            .unwrap()
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Screenshot));
+        reloaded
+            .set_builtin_feature_enabled(ManagedBuiltinFeature::Screenshot, false)
+            .unwrap();
+        assert_eq!(
+            ManagedBuiltinFeature::Screenshot.favorite_feature(),
+            BuiltinFeature::Screenshot
+        );
+        assert_eq!(
+            ManagedBuiltinFeature::Quicklinks.favorite_feature(),
+            BuiltinFeature::Quicklinks
+        );
+        assert_eq!(
+            ManagedBuiltinFeature::WebSearch.favorite_feature(),
+            BuiltinFeature::WebSearch
+        );
+        fs::remove_file(dir.current()).unwrap();
+        fs::create_dir(dir.current()).unwrap();
+        assert!(reloaded
+            .set_builtin_feature_enabled(ManagedBuiltinFeature::Screenshot, true)
+            .is_err());
+        assert!(!reloaded
+            .snapshot()
+            .builtin_feature_enabled(ManagedBuiltinFeature::Screenshot));
     }
 
     #[test]
@@ -1420,6 +1531,7 @@ mod tests {
             use_counts: BTreeMap::from([(APP_A.into(), 9)]),
             file_preview_enabled: true,
             favorite_builtin_features: BTreeSet::new(),
+            disabled_builtin_features: BTreeSet::new(),
             window_position: None,
             find_window_position: None,
             plugin_window_positions: BTreeMap::new(),

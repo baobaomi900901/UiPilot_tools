@@ -78,8 +78,8 @@ use crate::{
         QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry,
     },
     settings::{
-        BuiltinFeature, SettingsError, SettingsStore, SettingsUpdate, ThemePreference,
-        WebSearchEngine, WindowPosition,
+        BuiltinFeature, ManagedBuiltinFeature, Settings, SettingsError, SettingsStore,
+        SettingsUpdate, ThemePreference, WebSearchEngine, WindowPosition,
     },
     window_transfer::MainWindowTransferCoordinator,
 };
@@ -1561,6 +1561,92 @@ pub(crate) fn resolve_public_plugin_command_entry(
         activation_mode: route.activation_mode,
         input_required: route.input_required,
         input_placeholder: route.input_placeholder,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BuiltinFeatureView {
+    feature: ManagedBuiltinFeature,
+    name: &'static str,
+    command: &'static str,
+    description: &'static str,
+    examples: Vec<&'static str>,
+    version: &'static str,
+    enabled: bool,
+}
+
+fn builtin_feature_views(settings: &Settings) -> Vec<BuiltinFeatureView> {
+    ManagedBuiltinFeature::ALL
+        .into_iter()
+        .map(|feature| {
+            let (name, command, description, examples) = match feature {
+                ManagedBuiltinFeature::Screenshot => (
+                    "截图",
+                    "/screenshot",
+                    "截取屏幕区域，编辑、复制、保存或贴图。",
+                    vec!["/screenshot"],
+                ),
+                ManagedBuiltinFeature::Quicklinks => (
+                    "快捷链接",
+                    "/quicklinks",
+                    "管理快捷链接，使用自定义命令打开链接。",
+                    vec!["/quicklinks", "/quicklinks add"],
+                ),
+                ManagedBuiltinFeature::WebSearch => (
+                    "网页搜索",
+                    "/web-search",
+                    "使用默认搜索引擎搜索网页。",
+                    vec!["/web-search UiPilot"],
+                ),
+            };
+            BuiltinFeatureView {
+                feature,
+                name,
+                command,
+                description,
+                examples,
+                version: env!("CARGO_PKG_VERSION"),
+                enabled: settings.builtin_feature_enabled(feature),
+            }
+        })
+        .collect()
+}
+
+fn with_managed_builtin<T>(
+    label: &str,
+    feature: &str,
+    operation: impl FnOnce(ManagedBuiltinFeature) -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
+    require_main_label(label)?;
+    let feature = ManagedBuiltinFeature::parse(feature).ok_or(CommandError {
+        code: "invalidBuiltinFeature",
+        message: "builtin feature is invalid",
+    })?;
+    operation(feature)
+}
+
+#[tauri::command]
+pub(crate) fn list_builtin_features(
+    window: WebviewWindow,
+) -> Result<Vec<BuiltinFeatureView>, CommandError> {
+    require_main_window(&window)?;
+    let settings = window.app_handle().state::<SettingsStore>();
+    Ok(builtin_feature_views(&settings.snapshot()))
+}
+
+#[tauri::command]
+pub(crate) fn set_builtin_feature_enabled(
+    window: WebviewWindow,
+    feature: String,
+    enabled: bool,
+) -> Result<Vec<BuiltinFeatureView>, CommandError> {
+    with_managed_builtin(window.label(), &feature, |feature| {
+        let settings = window.app_handle().state::<SettingsStore>();
+        settings
+            .set_builtin_feature_enabled(feature, enabled)
+            .map_err(|_| CommandError::settings_failed())?;
+        Ok(builtin_feature_views(&settings.snapshot()))
     })
 }
 
@@ -6685,11 +6771,12 @@ mod tests {
     };
 
     use super::{
-        clear_and_hide_with, execute_file_action_with, execute_resolved_result_with,
-        execute_result_with, focus_live_panel_host_content, host_input_focus_failure,
-        load_settings_core, load_settings_ready_with, map_everything_search_error,
-        map_file_preview_worker_result, map_save_worker_result, map_theme_preference_worker_result,
-        panel_route_matches_identity, parse_panel_session_epoch, parse_timer_session_generation,
+        builtin_feature_views, clear_and_hide_with, execute_file_action_with,
+        execute_resolved_result_with, execute_result_with, focus_live_panel_host_content,
+        host_input_focus_failure, load_settings_core, load_settings_ready_with,
+        map_everything_search_error, map_file_preview_worker_result, map_save_worker_result,
+        map_theme_preference_worker_result, panel_route_matches_identity,
+        parse_panel_session_epoch, parse_timer_session_generation,
         parse_window_storage_session_generation, plugin_discovery_prefix, prepare_file_query,
         prepare_hotkey_save, prepare_settings_save, public_plugin_prompt,
         public_plugin_search_decision, publish_everything_search,
@@ -6699,10 +6786,10 @@ mod tests {
         search_apps_with_catalog_and_currency, search_apps_with_clocks,
         search_apps_with_local_date, search_files_with, select_public_plugin_source_with,
         set_file_preview_preference_with, start_host_input_focus, submitted_main_result_command,
-        CatalogSearchRequest, CommandError, CompletionOriginInput, CompletionOriginPhase,
-        ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome, HostInputFocusStart,
-        HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision, ThemePreferenceUpdate,
-        UserSettingsUpdate,
+        with_managed_builtin, CatalogSearchRequest, CommandError, CompletionOriginInput,
+        CompletionOriginPhase, ExecuteOutcome, FilePreviewPreferenceUpdate, FindReadyOutcome,
+        HostInputFocusStart, HotkeySettingsUpdate, PreparedFileQuery, PublicPluginSearchDecision,
+        ThemePreferenceUpdate, UserSettingsUpdate,
     };
     use crate::{
         apps::{Application, ApplicationActionOutcome, ApplicationLaunchTarget},
@@ -6725,8 +6812,8 @@ mod tests {
         quicklinks::QuicklinkView,
         result_registry::{QueryDomain, RegistryError, ResultAction, ResultRegistry},
         settings::{
-            BuiltinFeature, Settings, SettingsStore, SettingsUpdate, ThemePreference,
-            WebSearchEngine,
+            BuiltinFeature, ManagedBuiltinFeature, Settings, SettingsStore, SettingsUpdate,
+            ThemePreference, WebSearchEngine,
         },
     };
     use tauri_plugin_global_shortcut::Shortcut;
@@ -8160,6 +8247,7 @@ mod tests {
             web_search_engine: WebSearchEngine::Bing,
             file_preview_enabled: true,
             favorite_builtin_features: Default::default(),
+            disabled_builtin_features: Default::default(),
             use_counts: BTreeMap::from([(APP_DUPLICATE_A.into(), 9), (APP_ABSENT.into(), 13)]),
             window_position: None,
             find_window_position: None,
@@ -8174,6 +8262,40 @@ mod tests {
         )
         .unwrap();
         SettingsStore::load(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn builtin_management_authorizes_and_validates_before_settings_access() {
+        assert!(with_managed_builtin(
+            "plugin-window",
+            "screenshot",
+            |_| -> Result<(), CommandError> { panic!("protected settings accessed") }
+        )
+        .is_err());
+        assert!(
+            with_managed_builtin("main", "find", |_| -> Result<(), CommandError> {
+                panic!("protected settings accessed")
+            })
+            .is_err()
+        );
+        assert!(with_managed_builtin(
+            "main",
+            "com.example.plugin",
+            |_| -> Result<(), CommandError> { panic!("protected settings accessed") }
+        )
+        .is_err());
+        let value = builtin_feature_views(&Settings::default());
+        assert_eq!(
+            value.iter().map(|item| item.feature).collect::<Vec<_>>(),
+            ManagedBuiltinFeature::ALL
+        );
+        assert_eq!(
+            value.iter().map(|item| item.command).collect::<Vec<_>>(),
+            ["/screenshot", "/quicklinks", "/web-search"]
+        );
+        assert!(value.iter().all(|item| item.enabled
+            && !item.examples.is_empty()
+            && item.version == env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

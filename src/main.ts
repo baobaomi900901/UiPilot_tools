@@ -21,6 +21,7 @@ import {
   parsePluginPanelCommandResult,
   parsePluginPanelHostKeyEnqueueResult,
   parsePublicPluginInventory,
+  parseBuiltinFeatures,
   parsePublicPluginPrepareSummary,
   parsePublicPluginWindowIdentity,
   parseFindPreviewPreferenceResult,
@@ -117,6 +118,16 @@ export const client: LauncherClient = {
     const resolved = parseCommandEntryResolution(await invoke('resolve_public_plugin_command_entry', input))
     if (!resolved) throw { code: 'pluginQueryFailed' }
     return resolved
+  },
+  listBuiltinFeatures: async () => {
+    const items = parseBuiltinFeatures(await invoke<unknown>('list_builtin_features'))
+    if (!items) throw { code: 'builtinFeatureListFailed', message: 'builtin feature list failed' }
+    return items
+  },
+  setBuiltinFeatureEnabled: async (input) => {
+    const items = parseBuiltinFeatures(await invoke<unknown>('set_builtin_feature_enabled', input))
+    if (!items) throw { code: 'builtinFeatureListFailed', message: 'builtin feature list failed' }
+    return items
   },
   listPublicPlugins: async () => {
     const value = await invoke<unknown>('list_public_plugins')

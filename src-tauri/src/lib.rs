@@ -507,6 +507,8 @@ pub fn run() {
             commands::load_find_thumbnail,
             commands::hide_find_window,
             commands::select_public_plugin_directory,
+            commands::list_builtin_features,
+            commands::set_builtin_feature_enabled,
             commands::list_public_plugins,
             commands::set_public_plugin_command_hotkey,
             commands::resolve_public_plugin_command_entry,
