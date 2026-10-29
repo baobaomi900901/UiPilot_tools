@@ -1,5 +1,6 @@
 mod capture;
 mod overlay;
+pub(crate) use overlay::pin::PinManager;
 
 use super::{
     geometry::{BudgetedImage, PixelBudget},
@@ -151,6 +152,7 @@ pub fn start_selection(
     excluded_windows: Vec<isize>,
     provider: Option<std::path::PathBuf>,
     desktop: Option<std::path::PathBuf>,
+    pins: Arc<PinManager>,
     complete: impl FnOnce(Result<SelectionResult, NativeError>) + Send + 'static,
 ) -> Result<SelectionHandle, NativeError> {
     let cancellation = Arc::new(Cancellation {
@@ -172,6 +174,7 @@ pub fn start_selection(
                     &excluded_windows,
                     provider,
                     desktop,
+                    pins,
                     &worker_cancel,
                 )
             }))

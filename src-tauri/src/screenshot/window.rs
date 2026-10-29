@@ -62,6 +62,7 @@ pub(crate) struct ScreenshotHost {
     next_instance: AtomicU64,
     preview: Mutex<Option<Preview>>,
     selection: Mutex<Vec<SelectionHandle>>,
+    pins: Arc<windows::PinManager>,
     launcher_origin: Mutex<Option<LauncherOrigin>>,
 }
 impl ScreenshotHost {
@@ -318,6 +319,7 @@ impl ScreenshotHost {
             excluded,
             super::probe::executable(&app),
             save_directory,
+            self.pins.clone(),
             move |result| {
                 let app = callback_app;
                 let _display = display;
@@ -710,6 +712,7 @@ impl ScreenshotHost {
     pub fn shutdown(&self, app: &AppHandle) {
         self.service.shutdown();
         self.cancel_selection(CancelReason::Shutdown);
+        self.pins.stop();
         if let Some(instance) = self
             .preview
             .lock()
@@ -723,11 +726,13 @@ impl ScreenshotHost {
             .lock()
             .map(|mut h| std::mem::take(&mut *h))
             .unwrap_or_default();
+        let pins = self.pins.clone();
         // Native loop cancellation is cooperative and wakes its message queue.
         // Avoid blocking Tauri main; handles remain rooted until native cleanup.
         let _ = std::thread::Builder::new()
             .name("screenshot-cleanup".into())
             .spawn(move || {
+                pins.shutdown();
                 for handle in handles {
                     let _ = handle.join();
                 }
@@ -756,6 +761,7 @@ fn output_feedback(output: &super::desktop_output::OutputSuccess) -> String {
             format!("截图已保存到 {}", path.display())
         }
         super::desktop_output::OutputSuccess::Copied => "截图已复制到剪贴板".into(),
+        super::desktop_output::OutputSuccess::Pinned => "截图已贴图".into(),
     }
     .chars()
     .filter(|character| !character.is_control())

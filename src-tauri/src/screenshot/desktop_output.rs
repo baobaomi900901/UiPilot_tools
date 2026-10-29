@@ -22,6 +22,7 @@ pub(crate) enum OutputKind {
 pub(crate) enum OutputSuccess {
     Saved(PathBuf),
     Copied,
+    Pinned,
 }
 #[derive(Default)]
 pub(crate) struct OutputGate {
@@ -59,7 +60,7 @@ impl OutputGate {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == CANCELLED
     }
-    fn begin(&self) -> Result<(), String> {
+    pub(crate) fn begin(&self) -> Result<(), String> {
         self.state
             .compare_exchange(READY, RUNNING, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
@@ -80,7 +81,7 @@ impl OutputGate {
         }
     }
     /// The single linearization point between cancellation and external output.
-    fn authorize_commit(&self) -> Result<(), String> {
+    pub(crate) fn authorize_commit(&self) -> Result<(), String> {
         self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 matches!(state, READY | RUNNING).then_some(COMMITTING)
@@ -96,7 +97,7 @@ impl OutputGate {
             })
     }
 }
-struct FinishJob<'a>(&'a OutputGate);
+pub(crate) struct FinishJob<'a>(pub(crate) &'a OutputGate);
 impl Drop for FinishJob<'_> {
     fn drop(&mut self) {
         let _ = self

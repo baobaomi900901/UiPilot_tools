@@ -1,6 +1,10 @@
 use super::*;
 #[path = "editor.rs"]
 mod editor;
+#[path = "pin.rs"]
+pub(super) mod pin;
+#[path = "toolbar.rs"]
+mod toolbar;
 use crate::screenshot::desktop_output::{self, OutputGate, OutputKind, OutputSuccess};
 use crate::screenshot::editing::{self, Handle};
 use crate::screenshot::selection::{Direction, SelectionInput, SelectionOutcome, SelectionState};
@@ -37,13 +41,12 @@ enum Event {
     ProbeReady,
     PaintFailed,
     Key(u16, bool, bool),
-    Save,
-    SaveFocused,
+    Button(editor::Button),
+    ButtonFocused(editor::Button),
     OutputReady,
 }
 const WM_PROBE_READY: u32 = WM_APP + 19;
 const WM_OUTPUT_READY: u32 = WM_APP + 20;
-const SAVE_BUTTON_ID: usize = 100;
 struct State {
     desktop: Arc<capture::Desktop>,
     budget: PixelBudget,
@@ -438,19 +441,28 @@ unsafe extern "system" fn window_proc(
     let state = &*context.state;
     let event = match message {
         WM_COMMAND
-            if wparam.0 & 0xffff == SAVE_BUTTON_ID
+            if toolbar::from_id(wparam.0 & 0xffff).is_some()
                 && (wparam.0 >> 16) & 0xffff == BN_CLICKED as usize =>
         {
-            Some(Event::Save)
+            Some(Event::Button(toolbar::from_id(wparam.0 & 0xffff).unwrap()))
         }
         WM_COMMAND
-            if wparam.0 & 0xffff == SAVE_BUTTON_ID
+            if toolbar::from_id(wparam.0 & 0xffff).is_some()
                 && (wparam.0 >> 16) & 0xffff == BN_SETFOCUS as usize =>
         {
-            Some(Event::SaveFocused)
+            Some(Event::ButtonFocused(
+                toolbar::from_id(wparam.0 & 0xffff).unwrap(),
+            ))
         }
-        WM_DRAWITEM if wparam.0 == SAVE_BUTTON_ID => {
-            if draw_save_button(state, &*(lparam.0 as *const DRAWITEMSTRUCT)).is_err() {
+        WM_DRAWITEM if toolbar::from_id(wparam.0).is_some() => {
+            let outputting = state.editor.borrow().as_ref().is_some_and(|e| e.outputting);
+            if toolbar::draw(
+                state.palette,
+                outputting,
+                &*(lparam.0 as *const DRAWITEMSTRUCT),
+            )
+            .is_err()
+            {
                 state.events.borrow_mut().push_back(Event::PaintFailed);
             }
             return LRESULT(1);
@@ -582,120 +594,59 @@ unsafe fn update_editor_cursor(state: &State, point: PhysicalPoint) {
     }
 }
 
-struct SaveButton {
-    hwnd: HWND,
-    _font: GdiObject,
-}
-impl SaveButton {
-    unsafe fn new(parent: HWND, dpi: u32) -> Result<Self, NativeError> {
-        let font = GdiObject(HGDIOBJ(
-            CreateFontW(
-                -((13 * dpi as i32 + 48) / 96).max(1),
-                0,
-                0,
-                0,
-                500,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                w!("Inter"),
-            )
-            .0,
-        ));
-        if font.0 .0.is_null() {
-            return Err(NativeError::OverlayFailed);
-        }
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("BUTTON"),
-            w!("保存到桌面"),
-            WS_CHILD | WS_TABSTOP | WINDOW_STYLE((BS_OWNERDRAW | BS_NOTIFY) as u32),
-            0,
-            0,
-            1,
-            1,
-            Some(parent),
-            Some(HMENU(SAVE_BUTTON_ID as *mut _)),
-            None,
-            None,
-        )
-        .map_err(|_| NativeError::OverlayFailed)?;
-        SendMessageW(
-            hwnd,
-            WM_SETFONT,
-            Some(WPARAM(font.0 .0 as usize)),
-            Some(LPARAM(0)),
-        );
-        Ok(Self { hwnd, _font: font })
-    }
-}
-impl Drop for SaveButton {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyWindow(self.hwnd);
-        }
-    }
-}
-
 fn sync_editor(
     state: &State,
     windows: &[OwnedWindow],
-    buttons: &[SaveButton],
+    buttons: &[toolbar::Toolbar],
     focus: bool,
 ) -> Result<(), NativeError> {
-    let (rect, hidden, outputting, copying, focused) = {
+    let (rect, hidden, outputting, focused) = {
         let editor = state.editor.borrow();
         let Some(editor) = editor.as_ref() else {
             return Ok(());
         };
         (
-            editing::save_button_rect(editor.geometry.rect(), &editor_monitors(state), 120, 32),
+            editing::save_button_rect(editor.geometry.rect(), &editor_monitors(state), 112, 28),
             editor.geometry.resizing(),
             editor.outputting,
-            editor.copying,
             editor.focus,
         )
     };
     unsafe {
-        for (index, button) in buttons.iter().enumerate() {
+        for (index, toolbar) in buttons.iter().enumerate() {
             let monitor = state.desktop.monitors[index];
             let visible = !hidden
                 && monitor.rect.contains(PhysicalPoint {
                     x: rect.left,
                     y: rect.top,
                 });
-            if visible {
-                let text = if outputting {
-                    if copying {
-                        w!("复制中…")
-                    } else {
-                        w!("保存中…")
+            for (button_index, button) in toolbar.buttons.iter().enumerate() {
+                if visible {
+                    button.theme(state.palette);
+                    let _ = EnableWindow(button.hwnd, !outputting);
+                    let left = rect.left + (rect.right - rect.left) * button_index as i32 / 4;
+                    let right =
+                        rect.left + (rect.right - rect.left) * (button_index + 1) as i32 / 4;
+                    SetWindowPos(
+                        button.hwnd,
+                        None,
+                        left - monitor.rect.left,
+                        rect.top - monitor.rect.top,
+                        right - left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                    .map_err(|_| NativeError::OverlayFailed)?;
+                    if focus
+                        && !outputting
+                        && focused == editor::Focus::Button(editor::Button::ALL[button_index])
+                    {
+                        let _ = SetFocus(Some(button.hwnd));
                     }
+                    let _ = InvalidateRect(Some(button.hwnd), None, false);
                 } else {
-                    w!("保存到桌面")
-                };
-                SetWindowTextW(button.hwnd, text).map_err(|_| NativeError::OverlayFailed)?;
-                let _ = EnableWindow(button.hwnd, !outputting);
-                SetWindowPos(
-                    button.hwnd,
-                    None,
-                    rect.left - monitor.rect.left,
-                    rect.top - monitor.rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
-                .map_err(|_| NativeError::OverlayFailed)?;
-                if focus && !outputting && focused == editor::Focus::Save {
-                    let _ = SetFocus(Some(button.hwnd));
+                    let _ = ShowWindow(button.hwnd, SW_HIDE);
                 }
-            } else {
-                let _ = ShowWindow(button.hwnd, SW_HIDE);
             }
             if focus && !outputting {
                 if let editor::Focus::Handle(handle) = focused {
@@ -723,81 +674,6 @@ fn sync_editor(
     Ok(())
 }
 
-unsafe fn draw_save_button(state: &State, item: &DRAWITEMSTRUCT) -> Result<(), NativeError> {
-    let dpi = GetDpiForWindow(item.hwndItem).max(96);
-    let scale = |dip: i32| ((dip * dpi as i32 + 48) / 96).max(1);
-    let editor = state.editor.borrow();
-    let Some(editor) = editor.as_ref() else {
-        return Ok(());
-    };
-    let surface = if editor.outputting {
-        state.palette.surface
-    } else {
-        state.palette.primary
-    };
-    let foreground = if editor.outputting {
-        state.palette.foreground
-    } else {
-        state.palette.primary_foreground
-    };
-    fill(item.hDC, item.rcItem, state.palette.surface)?;
-    let region = GdiObject(HGDIOBJ(
-        CreateRoundRectRgn(
-            item.rcItem.left,
-            item.rcItem.top,
-            item.rcItem.right + 1,
-            item.rcItem.bottom + 1,
-            scale(12),
-            scale(12),
-        )
-        .0,
-    ));
-    let background = brush(surface)?;
-    if FillRgn(item.hDC, HRGN(region.0 .0), HBRUSH(background.0 .0)).0 == 0 {
-        return Err(NativeError::OverlayFailed);
-    }
-    // ODS_FOCUS (0x10) is supplied by the standard accessible BUTTON control.
-    if item.itemState.0 & 0x10 != 0 {
-        let border = brush(state.palette.primary_foreground)?;
-        if FrameRgn(
-            item.hDC,
-            HRGN(region.0 .0),
-            HBRUSH(border.0 .0),
-            scale(2),
-            scale(2),
-        )
-        .0 == 0
-        {
-            return Err(NativeError::OverlayFailed);
-        }
-    }
-    let _saved = SavedDc::new(item.hDC)?;
-    let font = SendMessageW(item.hwndItem, WM_GETFONT, None, None);
-    if font.0 != 0 {
-        SelectObject(item.hDC, HGDIOBJ(font.0 as *mut _));
-    }
-    SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, color(foreground));
-    let text = if editor.outputting {
-        if editor.copying {
-            "复制中…"
-        } else {
-            "保存中…"
-        }
-    } else {
-        "保存到桌面"
-    };
-    let mut text: Vec<u16> = text.encode_utf16().collect();
-    let mut rect = item.rcItem;
-    DrawTextW(
-        item.hDC,
-        &mut text,
-        &mut rect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-    );
-    Ok(())
-}
-
 struct OutputFlight {
     gate: Arc<OutputGate>,
     result: std::sync::mpsc::Receiver<Result<OutputSuccess, String>>,
@@ -806,14 +682,15 @@ fn start_output(
     state: &State,
     cancellation: &Cancellation,
     desktop_directory: Option<std::path::PathBuf>,
-    copying: bool,
+    action: editor::Action,
+    pins: Arc<pin::PinManager>,
 ) -> Result<Option<OutputFlight>, NativeError> {
     let rect = {
         let mut editor = state.editor.borrow_mut();
         let Some(editor) = editor.as_mut() else {
             return Ok(None);
         };
-        if !editor.begin_output(copying) {
+        if !editor.begin_output(action) {
             return Ok(None);
         }
         editor.geometry.rect()
@@ -835,8 +712,13 @@ fn start_output(
                 let image =
                     crate::screenshot::geometry::compose(desktop.frames.frames(), rect, &budget)
                         .map_err(|e| e.to_string())?;
+                if action == editor::Action::Pin {
+                    return pins
+                        .publish(image, rect, &budget, worker_gate)
+                        .map(|_| OutputSuccess::Pinned);
+                }
                 desktop_output::perform(
-                    if copying {
+                    if action == editor::Action::Copy {
                         OutputKind::Copy
                     } else {
                         OutputKind::SaveDesktop
@@ -872,6 +754,7 @@ pub(super) fn run(
     excluded: &[isize],
     provider: Option<std::path::PathBuf>,
     desktop_directory: Option<std::path::PathBuf>,
+    pins: Arc<pin::PinManager>,
     cancellation: &Cancellation,
 ) -> Result<SelectionResult, NativeError> {
     crate::screenshot::probe::trace(format!("selection starting mode={mode:?}"));
@@ -1003,7 +886,7 @@ pub(super) fn run(
         windows.iter().map(|w| w.hwnd.0 as isize).collect(),
     )?);
     let buttons = collect_overlays(windows.len(), |index| unsafe {
-        SaveButton::new(windows[index].hwnd, state.desktop.monitors[index].dpi_x)
+        toolbar::Toolbar::new(windows[index].hwnd)
     })?;
     let mut output: Option<OutputFlight> = None;
     let mut deferred_cancel = false;
@@ -1159,9 +1042,14 @@ pub(super) fn run(
                                 .key(key, shift, ctrl);
                             focus = true;
                         }
-                        Event::Save => action = editor::Action::Save,
-                        Event::SaveFocused => {
-                            state.editor.borrow_mut().as_mut().unwrap().focus_save();
+                        Event::Button(button) => action = button.action(),
+                        Event::ButtonFocused(button) => {
+                            state
+                                .editor
+                                .borrow_mut()
+                                .as_mut()
+                                .unwrap()
+                                .focus_button(button);
                             changed = true;
                         }
                         Event::Input(SelectionInput::Escape) => action = editor::Action::Cancel,
@@ -1169,7 +1057,7 @@ pub(super) fn run(
                     }
                     match action {
                         editor::Action::Cancel => cancellation.cancel(CancelReason::User),
-                        editor::Action::Save | editor::Action::Copy => {
+                        editor::Action::Save | editor::Action::Copy | editor::Action::Pin => {
                             if cancellation.reason().is_none() {
                                 if !capture::layout()
                                     .is_ok_and(|current| current == state.desktop.monitors)
@@ -1180,7 +1068,8 @@ pub(super) fn run(
                                         &state,
                                         cancellation,
                                         desktop_directory.clone(),
-                                        action == editor::Action::Copy,
+                                        action,
+                                        pins.clone(),
                                     )?;
                                     changed = true;
                                 }
@@ -1198,9 +1087,10 @@ pub(super) fn run(
                     continue;
                 }
                 let input = match event {
-                    Event::Key(_, _, _) | Event::Save | Event::SaveFocused | Event::OutputReady => {
-                        continue
-                    }
+                    Event::Key(_, _, _)
+                    | Event::Button(_)
+                    | Event::ButtonFocused(_)
+                    | Event::OutputReady => continue,
                     Event::Cancel(reason) => return Ok(SelectionResult::Cancelled(reason)),
                     Event::PaintFailed => return Err(NativeError::OverlayFailed),
                     Event::CaptureLost => {
@@ -2181,14 +2071,14 @@ unsafe fn render_overlay(
         } else if editor.outputting {
             format!(
                 "{width} × {height} px · {} · Esc 取消",
-                if editor.copying {
-                    "复制中…"
-                } else {
-                    "保存中…"
+                match editor.output_action {
+                    Some(editor::Action::Pin) => "贴图中…",
+                    Some(editor::Action::Copy) => "复制中…",
+                    _ => "保存中…",
                 }
             )
         } else {
-            format!("{width} × {height} px · Tab 调整点 · Enter 保存 · Ctrl+C 复制 · Esc 取消")
+            format!("{width} × {height} px · Tab 切换 · Enter 执行 · Ctrl+C 复制 · Esc 取消")
         }
     } else {
         match selected.and_then(|rect| rect.dimensions().ok()) {
@@ -2334,7 +2224,7 @@ mod tests {
         ));
     }
     #[test]
-    fn hidden_native_save_button_has_accessible_caption_and_routes_click_to_editor() {
+    fn hidden_native_toolbar_has_accessible_names_routes_actions_and_renders_both_themes() {
         // All messages target this fixture's hidden HWND; no input is injected
         // into the desktop, provider or any application belonging to the user.
         let _dpi = DpiContext::enter().unwrap();
@@ -2426,25 +2316,51 @@ mod tests {
             _context: context,
             session_notifications: false,
         };
-        let button = unsafe { SaveButton::new(hwnd, 96).unwrap() };
-        let mut caption = [0u16; 32];
-        let length = unsafe { GetWindowTextW(button.hwnd, &mut caption) };
-        assert_eq!(
-            String::from_utf16_lossy(&caption[..length as usize]),
-            "保存到桌面"
-        );
-        assert_ne!(
-            unsafe { GetWindowLongPtrW(button.hwnd, GWL_STYLE) } as u32 & WS_TABSTOP.0,
-            0
-        );
-        unsafe {
-            SendMessageW(button.hwnd, BM_CLICK, None, None);
+        let toolbar = unsafe { toolbar::Toolbar::new(hwnd).unwrap() };
+        for (index, button) in toolbar.buttons.iter().enumerate() {
+            let action = editor::Button::ALL[index];
+            let mut caption = [0u16; 32];
+            let length = unsafe { GetWindowTextW(button.hwnd, &mut caption) };
+            assert_eq!(
+                String::from_utf16_lossy(&caption[..length as usize]),
+                toolbar::name(action)
+            );
+            assert_ne!(
+                unsafe { GetWindowLongPtrW(button.hwnd, GWL_STYLE) } as u32 & WS_TABSTOP.0,
+                0
+            );
+            unsafe {
+                SendMessageW(button.hwnd, BM_CLICK, None, None);
+            }
+            assert!(state
+                .events
+                .borrow_mut()
+                .drain(..)
+                .any(|event| matches!(event, Event::Button(b) if b == action)));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(toolbar::id(action) | ((BN_SETFOCUS as usize) << 16))),
+                    Some(LPARAM(button.hwnd.0 as isize)),
+                );
+            }
+            assert!(
+                matches!(state.events.borrow_mut().pop_front(), Some(Event::ButtonFocused(b)) if b == action)
+            );
+            unsafe {
+                assert_eq!(
+                    SendMessageW(
+                        button.tooltip,
+                        windows::Win32::UI::Controls::TTM_GETTOOLCOUNT,
+                        None,
+                        None
+                    )
+                    .0,
+                    1
+                );
+            }
         }
-        assert!(state
-            .events
-            .borrow_mut()
-            .drain(..)
-            .any(|event| matches!(event, Event::Save)));
         unsafe {
             SendMessageW(
                 hwnd,
@@ -2456,18 +2372,6 @@ mod tests {
         assert!(matches!(
             state.events.borrow_mut().pop_front(),
             Some(Event::Key(9, _, _))
-        ));
-        unsafe {
-            SendMessageW(
-                hwnd,
-                WM_COMMAND,
-                Some(WPARAM(SAVE_BUTTON_ID | ((BN_SETFOCUS as usize) << 16))),
-                Some(LPARAM(button.hwnd.0 as isize)),
-            );
-        }
-        assert!(matches!(
-            state.events.borrow_mut().pop_front(),
-            Some(Event::SaveFocused)
         ));
         let edge_rect = PhysicalRect {
             left: 50,
@@ -2556,31 +2460,53 @@ mod tests {
                 let button_rect = editing::save_button_rect(
                     editor.geometry.rect(),
                     &editor_monitors(&state),
-                    120,
-                    32,
+                    112,
+                    28,
                 );
-                let item = DRAWITEMSTRUCT {
-                    hwndItem: button.hwnd,
-                    hDC: buffer.dc,
-                    itemState: windows::Win32::UI::Controls::ODS_FOCUS,
-                    rcItem: RECT {
-                        left: button_rect.left,
-                        top: button_rect.top,
-                        right: button_rect.right,
-                        bottom: button_rect.bottom,
-                    },
-                    ..Default::default()
-                };
-                draw_save_button(&state, &item).unwrap();
-                assert_eq!(
-                    GetPixel(
-                        buffer.dc,
-                        (button_rect.left + button_rect.right) / 2,
-                        button_rect.top
-                    ),
-                    color(primary_foreground),
-                    "save focus ring must contrast with primary in {name}"
-                );
+                for (index, button) in toolbar.buttons.iter().enumerate() {
+                    let left = button_rect.left + 28 * index as i32;
+                    let item = DRAWITEMSTRUCT {
+                        CtlID: toolbar::id(editor::Button::ALL[index]) as u32,
+                        hwndItem: button.hwnd,
+                        hDC: buffer.dc,
+                        itemState: windows::Win32::UI::Controls::ODS_FOCUS,
+                        rcItem: RECT {
+                            left,
+                            top: button_rect.top,
+                            right: left + 28,
+                            bottom: button_rect.bottom,
+                        },
+                        ..Default::default()
+                    };
+                    toolbar::draw(state.palette, false, &item).unwrap();
+                    let background = if index == 2 { primary } else { surface };
+                    assert_ne!(
+                        GetPixel(buffer.dc, left + 14, button_rect.top),
+                        color(background),
+                        "all action focus rings must be visible in {name}"
+                    );
+                    let mut different = 0;
+                    for y in button_rect.top + 6..button_rect.bottom - 6 {
+                        for x in left + 6..left + 22 {
+                            if GetPixel(buffer.dc, x, y) != color(background) {
+                                different += 1;
+                            }
+                        }
+                    }
+                    assert!(
+                        different > 15,
+                        "canonical icon must be actually painted for action {index} in {name}"
+                    );
+                    let item = DRAWITEMSTRUCT {
+                        itemState: if index == 2 {
+                            windows::Win32::UI::Controls::ODS_FOCUS
+                        } else {
+                            windows::Win32::UI::Controls::ODS_DEFAULT
+                        },
+                        ..item
+                    };
+                    toolbar::draw(state.palette, false, &item).unwrap();
+                }
                 // Bright selection and shaded outside are composed from the
                 // fixture's frozen frame, using the production native renderer.
                 assert_eq!(GetPixel(buffer.dc, 100, 100), color(0x918fb4));
@@ -2603,7 +2529,7 @@ mod tests {
                 }
                 let png = crate::screenshot::output::encode_png(400, 300, &rgba).unwrap();
                 let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                    "../.superpowers/sdd/element-probe/native-editor-{name}.png"
+                    "../.superpowers/sdd/toolbar-pin/native-editor-{name}.png"
                 ));
                 std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
                 std::fs::write(artifact, png).unwrap();
@@ -2615,9 +2541,15 @@ mod tests {
             unsafe { GetCurrentThreadId() }
         ));
         std::fs::create_dir_all(&temporary).unwrap();
-        let output = start_output(&state, &cancellation, Some(temporary.clone()), false)
-            .unwrap()
-            .unwrap();
+        let output = start_output(
+            &state,
+            &cancellation,
+            Some(temporary.clone()),
+            editor::Action::Save,
+            Arc::new(pin::PinManager::default()),
+        )
+        .unwrap()
+        .unwrap();
         let success = output
             .result
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -2636,7 +2568,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(temporary).unwrap();
         state.closing.set(true);
-        drop(button);
+        drop(toolbar);
         drop(window);
     }
     #[test]
