@@ -112,6 +112,10 @@ pub(super) struct Editor {
     pub preview_rect: PhysicalRect,
     pub committed_preview: Option<Arc<BudgetedImage>>,
     pub preview_dirty: bool,
+    pub preview_revision: u64,
+    pub preview_damage: Option<PhysicalRect>,
+    preview_pending_bounds: Option<PhysicalRect>,
+    mosaic_processed: Option<usize>,
     nudge_active: bool,
     pub drag_tolerance: Option<(i32, i32)>,
     pub geometry: EditingSelection,
@@ -124,6 +128,24 @@ pub(super) struct Editor {
 }
 
 impl Editor {
+    fn note_preview_change(&mut self, damage: PhysicalRect) {
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        self.preview_damage = Some(match self.preview_damage {
+            Some(old) => PhysicalRect {
+                left: old.left.min(damage.left),
+                top: old.top.min(damage.top),
+                right: old.right.max(damage.right),
+                bottom: old.bottom.max(damage.bottom),
+            },
+            None => damage,
+        });
+    }
+    /// A skipped/failed upload cannot discard changes from a newer revision.
+    pub fn acknowledge_preview(&mut self, revision: u64) {
+        if revision == self.preview_revision {
+            self.preview_damage = None;
+        }
+    }
     pub fn focus_button(&mut self, button: Button) {
         self.focus = Focus::Button(button);
     }
@@ -142,6 +164,10 @@ impl Editor {
             committed_preview: None,
             preview_rect: rect,
             preview_dirty: true,
+            preview_revision: 0,
+            preview_damage: Some(rect),
+            preview_pending_bounds: None,
+            mosaic_processed: None,
             nudge_active: false,
             drag_tolerance: None,
             bounds,
@@ -388,7 +414,9 @@ impl Editor {
                     self.restore_geometry();
                     return result;
                 }
+                self.note_preview_change(self.geometry.rect());
                 self.preview = image;
+                self.mosaic_processed = None;
                 self.committed_preview = self.preview.clone();
                 self.preview_rect = self.geometry.rect();
                 self.preview_dirty = self.preview.is_none();
@@ -462,11 +490,14 @@ impl Editor {
         self.preview_dirty = true;
     }
     pub fn cancel_drag(&mut self) {
+        self.mosaic_processed = None;
+        self.preview_pending_bounds = None;
         self.gesture = None;
         self.pending = None;
         if self.geometry.resizing() {
             self.restore_geometry();
         }
+        self.note_preview_change(self.geometry.rect());
         self.preview = self.committed_preview.clone();
         self.preview_dirty = false;
     }
@@ -477,7 +508,9 @@ impl Editor {
     pub fn finish_selection(&mut self) -> Result<bool, ScreenshotError> {
         let result = self.history.set_selection(self.geometry.rect());
         if matches!(result, Ok(true)) {
+            self.mosaic_processed = None;
             self.committed_preview = None;
+            self.note_preview_change(self.geometry.rect());
             self.preview = None;
             self.preview_dirty = true;
         }
@@ -501,10 +534,34 @@ impl Editor {
         if self.committed_preview.is_none() || self.preview_rect != self.geometry.rect() {
             let image =
                 snapshot.compose_preview(frames, budget, Some(self.geometry.rect()), None, None)?;
+            self.mosaic_processed = None;
             self.committed_preview = Some(Arc::new(image));
             self.preview_rect = self.geometry.rect();
         }
         let image = if let Some(pending) = self.pending.as_ref() {
+            if let (Annotation::Mosaic(stroke), Some(processed)) = (pending, self.mosaic_processed)
+            {
+                if let Some(mut previous) = self.preview.take() {
+                    if let Some(output) = Arc::get_mut(&mut previous) {
+                        let updated = crate::screenshot::annotations::apply_mosaic_incremental(
+                            self.committed_preview.as_ref().unwrap(),
+                            output,
+                            self.geometry.rect(),
+                            stroke,
+                            processed,
+                            budget,
+                        );
+                        self.preview = Some(previous);
+                        self.mosaic_processed = Some(updated?);
+                        if let Some(damage) = stroke.damage_since(processed) {
+                            self.note_preview_change(damage);
+                        }
+                        self.preview_dirty = false;
+                        return Ok(());
+                    }
+                    self.preview = Some(previous);
+                }
+            }
             crate::screenshot::annotations::compose_pending(
                 self.committed_preview.as_ref().unwrap(),
                 self.geometry.rect(),
@@ -512,13 +569,39 @@ impl Editor {
                 budget,
             )?
         } else {
+            self.note_preview_change(self.geometry.rect());
             self.preview = self.committed_preview.clone();
             self.preview_dirty = false;
             return Ok(());
         };
+        let damage = match self.pending.as_ref() {
+            Some(Annotation::Rectangle { rect, .. }) => match self.preview_pending_bounds {
+                Some(old) => PhysicalRect {
+                    left: old.left.min(rect.left),
+                    top: old.top.min(rect.top),
+                    right: old.right.max(rect.right),
+                    bottom: old.bottom.max(rect.bottom),
+                },
+                None => *rect,
+            },
+            Some(Annotation::Mosaic(stroke)) => {
+                stroke.damage_since(0).unwrap_or(self.geometry.rect())
+            }
+            _ => self.geometry.rect(),
+        };
+        self.note_preview_change(damage);
+        self.preview_pending_bounds = match self.pending.as_ref() {
+            Some(Annotation::Rectangle { rect, .. }) => Some(*rect),
+            _ => None,
+        };
         self.preview = Some(Arc::new(image));
+        self.mosaic_processed = match self.pending.as_ref() {
+            Some(Annotation::Mosaic(stroke)) => Some(stroke.point_count()),
+            _ => None,
+        };
         self.preview_rect = self.geometry.rect();
         if self.pending.is_none() {
+            self.mosaic_processed = None;
             self.committed_preview = self.preview.clone();
         }
         self.preview_dirty = false;
@@ -539,6 +622,7 @@ impl Editor {
         let result = self.history.append(self.pending.take().unwrap());
         if result.is_ok() {
             self.error = None;
+            self.mosaic_processed = None;
             self.committed_preview = self.preview.clone();
         } else {
             self.cancel_drag();
@@ -565,7 +649,9 @@ impl Editor {
         };
         if changed {
             self.error = None;
+            self.note_preview_change(self.geometry.rect());
             self.preview = Some(Arc::new(image));
+            self.mosaic_processed = None;
             self.committed_preview = self.preview.clone();
             self.preview_rect = self.geometry.rect();
             self.preview_dirty = false;
@@ -596,7 +682,9 @@ impl Editor {
         match image {
             Ok(image) => {
                 self.restore_geometry();
+                self.note_preview_change(self.geometry.rect());
                 self.preview = image;
+                self.mosaic_processed = None;
                 self.committed_preview = self.preview.clone();
                 self.preview_rect = self.geometry.rect();
                 self.preview_dirty = false;
@@ -1104,5 +1192,95 @@ mod review_regressions {
         let mut e = Editor::new(r(), r()).unwrap();
         assert_eq!(Button::Cancel.action(), Action::Terminate);
         assert_eq!(e.key(27, false, false), Action::Cancel);
+    }
+    #[test]
+    fn mosaic_updates_reuse_pixels_but_advance_content_revision() {
+        let rect = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let b = PixelBudget::new(1000000);
+        let frames = [MonitorFrame {
+            rect,
+            image: crate::screenshot::model::RgbaImage {
+                width: 100,
+                height: 100,
+                pixels: vec![255; 40000],
+            },
+        }];
+        let mut e = Editor::new(rect, rect).unwrap();
+        e.activate(Button::Mosaic);
+        e.down(PhysicalPoint { x: 20, y: 20 }, &[(rect, 96)]);
+        e.refresh_preview(&frames, &b).unwrap();
+        let address = Arc::as_ptr(e.preview.as_ref().unwrap());
+        let revision = e.preview_revision;
+        e.moved(PhysicalPoint { x: 40, y: 35 });
+        e.refresh_preview(&frames, &b).unwrap();
+        assert_eq!(address, Arc::as_ptr(e.preview.as_ref().unwrap()));
+        assert!(e.preview_revision > revision);
+        let expected = crate::screenshot::annotations::compose_pending(
+            e.committed_preview.as_ref().unwrap(),
+            rect,
+            e.pending.as_ref().unwrap(),
+            &b,
+        )
+        .unwrap();
+        assert_eq!(e.preview.as_ref().unwrap().image(), expected.image());
+        let revision = e.preview_revision;
+        e.cancel_drag();
+        assert!(e.preview_revision > revision);
+        let revision = e.preview_revision;
+        e.moved(PhysicalPoint { x: 60, y: 60 });
+        e.refresh_preview(&frames, &b).unwrap();
+        assert_eq!(e.preview_revision, revision);
+    }
+    #[test]
+    fn preview_damage_accumulates_until_matching_revision_is_acknowledged() {
+        let rect = PhysicalRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let b = PixelBudget::new(1000000);
+        let frames = [MonitorFrame {
+            rect,
+            image: crate::screenshot::model::RgbaImage {
+                width: 100,
+                height: 100,
+                pixels: vec![255; 40000],
+            },
+        }];
+        let mut e = Editor::new(rect, rect).unwrap();
+        e.activate(Button::Mosaic);
+        e.down(PhysicalPoint { x: 20, y: 20 }, &[(rect, 96)]);
+        e.refresh_preview(&frames, &b).unwrap();
+        e.acknowledge_preview(e.preview_revision);
+        assert_eq!(e.preview_damage, None);
+        e.moved(PhysicalPoint { x: 30, y: 20 });
+        e.refresh_preview(&frames, &b).unwrap();
+        let first = e.preview_damage.unwrap();
+        let old_revision = e.preview_revision;
+        e.moved(PhysicalPoint { x: 60, y: 40 });
+        e.refresh_preview(&frames, &b).unwrap();
+        let combined = e.preview_damage.unwrap();
+        assert!(
+            combined.left <= first.left
+                && combined.top <= first.top
+                && combined.right >= first.right
+                && combined.bottom >= first.bottom
+        );
+        assert!(combined.right < rect.right);
+        e.acknowledge_preview(old_revision);
+        assert_eq!(e.preview_damage, Some(combined));
+        e.acknowledge_preview(e.preview_revision);
+        assert_eq!(e.preview_damage, None);
+        let revision = e.preview_revision;
+        e.moved(PhysicalPoint { x: 60, y: 40 });
+        e.refresh_preview(&frames, &b).unwrap();
+        assert_eq!(e.preview_revision, revision);
+        assert_eq!(e.preview_damage, None);
     }
 }

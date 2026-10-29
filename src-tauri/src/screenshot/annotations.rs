@@ -62,6 +62,9 @@ impl MosaicStroke {
             points: Vec::new(),
         })
     }
+    pub fn point_count(&self) -> usize {
+        self.points.len()
+    }
     /// Outside samples insert a break; reentry cannot connect across the clipped area.
     pub fn push(&mut self, point: PhysicalPoint) -> Result<(), ScreenshotError> {
         let value = self.clip.contains(point).then_some(point);
@@ -79,7 +82,20 @@ impl MosaicStroke {
     }
     /// Grid-aligned bounds preserve the complete pre-stroke sample of edge cells.
     fn affected_bounds(&self, clip: PhysicalRect) -> Option<PhysicalRect> {
-        let mut points = self.points.iter().flatten();
+        self.affected_since(clip, 0)
+    }
+    pub fn damage_since(&self, processed: usize) -> Option<PhysicalRect> {
+        if processed >= self.points.len() {
+            return None;
+        }
+        self.affected_since(self.clip, processed)
+    }
+    fn affected_since(&self, clip: PhysicalRect, processed: usize) -> Option<PhysicalRect> {
+        let mut points = self
+            .points
+            .iter()
+            .skip(processed.saturating_sub(1))
+            .flatten();
         let first = points.next()?;
         let (mut left, mut top, mut right, mut bottom) = (
             i64::from(first.x),
@@ -452,18 +468,75 @@ fn render(
     a: &Annotation,
     budget: &PixelBudget,
 ) -> Result<(), ScreenshotError> {
+    render_from(image, domain, a, budget, None)
+}
+
+/// Continue the same append-only stroke over its previously presented pixels.
+/// `processed` is the previous successful return value (zero for a new stroke).
+/// `base` stays immutable for the entire gesture; failures leave output unchanged.
+pub(crate) fn apply_mosaic_incremental(
+    base: &BudgetedImage,
+    output: &mut BudgetedImage,
+    domain: PhysicalRect,
+    stroke: &MosaicStroke,
+    processed: usize,
+    budget: &PixelBudget,
+) -> Result<usize, ScreenshotError> {
+    let dimensions = domain.dimensions()?;
+    if dimensions != (base.width(), base.height())
+        || dimensions != (output.width(), output.height())
+        || stroke.clip.intersection(domain) != Some(stroke.clip)
+        || processed > stroke.points.len()
+    {
+        return Err(ScreenshotError::InvalidGeometry);
+    }
+    Annotation::validate_stroke(stroke)?;
+    if processed == stroke.points.len() {
+        return Ok(processed);
+    }
+    let start = processed.saturating_sub(1);
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(stroke.points.len() - start)
+        .map_err(|_| ScreenshotError::AllocationFailed)?;
+    points.extend_from_slice(&stroke.points[start..]);
+    let suffix = Annotation::Mosaic(MosaicStroke {
+        clip: stroke.clip,
+        radius: stroke.radius,
+        block_size: stroke.block_size,
+        points,
+    });
+    render_from(output, domain, &suffix, budget, Some(base))?;
+    Ok(stroke.points.len())
+}
+
+fn render_from(
+    image: &mut BudgetedImage,
+    domain: PhysicalRect,
+    a: &Annotation,
+    budget: &PixelBudget,
+    source: Option<&BudgetedImage>,
+) -> Result<(), ScreenshotError> {
     let Some(clip) = domain.intersection(a.clip()) else {
         return Ok(());
     };
     match a {
         Annotation::Rectangle { rect, color, .. } => {
             if let Some(r) = clip.intersection(*rect) {
-                for y in r.top..r.bottom {
-                    for x in r.left..r.right {
-                        let i = offset(domain, x, y);
-                        image.pixels_mut()[i..i + 4]
-                            .copy_from_slice(&[color[0], color[1], color[2], 255]);
-                    }
+                let start = offset(domain, r.left, r.top);
+                let row_bytes = (r.right - r.left) as usize * 4;
+                let pixels = image.pixels_mut();
+                let color = [color[0], color[1], color[2], 255];
+                pixels[start..start + 4].copy_from_slice(&color);
+                let mut filled = 4;
+                while filled < row_bytes {
+                    let n = filled.min(row_bytes - filled);
+                    pixels.copy_within(start..start + n, start + filled);
+                    filled += n;
+                }
+                for y in r.top + 1..r.bottom {
+                    let dest = offset(domain, r.left, y);
+                    pixels.copy_within(start..start + row_bytes, dest);
                 }
             }
         }
@@ -521,7 +594,7 @@ fn render(
                         for x in left..right {
                             let i = offset(domain, x, y);
                             for c in 0..3 {
-                                sum[c] += u64::from(image.image().pixels[i + c]);
+                                sum[c] += u64::from(source.unwrap_or(image).image().pixels[i + c]);
                             }
                             count += 1;
                         }
@@ -828,6 +901,35 @@ mod tests {
         assert!(compose_pending(&base, rect, &red(rect, r(-8, 0, 9, 8)), &b).is_err());
         let tiny = PixelBudget::new(1);
         assert!(compose_pending(&base, rect, &red(rect, rect), &tiny).is_err());
+        assert_eq!(tiny.used(), 0);
+    }
+    #[test]
+    fn incremental_mosaic_matches_full_replay_through_breaks_revisits_and_failures() {
+        let rect = r(-7, -3, 41, 20);
+        let frames = [frame(rect)];
+        let b = PixelBudget::new(100000);
+        let mut h = AnnotationHistory::new(rect).unwrap();
+        h.append(red(r(-7, -3, 8, 20), rect)).unwrap();
+        let base = h.snapshot().compose(&frames, &b).unwrap();
+        let mut output = BudgetedImage::allocate(base.width(), base.height(), &b).unwrap();
+        output.pixels_mut().copy_from_slice(&base.image().pixels);
+        let mut stroke = MosaicStroke::new(rect, 3, 8).unwrap();
+        let mut processed = 0;
+        for point in [p(-6, 2), p(30, 4), p(50, 5), p(3, 15), p(-6, 2)] {
+            stroke.push(point).unwrap();
+            processed =
+                apply_mosaic_incremental(&base, &mut output, rect, &stroke, processed, &b).unwrap();
+            let reference =
+                compose_pending(&base, rect, &Annotation::Mosaic(stroke.clone()), &b).unwrap();
+            assert_eq!(output.image(), reference.image());
+        }
+        stroke.push(p(35, 15)).unwrap();
+        let before = output.image().pixels.clone();
+        let tiny = PixelBudget::new(1);
+        assert!(
+            apply_mosaic_incremental(&base, &mut output, rect, &stroke, processed, &tiny).is_err()
+        );
+        assert_eq!(output.image().pixels, before);
         assert_eq!(tiny.used(), 0);
     }
 }

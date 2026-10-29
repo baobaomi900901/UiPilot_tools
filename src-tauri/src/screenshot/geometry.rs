@@ -127,7 +127,13 @@ impl BudgetedImage {
         pixels
             .try_reserve_exact(bytes)
             .map_err(|_| ScreenshotError::AllocationFailed)?;
-        pixels.resize(bytes, 0);
+        // Vec::resize walks every byte in unoptimized builds. Copy initialized
+        // bytes in doubling spans while keeping all allocation failures fallible.
+        pixels.push(0);
+        while pixels.len() < bytes {
+            let n = pixels.len().min(bytes - pixels.len());
+            pixels.extend_from_within(..n);
+        }
         Ok(Self {
             image: RgbaImage {
                 width,
@@ -206,8 +212,15 @@ pub fn compose(
     }
     let (width, height) = selection.dimensions()?;
     let mut output = BudgetedImage::allocate(width, height, budget)?;
-    for pixel in output.image.pixels.chunks_exact_mut(4) {
-        pixel[3] = 255;
+    // Bulk doubling avoids a debug-build iterator/check per desktop pixel.
+    // Gaps remain opaque black, including captures spanning disjoint monitors.
+    let pixels = output.pixels_mut();
+    pixels[..4].copy_from_slice(&[0, 0, 0, 255]);
+    let mut filled = 4;
+    while filled < pixels.len() {
+        let n = filled.min(pixels.len() - filled);
+        pixels.copy_within(0..n, filled);
+        filled += n;
     }
     for frame in frames {
         let Some(overlap) = selection.intersection(frame.rect) else {
