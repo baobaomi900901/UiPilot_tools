@@ -1,5 +1,8 @@
 pub(crate) mod commands;
 pub(crate) mod display_gate;
+#[cfg(windows)]
+pub(crate) mod desktop_output;
+pub(crate) mod editing;
 pub mod geometry;
 pub(crate) mod hotkey;
 pub mod model;

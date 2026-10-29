@@ -307,6 +307,7 @@ impl ScreenshotHost {
             palette(&theme(&app)),
             excluded,
             super::probe::executable(&app),
+            app.path().desktop_dir().ok(),
             move |result| {
                 let app = callback_app;
                 let _display = display;
@@ -316,7 +317,12 @@ impl ScreenshotHost {
                         as isize;
                 let focus_allowed =
                     handoff_allows_focus(&result, desktop_foreground, handoff_foreground);
+                let mut completed_output = None;
                 let result = match result {
+                    Ok(SelectionResult::Completed { output }) => {
+                        completed_output = Some(output);
+                        Ok(None)
+                    }
                     Ok(SelectionResult::Selected { image, .. }) => (|| {
                         let _workspace = host
                             .service
@@ -362,12 +368,16 @@ impl ScreenshotHost {
                         unsafe { ::windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }
                             .0 as isize;
                     drop(_display);
-                    host.complete(
-                        &app,
-                        ticket,
-                        focus_allowed && foreground == handoff_foreground,
-                        result,
-                    );
+                    if let Some(output) = completed_output {
+                        host.complete_output(&app, ticket, output);
+                    } else {
+                        host.complete(
+                            &app,
+                            ticket,
+                            focus_allowed && foreground == handoff_foreground,
+                            result,
+                        );
+                    }
                     drop(_focus);
                 });
             },
@@ -383,6 +393,57 @@ impl ScreenshotHost {
                 self.complete(&app, ticket, true, Err(format!("captureFailed:{error:?}")))
             }
         }
+    }
+    fn complete_output(
+        &self,
+        app: &AppHandle,
+        ticket: CaptureTicket,
+        output: super::desktop_output::OutputSuccess,
+    ) {
+        let previous_preview = self
+            .preview
+            .lock()
+            .ok()
+            .and_then(|preview| preview.as_ref().map(|preview| preview.instance));
+        if !self.service.finish_selection_output(ticket) {
+            return;
+        }
+        if let Some(instance) = previous_preview {
+            self.destroy(app, instance);
+        }
+        if let Ok(mut origin) = self.launcher_origin.lock() {
+            if origin
+                .as_ref()
+                .is_some_and(|origin| origin.session_id == ticket.session_id)
+            {
+                origin.take();
+            }
+        }
+        // Success must not restore the launcher or focus an old preview. Use the
+        // existing local notification route after native overlays are destroyed.
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            use crate::message_center::{
+                MessageCenterService, MessagePostGuardEffect, MessagePublishOutcome,
+                MessagePublishRequest, MessagePublisher,
+            };
+            let content = output_feedback(&output);
+            let messages = app.state::<Arc<MessageCenterService>>();
+            let effect = match messages.commit_publish(MessagePublishRequest {
+                plugin_id: "builtin:screenshot".into(),
+                plugin_name_snapshot: "截图".into(),
+                content,
+            }) {
+                MessagePublishOutcome::Published(message) => {
+                    Some(MessagePostGuardEffect::Published(message))
+                }
+                MessagePublishOutcome::BecameUnavailable => {
+                    Some(MessagePostGuardEffect::BecameUnavailable)
+                }
+                _ => None,
+            };
+            messages.dispatch_post_guard(&app, effect);
+        });
     }
     fn complete(
         self: &Arc<Self>,
@@ -679,6 +740,18 @@ fn handoff_allows_focus(
                 | Err(_)
         )
 }
+fn output_feedback(output: &super::desktop_output::OutputSuccess) -> String {
+    match output {
+        super::desktop_output::OutputSuccess::Saved(path) => {
+            format!("截图已保存到 {}", path.display())
+        }
+        super::desktop_output::OutputSuccess::Copied => "截图已复制到剪贴板".into(),
+    }
+    .chars()
+    .filter(|character| !character.is_control())
+    .take(500)
+    .collect()
+}
 fn theme(app: &AppHandle) -> String {
     let preference = app
         .state::<crate::settings::SettingsStore>()
@@ -698,6 +771,9 @@ fn palette(theme: &str) -> OverlayPalette {
             selection_border: 0xffffff,
             mask: 0x07080a,
             mask_opacity: 110,
+            primary: 0xffffff,
+            primary_foreground: 0x000000,
+            destructive: 0xff6161,
         }
     } else {
         OverlayPalette {
@@ -706,6 +782,9 @@ fn palette(theme: &str) -> OverlayPalette {
             selection_border: 0x171719,
             mask: 0xf7f7f8,
             mask_opacity: 110,
+            primary: 0x18191a,
+            primary_foreground: 0xffffff,
+            destructive: 0xc62828,
         }
     }
 }
@@ -713,6 +792,25 @@ fn palette(theme: &str) -> OverlayPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_output_success_never_restores_launcher_focus_and_reports_actual_path() {
+        let saved = super::super::desktop_output::OutputSuccess::Saved(std::path::PathBuf::from(
+            "D:/Redirected Desktop/截图.png",
+        ));
+        assert!(output_feedback(&saved).contains("D:/Redirected Desktop/截图.png"));
+        assert!(!handoff_allows_focus(
+            &Ok(SelectionResult::Completed { output: saved }),
+            10,
+            10
+        ));
+        let copied = super::super::desktop_output::OutputSuccess::Copied;
+        assert_eq!(output_feedback(&copied), "截图已复制到剪贴板");
+        assert!(!handoff_allows_focus(
+            &Ok(SelectionResult::Completed { output: copied }),
+            10,
+            10
+        ));
+    }
     #[test]
     fn launcher_errors_keep_original_query_identity_and_ignore_unrelated_or_hotkey_sessions() {
         let host = ScreenshotHost::default();

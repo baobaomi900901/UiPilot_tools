@@ -7,7 +7,7 @@ use super::{
 };
 use std::sync::{
     atomic::{AtomicU8, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::JoinHandle;
 use windows::Win32::{
@@ -39,6 +39,9 @@ pub enum CancelReason {
 }
 #[derive(Debug)]
 pub enum SelectionResult {
+    Completed {
+        output: super::desktop_output::OutputSuccess,
+    },
     Selected {
         rect: PhysicalRect,
         image: BudgetedImage,
@@ -54,6 +57,9 @@ pub struct OverlayPalette {
     pub selection_border: u32,
     pub mask: u32,
     pub mask_opacity: u8,
+    pub primary: u32,
+    pub primary_foreground: u32,
+    pub destructive: u32,
 }
 struct WakeEvent(HANDLE);
 // Kernel events support cross-thread SetEvent/waits. The Arc keeps this handle
@@ -71,17 +77,33 @@ impl Drop for WakeEvent {
 struct Cancellation {
     reason: AtomicU8,
     wake: Option<WakeEvent>,
+    output_gate: Mutex<Option<Arc<super::desktop_output::OutputGate>>>,
 }
 impl Cancellation {
     fn cancel(&self, reason: CancelReason) {
         let _ = self
             .reason
             .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
+        if let Some(gate) = self
+            .output_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            gate.cancel();
+        }
         if let Some(wake) = &self.wake {
             unsafe {
                 let _ = SetEvent(wake.0);
             }
         }
+    }
+    fn register_output(&self, gate: Arc<super::desktop_output::OutputGate>) {
+        let mut slot = self.output_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if self.reason().is_some() {
+            gate.cancel();
+        }
+        *slot = Some(gate);
     }
     fn reason(&self) -> Option<CancelReason> {
         match self.reason.load(Ordering::Acquire) {
@@ -128,6 +150,7 @@ pub fn start_selection(
     palette: OverlayPalette,
     excluded_windows: Vec<isize>,
     provider: Option<std::path::PathBuf>,
+    desktop: Option<std::path::PathBuf>,
     complete: impl FnOnce(Result<SelectionResult, NativeError>) + Send + 'static,
 ) -> Result<SelectionHandle, NativeError> {
     let cancellation = Arc::new(Cancellation {
@@ -135,6 +158,7 @@ pub fn start_selection(
         wake: Some(WakeEvent(unsafe {
             CreateEventW(None, true, false, None).map_err(|_| NativeError::OverlayFailed)?
         })),
+        output_gate: Mutex::new(None),
     });
     let worker_cancel = cancellation.clone();
     let thread = std::thread::Builder::new()
@@ -147,6 +171,7 @@ pub fn start_selection(
                     palette,
                     &excluded_windows,
                     provider,
+                    desktop,
                     &worker_cancel,
                 )
             }))
@@ -163,6 +188,17 @@ pub fn start_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_before_or_after_output_registration_reaches_each_job_gate() {
+        let cancellation = Cancellation::default();
+        let gate = Arc::new(super::super::desktop_output::OutputGate::new());
+        cancellation.register_output(gate.clone());
+        cancellation.cancel(CancelReason::Requested);
+        assert!(gate.is_cancelled());
+        let late_gate = Arc::new(super::super::desktop_output::OutputGate::new());
+        cancellation.register_output(late_gate.clone());
+        assert!(late_gate.is_cancelled());
+    }
     #[test]
     fn cancellation_before_worker_queue_exists_is_retained_and_first_reason_wins() {
         let cancellation = Cancellation::default();

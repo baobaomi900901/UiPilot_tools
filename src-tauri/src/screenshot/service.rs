@@ -271,6 +271,23 @@ impl ScreenshotService {
         }
     }
 
+    /// Finish a native editor output without creating a preview session.
+    pub fn finish_selection_output(&self, ticket: CaptureTicket) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !state
+            .current
+            .as_ref()
+            .is_some_and(|session| session.ticket == ticket && session.phase == Phase::Selecting)
+            || state.bump().is_err()
+        {
+            return false;
+        }
+        state.current = None;
+        true
+    }
+
     pub fn bind_window(&self, ticket: CaptureTicket, instance: u64) -> Result<Owner, ServiceError> {
         if instance == 0 {
             return Err(ServiceError::Expired);
@@ -472,6 +489,55 @@ impl ScreenshotService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_output_completion_releases_session_without_a_preview() {
+        let service = ScreenshotService::default();
+        let Begin::Capture(ticket) = service
+            .begin(ScreenshotMode::Region, Origin::Launcher)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            !service.finish_selection_output(ticket),
+            "not selecting yet"
+        );
+        assert!(service.selecting(ticket));
+        assert!(service.finish_selection_output(ticket));
+        assert!(service.current_ticket().is_none());
+        let Begin::Capture(next) = service
+            .begin(ScreenshotMode::Region, Origin::Hotkey)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            !service.finish_selection_output(ticket),
+            "old completion must not close a new session"
+        );
+        assert_eq!(service.current_ticket(), Some(next));
+    }
+
+    #[test]
+    fn successful_retake_output_releases_previous_image_but_cancel_still_preserves_it() {
+        let service = ScreenshotService::default();
+        let owner = ready(&service);
+        assert!(service.budget.used() > 0);
+        let ticket = service.retake(owner).unwrap();
+        assert!(service.selecting(ticket));
+        assert!(service.finish_selection_output(ticket));
+        assert_eq!(service.budget.used(), 0);
+        assert!(service.current_ticket().is_none());
+        let owner = ready(&service);
+        let ticket = service.retake(owner).unwrap();
+        assert!(service.selecting(ticket));
+        assert_eq!(
+            service.finish_capture(ticket, Ok(None)),
+            CaptureFinish::Preview
+        );
+        assert!(service.budget.used() > 0);
+    }
 
     #[test]
     fn failed_preview_creation_allows_new_capture_but_stale_abort_does_not() {
