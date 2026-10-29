@@ -45,6 +45,8 @@ fn main() {
             "load_find_thumbnail",
             "hide_find_window",
             "select_public_plugin_directory",
+            "list_builtin_features",
+            "set_builtin_feature_enabled",
             "list_public_plugins",
             "set_public_plugin_command_hotkey",
             "resolve_public_plugin_command_entry",

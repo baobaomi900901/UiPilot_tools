@@ -879,7 +879,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 102);
+        assert_eq!(production.matches("commands::").count(), 106);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -892,6 +892,8 @@ mod tests {
             "load_find_thumbnail",
             "hide_find_window",
             "select_public_plugin_directory",
+            "list_builtin_features",
+            "set_builtin_feature_enabled",
             "list_public_plugins",
             "set_public_plugin_command_hotkey",
             "resolve_public_plugin_command_entry",
@@ -1077,6 +1079,32 @@ mod tests {
         assert!(
             !include_str!("../capabilities/plugin-runtime.json").contains("set-theme-preference")
         );
+    }
+
+    #[test]
+    fn builtin_management_commands_resolve_only_for_main_webview() {
+        use tauri::utils::{acl::resolved::Resolved, acl::ExecutionContext, platform::Target};
+
+        let manifests = serde_json::from_str(include_str!("../gen/schemas/acl-manifests.json"))
+            .expect("build-generated permission manifests must parse");
+        let capabilities = serde_json::from_str(include_str!("../gen/schemas/capabilities.json"))
+            .expect("build-generated capabilities must parse");
+        let resolved = Resolved::resolve(&manifests, capabilities, Target::Windows)
+            .expect("production capabilities must resolve");
+        assert!(resolved.has_app_acl);
+        for command in ["list_builtin_features", "set_builtin_feature_enabled"] {
+            let permissions = resolved
+                .allowed_commands
+                .get(command)
+                .unwrap_or_else(|| panic!("main WebView cannot invoke {command}"));
+            assert_eq!(permissions.len(), 1, "unexpected grants for {command}");
+            let permission = &permissions[0];
+            assert_eq!(permission.context, ExecutionContext::Local);
+            assert!(permission.windows.is_empty());
+            assert_eq!(permission.webviews.len(), 1);
+            assert_eq!(permission.webviews[0].as_str(), "main");
+            assert!(!resolved.denied_commands.contains_key(command));
+        }
     }
 
     #[test]

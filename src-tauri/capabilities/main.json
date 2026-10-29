@@ -8,6 +8,8 @@
     "core:app:allow-version",
     "allow-open-find-window",
     "allow-select-public-plugin-directory",
+    "allow-list-builtin-features",
+    "allow-set-builtin-feature-enabled",
     "allow-list-public-plugins",
     "allow-set-public-plugin-command-hotkey",
     "allow-set-screenshot-hotkey",

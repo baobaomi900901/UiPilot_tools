@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-builtin-feature-enabled"
+description = "Enables the set_builtin_feature_enabled command without any pre-configured scope."
+commands.allow = ["set_builtin_feature_enabled"]
+
+[[permission]]
+identifier = "deny-set-builtin-feature-enabled"
+description = "Denies the set_builtin_feature_enabled command without any pre-configured scope."
+commands.deny = ["set_builtin_feature_enabled"]
