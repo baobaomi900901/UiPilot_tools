@@ -224,3 +224,28 @@ test('preserves bounded structured Runtime failure while bridge exceptions stay 
   await h.tick()
   assert.deepEqual(h.model.getState().error,{code:'PERMISSION_DENIED',message:'请在设置中授权翻译服务'})
 })
+for (const outcome of ['success', 'failure']) {
+  test(`unchanged composition after ${outcome} does not request again`, async () => {
+    const h = harness()
+    h.ready()
+    await h.tick()
+    h.calls[0].resolve(outcome === 'success' ? success() : { ok: false, code: 'FAILED', message: '翻译失败' })
+    await h.tick()
+    h.model.setComposition(true)
+    h.model.setComposition(false)
+    await h.tick(500)
+    assert.equal(h.calls.length, 1)
+  })
+}
+test('composition resumes legitimate suspended pending text', async () => {
+  const h = harness()
+  h.ready('')
+  h.model.editText('pending')
+  h.model.setComposition(true)
+  await h.tick(500)
+  assert.equal(h.calls.length, 0)
+  h.model.setComposition(false)
+  await h.tick(500)
+  assert.equal(h.calls.length, 1)
+  assert.equal(h.calls[0].input.payload.text, 'pending')
+})

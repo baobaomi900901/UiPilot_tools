@@ -4,6 +4,7 @@ import { isLanguage, sanitizePreferences } from './languages.js'
 export function createPanelModel({ request, preferences, clock = { now: () => Date.now(), setTimeout, clearTimeout } }) {
  let state = { ...sanitizePreferences(preferences), text: '', translation: '', detectedSourceLanguage: null, status: 'idle', error: null, speaking: null, sessionEpoch: null, revision: 0 }
  let identity = null, ready = false, disposed = false, composing = false, pending = null, active = null, timer = null, generation = 0
+ let compositionWork = false
  const listeners = new Set()
  const getState = () => ({ ...state, error: state.error && { ...state.error } })
  const emit = () => { for (const listener of listeners) listener(getState()) }
@@ -16,7 +17,8 @@ export function createPanelModel({ request, preferences, clock = { now: () => Da
  function schedule(delay) {
   clearTimer()
   pending = null
-  if (disposed || composing || !state.text.trim()) { emit(); return }
+  if (disposed || !state.text.trim()) { emit(); return }
+  if (composing) { compositionWork = true; emit(); return }
   if (new TextEncoder().encode(state.text).length > 8192) {
    state.status = 'error'; state.error = { code: 'TEXT_TOO_LONG', message: '原文不能超过 8192 字节' }; emit(); return
   }
@@ -61,7 +63,7 @@ export function createPanelModel({ request, preferences, clock = { now: () => Da
   subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
   installUpdate(update) {
    if (disposed) return
-   generation++; ready = false; composing = false
+   generation++; ready = false; composing = false; compositionWork = false
    identity = { sessionEpoch: update.sessionEpoch, requestId: update.requestId }
    invalidate()
    state = { ...state, ...(update.preferences === undefined ? {} : sanitizePreferences(update.preferences)), sessionEpoch: update.sessionEpoch, text: typeof update.text === 'string' ? update.text : '' }
@@ -73,7 +75,20 @@ export function createPanelModel({ request, preferences, clock = { now: () => Da
    if (pending) { clearTimer(); timer = clock.setTimeout(pump, Math.max(0, pending.due - clock.now())) }
   },
   editText(text) { if (disposed) return; invalidate(); state.text = String(text); schedule(500) },
-  setComposition(value) { if (disposed) return; composing = Boolean(value); if (composing) { clearTimer(); pending = null } else schedule(500) },
+  setComposition(value) {
+   if (disposed || composing === Boolean(value)) return
+   composing = Boolean(value)
+   if (composing) {
+    // Preserve only work that was actually waiting before composition began.
+    compositionWork = pending !== null
+    clearTimer()
+    pending = null
+    return
+   }
+   const resume = compositionWork
+   compositionWork = false
+   if (resume) schedule(500)
+  },
   submit() { if (!disposed && !composing) { invalidate(); schedule(0) } },
   setLanguages(sourceLanguage, targetLanguage) {
    if (disposed) return
@@ -96,4 +111,3 @@ export function createPanelModel({ request, preferences, clock = { now: () => Da
   dispose() { disposed = true; generation++; clearTimer(); pending = null; listeners.clear(); state.speaking = null },
  }
 }
-
