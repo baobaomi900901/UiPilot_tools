@@ -31,7 +31,7 @@ function isValidPayload(payload) {
   if (keys.length !== payloadKeys.length || !payloadKeys.every(key =>
     Object.hasOwn(descriptors, key) && descriptors[key].enumerable && Object.hasOwn(descriptors[key], 'value'))) return false
   return typeof payload.providerId === 'string' && Boolean(getProvider(payload.providerId))
-    && typeof payload.text === 'string' && payload.text.length > 0
+    && typeof payload.text === 'string' && payload.text.trim().length > 0
     && !payload.text.includes('\0') && encoder.encode(payload.text).length <= 8192
     && (payload.sourceLanguage === 'auto' || isLanguage(payload.sourceLanguage))
     && isLanguage(payload.targetLanguage)

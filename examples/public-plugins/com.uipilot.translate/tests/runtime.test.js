@@ -105,3 +105,9 @@ test('sparse translation arrays are rejected', async () => {
   const response = await invoke(payload, service(async () => ({ ...success, translations: new Array(1) })))
   assert.equal(response.data.code, 'INVALID_RESPONSE')
 })
+
+test('whitespace-only explicit action never invokes the service', async () => {
+  const result = await invoke({ ...payload, text: ' \t\r\n ' }, service(() => assert.fail('blank text called service')))
+  assert.equal(result.data.ok, false)
+  assert.equal(result.data.code, 'INVALID_REQUEST')
+})
