@@ -630,10 +630,27 @@ fn normalized_item(source: &str, marker: &str) -> String {
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source
         .find(start)
+        .or_else(|| source.find(&start.replace('\n', "\r\n")))
         .unwrap_or_else(|| panic!("missing {start}"));
     let source = &source[start..];
-    let end = source.find(end).unwrap_or_else(|| panic!("missing {end}"));
+    let end = source
+        .find(end)
+        .or_else(|| source.find(&end.replace('\n', "\r\n")))
+        .unwrap_or_else(|| panic!("missing {end}"));
     &source[..end]
+}
+
+#[test]
+fn batch_catalog_source_boundaries_support_lf_and_crlf() {
+    let start = "#[cfg(not(windows))]\npub(crate) struct ProcessAuthority";
+    let end = "#[cfg(not(windows))]\npub(crate) enum ProcessAdmission";
+    let body = format!("{start};\n\n{end} {{}}\n");
+    for source in [body.clone(), body.replace('\n', "\r\n")] {
+        assert_eq!(
+            source_between(&source, start, end).replace("\r\n", "\n"),
+            format!("{start};\n\n")
+        );
+    }
 }
 
 fn expected_catalog(entries: &[&str]) -> Vec<String> {
@@ -3227,7 +3244,7 @@ mod windows_batch {
         }
 
         fn select_window_mode(&self, pid: u32, mode: &str) {
-            fs::write(self.dir.join(format!("{pid}.mode")), mode).unwrap();
+            publish_control_payload(&self.dir.join(format!("{pid}.mode")), mode).unwrap();
         }
 
         fn retain_pending(&mut self, child: PendingChild) -> usize {
@@ -3735,6 +3752,33 @@ mod windows_batch {
     }
 
     #[test]
+    fn windows_batch_selected_window_waits_for_parent_mode_publication() {
+        let mut fixture = FixtureController::new(false);
+        let mut child =
+            fixture.spawn_pending(&std::env::current_exe().unwrap(), "select-window", None);
+        let pid = child.id();
+        let selecting = fixture.dir.join(format!("{pid}.selecting"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !selecting.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not await mode selection"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The parent may still be spawning another child when this lease used to expire.
+        thread::sleep(Duration::from_millis(5_100));
+        assert!(
+            child.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "selected-window fixture exited before its parent published a mode"
+        );
+        fixture.select_window_mode(pid, "graceful-window");
+        let node = fixture.retain_pending(child);
+        fixture.wait_ready(node);
+        fixture.cleanup_asserted();
+    }
+
+    #[test]
     fn windows_batch_pre_registration_failure_keeps_child_guarded() {
         let mut fixture = FixtureController::new(true);
         let child = fixture.spawn_pending(fixture.copied_exe.as_ref().unwrap(), "sleep", None);
@@ -3818,13 +3862,14 @@ mod windows_batch {
             Ok("select-window") => {
                 let path = PathBuf::from(std::env::var_os(CONTROL).unwrap())
                     .join(format!("{}.mode", std::process::id()));
-                let deadline = Instant::now() + Duration::from_secs(5);
+                fs::write(path.with_extension("selecting"), b"waiting").unwrap();
+                // The parent owns this child while spawning its sibling. Use the
+                // fixture-wide watchdog above rather than a competing short lease.
                 let selected = loop {
                     if let Ok(value) = fs::read_to_string(&path) {
-                        break value;
-                    }
-                    if Instant::now() >= deadline {
-                        return;
+                        if matches!(value.trim(), "graceful-window" | "ignore-close-window") {
+                            break value;
+                        }
                     }
                     thread::sleep(Duration::from_millis(10));
                 };
@@ -3853,7 +3898,7 @@ mod windows_batch {
     fn run_tree_parent() {
         let child = PendingChild::new(spawn_descendant("tree-child"));
         let control = PathBuf::from(std::env::var_os(CONTROL).unwrap());
-        fs::write(control.join("child.pid"), child.id().to_string()).unwrap();
+        publish_control_payload(&control.join("child.pid"), &child.id().to_string()).unwrap();
         if !wait_for_ack(&control.join("child.ack")) {
             return;
         }
@@ -3865,12 +3910,26 @@ mod windows_batch {
         let grandchild =
             PendingChild::new(spawn_descendant(std::env::var(TREE_KIND).unwrap().as_str()));
         let control = PathBuf::from(std::env::var_os(CONTROL).unwrap());
-        fs::write(control.join("grandchild.pid"), grandchild.id().to_string()).unwrap();
+        publish_control_payload(
+            &control.join("grandchild.pid"),
+            &grandchild.id().to_string(),
+        )
+        .unwrap();
         if !wait_for_ack(&control.join("grandchild.ack")) {
             return;
         }
         grandchild.disarm();
         run_fixture_kind();
+    }
+
+    fn publish_control_payload(path: &std::path::Path, payload: &str) -> std::io::Result<()> {
+        // Readers may poll as soon as a path exists. Publish only after the
+        // complete payload has been written and the staging handle is closed.
+        let mut staging = path.as_os_str().to_os_string();
+        staging.push(".pending");
+        let staging = PathBuf::from(staging);
+        fs::write(&staging, payload)?;
+        fs::rename(staging, path)
     }
 
     fn wait_for_ack(path: &std::path::Path) -> bool {

@@ -1873,7 +1873,6 @@ fn repository_multi_demo_stages_real_directory_and_archive_on_current_and_reject
         version: [0, 5, 0],
         ..host()
     };
-    assert_eq!(host().version, [0, 10, 0]);
     let historical_host = PublicPluginHost {
         version: [0, 4, 0],
         ..host()
@@ -1896,7 +1895,16 @@ fn repository_multi_demo_stages_real_directory_and_archive_on_current_and_reject
                 .unwrap_err(),
             PublicPackageError::IncompatibleApi
         );
+        let current_root = TestRoot::new("multi-demo-current-host");
+        let current = stage_public_package(
+            package_source.clone(),
+            &current_root.staging(),
+            &host(),
+        )
+        .unwrap();
         let prepared = stage_public_package(package_source, &root.staging(), &new_host).unwrap();
+        assert_eq!(current.manifest, prepared.manifest);
+        assert_eq!(current.revalidate(), Ok(()));
         assert_eq!(prepared.manifest.plugin_id, "com.uipilot.demo-multi");
         assert!(prepared.manifest.is_multi_command());
         assert!(prepared.manifest.legacy_command().is_none());
@@ -2011,8 +2019,7 @@ fn repository_credential_demo_stages_on_0_4_0_and_rejects_0_3_4_without_cli_buil
         ),
         Err(PublicPackageError::IncompatibleApi)
     ));
-    let root = TestRoot::new("credential-demo-current-host");
-    assert_eq!(host().version, [0, 10, 0]);
+    let root = TestRoot::new("credential-demo-0-4-host");
     let credential_host = PublicPluginHost {
         version: [0, 4, 0],
         ..host()
@@ -2056,6 +2063,15 @@ fn repository_credential_demo_stages_on_0_4_0_and_rejects_0_3_4_without_cli_buil
         fs::read(source.join("dist/runtime.js")).unwrap()
     );
     assert_eq!(prepared.revalidate(), Ok(()));
+    let current_root = TestRoot::new("credential-demo-current-host");
+    let current = stage_public_package(
+        PublicPackageSource::DevelopmentDirectory(source),
+        &current_root.staging(),
+        &host(),
+    )
+    .unwrap();
+    assert_eq!(current.manifest, prepared.manifest);
+    assert_eq!(current.revalidate(), Ok(()));
 }
 
 #[test]

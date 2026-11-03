@@ -421,10 +421,42 @@ mod tests {
             .unwrap_or_else(|code| panic!("{code}"));
         assert!(facts.user_sid.starts_with("S-1-"));
         assert!(facts.integrity > 0);
+        // Observe the runner's actual WTS state independently: RDP runners must
+        // exercise rejection, while a supported local-console runner must pass.
+        let active_console = unsafe { WTSGetActiveConsoleSessionId() };
+        let mut buffer = PWSTR::null();
+        let mut size = 0;
+        unsafe {
+            WTSQuerySessionInformationW(
+                None,
+                facts.session_id,
+                WTSClientProtocolType,
+                &mut buffer,
+                &mut size,
+            )
+        }
+        .expect("runner WTS protocol must be readable");
+        let protocol = if !buffer.is_null() && size == 2 {
+            Some(unsafe { buffer.0.read_unaligned() })
+        } else {
+            None
+        };
+        unsafe { WTSFreeMemory(buffer.0.cast()) };
+        let protocol = protocol.expect("runner WTS protocol must be a u16");
+        let expected = if facts.session_id != 0
+            && active_console != u32::MAX
+            && facts.session_id == active_console
+            && protocol == 0
+        {
+            Ok(())
+        } else {
+            Err("PeerSessionRejected")
+        };
         assert_eq!(
             verify_local_console(facts.session_id),
-            Ok(()),
-            "requires the supported local-console environment"
+            expected,
+            "native console policy disagrees with observed session={}, active_console={active_console}, protocol={protocol}",
+            facts.session_id
         );
     }
 }

@@ -11135,13 +11135,26 @@ mod tests {
             Some(first_epoch)
         );
 
+        let before_reservation = manager.route("/renamed").unwrap().unwrap();
+        assert_eq!(before_reservation.generation, 1);
+        assert_eq!(before_reservation.activation_id, first_id);
+        assert_eq!(before_reservation.admission_epoch, first_epoch);
         let reservation = manager.bundles.reserve("com.example.activation").unwrap();
-        assert_eq!(manager.route("/renamed").unwrap().unwrap().generation, 1);
+        // Routing requires a confirmed owner even while the old bundle remains
+        // readable: a reservation can begin committing outside the mutation lock.
+        assert_eq!(
+            manager.route("/renamed"),
+            Err(PublicPluginManagementError::Unavailable)
+        );
         assert_eq!(
             manager.rename("com.example.activation", Some("blocked")),
             Err(PublicPluginManagementError::Unavailable)
         );
         drop(reservation);
+        assert_eq!(
+            manager.route("/renamed").unwrap().unwrap(),
+            before_reservation
+        );
 
         manager.uninstall("com.example.activation", false).unwrap();
         assert_eq!(manager.activation_id("com.example.activation"), None);
@@ -11448,7 +11461,10 @@ mod tests {
             .begin_uninstall("com.example.activation", false)
             .unwrap()
             .unwrap();
-        manager.abort_uninstall_before_commit(transaction).unwrap();
+        let recovery = manager
+            .abort_uninstall_before_commit(transaction)
+            .unwrap()
+            .unwrap();
         let suggestions = manager
             .command_suggestions("activation")
             .unwrap()
@@ -11465,13 +11481,16 @@ mod tests {
         assert_eq!(selected.plugin_id, "com.example.other");
         assert_eq!(selected.input, "hello  world");
         assert!(!selected.runtime_recovery_needed);
-        assert!(
-            manager
-                .route("/activation hello  world")
-                .unwrap()
-                .unwrap()
-                .runtime_recovery_needed
-        );
+        // Both bundles own this alias; name lookup has no stable iteration order.
+        // Inspect the excluded recovering owner through its captured identity.
+        let recovering = manager
+            .route_by_id(&recovery.plugin_id, "default", &argument)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovering.plugin_id, "com.example.activation");
+        assert_eq!(recovering.activation_id, recovery.activation_id);
+        assert_eq!(recovering.admission_epoch, recovery.admission_epoch);
+        assert!(recovering.runtime_recovery_needed);
     }
 
     #[test]

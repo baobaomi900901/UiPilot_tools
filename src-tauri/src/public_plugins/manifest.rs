@@ -1708,9 +1708,13 @@ mod schema_tests {
             ),
             Err(PublicPackageError::UnsupportedPermission)
         );
+        let mut boundary_host = PublicPluginHost::current(PublicPlatform::Windows);
+        boundary_host.version = [0, 3, 2];
+        assert!(parse_manifest(&serde_json::to_vec(&eight_hosts).unwrap(), &boundary_host).is_ok());
+        boundary_host.version = [0, 3, 1];
         assert_eq!(
-            PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 16, 0]
+            parse_manifest(&serde_json::to_vec(&eight_hosts).unwrap(), &boundary_host),
+            Err(PublicPackageError::IncompatibleApi)
         );
     }
 

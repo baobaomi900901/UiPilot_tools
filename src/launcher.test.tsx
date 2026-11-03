@@ -10888,17 +10888,36 @@ describe('command hotkey entry', () => {
       }
     } finally { await mounted.unmount(); core.destroy() }
   })
-  it('still defers default search for an ordinary native show', async () => {
+  it.each([false, true])('still defers default search for an ordinary native show (same-value input: %s)', async (sameValueInput) => {
     vi.useFakeTimers()
     const fake = await startedCore()
     try {
       vi.mocked(fake.client.searchApps).mockResolvedValueOnce({ requestId: 'ordinary-default', items: [panelItem('')] } as unknown as SearchResponse)
       fake.emit(shown('ordinary-native-show'))
+      if (sameValueInput) {
+        fake.core.text({ kind: 'ordinaryInput', control: fake.core.getSnapshot().queryControl, value: '', inputType: 'insertText' })
+      }
       expect(fake.client.searchApps).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(0)
       expect(fake.client.searchApps).toHaveBeenCalledExactlyOnceWith({ query: '', invocationId: 'ordinary-native-show', querySequence: 1 })
       expect(fake.core.getSnapshot().results).toHaveLength(1)
       expect(fake.client.resolvePublicPluginCommandEntry).not.toHaveBeenCalled()
+    } finally { fake.core.destroy(); vi.useRealTimers() }
+  })
+
+  it.each(['edit', 'composition'] as const)('retires the native-show default search after a real %s', async (change) => {
+    vi.useFakeTimers()
+    const fake = await startedCore()
+    try {
+      fake.emit(shown('ordinary-native-show'))
+      const control = fake.core.getSnapshot().queryControl
+      if (change === 'edit') {
+        fake.core.text({ kind: 'ordinaryInput', control, value: 'new query', inputType: 'insertText' })
+      } else {
+        fake.core.text({ kind: 'compositionStart', control })
+      }
+      await vi.advanceTimersByTimeAsync(0)
+      expect(vi.mocked(fake.client.searchApps).mock.calls.map(([request]) => request.query)).toEqual(change === 'edit' ? ['new query'] : [])
     } finally { fake.core.destroy(); vi.useRealTimers() }
   })
 

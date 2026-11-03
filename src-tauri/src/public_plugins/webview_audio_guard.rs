@@ -733,10 +733,10 @@ mod tests {
         }
         let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            compact.contains("runtime::public_runtime_bootstrap_with_actions(candidate.network_https_declared,candidate.panel_actions,candidate.window_actions,)")
-                || compact.contains("runtime::public_runtime_bootstrap_with_actions(candidate.network_https_declared,candidate.panel_actions,candidate.window_actions)"),
+            compact.contains("runtime::public_runtime_bootstrap_with_result_actions(candidate.network_https_declared,candidate.panel_actions,candidate.window_actions,candidate.result_actions,)")
+                || compact.contains("runtime::public_runtime_bootstrap_with_result_actions(candidate.network_https_declared,candidate.panel_actions,candidate.window_actions,candidate.result_actions)"),
             "missing opt-in-aware runtime bootstrap call"
         );
-        assert!(!production.contains(".initialization_script(public_runtime_bootstrap"));
+        assert!(!compact.contains(".initialization_script("));
     }
 }

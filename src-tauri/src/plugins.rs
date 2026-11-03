@@ -7666,8 +7666,10 @@ mod tests {
         #[test]
         fn result_action_review_native_invalidation_callpoints_drain_before_rollback_receipts_and_error_propagation(
         ) {
-            let source = include_str!("plugins.rs");
-            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let source = include_str!("plugins.rs").replace("\r\n", "\n");
+            let (production, _) = source
+                .split_once("#[cfg(test)]\nmod tests")
+                .expect("production/test boundary is missing");
             let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
             assert_eq!(normalized.matches("cleanup_retired_public_result_actions(app, registry); let revision = match promotion").count(),3);
             assert!(normalized

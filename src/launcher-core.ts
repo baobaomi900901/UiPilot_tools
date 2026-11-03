@@ -2739,6 +2739,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const settingsControl = findTextControl(record.control) !== undefined
     if (!queryControl && !mainResultControl && !panelControl && !settingsControl) return
     if (settingsControl && !settingsEditable()) return
+    // A duplicate input notification must not retire the native show's queued search.
+    if (record.kind === 'ordinaryInput' && queryControl &&
+      record.value === model.query && record.value === model.queryControlValue &&
+      !ownsComposition(composition, record.control)) return
     if (record.kind === 'ordinaryInput' || record.kind === 'compositionStart') {
       commandEntryToken++
       void client.cancelTranslationSelection?.().catch(() => {})

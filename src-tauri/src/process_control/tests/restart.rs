@@ -616,8 +616,7 @@ fn restart_receipt_contract_is_opaque_nonclone_and_debug_redacted() {
         "pub(crate) struct ProcessLaunchReceipt",
         "pub(crate) struct ProcessRestartPlan",
     ] {
-        let prefix = source.split(declaration).next().unwrap();
-        let attributes = prefix.rsplit("\n\n").next().unwrap_or_default();
+        let attributes = restart_declaration_attributes(source, declaration);
         assert!(!attributes.contains("Clone"));
         assert!(!attributes.contains("Copy"));
         assert!(!attributes.contains("Serialize"));
@@ -634,6 +633,29 @@ fn restart_receipt_contract_is_opaque_nonclone_and_debug_redacted() {
         _ => unreachable!(),
     };
     assert_eq!(format!("{receipt:?}"), "ProcessLaunchReceipt { .. }");
+}
+
+fn restart_declaration_attributes(source: &str, declaration: &str) -> String {
+    let source = source.replace("\r\n", "\n");
+    let (prefix, _) = source
+        .split_once(declaration)
+        .unwrap_or_else(|| panic!("missing {declaration}"));
+    prefix.rsplit("\n\n").next().unwrap_or_default().to_owned()
+}
+
+#[test]
+fn restart_receipt_attribute_guard_supports_lf_and_crlf() {
+    let declaration = "pub(crate) struct ProcessLaunchReceipt";
+    for ending in ["\n", "\r\n"] {
+        let source = format!("#[derive(Clone)]\nstruct Unrelated;\n\n{declaration} {{}}")
+            .replace('\n', ending);
+        assert!(restart_declaration_attributes(&source, declaration).is_empty());
+        for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+            let source =
+                format!("#[derive({forbidden})]\n{declaration} {{}}").replace('\n', ending);
+            assert!(restart_declaration_attributes(&source, declaration).contains(forbidden));
+        }
+    }
 }
 
 #[test]
