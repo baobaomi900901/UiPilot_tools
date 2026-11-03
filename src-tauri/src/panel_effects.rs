@@ -16,13 +16,7 @@ impl EffectLease {
         self.0.lock().map(|v| *v).unwrap_or(false)
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) enum SpeechLanguage {
-    #[serde(rename = "en")]
-    English,
-    #[serde(rename = "zh-CHS")]
-    Chinese,
-}
+pub(crate) use crate::translation_languages::TranslationLanguage as SpeechLanguage;
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SpeechVoice {
@@ -445,6 +439,26 @@ mod tests {
         assert!(!a.valid());
     }
     #[test]
+    fn speech_language_contract_matches_catalog_and_rejects_unknown_codes() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../../docs/plugin-sdk/youdao-languages.json"))
+                .unwrap();
+        for entry in catalog["languages"].as_array().unwrap() {
+            let language = &entry["id"];
+            let input: SpeechPlay = serde_json::from_value(
+                serde_json::json!({ "text": "hello", "language": language }),
+            )
+            .unwrap();
+            assert_eq!(serde_json::to_value(input.language).unwrap(), *language);
+        }
+        for language in ["auto", "xx", "JA", "zh-cn", "sr", ""] {
+            assert!(serde_json::from_value::<SpeechPlay>(
+                serde_json::json!({ "text": "hello", "language": language })
+            )
+            .is_err());
+        }
+    }
+    #[test]
     fn text_contract_preserves_whitespace_and_bounds_utf8() {
         assert_eq!(validate_text(" \n "), Ok(()));
         for value in ["".into(), "a\0b".into(), "中".repeat(5462)] {
@@ -477,7 +491,12 @@ mod tests {
         let old = worker.play(b.clone(), input()).unwrap();
         let current = worker.play(b.clone(), input()).unwrap();
         let stops = worker.driver.stops;
-        assert_eq!(worker.stop(&b, old.playback_id.as_deref().unwrap()).unwrap(), current);
+        assert_eq!(
+            worker
+                .stop(&b, old.playback_id.as_deref().unwrap())
+                .unwrap(),
+            current
+        );
         assert_eq!(worker.driver.stops, stops);
     }
     #[test]

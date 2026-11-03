@@ -1,6 +1,8 @@
 // Captured-session clipboard and native-speech facades. No native error text crosses this boundary.
 const panelEffects = (() => {
   const errors = new Set(['PermissionDenied', 'ExpiredPanelSession', 'InvalidPanelText', 'ClipboardWriteFailed', 'SpeechUnavailable', 'SpeechBusy', 'SpeechVoiceUnavailable', 'SpeechFailed']);
+  // Catalog: docs/plugin-sdk/youdao-languages.json; kept in agreement by bridge tests.
+  const speechLanguages = new Set(["ar","de","en","es","fr","hi","id","it","ja","ko","nl","pt","ru","th","vi","zh-CHS","zh-CHT","af","am","az","be","bg","bn","bs","ca","ceb","co","cs","cy","da","el","eo","et","eu","fa","fi","fj","fy","ga","gd","gl","gu","ha","haw","he","hr","ht","hu","hy","ig","is","jw","ka","kk","km","kn","ku","ky","la","lb","lo","lt","lv","mg","mi","mk","ml","mn","mr","ms","mt","mww","my","ne","no","ny","otq","pa","pl","ps","ro","sd","si","sk","sl","sm","sn","so","sq","sr-Cyrl","sr-Latn","st","su","sv","sw","ta","te","tg","tl","tlh","to","tr","ty","uk","ur","uz","xh","yi","yo","yua","yue","zu"]);
   let session = null;
   const inputSnapshot = (input, keys) => {
     try {
@@ -23,14 +25,14 @@ const panelEffects = (() => {
     return value;
   };
   const language = value => {
-    if (value !== 'en' && value !== 'zh-CHS') throw namedError('InvalidPanelText');
+    if (!speechLanguages.has(value)) throw namedError('InvalidPanelText');
     return value;
   };
   const state = value => {
     if (!value || typeof value !== 'object' || Object.keys(value).some(key => !['playbackId','status','language','errorCode'].includes(key)) ||
         !['idle','playing','completed','stopped','error'].includes(value.status) ||
         !(value.playbackId === null || typeof value.playbackId === 'string' && value.playbackId.length > 0) ||
-        !(value.language === null || ['en','zh-CHS'].includes(value.language)) ||
+        !(value.language === null || speechLanguages.has(value.language)) ||
         (value.errorCode !== undefined && !errors.has(value.errorCode))) throw namedError('SpeechFailed');
     return deepFreeze({ playbackId: value.playbackId, status: value.status, language: value.language, ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }) });
   };
@@ -58,7 +60,7 @@ const panelEffects = (() => {
     owner.speech = deepFreeze({
       async voices() {
         const voices = await call('plugin_panel_speech_voices');
-        if (!Array.isArray(voices) || voices.some(voice => !voice || Object.keys(voice).sort().join(',') !== 'id,language,name' || typeof voice.id !== 'string' || typeof voice.name !== 'string' || !['en','zh-CHS'].includes(voice.language))) throw namedError('SpeechFailed');
+        if (!Array.isArray(voices) || voices.some(voice => !voice || Object.keys(voice).sort().join(',') !== 'id,language,name' || typeof voice.id !== 'string' || typeof voice.name !== 'string' || !speechLanguages.has(voice.language))) throw namedError('SpeechFailed');
         return deepFreeze(voices.map(voice => ({ id: voice.id, name: voice.name, language: voice.language })));
       },
       async play(input) { valid(); const value = inputSnapshot(input, ['text','language']); text(value.text); language(value.language); return state(await call('plugin_panel_speech_play', value)); },

@@ -340,6 +340,51 @@ describe('public plugin panel bootstrap', () => {
 
 
 describe('Panel text effects', () => {
+  it('keeps the bridge language whitelist exactly aligned with the catalog', () => {
+    const catalog = JSON.parse(readFileSync('docs/plugin-sdk/youdao-languages.json', 'utf8')) as { languages: { id: string }[] }
+    const source = readFileSync('src-tauri/src/panel_effects.js', 'utf8')
+    const literal = source.match(/const speechLanguages = new Set\((\[[^;]+\])\);/u)?.[1]
+    expect(literal).toBeDefined()
+    expect(JSON.parse(literal!)).toEqual(catalog.languages.map(({ id }) => id))
+  })
+  it('keeps missing voices unavailable and discards unknown-language host states', async () => {
+    const { hostWindow, invoke } = executePanelBootstrap(vi.fn(async (command: string): Promise<unknown> => {
+      if (command === 'plugin_panel_speech_voices') return []
+      throw { code: 'SpeechVoiceUnavailable', message: 'native private detail' }
+    }))
+    const speech = (hostWindow.uipilotPluginPanel as { speech: { voices(): Promise<unknown>, play(input: unknown): Promise<unknown>, onState(handler: (state: unknown) => void): void } }).speech
+    await expect(speech.voices()).resolves.toEqual([])
+    await expect(speech.play({ text: 'hello', language: 'ja' })).rejects.toMatchObject({ name: 'SpeechVoiceUnavailable', message: 'SpeechVoiceUnavailable' })
+    const handler = vi.fn()
+    speech.onState(handler)
+    ;(hostWindow.__UIPILOT_PLUGIN_PANEL_SPEECH_STATE__ as (input: unknown) => void)({ sessionEpoch: '7', state: { playbackId: 'speech-1', status: 'playing', language: 'xx' } })
+    expect(handler).not.toHaveBeenCalled()
+    invoke.mockResolvedValueOnce([{ id: 'bad', name: 'bad', language: 'xx' }])
+    await expect(speech.voices()).rejects.toMatchObject({ name: 'SpeechFailed' })
+  })
+  it('round trips every catalog language through play, voice listings and state events', async () => {
+    const catalog = JSON.parse(readFileSync('docs/plugin-sdk/youdao-languages.json', 'utf8')) as { languages: { id: string }[] }
+    const voices = catalog.languages.map(({ id }) => ({ id: `voice-${id}`, name: id, language: id }))
+    const { hostWindow, invoke } = executePanelBootstrap(vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
+      if (command === 'plugin_panel_speech_voices') return voices
+      return { playbackId: 'speech-1', status: 'playing', language: (args as { input: { language: string } }).input.language }
+    }))
+    const speech = (hostWindow.uipilotPluginPanel as { speech: { voices(): Promise<unknown>, play(input: unknown): Promise<unknown>, onState(handler: (state: unknown) => void): void } }).speech
+    await expect(speech.voices()).resolves.toEqual(voices)
+    const handler = vi.fn()
+    speech.onState(handler)
+    for (const { id } of catalog.languages) {
+      await expect(speech.play({ text: 'hello', language: id })).resolves.toMatchObject({ language: id })
+      ;(hostWindow.__UIPILOT_PLUGIN_PANEL_SPEECH_STATE__ as (input: unknown) => void)({ sessionEpoch: '7', state: { playbackId: 'speech-1', status: 'completed', language: id } })
+      expect(handler).toHaveBeenLastCalledWith({ playbackId: 'speech-1', status: 'completed', language: id })
+    }
+    const calls = invoke.mock.calls.length
+    for (const language of ['auto', 'xx', 'JA', 'zh-cn', '', 'sr']) {
+      await expect(speech.play({ text: 'hello', language })).rejects.toMatchObject({ name: 'InvalidPanelText' })
+    }
+    expect(invoke).toHaveBeenCalledTimes(calls)
+  })
+
   it('omits undeclared text capabilities', () => {
     const { hostWindow, invoke } = executePanelBootstrap(undefined, { clipboard: false, speech: false })
     expect(Object.prototype.hasOwnProperty.call(hostWindow.uipilotPluginPanel, 'clipboard')).toBe(false)
