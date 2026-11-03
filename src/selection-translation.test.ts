@@ -4,13 +4,16 @@ import { createLauncherCore } from './launcher-core'
 import { parseLauncherShown, type LauncherClient } from './protocol'
 const entry = { pluginId: 'com.uipilot.translate', commandId: 'default', hotkey: 'Alt+A', bindingRevision: '1' }
 const resolved = { pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'renamed', outputMode: 'mainResult', activationMode: 'submit', inputRequired: true, inputPlaceholder: null }
-function fixture(delayed = false) {
+function fixture(delayed = false, outputMode = 'mainResult', inputRequired = true) {
+  const resolution = { ...resolved, outputMode, inputRequired }
+  const openPluginPanel = vi.fn<LauncherClient['openPluginPanel']>(() => new Promise(() => {}))
   let resolve!: (value: unknown) => void
   const searchApps = vi.fn<LauncherClient['searchApps']>(async () => null)
-  const core = createLauncherCore({ searchApps, resolvePublicPluginCommandEntry: delayed ? () => new Promise((accept) => { resolve = accept }) : async () => resolved,
+  const core = createLauncherCore({ searchApps, resolvePublicPluginCommandEntry: delayed ? () => new Promise((accept) => { resolve = accept }) : async () => resolution,
+    openPluginPanel,
     getMessageSummary: async () => ({ revision: '0', unreadCount: 0 }) } as unknown as LauncherClient)
   const show = (selectionTranslation: unknown) => core.shown({ invocationId: 'selection', target: 'launcher', notice: null, commandEntry: entry, selectionTranslation })
-  return { core, show, searchApps, resolve: () => resolve(resolved) }
+  return { core, show, searchApps, openPluginPanel, resolve: () => resolve(resolution) }
 }
 it('submits selected Unicode and multiline text once with stable identity', async () => {
   const f = fixture()
@@ -109,4 +112,26 @@ it.each(['x'.repeat(8193), 'hello\0world'])('does not submit invalid captured te
   const f = fixture()
   try { f.show({ id: 'invalid', text }); await Promise.resolve(); expect(f.searchApps).not.toHaveBeenCalled() }
   finally { f.core.destroy() }
+})
+
+it.each([true, false])('opens selection text in a Panel once when inputRequired=%s', async (inputRequired) => {
+ const f = fixture(false, 'panel', inputRequired)
+ try {
+  f.show({id:'panel-selection',text:' 你好\nworld '})
+  await vi.waitFor(() => expect(f.openPluginPanel).toHaveBeenCalledWith({pluginId:entry.pluginId,commandId:'default',argument:' 你好\nworld ',stableCommandTarget:entry}))
+  f.show({id:'panel-selection',text:'duplicate'})
+  await Promise.resolve()
+  expect(f.openPluginPanel).toHaveBeenCalledTimes(1)
+  expect(f.searchApps).not.toHaveBeenCalled()
+ } finally {f.core.destroy()}
+})
+it('does not open a Panel or overwrite edits after delayed selection resolution', async () => {
+ const f=fixture(true,'panel',false)
+ try {
+  f.show({id:'old-panel-selection',text:'old'})
+  f.core.text({kind:'ordinaryInput',control:f.core.getSnapshot().queryControl,value:'new input',inputType:'insertText'})
+  f.resolve(); await Promise.resolve()
+  expect(f.openPluginPanel).not.toHaveBeenCalled()
+  expect(f.core.getSnapshot().query).toBe('new input')
+ } finally {f.core.destroy()}
 })

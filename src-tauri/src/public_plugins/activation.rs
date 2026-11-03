@@ -942,8 +942,12 @@ impl PublicPluginManager {
             && m.permissions.contains(&PublicPermission::SelectionRead)
             && c.permission_grants
                 .contains(&PublicPermission::SelectionRead)
-            && m.legacy_command()
-                .is_some_and(|c| c.output_mode == PublicOutputMode::MainResult))
+            && !bundle.runtime_recovery_needed
+            && (m
+                .legacy_command()
+                .is_some_and(|c| c.output_mode == PublicOutputMode::MainResult)
+                || (m.translation_panel_compatible()
+                    && c.permission_grants.contains(&PublicPermission::UiPanel))))
         .then_some(c.active_generation)
     }
 
@@ -4965,13 +4969,27 @@ impl PublicPluginManager {
             {
                 return Err("servicePermissionDenied");
             }
-            if bundle.runtime.manifest.is_multi_command()
-                || bundle.runtime.manifest.runtime.result_actions
-                || bundle
-                    .runtime
-                    .manifest
-                    .normalized_commands()
-                    .any(|(_, command)| command.output_mode != PublicOutputMode::MainResult)
+            let manifest = &bundle.runtime.manifest;
+            let extended_supported =
+                super::manifest::parse_canonical_version(&manifest.minimum_host_version)
+                    .is_some_and(|v| v >= [0, 18, 0]);
+            let legacy = !manifest.runtime.result_actions
+                && manifest
+                    .legacy_command()
+                    .is_some_and(|command| command.output_mode == PublicOutputMode::MainResult);
+            let panel = manifest.translation_panel_compatible()
+                && bundle
+                    .config
+                    .permission_grants
+                    .contains(&PublicPermission::UiPanel);
+            if !(legacy || panel) || (input.input.extended_input() && !extended_supported) {
+                return Err("invalidServiceRequest");
+            }
+            if panel
+                && !self
+                    .scheduler
+                    .with_current(&input.context, |request| request.is_panel_action())
+                    .map_err(|_| "expiredRequest")?
             {
                 return Err("invalidServiceRequest");
             }
@@ -5019,6 +5037,15 @@ impl PublicPluginManager {
             )
         };
         let (revision, prepared) = prepare().map_err(ServiceError::from)?;
+        if let Some(response) = input.input.unchanged_response() {
+            return store
+                .with_revision(revision, || {
+                    self.network_authority
+                        .deliver_local(prepared, self.scheduler.as_ref(), response)
+                        .map_err(network_code)
+                })
+                .map_err(ServiceError::from);
+        }
         let pending = self
             .network_authority
             .broker()
@@ -5036,7 +5063,7 @@ impl PublicPluginManager {
                     .network_authority
                     .deliver(pending, self.scheduler.as_ref())
                     .map_err(network_code)?;
-                parse_response(response.status, &response.body)
+                parse_response(response.status, &response.body, &input.input)
             })
             .map_err(ServiceError::from)
     }
@@ -15736,5 +15763,228 @@ mod tests {
                 .code,
             "invalidServiceRequest"
         );
+    }
+    fn installed_translation_panel(
+        dir: &TestDir,
+        gate: Arc<PluginNetworkAuthorityGate>,
+        plugin_id: &str,
+    ) -> (
+        PublicPluginManager,
+        crate::plugin_panel::PanelSessionIdentity,
+    ) {
+        write_host_service_package(dir);
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["pluginId"] = json!(plugin_id);
+        manifest["minimumHostVersion"] = json!("0.18.0");
+        manifest["command"]["activationMode"] = json!("submit");
+        manifest["command"]["outputMode"] = json!("panel");
+        manifest["panel"] = json!({"entry":"dist/panel.html","runtimeActions":true});
+        manifest["permissions"] = json!([
+            "network.https",
+            "credentials.youdaoTranslation",
+            "ui.panel",
+            "selection.read"
+        ]);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(dir.source().join("dist/panel.html"), "<!doctype html>").unwrap();
+        let mut manager = manager_with_network_authority(dir, gate);
+        manager.host.version = [0, 18, 0];
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps, PublicPermission::UiPanel]),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        manager
+            .set_permission_access_with_effects(
+                plugin_id,
+                PublicPermission::CredentialsYoudaoTranslation,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        let b = manager
+            .bundles
+            .confirmed_bundle(plugin_id)
+            .unwrap()
+            .unwrap();
+        let identity = crate::plugin_panel::PanelSessionIdentity {
+            session_epoch: 1,
+            plugin_id: plugin_id.into(),
+            generation: b.runtime.generation,
+            activation_id: b.activation_id,
+            admission_epoch: b.admission_epoch,
+            command_label: "translate".into(),
+            content_label: "translation-panel".into(),
+            host_keys: vec![],
+            host_key_focus: PanelHostKeyFocus::Content,
+        };
+        (manager, identity)
+    }
+    #[tokio::test]
+    async fn host_services_panel_local_response_keeps_credentials_and_completion_fenced() {
+        let dir = TestDir::new("translation-panel-local");
+        let (gate, _started) = PluginNetworkAuthorityGate::blocking_for_test();
+        let (manager, identity) = installed_translation_panel(&dir, gate, "com.example.network");
+        let action = manager
+            .admit_panel_action(
+                &identity,
+                super::super::panel_action::PanelActionRequest {
+                    action: "translate".into(),
+                    payload: Value::Null,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let context = action.context;
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        let command = || {
+            serde_json::from_value(
+                json!({"context":context,"input":{"text":" hello ","from":"en","to":"en"}}),
+            )
+            .unwrap()
+        };
+        let store = crate::credentials::CredentialStore::new(dir.path().join("synthetic-panel"));
+        assert_eq!(
+            manager
+                .youdao_translate(caller.clone(), command(), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "credentialNotConfigured"
+        );
+        store.synthetic_youdao_for_test();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.youdao_translate(caller.clone(), command(), &store),
+        )
+        .await
+        .expect("same language must never reach blocking transport")
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({"translations":[" hello "],"sourceLanguage":"en","targetLanguage":"en","unchanged":true})
+        );
+        assert_eq!(manager.network_authority.global_active_for_test(), 0);
+        let completion = store
+            .with_completion(&context, |_| {
+                manager
+                    .scheduler
+                    .complete(&context, Instant::now())
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(completion.accepted);
+        store.disable_youdao_for_test();
+        assert_eq!(
+            manager.claim_panel_completion(&identity, &context),
+            Err(super::super::panel_action::PanelActionError::ExpiredPanelSession)
+        );
+        assert_eq!(
+            manager
+                .youdao_translate(caller, command(), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "expiredRequest"
+        );
+    }
+    #[tokio::test]
+    async fn host_services_panel_pending_provider_cannot_survive_revocation() {
+        let dir = TestDir::new("translation-panel-revoked");
+        let (gate, started) = PluginNetworkAuthorityGate::blocking_for_test();
+        let (manager, identity) = installed_translation_panel(&dir, gate, "com.example.network");
+        let manager = Arc::new(manager);
+        let action = manager
+            .admit_panel_action(
+                &identity,
+                super::super::panel_action::PanelActionRequest {
+                    action: "translate".into(),
+                    payload: Value::Null,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let context = action.context;
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        let command = serde_json::from_value(
+            json!({"context":context,"input":{"text":"hello","from":"auto","to":"zh-CHS"}}),
+        )
+        .unwrap();
+        let store = Arc::new(crate::credentials::CredentialStore::new(
+            dir.path().join("synthetic-panel"),
+        ));
+        store.synthetic_youdao_for_test();
+        let task = {
+            let manager = manager.clone();
+            let store = store.clone();
+            tokio::spawn(async move { manager.youdao_translate(caller, command, &store).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("authorized panel must reach fake provider");
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::UiPanel,
+                false,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap_err().code, "expiredRequest");
+        assert!(
+            !manager
+                .scheduler
+                .complete(&context, Instant::now())
+                .unwrap()
+                .accepted
+        );
+        assert!(manager.claim_panel_completion(&identity, &context).is_err());
+    }
+
+    #[test]
+    fn selection_translation_accepts_authorized_panel_and_rechecks_ui_grant() {
+        let dir = TestDir::new("selection-translation-panel");
+        let (gate, _) = PluginNetworkAuthorityGate::blocking_for_test();
+        let (manager, identity) = installed_translation_panel(&dir, gate, "com.uipilot.translate");
+        assert_eq!(manager.selection_translation_authority(), None);
+        manager
+            .set_permission_access_with_effects(
+                "com.uipilot.translate",
+                PublicPermission::SelectionRead,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.selection_translation_authority(),
+            Some(identity.generation)
+        );
+        manager
+            .set_permission_access_with_effects(
+                "com.uipilot.translate",
+                PublicPermission::UiPanel,
+                false,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        assert_eq!(manager.selection_translation_authority(), None);
     }
 }

@@ -289,8 +289,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
               if (reflectOwnKeys(snapshot).length !== 3 || typeof snapshot.text !== 'string'
                   || !snapshot.text.length || stringIncludes(snapshot.text, '\0')
                   || encodeText(snapshot.text).length > 8192
-                  || !((snapshot.from === 'en' && snapshot.to === 'zh-CHS')
-                    || (snapshot.from === 'zh-CHS' && snapshot.to === 'en'))) throw 0;
+                  || !(snapshot.from === 'auto' || snapshot.from === 'en' || snapshot.from === 'zh-CHS')
+                  || !(snapshot.to === 'en' || snapshot.to === 'zh-CHS')) throw 0;
               deepFreeze(snapshot);
             } catch (_) { throw fail('InvalidServiceRequestError'); }
             const requestContext = context();
@@ -300,11 +300,12 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
             } catch (error) { throw mapNetworkError(error); }
             context();
             try {
-              const source = ownData(response, new SetConstructor(['translations']));
+              const source = ownData(response, new SetConstructor(['translations', 'sourceLanguage', 'targetLanguage', 'unchanged']));
               const translations = copyJson(source.translations);
-              if (reflectOwnKeys(source).length !== 1 || !arrayIsArray(translations)
+              if (reflectOwnKeys(source).length !== 4 || !(source.sourceLanguage === null || source.sourceLanguage === 'en' || source.sourceLanguage === 'zh-CHS')
+                  || source.targetLanguage !== snapshot.to || typeof source.unchanged !== 'boolean' || !arrayIsArray(translations)
                   || !translations.length || arraySome(translations, (text) => typeof text !== 'string' || !text.length)) throw 0;
-              return deepFreeze(nullRecord({ translations }));
+              return deepFreeze(nullRecord({ translations, sourceLanguage: source.sourceLanguage, targetLanguage: source.targetLanguage, unchanged: source.unchanged }));
             } catch (_) { throw fail('NetworkResponseInvalidError'); }
           },
         }) });

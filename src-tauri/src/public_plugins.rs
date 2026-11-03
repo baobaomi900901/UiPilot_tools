@@ -1405,7 +1405,20 @@ impl PublicPluginService {
                 .map(|p| p.identity.runtime_owner())
         });
         let panel_success = panel_result.is_ok();
-        if self.settle_panel_action(&completion.context, panel_result, true) {
+        // Credential validation must cover the actual content sender, not only
+        // physical Runtime completion: mutation can win between those two steps.
+        let settled = if let Some((revision, _)) = &outcome.credential_publication {
+            app.state::<crate::credentials::CredentialStore>()
+                .with_revision(*revision, || {
+                    Ok(self.settle_panel_action(&completion.context, panel_result, true))
+                })
+                .unwrap_or_else(|_| {
+                    self.settle_panel_action(&completion.context, Err(E::ExpiredPanelSession), true)
+                })
+        } else {
+            self.settle_panel_action(&completion.context, panel_result, true)
+        };
+        if settled {
             if let Some((plugin_id, generation, activation_id)) =
                 panel_owner.filter(|_| outcome.accepted)
             {

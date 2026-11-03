@@ -1119,12 +1119,12 @@ Windows `mainResult` 插件可声明 `clipboard.paste` 与 `clipboard.write`，�
 
 ## Host 0.15.0：主程序密钥业务服务
 
-当前有道业务调用仅支持旧 `command` 形态的 `mainResult` 包，且 `runtime.resultActions` 必须省略或为 `false`。`commands` 多命令包、Panel、子窗口及启用结果动作的包均不能调用有道业务方法；即使权限已授予，也会拒绝 `InvalidServiceRequestError`。其他插件形态仍可声明和管理三项服务授权，以供未来能力使用。`api.services` 当前随 Runtime 网络能力提供，其存在不代表服务已授权，也不代表插件命令/输出形态兼容。百度 OCR 与 DeepSeek 仍无公开业务方法。
+Host 0.15.0–0.17.x 的有道业务调用仅支持旧 `command` 形态的 `mainResult` 包，且 `runtime.resultActions` 必须省略或为 `false`。`commands` 多命令包、Panel、子窗口及启用结果动作的包均不能调用有道业务方法；即使权限已授予，也会拒绝 `InvalidServiceRequestError`。其他插件形态仍可声明和管理三项服务授权，以供未来能力使用。`api.services` 随 Runtime 网络能力提供，其存在不代表服务已授权，也不代表插件命令/输出形态兼容。百度 OCR 与 DeepSeek 仍无公开业务方法。
 
 
 Windows Runtime 的 `api.services?.youdao.translate({text, from, to})` 使用宿主配置的有道翻译密钥；插件不接收密钥、签名、URL 或认证参数。声明 `credentials.youdaoTranslation`、`network.https`，最低版本 `0.15.0`，并声明 `network.httpsHosts: ["openapi.youdao.com"]`。用户在设置 → 权限单独授权，在设置 → 密钥配置中配置并启用服务；两者独立，关闭配置不会清除授权。
 
-仅允许 `en` → `zh-CHS` 或反向。text 不 trim，须为 1..8192 UTF-8 字节且不含 NUL。只接受三个自有可枚举数据属性，不执行 getter、不接受额外字段。返回深冻结的 `{translations: string[]}`；facade 与原请求绑定，处理结束后保留的方法拒绝 `ExpiredRequestError`，不能借用后续调用。
+Host 0.15.0–0.17.x 仅允许 `en` → `zh-CHS` 或反向。text 不 trim，须为 1..8192 UTF-8 字节且不含 NUL。只接受三个自有可枚举数据属性，不执行 getter、不接受额外字段。Host 0.15.0–0.17.x 返回深冻结的 `{translations: string[]}`；facade 与原请求绑定，处理结束后保留的方法拒绝 `ExpiredRequestError`，不能借用后续调用。
 
 固定错误名：`InvalidServiceRequestError`、`ServicePermissionDeniedError`、`CredentialNotConfiguredError`、`CredentialDisabledError`、`CredentialUnavailableError`、`PermissionDeniedError`、`NetworkTargetDeniedError`、`NetworkTimeoutError`、`NetworkFailureError`、`NetworkResponseTooLargeError`、`NetworkResponseInvalidError`、`NetworkLimitExceededError`、`ExpiredRequestError`、`ProviderAuthenticationError`、`ProviderQuotaError`、`ProviderFailureError`。错误不包含真实凭据或供应商原始响应。
 
@@ -1156,3 +1156,38 @@ Host 0.16.0 起，Panel 保留宿主底部状态栏。调用 `uipilotPluginPanel
 `clipboardHistory.list(input?: { query?: string })` accepts only the optional `query` field. No argument and empty/whitespace queries return all summaries. Queries are limited to 512 Unicode characters before trimming; invalid input rejects with `TypeError`. The Host matches a case-insensitive contiguous substring against the complete text or any file name (including extension, excluding parent directories). Nonempty queries exclude images. Results preserve recent-first ordering and the history revision. A filtered result never replaces the unfiltered `onChanged` snapshot cache; when history changes, query again and discard stale requests using the Panel session and a request generation.
 
 `clipboardHistory.copy({ id })` requires declared and granted `clipboard.history.read` plus `clipboard.history.copy`, exact Windows support, `submit + panel + ui.panel`, and `minimumHostVersion >= 0.17.0`. New copy permission is never implicitly granted by an upgrade. It uses the current active Panel session and resolves to `{ outcome: 'copied' }` only after the Host writes the complete text, original image, or file list to the system clipboard. It preserves the Panel and focus and does not simulate paste. Unknown fields are rejected. Stable errors are `PermissionDenied`, `ExpiredPanelSession`, `RecordNotFound`, `RecordUnavailable`, and `ClipboardWriteFailed`; error messages are redacted. There is no retry and no routed Enter ticket requirement. The existing `paste` API and permission retain their behavior.
+
+
+### Translation Panel and detection (Windows Host 0.18.0+)
+
+The Youdao service keeps legacy single-command `mainResult` support (without
+`runtime.resultActions`). It additionally admits a legacy `command` with
+`submit + panel`, `panel.runtimeActions: true`, declared and granted `ui.panel`,
+and `minimumHostVersion >= 0.18.0`, only from its current `onPanelAction` Runtime
+request. Multi-command, Window and result-action packages remain unsupported.
+The content Panel uses its request bridge; it does not contact Youdao directly.
+
+The fixed supported languages are English (`en`) and Simplified Chinese
+(`zh-CHS`). Source additionally accepts `auto`; target never accepts `auto`.
+Auto and explicit same-language inputs require `minimumHostVersion >= 0.18.0`.
+The existing bounded input and independent `network.https`,
+`credentials.youdaoTranslation`, HTTPS host allowlist and enabled Host credential
+checks still apply. An explicit same-language call returns the original text
+without provider transport after all admission checks; it cannot bypass revoked
+permissions, a stale request or disabled credentials.
+
+The frozen response is `{translations, sourceLanguage, targetLanguage, unchanged}`.
+`sourceLanguage` is `en`, `zh-CHS` or `null`, based only on the provider `l` pair;
+unknown/unsupported detection is never guessed from text. Host requests
+`strict=true`, normalizes language spelling and rejects an actual target that
+mismatches the requested target with `NetworkResponseInvalidError`. A missing
+legacy provider language field yields `sourceLanguage: null`. The target is
+always the requested supported language. `unchanged` is true for explicit
+same-language calls or provider detection equal to target. Existing `translations`
+remains available, and fixed service error names stay unchanged.
+
+`selection.read` also admits this authorized Panel shape on Host 0.18.0+. The
+Host still owns explicit selection capture and restoration, passes the captured
+text as this Panel invocation's input, and invalidates late capture after intent,
+plugin generation or permission changes. Failed captures never translate stale
+clipboard or Panel text. The previous mainResult entry remains supported.

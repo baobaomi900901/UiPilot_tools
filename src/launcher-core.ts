@@ -2625,14 +2625,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       }
       cancelSlashSearch()
       stableCommandTarget = { ...entry }
-      if ((selectionText !== undefined || selectionError !== undefined) && (entry.pluginId !== 'com.uipilot.translate' || resolved.outputMode !== 'mainResult')) { model.status = '划词翻译命令不可用。'; publish(true); return }
+      if ((selectionText !== undefined || selectionError !== undefined) && (entry.pluginId !== 'com.uipilot.translate' || (resolved.outputMode !== 'mainResult' && resolved.outputMode !== 'panel'))) { model.status = '划词翻译命令不可用。'; publish(true); return }
       stableCommandOutputMode = resolved.outputMode
       const key = resultKey++
       const base = { key, resultId: `command-hotkey-${key}`, kind: 'application' as const, title: `/${resolved.commandLabel}`, hasDefaultAction: false }
-      if (resolved.outputMode === 'panel' && !resolved.inputRequired) {
+      if (resolved.outputMode === 'panel' && selectionError === undefined && (selectionText !== undefined || !resolved.inputRequired)) {
+        const argument = selectionText ?? ''
         clearResults()
-        activateMainResultCommand({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, argument: '' })
-        const result: PrivateApplicationResult = { ...base, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: entry.pluginId, commandId: entry.commandId, initialArgument: '', favorite: false } }
+        activateMainResultCommand({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, argument })
+        const result: PrivateApplicationResult = { ...base, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: entry.pluginId, commandId: entry.commandId, initialArgument: argument, favorite: false } }
         model.results = [result]
         openPanel(result)
       } else if (resolved.outputMode === 'window' && !resolved.inputRequired) {

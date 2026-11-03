@@ -457,6 +457,17 @@ describe('credential reference snapshot', () => {
 
 
 describe('host Youdao service facade', () => {
+ it('accepts auto and same-language inputs and returns frozen normalized metadata', async () => {
+  const responses: unknown[] = []
+  const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
+   for (const from of ['auto', 'en', 'zh-CHS']) responses.push(await api.services!.youdao.translate({text:'hello',from,to:'en'}))
+   return {results:[]}
+  }, async () => ({translations:['hello'],sourceLanguage:null,targetLanguage:'en',unchanged:false}))
+  await runtime.dispatch()
+  expect(responses).toHaveLength(3)
+  expect(responses[0]).toEqual({translations:['hello'],sourceLanguage:null,targetLanguage:'en',unchanged:false})
+  expect(Object.isFrozen(responses[0])).toBe(true)
+ })
  it('snapshots input, freezes output and expires retained APIs', async () => {
   let retained: BootstrapRuntimeApi | undefined
   let output: unknown
@@ -467,7 +478,7 @@ describe('host Youdao service facade', () => {
    input.text = 'changed'
    output = await pending
    return { results: [] }
-  }, async () => ({ translations: ['你好'] }))
+  }, async () => ({ translations: ['你好'], sourceLanguage: 'en', targetLanguage: 'zh-CHS', unchanged: false }))
   await runtime.dispatch()
   expect(Object.isFrozen(retained!.services!.youdao)).toBe(true)
   expect(Object.isFrozen(output)).toBe(true)
@@ -482,7 +493,7 @@ describe('host Youdao service facade', () => {
     { get text() { getterCalls++; return 'hello' }, from: 'en', to: 'zh-CHS' },
     { text: '', from: 'en', to: 'zh-CHS' },
     { text: '中'.repeat(2731), from: 'en', to: 'zh-CHS' },
-    { text: 'hello', from: 'en', to: 'en' },
+    { text: 'hello', from: 'fr', to: 'en' },
     { text: 'hello', from: 'en', to: 'zh-CHS', url: 'https://example.com' },
    ]) await expect(api.services!.youdao.translate(input)).rejects.toMatchObject({name: 'InvalidServiceRequestError'})
    return { results: [] }

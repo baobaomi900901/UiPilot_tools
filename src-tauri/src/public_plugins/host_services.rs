@@ -21,8 +21,12 @@ pub(crate) struct YoudaoInput {
     to: String,
 }
 #[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct YoudaoResponse {
     pub(crate) translations: Vec<String>,
+    pub(crate) source_language: Option<String>,
+    pub(crate) target_language: String,
+    pub(crate) unchanged: bool,
 }
 #[derive(Debug, Serialize, PartialEq)]
 pub(crate) struct ServiceError {
@@ -52,15 +56,24 @@ impl YoudaoInput {
         if self.text.trim().is_empty()
             || self.text.contains('\0')
             || self.text.len() > 8192
-            || !matches!(
-                (self.from.as_str(), self.to.as_str()),
-                ("en", "zh-CHS") | ("zh-CHS", "en")
-            )
+            || !matches!(self.from.as_str(), "auto" | "en" | "zh-CHS")
+            || !matches!(self.to.as_str(), "en" | "zh-CHS")
         {
             Err("invalidServiceRequest")
         } else {
             Ok(())
         }
+    }
+    pub(crate) fn extended_input(&self) -> bool {
+        self.from == "auto" || self.from == self.to
+    }
+    pub(crate) fn unchanged_response(&self) -> Option<YoudaoResponse> {
+        (self.from == self.to).then(|| YoudaoResponse {
+            translations: vec![self.text.clone()],
+            source_language: Some(self.from.clone()),
+            target_language: self.to.clone(),
+            unchanged: true,
+        })
     }
     pub(crate) fn request(
         &self,
@@ -93,6 +106,7 @@ impl YoudaoInput {
             ("appKey".into(), app_id.clone()),
             ("salt".into(), salt.into()),
             ("signType".into(), "v3".into()),
+            ("strict".into(), "true".into()),
             ("curtime".into(), timestamp.into()),
             ("sign".into(), sign),
         ]);
@@ -105,7 +119,11 @@ impl YoudaoInput {
         })
     }
 }
-pub(crate) fn parse_response(status: u16, body: &str) -> Result<YoudaoResponse, &'static str> {
+pub(crate) fn parse_response(
+    status: u16,
+    body: &str,
+    input: &YoudaoInput,
+) -> Result<YoudaoResponse, &'static str> {
     if matches!(status, 401 | 403) {
         return Err("providerAuthentication");
     }
@@ -150,18 +168,92 @@ pub(crate) fn parse_response(status: u16, body: &str) -> Result<YoudaoResponse, 
     {
         return Err("networkResponseTooLarge");
     }
-    Ok(YoudaoResponse { translations })
+    let language = |value: &str| {
+        if value.eq_ignore_ascii_case("en") {
+            Some("en".to_string())
+        } else if value.eq_ignore_ascii_case("zh-CHS") {
+            Some("zh-CHS".to_string())
+        } else {
+            None
+        }
+    };
+    let source_language = match value.get("l") {
+        None => None,
+        Some(pair) => {
+            let (from, to) = pair
+                .as_str()
+                .and_then(|pair| pair.split_once('2'))
+                .ok_or("networkResponseInvalid")?;
+            if language(to).as_deref() != Some(input.to.as_str()) {
+                return Err("networkResponseInvalid");
+            }
+            language(from)
+        }
+    };
+    Ok(YoudaoResponse {
+        unchanged: source_language.as_deref() == Some(input.to.as_str()),
+        translations,
+        source_language,
+        target_language: input.to.clone(),
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn panel_languages_and_detection_are_normalized_without_guessing() {
+        for from in ["auto", "en", "zh-CHS"] {
+            for to in ["en", "zh-CHS"] {
+                let input: YoudaoInput = serde_json::from_value(
+                    serde_json::json!({"text":"hello", "from":from, "to":to}),
+                )
+                .unwrap();
+                assert_eq!(input.validate(), Ok(()));
+            }
+        }
+    }
+    #[test]
+    fn detection_metadata_comes_only_from_provider_language_pair() {
+        let input: YoudaoInput = serde_json::from_value(
+            serde_json::json!({"text":"hello", "from":"auto", "to":"zh-CHS"}),
+        )
+        .unwrap();
+        let response = parse_response(
+            200,
+            r#"{"errorCode":"0","translation":["你好"],"l":"EN2zh-CHS"}"#,
+            &input,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"translations":["你好"],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false})
+        );
+        let unknown = parse_response(
+            200,
+            r#"{"errorCode":"0","translation":["你好"],"l":"fr2zh-CHS"}"#,
+            &input,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap()["sourceLanguage"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            parse_response(
+                200,
+                r#"{"errorCode":"0","translation":["hi"],"l":"zh-CHS2EN"}"#,
+                &input
+            ),
+            Err("networkResponseInvalid")
+        );
+    }
+    #[test]
     fn input_is_bounded_and_direction_is_fixed() {
         for (text, from, to) in [
             ("".into(), "en", "zh-CHS"),
             ("x".repeat(8193), "en", "zh-CHS"),
-            ("hello".into(), "en", "en"),
-            ("你好".into(), "auto", "en"),
+            ("hello".into(), "fr", "en"),
+            ("你好".into(), "auto", "auto"),
         ] {
             assert_eq!(
                 YoudaoInput {
@@ -176,6 +268,11 @@ mod tests {
     }
     #[test]
     fn provider_errors_are_static_and_responses_are_normalized() {
+        let input: YoudaoInput =
+            serde_json::from_value(serde_json::json!({"text":"hello","from":"en","to":"zh-CHS"}))
+                .unwrap();
+        let parse_response = |status, body| super::parse_response(status, body, &input);
+
         assert_eq!(
             parse_response(200, r#"{"errorCode":"202","secret":"never returned"}"#),
             Err("providerAuthentication")
@@ -211,6 +308,7 @@ mod tests {
         let Some(PluginNetworkRequestBody::Form { value }) = request.body else {
             panic!()
         };
+        assert_eq!(value["strict"], "true");
         assert_eq!(
             value["sign"],
             format!(

@@ -145,6 +145,10 @@ pub(crate) struct PreparedPluginNetworkCall {
 }
 
 impl PreparedPluginNetworkCall {
+    pub(super) fn identity(&self) -> &PluginNetworkCallIdentity {
+        self.call.identity()
+    }
+
     pub(crate) fn deny_redirects(&mut self) {
         self.request.deny_redirects = true;
     }

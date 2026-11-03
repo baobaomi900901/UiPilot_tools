@@ -69,18 +69,29 @@ export type PluginNetworkErrorName =
   | 'NetworkLimitExceededError'
   | 'ExpiredRequestError'
 
+export type PluginYoudaoTranslationLanguage = 'en' | 'zh-CHS'
+/** Fixed supported language list: English and Simplified Chinese. */
 export interface PluginYoudaoTranslationInput {
  readonly text: string
- readonly from: 'en' | 'zh-CHS'
- readonly to: 'en' | 'zh-CHS'
+ readonly from: 'auto' | PluginYoudaoTranslationLanguage
+ readonly to: PluginYoudaoTranslationLanguage
+}
+export interface PluginYoudaoTranslationResponse {
+ readonly translations: readonly string[]
+ /** Provider detection only; null means unknown or unsupported, never a text heuristic. */
+ readonly sourceLanguage: PluginYoudaoTranslationLanguage | null
+ readonly targetLanguage: PluginYoudaoTranslationLanguage
+ readonly unchanged: boolean
 }
 export interface PluginServicesApi {
  readonly youdao: {
-  /** Host 0.15.0 currently permits only legacy `command` mainResult packages with
-   * runtime.resultActions absent or false. Other output/command shapes reject
-   * InvalidServiceRequestError even if this facade exists and grants are enabled.
+  /** Legacy mainResult remains supported. Host 0.18.0+ also permits legacy
+   * submit+panel Runtime actions with ui.panel granted and panel.runtimeActions.
+   * Auto detection and explicit same-language inputs require minimumHostVersion
+   * >=0.18.0. Same-language calls still validate all authority and credentials.
+   * Facade presence does not imply authorization; text is bounded to 8192 UTF-8 bytes.
    */
-  translate(input: Readonly<PluginYoudaoTranslationInput>): Promise<Readonly<{ translations: readonly string[] }>>
+  translate(input: Readonly<PluginYoudaoTranslationInput>): Promise<Readonly<PluginYoudaoTranslationResponse>>
  }
 }
 export type PluginServiceErrorName = PluginNetworkErrorName

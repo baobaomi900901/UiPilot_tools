@@ -309,6 +309,21 @@ impl PluginNetworkAuthorityGate {
         Arc::new(move |identity, hostname| gate.call_is_current(identity, hostname, &scheduler))
     }
 
+    /// Complete an admitted Host-local service result without transport. Dropping the
+    /// reservation releases its slot; the same authority recheck as delivery applies.
+    pub(crate) fn deliver_local<T>(
+        &self,
+        prepared: PreparedPluginNetworkCall,
+        scheduler: &PluginRequestScheduler,
+        response: T,
+    ) -> Result<T, PluginNetworkErrorCode> {
+        let state = self.lock()?;
+        if !call_is_current_locked(&state, prepared.identity(), scheduler, None) {
+            return Err(PluginNetworkErrorCode::ExpiredRequest);
+        }
+        Ok(response)
+    }
+
     pub(crate) fn deliver(
         &self,
         pending: PendingPluginNetworkResponse,

@@ -505,6 +505,21 @@ impl PublicManifestV1 {
         }
     }
 
+    /// Translation service/selection extension shares one narrow Panel contract.
+    pub(crate) fn translation_panel_compatible(&self) -> bool {
+        parse_canonical_version(&self.minimum_host_version).is_some_and(|v| v >= [0, 18, 0])
+            && !self.runtime.result_actions
+            && self.legacy_command().is_some_and(|command| {
+                command.output_mode == PublicOutputMode::Panel
+                    && command.activation_mode == PublicActivationMode::Submit
+            })
+            && self
+                .panel
+                .as_ref()
+                .is_some_and(|panel| panel.runtime_actions)
+            && self.permissions.contains(&PublicPermission::UiPanel)
+    }
+
     pub(crate) fn is_multi_command(&self) -> bool {
         self.commands.is_some()
     }

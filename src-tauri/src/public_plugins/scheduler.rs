@@ -218,6 +218,7 @@ struct RunningRequest {
 }
 
 pub(crate) struct PluginCurrentRequest<'a> {
+    panel_action: bool,
     plugin_generation: u64,
     activation_id: u64,
     admission_epoch: u64,
@@ -225,6 +226,10 @@ pub(crate) struct PluginCurrentRequest<'a> {
 }
 
 impl PluginCurrentRequest<'_> {
+    pub(crate) fn is_panel_action(&self) -> bool {
+        self.panel_action
+    }
+
     pub(crate) fn activation_id(&self) -> u64 {
         self.activation_id
     }
@@ -902,6 +907,10 @@ impl PluginRequestScheduler {
                 .as_mut()
                 .ok_or(PluginContextAccessError::Unavailable)?;
             Ok(operation(&mut PluginCurrentRequest {
+                panel_action: matches!(
+                    running.request.candidate.owner,
+                    PluginRequestOwner::PanelAction { .. }
+                ),
                 plugin_generation: running.request.candidate.plugin_generation,
                 activation_id: running.request.candidate.activation_id,
                 admission_epoch: running.request.candidate.admission_epoch,
