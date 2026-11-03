@@ -12,4 +12,3 @@ test('preference whitelist excludes bodies and sanitizes invalid values',() => {
   assert.deepEqual(sanitizePreferences({sourceLanguage:'xx',targetLanguage:'auto',providerId:'constructor',text:'secret',translation:'secret'}),{sourceLanguage:'auto',targetLanguage:'zh-CHS',providerId:'youdao'});
   assert.deepEqual(sanitizePreferences({sourceLanguage:'zh-CHS',targetLanguage:'en',providerId:'youdao'}),{sourceLanguage:'zh-CHS',targetLanguage:'en',providerId:'youdao'});
   assert.deepEqual(sanitizePreferences(null),sanitizePreferences({}))})
-

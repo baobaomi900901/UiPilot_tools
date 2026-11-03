@@ -29,4 +29,3 @@ async function translateYoudao(input, api) {
 
 const providers = new Map([['youdao', translateYoudao]])
 export function getProvider(id) { return providers.get(id) }
-
