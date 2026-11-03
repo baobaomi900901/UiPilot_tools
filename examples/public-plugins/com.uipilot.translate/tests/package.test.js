@@ -6,9 +6,9 @@ import { getProvider } from '../package/dist/providers.js'
 const root = new URL('../package/', import.meta.url)
 const manifest = JSON.parse(await readFile(new URL('plugin.json', root), 'utf8'))
 
-test('1.4.0 keeps legacy identity and explicitly requires the released Panel capability floor', () => {
+test('1.4.3 keeps legacy identity and explicitly requires the released Panel capability floor', () => {
   assert.equal(manifest.pluginId, 'com.uipilot.translate')
-  assert.equal(manifest.version, '1.4.0')
+  assert.equal(manifest.version, '1.4.3')
   assert.equal(manifest.minimumHostVersion, '0.19.0')
   assert.equal(manifest.command.defaultName, 'translate')
   assert.equal(manifest.commands, undefined)

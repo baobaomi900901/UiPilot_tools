@@ -194,8 +194,8 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
   function openChoices(kind, opener) {
     closeChoices(false)
     modal = { kind, opener }
-    node('choice-title').textContent = kind === 'provider' ? '翻译服务' : kind === 'source' ? '源语言' : '目标语言'
-    search.placeholder = kind === 'provider' ? '搜索翻译服务' : '搜索语言名称或代码'
+    node('choice-title').textContent = kind === 'provider' ? '翻译源' : kind === 'source' ? '源语言' : '目标语言'
+    search.placeholder = kind === 'provider' ? '搜索翻译源' : '搜索语言名称或代码'
     search.setAttribute('aria-label', search.placeholder)
     options.setAttribute('aria-label', node('choice-title').textContent)
     search.value = ''
