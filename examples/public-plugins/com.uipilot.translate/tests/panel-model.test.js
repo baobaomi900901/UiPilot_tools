@@ -249,3 +249,29 @@ test('composition resumes legitimate suspended pending text', async () => {
   assert.equal(h.calls.length, 1)
   assert.equal(h.calls[0].input.payload.text, 'pending')
 })
+
+test('default scheduler calls receiver-sensitive global timers with their owning global', () => {
+ const originalSet = globalThis.setTimeout, originalClear = globalThis.clearTimeout
+ const scheduled = [], cleared = []
+ globalThis.setTimeout = function (callback, delay) {
+  assert.equal(this, globalThis, 'native timer retains global receiver')
+  scheduled.push({ callback, delay })
+  return 123
+ }
+ globalThis.clearTimeout = function (id) {
+  assert.equal(this, globalThis, 'native timer cancellation retains global receiver')
+  cleared.push(id)
+ }
+ let model
+ try {
+  model = createPanelModel({ request: async () => ({ ok: false }) })
+  model.installUpdate({ sessionEpoch: '1', requestId: 'r1', text: 'hello' })
+  model.dispose()
+  assert.equal(scheduled.length, 1)
+  assert.deepEqual(cleared, [123])
+ } finally {
+  model?.dispose()
+  globalThis.setTimeout = originalSet
+  globalThis.clearTimeout = originalClear
+ }
+})

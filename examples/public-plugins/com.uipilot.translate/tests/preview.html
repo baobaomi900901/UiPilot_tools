@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>翻译 Panel · 离线假 Host</title>
+<style>
+* { box-sizing: border-box; } body { margin: 24px; font: 13px 'Microsoft YaHei UI', system-ui, sans-serif; background: #e5e5e8; color: #171719; } main { margin: auto; max-width: 760px; } .frame { border: 1px solid #b9b9bd; border-radius: 10px; overflow: hidden; background: #f7f7f8; } form { display: flex; align-items: center; gap: 8px; padding: 8px; height: 60px; border-bottom: 1px solid #d9d9dc; } label { padding: 8px; background: #e9e9eb; border-radius: 6px; } input { min-width: 0; flex: 1; height: 36px; border: 1px solid #b9b9bd; border-radius: 8px; padding: 8px; color: inherit; background: inherit; font: inherit; } button { font: inherit; padding: 6px; } iframe { display: block; width: 100%; height: 420px; border: 0; } footer { height: 36px; padding: 10px; border-top: 1px solid #d9d9dc; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } nav { margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 12px; } a { color: inherit; } p { color: #6f6f74; } body.dark { background: #202123; color: #f4f4f6; } .dark .frame { background: #07080a; border-color: #434345; } .dark form, .dark footer { border-color: #242728; } .dark label { background: #1b1c1e; } .dark input { border-color: #434345; } .dark button { background: #121212; color: inherit; border: 1px solid #434345; } body.narrow main { max-width: 350px; } body.compact iframe { height: 240px; }
+</style>
+<main>
+<nav><a href="?theme=light&layout=wide">Light · Wide</a><a href="?theme=dark&layout=wide">Dark · Wide</a><a href="?theme=light&layout=narrow">Light · Narrow</a><a href="?theme=dark&layout=narrow">Dark · Narrow</a><a href="?theme=dark&layout=narrow&state=long">Long</a><a href="?theme=light&layout=narrow&state=error">Error</a><a href="?theme=dark&layout=narrow&state=loading">Loading</a><a href="?theme=light&layout=narrow&state=empty">Empty</a><a href="?theme=dark&layout=narrow&height=compact">Compact height</a></nav>
+<div class="frame"><form id="host-form"><label for="host-input">translate</label><input id="host-input" aria-label="宿主输入" value="hello" autofocus><button>提交</button></form><iframe id="panel" title="翻译 Panel"></iframe><footer id="host-status">离线假 Host · 无网络、音频或剪贴板操作</footer></div>
+<p>离线视觉预览；实际加载包内 HTML/CSS/JS，不代表原生 Host 验收。</p>
+</main>
+<script>
+const query = new URLSearchParams(location.search)
+document.body.classList.toggle('dark', query.get('theme') === 'dark')
+document.body.classList.toggle('narrow', query.get('layout') === 'narrow')
+document.body.classList.toggle('compact', query.get('height') === 'compact')
+document.getElementById('panel').src = '/panel.html?' + query
+if (query.get('state') === 'empty') document.getElementById('host-input').value = ''
+document.getElementById('host-form').addEventListener('submit', event => { event.preventDefault(); document.getElementById('panel').contentWindow.postMessage({ type: 'host-input', text: document.getElementById('host-input').value }, location.origin) })
+window.addEventListener('message', event => { if (event.origin === location.origin && event.data?.type === 'host-status') document.getElementById('host-status').textContent = event.data.message })
+</script></html>

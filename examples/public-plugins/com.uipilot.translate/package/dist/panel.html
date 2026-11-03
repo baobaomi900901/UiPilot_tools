@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>翻译</title>
+  <link rel="stylesheet" href="./panel.css">
+</head>
+<body>
+  <main class="translator" aria-label="翻译">
+    <section class="text-block source-block" aria-label="原文">
+      <label class="sr-only" for="source-text">原文</label>
+      <textarea id="source-text" placeholder="输入要翻译的文本" spellcheck="false"></textarea>
+      <div class="text-tools">
+        <button id="source-speak" class="icon-button" type="button" aria-label="朗读原文" title="朗读原文" data-icon="volume"></button>
+        <button id="source-copy" class="icon-button" type="button" aria-label="复制原文" title="复制原文" data-icon="copy"></button>
+        <button id="detected-language" class="detected" type="button" aria-haspopup="dialog">等待识别</button>
+      </div>
+    </section>
+    <div class="language-bar" aria-label="翻译方向">
+      <button id="source-language" class="language-button" type="button" aria-haspopup="dialog"><span>自动检测</span><span data-icon="chevron"></span></button>
+      <button id="swap" class="icon-button" type="button" aria-label="交换语言与文本" title="需要有效译文和明确的源语言" data-icon="swap" disabled></button>
+      <button id="target-language" class="language-button" type="button" aria-haspopup="dialog"><span>简体中文</span><span data-icon="chevron"></span></button>
+    </div>
+    <section class="text-block translation-block" aria-label="译文">
+      <button id="provider" class="provider-button" type="button" aria-haspopup="dialog"><span>有道翻译</span><span data-icon="chevron"></span></button>
+      <div class="output-body" aria-busy="false">
+        <div id="translation" role="region" aria-label="译文" tabindex="0"></div>
+        <p id="translation-status" role="status">译文将显示在这里</p>
+      </div>
+      <div class="text-tools">
+        <button id="translation-speak" class="icon-button" type="button" aria-label="朗读译文" title="朗读译文" data-icon="volume"></button>
+        <button id="translation-copy" class="icon-button" type="button" aria-label="复制译文" title="复制译文" data-icon="copy"></button>
+      </div>
+    </section>
+  </main>
+  <dialog id="choice-dialog" aria-labelledby="choice-title">
+    <div class="choice-header"><h2 id="choice-title">源语言</h2><button id="choice-close" class="icon-button" type="button" aria-label="关闭选择面板" title="关闭" data-icon="close"></button></div>
+    <input id="choice-search" type="search" placeholder="搜索语言" aria-label="搜索语言" role="combobox" aria-controls="choice-options" aria-expanded="true" aria-autocomplete="list" autocomplete="off">
+    <div id="choice-options" role="listbox" aria-label="语言"></div>
+    <p id="choice-empty" hidden>没有匹配项</p>
+  </dialog>
+  <script type="module" src="./panel.js"></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 import { isLanguage, sanitizePreferences } from './languages.js'
 
 /** Pure scheduler: request resolves business data directly, never the Runtime envelope. */
-export function createPanelModel({ request, preferences, clock = { now: () => Date.now(), setTimeout, clearTimeout } }) {
+export function createPanelModel({ request, preferences, clock = { now: () => Date.now(), setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay), clearTimeout: id => globalThis.clearTimeout(id) } }) {
  let state = { ...sanitizePreferences(preferences), text: '', translation: '', detectedSourceLanguage: null, status: 'idle', error: null, speaking: null, sessionEpoch: null, revision: 0 }
  let identity = null, ready = false, disposed = false, composing = false, pending = null, active = null, timer = null, generation = 0
  let compositionWork = false
