@@ -371,6 +371,7 @@ struct PanelHideTicket {
 }
 
 struct LiveSession {
+    speech_lease: crate::panel_effects::EffectLease,
     identity: PanelSessionIdentity,
     show_generation: u64,
     phase: PanelPhase,
@@ -386,6 +387,7 @@ struct LiveSession {
 
 fn invalidate_session_locked(core: &mut ControllerCore) -> Option<LiveSession> {
     let mut session = core.session.take()?;
+    session.speech_lease.revoke();
     session.runtime_request.take();
     Some(session)
 }
@@ -560,6 +562,8 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     }
     return deepFreeze({ outcome: 'copied' });
   };
+  __PANEL_EFFECTS__
+  panelEffects.reset(liveSessionEpoch);
   const hostKeys = deepFreeze(__HOST_KEYS__);
   const expiredStorage = deepFreeze({
     get: async () => { throw new Error('ExpiredWindowSessionError'); },
@@ -819,6 +823,8 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     get storage() { return storageSession ? storageSession.storage : expiredStorage; },
     get clipboardHistory() { return clipboardHistorySession ? clipboardHistorySession.facade : expiredClipboardHistory; },
   };
+  if (__CLIPBOARD_ENABLED__) Object.defineProperty(apiShape, 'clipboard', { enumerable: true, get: panelEffects.clipboard });
+  if (__SPEECH_ENABLED__) Object.defineProperty(apiShape, 'speech', { enumerable: true, get: panelEffects.speech });
   if (runtimeActions) {
     let pending = false;
     const makeRequest = (epoch) => async function(input) {
@@ -854,6 +860,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       if (storageSession && storageSession.sessionEpoch !== sessionEpoch) storageSession.active = false;
       if (clipboardHistorySession && clipboardHistorySession.sessionEpoch !== sessionEpoch) clipboardHistorySession.close();
       liveSessionEpoch = sessionEpoch;
+      panelEffects.reset(sessionEpoch);
       if (!storageSession || storageSession.sessionEpoch !== sessionEpoch) {
         storageSession = createStorageSession(sessionEpoch);
       }
@@ -926,12 +933,25 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 fn panel_bootstrap(session_epoch: u64, host_keys: &[PanelHostKeyDeclaration]) -> String {
     panel_bootstrap_with_actions(session_epoch, host_keys, false)
 }
+#[cfg(test)]
 fn panel_bootstrap_with_actions(
     session_epoch: u64,
     host_keys: &[PanelHostKeyDeclaration],
     actions: bool,
 ) -> String {
+    panel_bootstrap_with_effects(session_epoch, host_keys, actions, false, false)
+}
+fn panel_bootstrap_with_effects(
+    session_epoch: u64,
+    host_keys: &[PanelHostKeyDeclaration],
+    actions: bool,
+    clipboard: bool,
+    speech: bool,
+) -> String {
     PUBLIC_PANEL_BOOTSTRAP_TEMPLATE
+        .replace("__PANEL_EFFECTS__", include_str!("panel_effects.js"))
+        .replace("__CLIPBOARD_ENABLED__", if clipboard { "true" } else { "false" })
+        .replace("__SPEECH_ENABLED__", if speech { "true" } else { "false" })
         .replace("__CONTEXT_ACTIONS_UI__", &format!("{}\n{}",
             include_str!("../../src/context-actions-ui.js").replace("export function", "function"),
             include_str!("../../src/panel-context-actions.js").replace("export function", "function")))
@@ -1144,6 +1164,7 @@ impl PluginPanelController {
         let show_generation = core.show_generation;
         invalidate_session_locked(&mut core);
         core.session = Some(LiveSession {
+            speech_lease: crate::panel_effects::EffectLease::new(),
             identity: identity.clone(),
             show_generation,
             phase: PanelPhase::AwaitingReady,
@@ -2621,6 +2642,29 @@ impl PluginPanelController {
         effect(&session.identity)
     }
 
+    pub(crate) fn with_current_text_effect<T>(
+        &self,
+        label: &str,
+        epoch: u64,
+        effect: impl FnOnce(
+            &PanelSessionIdentity,
+            crate::panel_effects::EffectLease,
+        ) -> Result<T, crate::panel_effects::EffectError>,
+    ) -> Result<T, crate::panel_effects::EffectError> {
+        use crate::panel_effects::EffectError as E;
+        let plugin_id = plugin_id_from_panel_content_label(label).ok_or(E::ExpiredPanelSession)?;
+        let core = self.core.lock().map_err(|_| E::ExpiredPanelSession)?;
+        let session = core.session.as_ref().ok_or(E::ExpiredPanelSession)?;
+        if session.identity.content_label != label
+            || session.identity.plugin_id != plugin_id
+            || session.identity.session_epoch != epoch
+            || session.phase == PanelPhase::AwaitingReady
+        {
+            return Err(E::ExpiredPanelSession);
+        }
+        effect(&session.identity, session.speech_lease.clone())
+    }
+
     pub(crate) fn teardown_session(
         &self,
         session_epoch: Option<u64>,
@@ -3119,12 +3163,14 @@ fn mount_webview(
             plugin_id: identity.plugin_id.clone(),
             session_generation: identity.session_epoch,
         },
-        panel_bootstrap_with_actions(
+        panel_bootstrap_with_effects(
             identity.session_epoch,
             &identity.host_keys,
             app.state::<Arc<PublicPluginService>>()
                 .manager()?
                 .panel_actions_enabled(identity),
+            app.state::<Arc<PublicPluginService>>().manager()?.panel_effect_declared(identity, crate::public_plugins::PublicPermission::ClipboardWrite),
+            app.state::<Arc<PublicPluginService>>().manager()?.panel_effect_declared(identity, crate::public_plugins::PublicPermission::SpeechSpeak),
         ),
         content_url,
         on_unmuted,
@@ -5845,6 +5891,72 @@ mod tests {
     }
 
     #[test]
+    fn text_effect_session_lease_revokes_on_every_teardown_path() {
+        for path in 0..6 {
+            let controller = PluginPanelController::default();
+            let identity = content_ready_session(&controller);
+            let lease = controller
+                .with_current_text_effect(
+                    &identity.content_label,
+                    identity.session_epoch,
+                    |_, lease| Ok(lease),
+                )
+                .unwrap();
+            assert!(lease.valid());
+            match path {
+                0 => {
+                    controller.host_hidden();
+                }
+                1 => {
+                    controller.teardown_session(Some(identity.session_epoch));
+                }
+                2 => {
+                    controller.teardown_plugin(&identity.plugin_id);
+                }
+                3 => {
+                    controller.teardown_generation(&identity.plugin_id, identity.generation);
+                }
+                4 => {
+                    controller.teardown_current(identity.session_epoch, "a", "token-a");
+                }
+                _ => {
+                    controller.open_session(owner("replacement"));
+                }
+            }
+            assert!(!lease.valid(), "teardown path {path}");
+        }
+    }
+    #[test]
+    fn text_effect_copy_rejects_wrong_caller_and_keeps_failures() {
+        use crate::panel_effects::EffectError as E;
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        for label in ["main", "plugin-runtime-forged", "plugin-content-forged"] {
+            assert_eq!(
+                controller.with_current_text_effect(label, identity.session_epoch, |_, _| Ok(())),
+                Err(E::ExpiredPanelSession)
+            );
+        }
+        assert_eq!(
+            controller.with_current_text_effect(
+                &identity.content_label,
+                identity.session_epoch,
+                |_, _| Err::<(), _>(E::ClipboardWriteFailed)
+            ),
+            Err(E::ClipboardWriteFailed)
+        );
+        controller.open_session(owner("new"));
+        assert_eq!(
+            controller.with_current_text_effect(
+                &identity.content_label,
+                identity.session_epoch,
+                |_, _| Ok(())
+            ),
+            Err(E::ExpiredPanelSession)
+        );
+    }
+
+    #[test]
     fn storage_calls_require_live_panel_session_and_epoch() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
@@ -5929,7 +6041,7 @@ mod tests {
         let api_body = bootstrap
             .split("const apiShape = {\n")
             .nth(1)
-            .and_then(|tail| tail.split("\n  };\n  if (runtimeActions)").next())
+            .and_then(|tail| tail.split("\n  };\n").next())
             .expect("public panel API object is missing");
         let public_members = api_body
             .lines()

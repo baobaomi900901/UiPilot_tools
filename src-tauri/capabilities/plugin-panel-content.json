@@ -19,6 +19,11 @@
     "allow-plugin-panel-storage-remove",
     "allow-plugin-panel-clipboard-history-list",
     "allow-plugin-panel-clipboard-history-copy",
+    "allow-plugin-panel-clipboard-write-text",
+    "allow-plugin-panel-speech-voices",
+    "allow-plugin-panel-speech-play",
+    "allow-plugin-panel-speech-stop",
+    "allow-plugin-panel-speech-state",
     "allow-plugin-panel-clipboard-history-paste",
     "allow-plugin-panel-clipboard-history-remove",
     "allow-plugin-panel-clipboard-history-clear"

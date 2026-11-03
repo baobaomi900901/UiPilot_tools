@@ -25,3 +25,5 @@ it('refreshes real settings after failed clear without retrying the write', asyn
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('无法保存')
   } finally { await act(async () => root.unmount()); host.remove() }
 })
+
+it('keeps speech opt-in independent of installation consent', () => { expect(installationPermissionGrants(['speech.speak', 'clipboard.write'])).toEqual(['clipboard.write']) })

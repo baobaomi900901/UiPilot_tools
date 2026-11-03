@@ -631,6 +631,10 @@ impl From<ClipboardHistoryPasteError> for CommandError {
     }
 }
 
+impl From<crate::panel_effects::EffectError> for CommandError {
+    fn from(error: crate::panel_effects::EffectError) -> Self { Self { code: error.code(), message: error.code() } }
+}
+
 fn parse_canonical_nonzero_u64(value: &str) -> Option<u64> {
     if value == "0"
         || value.is_empty()
@@ -3550,6 +3554,171 @@ pub(crate) fn plugin_panel_clipboard_history_clear(
             identity.admission_epoch,
         )
         .map_err(CommandError::from)
+}
+
+fn begin_panel_text_effect(
+    label: &str,
+    controller: &PluginPanelController,
+    epoch: &str,
+) -> Result<PanelSessionIdentity, CommandError> {
+    use crate::panel_effects::EffectError as E;
+    let epoch = parse_canonical_nonzero_u64(epoch).ok_or(E::ExpiredPanelSession)?;
+    controller
+        .begin_content_call(label, epoch, true)
+        .map_err(|_| E::ExpiredPanelSession.into())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_clipboard_write_text(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    input: crate::panel_effects::PanelText,
+) -> Result<(), CommandError> {
+    use crate::panel_effects::{validate_text, EffectError as E};
+    let identity = begin_panel_text_effect(webview.label(), &controller, &session_epoch)?;
+    service
+        .manager()?
+        .with_panel_text_authorization(&identity, PublicPermission::ClipboardWrite, |_| {
+            controller.with_current_text_effect(
+                webview.label(),
+                identity.session_epoch,
+                |current, _| {
+                    if current != &identity {
+                        return Err(E::ExpiredPanelSession);
+                    }
+                    validate_text(&input.text)?;
+                    app.clipboard()
+                        .write_text(input.text)
+                        .map_err(|_| E::ClipboardWriteFailed)
+                },
+            )
+        })
+        .map_err(Into::into)
+}
+
+fn panel_speech_owner(
+    label: &str,
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    manager: &PublicPluginManager,
+    epoch: &str,
+) -> Result<crate::panel_effects::SpeechOwner, CommandError> {
+    let identity = begin_panel_text_effect(label, controller, epoch)?;
+    manager
+        .with_panel_text_authorization(&identity, PublicPermission::SpeechSpeak, |authorization| {
+            controller.with_current_text_effect(
+                label,
+                identity.session_epoch,
+                |current, session| {
+                    if current != &identity {
+                        return Err(crate::panel_effects::EffectError::ExpiredPanelSession);
+                    }
+                    let app = app.clone();
+                    let label = identity.content_label.clone();
+                    let epoch = identity.session_epoch.to_string();
+                    Ok(crate::panel_effects::SpeechOwner {
+                        key: format!("{}:{}", label, epoch),
+                        session,
+                        authorization,
+                        publish: Arc::new(move |state| {
+                            // Only the captured content document receives this event. Its bridge checks epoch again.
+                            let event = serde_json::json!({"sessionEpoch":epoch,"state":state});
+                            if let Some(content) = app.get_webview(&label) {
+                                let _ = content.eval(format!(
+                                    "window.__UIPILOT_PLUGIN_PANEL_SPEECH_STATE__({event});"
+                                ));
+                            }
+                        }),
+                    })
+                },
+            )
+        })
+        .map_err(Into::into)
+}
+#[tauri::command]
+pub(crate) async fn plugin_panel_speech_voices(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+) -> Result<Vec<crate::panel_effects::SpeechVoice>, CommandError> {
+    let owner = panel_speech_owner(
+        webview.label(),
+        &app,
+        &controller,
+        service.manager()?.as_ref(),
+        &session_epoch,
+    )?;
+    crate::panel_effects::PanelSpeech::global()
+        .voices(owner)
+        .await
+        .map_err(Into::into)
+}
+#[tauri::command]
+pub(crate) async fn plugin_panel_speech_play(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    input: crate::panel_effects::SpeechPlay,
+) -> Result<crate::panel_effects::SpeechState, CommandError> {
+    let owner = panel_speech_owner(
+        webview.label(),
+        &app,
+        &controller,
+        service.manager()?.as_ref(),
+        &session_epoch,
+    )?;
+    crate::panel_effects::PanelSpeech::global()
+        .play(owner, input)
+        .await
+        .map_err(Into::into)
+}
+#[tauri::command]
+pub(crate) async fn plugin_panel_speech_stop(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    input: crate::panel_effects::SpeechStop,
+) -> Result<crate::panel_effects::SpeechState, CommandError> {
+    let owner = panel_speech_owner(
+        webview.label(),
+        &app,
+        &controller,
+        service.manager()?.as_ref(),
+        &session_epoch,
+    )?;
+    crate::panel_effects::PanelSpeech::global()
+        .stop(owner, input)
+        .await
+        .map_err(Into::into)
+}
+#[tauri::command]
+pub(crate) async fn plugin_panel_speech_state(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+) -> Result<crate::panel_effects::SpeechState, CommandError> {
+    let owner = panel_speech_owner(
+        webview.label(),
+        &app,
+        &controller,
+        service.manager()?.as_ref(),
+        &session_epoch,
+    )?;
+    crate::panel_effects::PanelSpeech::global()
+        .state(owner)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

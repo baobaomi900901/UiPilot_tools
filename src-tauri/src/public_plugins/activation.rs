@@ -1039,6 +1039,70 @@ impl PublicPluginManager {
             })
     }
 
+    pub(crate) fn panel_effect_declared(
+        &self,
+        identity: &crate::plugin_panel::PanelSessionIdentity,
+        permission: PublicPermission,
+    ) -> bool {
+        self.bundles
+            .confirmed_bundle(&identity.plugin_id)
+            .ok()
+            .flatten()
+            .is_some_and(|b| {
+                let m = &b.runtime.manifest;
+                b.runtime.generation == identity.generation
+                    && b.activation_id == identity.activation_id
+                    && b.admission_epoch == identity.admission_epoch
+                    && m.permissions.contains(&permission)
+                    && m.permissions.contains(&PublicPermission::UiPanel)
+                    && m.supported_platforms == [super::PublicPlatform::Windows]
+                    && super::manifest::parse_canonical_version(&m.minimum_host_version)
+                        .is_some_and(|v| v >= [0, 18, 0])
+                    && m.legacy_command().is_some_and(|c| {
+                        c.activation_mode == PublicActivationMode::Submit
+                            && c.output_mode == PublicOutputMode::Panel
+                    })
+            })
+    }
+    pub(crate) fn with_panel_text_authorization<T>(
+        &self,
+        identity: &crate::plugin_panel::PanelSessionIdentity,
+        permission: PublicPermission,
+        effect: impl FnOnce(
+            crate::panel_effects::EffectLease,
+        ) -> Result<T, crate::panel_effects::EffectError>,
+    ) -> Result<T, crate::panel_effects::EffectError> {
+        use crate::panel_effects::EffectError as E;
+        let _mutation = self.lock_mutation().map_err(|_| E::ExpiredPanelSession)?;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(&identity.plugin_id)
+            .map_err(|_| E::ExpiredPanelSession)?
+            .ok_or(E::ExpiredPanelSession)?;
+        let config = &bundle.config;
+        if !config.installed
+            || !config.enabled
+            || config.fault.is_some()
+            || bundle.runtime_recovery_needed
+            || config.active_generation != identity.generation
+            || !self.panel_effect_declared(identity, permission)
+        {
+            return Err(E::ExpiredPanelSession);
+        }
+        if !config
+            .permission_grants
+            .contains(&PublicPermission::UiPanel)
+            || !config.permission_grants.contains(&permission)
+        {
+            return Err(E::PermissionDenied);
+        }
+        let lease = self
+            .bundles
+            .speech_lease(&identity.plugin_id)
+            .map_err(|_| E::ExpiredPanelSession)?;
+        effect(lease)
+    }
+
     /// Permission publication stays serialized until the guarded native write completes.
     pub(crate) fn with_clipboard_history_copy_authorization<T>(
         &self,
@@ -1658,6 +1722,7 @@ impl PublicPluginManager {
                                 **p,
                                 PublicPermission::SelectionRead
                                     | PublicPermission::ClipboardHistoryCopy
+                                    | PublicPermission::SpeechSpeak
                             )
                     })
                     .copied()
@@ -1670,6 +1735,7 @@ impl PublicPluginManager {
                                     **p,
                                     PublicPermission::SelectionRead
                                         | PublicPermission::ClipboardHistoryCopy
+                                    | PublicPermission::SpeechSpeak
                                 )
                         })
                         .copied()
@@ -1718,6 +1784,7 @@ impl PublicPluginManager {
                             *p,
                             PublicPermission::SelectionRead
                                 | PublicPermission::ClipboardHistoryCopy
+                                    | PublicPermission::SpeechSpeak
                         ))
                         || previous_config
                             .as_ref()
@@ -5921,6 +5988,7 @@ impl PublicPluginManager {
     }
 
     fn close_network_authority(&self, plugin_id: &str) {
+        self.bundles.revoke_speech(plugin_id);
         self.network_authority.close_plugin(plugin_id);
     }
 
@@ -8079,6 +8147,99 @@ mod tests {
                 )
                 .is_ok());
         }
+    }
+
+    #[test]
+    fn panel_text_effects_check_independent_grants_and_revoke_authorization() {
+        use crate::panel_effects::EffectError as E;
+        let dir = TestDir::new("panel-text-authorization");
+        write_clipboard_history_package_with_permissions(
+            &dir.source(),
+            "1.0.0",
+            vec!["ui.panel", "clipboard.write", "speech.speak"],
+        );
+        let path = dir.source().join("plugin.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["minimumHostVersion"] = json!("0.18.0");
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::UiPanel, PublicPermission::ClipboardWrite]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let id = "com.example.clipboard-history";
+        let identity = crate::plugin_panel::PanelSessionIdentity {
+            session_epoch: 1,
+            plugin_id: id.into(),
+            generation: 1,
+            activation_id: manager.activation_id(id).unwrap(),
+            admission_epoch: manager.admission_epoch(id).unwrap(),
+            command_label: "cliphist".into(),
+            content_label: "content".into(),
+            host_keys: vec![],
+            host_key_focus: PanelHostKeyFocus::Content,
+        };
+        assert_eq!(
+            manager.with_panel_text_authorization(
+                &identity,
+                PublicPermission::SpeechSpeak,
+                |_| Ok(())
+            ),
+            Err(E::PermissionDenied)
+        );
+        assert_eq!(
+            manager.with_panel_text_authorization(
+                &identity,
+                PublicPermission::ClipboardWrite,
+                |_| Err::<(), _>(E::ClipboardWriteFailed)
+            ),
+            Err(E::ClipboardWriteFailed)
+        );
+        let change = |permission, granted| {
+            manager
+                .set_permission_access_with_effects(
+                    id,
+                    permission,
+                    granted,
+                    &manager.inventory().unwrap().revision,
+                    &mut ManagementEffects::default(),
+                )
+                .unwrap()
+        };
+        change(PublicPermission::SpeechSpeak, true);
+        let lease = manager
+            .with_panel_text_authorization(&identity, PublicPermission::SpeechSpeak, Ok)
+            .unwrap();
+        assert!(lease.valid());
+        // No-op edits preserve current authorization; real revocation does not.
+        change(PublicPermission::SpeechSpeak, true);
+        assert!(lease.valid());
+        change(PublicPermission::SpeechSpeak, false);
+        assert!(!lease.valid());
+        assert_eq!(
+            manager.with_panel_text_authorization(
+                &identity,
+                PublicPermission::SpeechSpeak,
+                |_| Ok(())
+            ),
+            Err(E::PermissionDenied)
+        );
+        change(PublicPermission::ClipboardWrite, false);
+        assert_eq!(
+            manager.with_panel_text_authorization(
+                &identity,
+                PublicPermission::ClipboardWrite,
+                |_| Ok(())
+            ),
+            Err(E::PermissionDenied)
+        );
     }
 
     #[test]

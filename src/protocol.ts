@@ -253,6 +253,7 @@ export type PublicPermission =
   | 'credentials.deepseek'
   | 'ui.window'
   | 'ui.panel'
+  | 'speech.speak'
   | 'clipboard.write'
   | 'clipboard.paste'
   | 'url.open'
@@ -1058,7 +1059,7 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 const publicPermissions = new Set<PublicPermission>([
   'selection.read',
   'credentials.youdaoTranslation', 'credentials.baiduOcr', 'credentials.deepseek',
-  'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.paste', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'clipboard.history.copy', 'network.https',
+  'speech.speak', 'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.paste', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'clipboard.history.copy', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])

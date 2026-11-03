@@ -45,6 +45,16 @@ async function search(host: HTMLElement, value: string) {
 }
 
 describe('PluginPermissionsPanel', () => {
+  it('requires separate confirmation for local speech permission', async () => {
+    const { host, write } = await setup(snapshot([plugin(['speech.speak'])]))
+    expect(host.textContent).toContain('本地朗读')
+    await click(switches(host)[0])
+    expect(write).not.toHaveBeenCalled()
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('系统本地声音')
+    await click(button('确认开启本地朗读'))
+    expect(write).toHaveBeenCalledWith({ pluginId: 'test.plugin', permission: 'speech.speak', granted: true, expectedInventoryRevision: '1' })
+  })
+
   it('confirms host credential quota use and keeps service grants independent', async () => {
     const { host, write } = await setup(snapshot([plugin(['credentials.youdaoTranslation', 'credentials.baiduOcr', 'credentials.deepseek'])]))
     expect([...host.querySelectorAll('h3')].map((entry) => entry.textContent)).toEqual(['有道翻译密钥 / Youdao Translation', '百度 OCR 密钥 / Baidu OCR', 'DeepSeek 密钥 / DeepSeek'])

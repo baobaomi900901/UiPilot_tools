@@ -1191,3 +1191,42 @@ Host still owns explicit selection capture and restoration, passes the captured
 text as this Panel invocation's input, and invalidates late capture after intent,
 plugin generation or permission changes. Failed captures never translate stale
 clipboard or Panel text. The previous mainResult entry remains supported.
+
+
+### Panel clipboard and local speech (Windows Host 0.18.0+)
+
+A legacy `command` using `submit + panel + ui.panel`, exactly Windows support and
+`minimumHostVersion >= 0.18.0` may declare `clipboard.write` and/or `speech.speak`.
+The readonly optional `panel.clipboard` and `panel.speech` facades appear only for
+their declared capability; each call independently checks its current grant and
+captured Panel session. Runtime, main-window and Window callers are denied.
+
+`clipboard.writeText({text})` preserves text including whitespace. It rejects
+empty strings, NUL and more than 16384 UTF-8 bytes. It resolves after the OS
+write succeeds, preserves focus and the Panel, and neither reads nor pastes.
+
+`speech.speak` is an independent, default-off permission. Installation/update
+consent lists it, existing explicit grants remain, and new grants require the
+separate confirmation in Settings → Permissions. Speech has no network or
+credential dependency. Call it only from an explicit user button/menu action.
+`voices()` returns available local `{id,name,language}` entries for `en` and
+`zh-CHS`. `play({text,language})` uses the same text limits and exact language
+allowlist. The Host selects a matching local SAPI voice; there is no `voiceId`
+override, voice download, audio URL, file or XML/SSML input.
+
+`play`, `stop({playbackId})` and `state()` return
+`{playbackId:string|null,status:'idle'|'playing'|'completed'|'stopped'|'error',language:'en'|'zh-CHS'|null,errorCode?:string}`.
+`onState(handler)` returns an unsubscribe function. States and events belong to
+the captured session. Global playback has one owner; new playback stops old
+playback, while old IDs and late completion cannot affect the replacement.
+Hide, replacement, disable, reload, uninstall and permission changes revoke the
+old owner before queued native work. Retained facades and late promises reject
+`ExpiredPanelSession`. Canceled mutations may issue a fresh authorized lease;
+old leases never become valid again. The bounded worker queue rejects overload
+without blocking revocation. WebViews remain muted and media CSP unchanged.
+
+Fixed sanitized errors: `PermissionDenied`, `ExpiredPanelSession`,
+`InvalidPanelText`, `ClipboardWriteFailed`, `SpeechUnavailable`, `SpeechBusy`,
+`SpeechVoiceUnavailable`, `SpeechFailed`. Missing local matching voices report
+`SpeechVoiceUnavailable`; no fallback to another language or automatic retry.
+Native diagnostics, text and OS errors are never returned to plugin code.

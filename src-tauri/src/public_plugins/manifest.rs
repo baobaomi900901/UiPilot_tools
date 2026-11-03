@@ -24,6 +24,8 @@ pub(crate) enum PublicPermission {
     UiPanel,
     #[serde(rename = "clipboard.write")]
     ClipboardWrite,
+    #[serde(rename = "speech.speak")]
+    SpeechSpeak,
     #[serde(rename = "clipboard.paste")]
     ClipboardPaste,
     #[serde(rename = "files.openText")]
@@ -73,7 +75,8 @@ impl PublicPermission {
         matches!(self, Self::UiWindow | Self::UiPanel | Self::ClipboardWrite)
             || (matches!(
                 self,
-                Self::SelectionRead
+                Self::SpeechSpeak
+                    | Self::SelectionRead
                     | Self::UrlOpen
                     | Self::ClipboardPaste
                     | Self::FilesOpenText
@@ -550,7 +553,7 @@ pub(crate) fn public_manifest_v1_schema() -> schemars::Schema {
         {"required": ["commands"], "not": {"anyOf": [
             {"required": ["command"], "properties": {"command": true}}, {"required": ["window"], "properties": {"window": true}}, {"required": ["panel"], "properties": {"panel": true}}
         ]}, "properties": {"commands": true, "permissions": {"type": "array", "not": {"contains": {"enum": [
-            "ui.window", "ui.panel", "timer.control", "clipboard.history.read", "clipboard.history.paste", "clipboard.history.copy"
+            "ui.window", "ui.panel", "speech.speak", "timer.control", "clipboard.history.read", "clipboard.history.paste", "clipboard.history.copy"
         ]}}}}}
     ]));
     schema.as_object_mut().unwrap().get_mut("$defs").unwrap()["PublicNamedCommandV1"]
@@ -630,6 +633,7 @@ fn validate_manifest(
                             | PublicPermission::ClipboardHistoryRead
                             | PublicPermission::ClipboardHistoryPaste
                             | PublicPermission::ClipboardHistoryCopy
+                            | PublicPermission::SpeechSpeak
                     )
                 })
         })
@@ -767,6 +771,11 @@ fn validate_manifest(
     if manifest.permissions.iter().any(|p| p.is_host_service())
         && (minimum_host < [0, 15, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
     {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest.permissions.contains(&PublicPermission::SpeechSpeak) && (minimum_host < [0,18,0] || manifest.supported_platforms != [PublicPlatform::Windows]
+        || !manifest.permissions.contains(&PublicPermission::UiPanel) || manifest.panel.is_none()
+        || !manifest.legacy_command().is_some_and(|c| c.activation_mode == PublicActivationMode::Submit && c.output_mode == PublicOutputMode::Panel)) {
         return Err(PublicPackageError::IncompatibleApi);
     }
     if has_clipboard_history_copy && (minimum_host < [0, 17, 0] || manifest.supported_platforms != [PublicPlatform::Windows]) {
@@ -1080,6 +1089,38 @@ mod schema_tests {
             &serde_json::to_vec(value).unwrap(),
             &PublicPluginHost::current(PublicPlatform::Windows),
         )
+    }
+
+    #[test]
+    fn speech_schema_artifact_matches_the_rust_generator() {
+        let mut generated = serde_json::to_string_pretty(&crate::public_plugin_manifest_schema()).unwrap();
+        generated.push('\n');
+        assert_eq!(
+            generated,
+            include_str!("../../../docs/plugin-sdk/uipilot-plugin-v1.schema.json")
+        );
+    }
+    #[test]
+    fn speech_requires_opted_in_windows_panel_and_host_0_18() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.18.0");
+        value["command"]["outputMode"] = serde_json::json!("panel");
+        value["panel"] = serde_json::json!({"entry":"dist/panel.html"});
+        value["permissions"] = serde_json::json!(["ui.panel", "speech.speak"]);
+        assert!(parse(&value).is_ok());
+        for (field, invalid) in [
+            ("minimumHostVersion", serde_json::json!("0.17.0")),
+            (
+                "supportedPlatforms",
+                serde_json::json!(["windows", "macos"]),
+            ),
+        ] {
+            let mut invalid_value = value.clone();
+            invalid_value[field] = invalid;
+            assert!(parse(&invalid_value).is_err());
+        }
+        value["command"]["outputMode"] = serde_json::json!("mainResult");
+        assert!(parse(&value).is_err());
     }
 
     #[test]

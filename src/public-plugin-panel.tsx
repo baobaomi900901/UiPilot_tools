@@ -47,6 +47,8 @@ const CLIPBOARD_HISTORY_NOTICE = '授权后，UiPilot 运行、插件启用且�
 function permissionLabel(permission: PublicPermission): string {
   if (isHostCredentialPermission(permission)) return HOST_CREDENTIALS[permission].label
   switch (permission) {
+    case 'speech.speak':
+      return '本地朗读（默认关闭，安装后在权限页单独开启）'
     case 'selection.read':
       return '读取选中文字（仅在主动触发划词翻译时）'
     case 'files.openText':

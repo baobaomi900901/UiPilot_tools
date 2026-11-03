@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-panel-speech-state"
+description = "Enables the plugin_panel_speech_state command without any pre-configured scope."
+commands.allow = ["plugin_panel_speech_state"]
+
+[[permission]]
+identifier = "deny-plugin-panel-speech-state"
+description = "Denies the plugin_panel_speech_state command without any pre-configured scope."
+commands.deny = ["plugin_panel_speech_state"]

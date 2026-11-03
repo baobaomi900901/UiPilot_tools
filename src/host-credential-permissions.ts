@@ -12,7 +12,7 @@ export function isHostCredentialPermission(permission: PublicPermission): permis
   return Object.prototype.hasOwnProperty.call(HOST_CREDENTIALS, permission)
 }
 export function installationPermissionGrants(permissions: readonly PublicPermission[]) {
-  return permissions.filter((permission) => !isHostCredentialPermission(permission) && permission !== 'selection.read')
+  return permissions.filter((permission) => !isHostCredentialPermission(permission) && permission !== 'selection.read' && permission !== 'speech.speak')
 }
 export const HOST_CREDENTIAL_CONSENT = '允许此插件通过主程序使用对应官方服务，可能消耗 API 额度。此授权不提供密钥明文，也不会开启全局配置。'
 
@@ -36,3 +36,5 @@ export function useHostCredentialStatus(client: LauncherClient, active: boolean,
 }
 
 export const SELECTION_CONSENT = '仅在你主动按下划词翻译快捷键时取词。无法直接读取时，主程序会临时复制、有条件恢复原剪贴板，并处理 UiPilot 与 Windows 的临时历史记录；期间新复制的内容会保留。原剪贴板仅在主程序内存中缓存，不交给插件。不会后台监控选择，也不授予插件任意读取剪贴板的能力。'
+
+export const SPEECH_CONSENT = '允许此插件在你主动操作时使用系统本地声音朗读英语或简体中文。不会联网或安装声音；关闭面板或撤销授权会停止朗读。'

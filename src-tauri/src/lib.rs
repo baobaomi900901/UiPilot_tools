@@ -114,6 +114,8 @@ mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_panel;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod panel_effects;
 mod panel_status;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_window;
@@ -602,6 +604,11 @@ pub fn run() {
             commands::plugin_panel_storage_remove,
             commands::plugin_panel_clipboard_history_list,
             commands::plugin_panel_clipboard_history_copy,
+            commands::plugin_panel_clipboard_write_text,
+            commands::plugin_panel_speech_voices,
+            commands::plugin_panel_speech_play,
+            commands::plugin_panel_speech_stop,
+            commands::plugin_panel_speech_state,
             commands::plugin_panel_clipboard_history_paste,
             commands::plugin_panel_clipboard_history_remove,
             commands::plugin_panel_clipboard_history_clear,
@@ -1014,6 +1021,11 @@ mod tests {
             "commands::plugin_panel_storage_remove",
             "commands::plugin_panel_clipboard_history_list",
             "commands::plugin_panel_clipboard_history_copy",
+            "commands::plugin_panel_clipboard_write_text",
+            "commands::plugin_panel_speech_voices",
+            "commands::plugin_panel_speech_play",
+            "commands::plugin_panel_speech_stop",
+            "commands::plugin_panel_speech_state",
             "commands::plugin_panel_clipboard_history_paste",
             "commands::plugin_panel_clipboard_history_remove",
             "commands::plugin_panel_clipboard_history_clear",
@@ -1328,6 +1340,11 @@ mod tests {
             "plugin_panel_storage_remove",
             "plugin_panel_clipboard_history_list",
             "plugin_panel_clipboard_history_copy",
+            "plugin_panel_clipboard_write_text",
+            "plugin_panel_speech_voices",
+            "plugin_panel_speech_play",
+            "plugin_panel_speech_stop",
+            "plugin_panel_speech_state",
             "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",

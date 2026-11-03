@@ -18,12 +18,14 @@ interface BootstrapPanelApi {
   requestHide(): Promise<void>
 }
 
-function panelBootstrapSource(): string {
+function panelBootstrapSource(capabilities = { clipboard: true, speech: true }): string {
   const rust = readFileSync('src-tauri/src/plugin_panel.rs', 'utf8')
   const template = rust.match(/PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"([\s\S]*?)"#;/u)?.[1]
   if (!template) throw new Error('panel bootstrap template is missing')
   return template
     .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
+    .replace('__PANEL_EFFECTS__', readFileSync('src-tauri/src/panel_effects.js', 'utf8'))
+    .replace('__CLIPBOARD_ENABLED__', String(capabilities.clipboard)).replace('__SPEECH_ENABLED__', String(capabilities.speech))
     .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
     .replace('__PANEL_ACTIONS__', 'false')
     .replace('__RUNTIME_ACTIONS__', 'false')
@@ -33,6 +35,7 @@ function panelBootstrapSource(): string {
 
 function executePanelBootstrap(
   invoke = vi.fn(async (_command: string, _args?: unknown): Promise<unknown> => undefined),
+  capabilities = { clipboard: true, speech: true },
 ) {
   const hostWindow: Record<string, unknown> = {
     __TAURI_INTERNALS__: { invoke },
@@ -42,7 +45,7 @@ function executePanelBootstrap(
     addEventListener: vi.fn(),
     querySelector: vi.fn(() => null),
   }
-  vm.runInNewContext(panelBootstrapSource(), {
+  vm.runInNewContext(panelBootstrapSource(capabilities), {
     document,
     TextEncoder,
     clearInterval,
@@ -329,5 +332,47 @@ describe('public plugin panel bootstrap', () => {
       id: 'entry-1',
       routeSequence: '12',
     })
+  })
+})
+
+
+describe('Panel text effects', () => {
+  it('omits undeclared text capabilities', () => {
+    const { hostWindow, invoke } = executePanelBootstrap(undefined, { clipboard: false, speech: false })
+    expect(Object.prototype.hasOwnProperty.call(hostWindow.uipilotPluginPanel, 'clipboard')).toBe(false)
+    expect(Object.prototype.hasOwnProperty.call(hostWindow.uipilotPluginPanel, 'speech')).toBe(false)
+    expect(invoke).not.toHaveBeenCalled()
+  })
+
+  it('copies exact whitespace and rejects extra fields without IPC', async () => {
+    const { hostWindow, invoke } = executePanelBootstrap()
+    const api = hostWindow.uipilotPluginPanel as { clipboard: { writeText(input: unknown): Promise<void> } }
+    await api.clipboard.writeText({ text: ' \n ' })
+    expect(invoke).toHaveBeenCalledWith('plugin_panel_clipboard_write_text', { sessionEpoch: '7', input: { text: ' \n ' } })
+    await expect(api.clipboard.writeText({ text: '', x: true })).rejects.toMatchObject({ name: 'InvalidPanelText' })
+    await expect(api.clipboard.writeText({ text: '中'.repeat(5462) })).rejects.toMatchObject({ name: 'InvalidPanelText' })
+    expect(invoke).toHaveBeenCalledTimes(1)
+  })
+  it('isolates speech callbacks, old facades and late copy completion by session', async () => {
+    let resolve: (value: unknown) => void = () => undefined
+    const { hostWindow } = executePanelBootstrap(vi.fn(() => new Promise(done => { resolve = done })))
+    const api = hostWindow.uipilotPluginPanel as { clipboard: { writeText(input: unknown): Promise<void> }, speech: { play(input: unknown): Promise<unknown>, onState(fn: (state: unknown) => void): () => void } }
+    const old = api.speech
+    const handler = vi.fn()
+    old.onState(handler)
+    const pending = api.clipboard.writeText({ text: 'hello' })
+    ;(hostWindow.__UIPILOT_PLUGIN_PANEL_PREPARE__ as (input: unknown) => void)({ sessionEpoch: '8' })
+    resolve(undefined)
+    await expect(pending).rejects.toMatchObject({ name: 'ExpiredPanelSession' })
+    await expect(old.play({ text: 'hello', language: 'en' })).rejects.toMatchObject({ name: 'ExpiredPanelSession' })
+    ;(hostWindow.__UIPILOT_PLUGIN_PANEL_SPEECH_STATE__ as (input: unknown) => void)({ sessionEpoch: '7', state: { playbackId: 'a', status: 'completed', language: 'en' } })
+    expect(handler).not.toHaveBeenCalled()
+  })
+  it('rejects voice overrides and sanitizes native failures', async () => {
+    const { hostWindow, invoke } = executePanelBootstrap(vi.fn(async () => { throw { code: 'SpeechUnavailable', message: 'private native details' } }))
+    const speech = (hostWindow.uipilotPluginPanel as { speech: { play(input: unknown): Promise<unknown> } }).speech
+    await expect(speech.play({ text: 'hello', language: 'en', voiceId: 'x' })).rejects.toMatchObject({ name: 'InvalidPanelText' })
+    await expect(speech.play({ text: 'hello', language: 'en' })).rejects.toMatchObject({ name: 'SpeechUnavailable', message: 'SpeechUnavailable' })
+    expect(invoke).toHaveBeenCalledTimes(1)
   })
 })

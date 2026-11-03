@@ -15,6 +15,8 @@ const panel = (actions = true, result: () => Promise<unknown> = async () => ({ o
   const window: any = { __TAURI_INTERNALS__: { invoke } }
   const source = template('src-tauri/src/plugin_panel.rs', 'PUBLIC_PANEL_BOOTSTRAP_TEMPLATE')
     .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
+    .replace('__PANEL_EFFECTS__', readFileSync('src-tauri/src/panel_effects.js', 'utf8'))
+    .replace('__CLIPBOARD_ENABLED__', 'false').replace('__SPEECH_ENABLED__', 'false')
     .replace('__PANEL_JSON__', jsonSource).replace('__RUNTIME_ACTIONS__', String(actions))
     .replaceAll('__SESSION_EPOCH__', '7').replace('__HOST_KEYS__', '[]')
   vm.runInNewContext(source, { ...env, window, document: { addEventListener() {}, querySelector() { return null } } })

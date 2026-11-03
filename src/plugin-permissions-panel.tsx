@@ -6,11 +6,12 @@ import { PluginIcon } from './plugin-icon'
 import { compareDecimalRevision, parseU64Decimal } from './protocol'
 import type { LauncherClient, PublicPermission, PublicPluginInventory, PublicPluginInventoryItem } from './protocol'
 import './plugin-permissions-panel.css'
-import { HOST_CREDENTIALS, HOST_CREDENTIAL_CONSENT, SELECTION_CONSENT, isHostCredentialPermission, useHostCredentialStatus } from './host-credential-permissions'
+import { HOST_CREDENTIALS, HOST_CREDENTIAL_CONSENT, SELECTION_CONSENT, SPEECH_CONSENT, isHostCredentialPermission, useHostCredentialStatus } from './host-credential-permissions'
 
-const GROUPS = ['选中文字', '网络', '剪贴板', '文件访问', '界面', '通知', '计时器', '后台运行', '主程序密钥'] as const
+const GROUPS = ['选中文字', '朗读', '网络', '剪贴板', '文件访问', '界面', '通知', '计时器', '后台运行', '主程序密钥'] as const
 const ENGLISH_LABELS: Record<PublicPermission, string> = {
   ...Object.fromEntries(Object.entries(HOST_CREDENTIALS).map(([key, value]) => [key, value.english])) as Record<keyof typeof HOST_CREDENTIALS, string>,
+  'speech.speak': 'Local Speech',
   'selection.read': 'Selected Text',
   'network.https': 'HTTPS Network',
   'url.open': 'Open URLs',
@@ -31,6 +32,7 @@ const ENGLISH_LABELS: Record<PublicPermission, string> = {
 }
 const PERMISSIONS: Record<PublicPermission, { group: typeof GROUPS[number]; label: string; description: string }> = {
   ...Object.fromEntries(Object.entries(HOST_CREDENTIALS).map(([key, value]) => [key, { group: '主程序密钥', label: value.label, description: '使用主程序配置的官方服务，可能消耗 API 额度' }])) as Record<keyof typeof HOST_CREDENTIALS, { group: '主程序密钥'; label: string; description: string }>,
+  'speech.speak': { group: '朗读', label: '本地朗读', description: SPEECH_CONSENT },
   'selection.read': { group: '选中文字', label: '读取选中文字', description: SELECTION_CONSENT },
   'network.https': { group: '网络', label: '网络访问', description: '通过 UiPilot Host 访问申报的 HTTPS 主机' },
   'url.open': { group: '网络', label: '打开网页', description: '在默认浏览器打开 HTTP(S) 链接' },
@@ -175,7 +177,7 @@ export function PluginPermissionsPanel({ client, active }: { client: LauncherCli
   }
   const toggle = (plugin: PublicPluginInventoryItem, permission: PublicPermission, granted: boolean, origin: HTMLElement) => {
     if (!current.current || loadError || pending.current.has(plugin.pluginId) || consentRef.current) return
-    if ((permission === 'network.https' || permission === 'selection.read' || isHostCredentialPermission(permission)) && granted) {
+    if ((permission === 'network.https' || permission === 'selection.read' || permission === 'speech.speak' || isHostCredentialPermission(permission)) && granted) {
       const next = { permission, plugin, revision: current.current.revision, origin }; consentRef.current = next; setConsent(next)
     } else {
       focusReturn.current = { origin, pluginId: plugin.pluginId, dialog: null, closed: true, moved: false }
@@ -227,7 +229,7 @@ export function PluginPermissionsPanel({ client, active }: { client: LauncherCli
     })}
     <p className="permissions-footer">此页管理公开插件申报的权限；内置功能与旧版兼容插件不在此管理。</p>
     <Modal className="public-plugin-confirmation permission-network-confirmation" destroyOnHidden title={consent ? `开启${PERMISSIONS[consent.permission].label}` : '开启权限'} open={consent !== null} onCancel={closeConsent} focusable={{ focusTriggerAfterClose: false }} afterClose={() => { if (focusReturn.current) focusReturn.current.closed = true; setClosedDialog((version) => version + 1) }} onOk={confirmNetwork} okText="确认开启" cancelText="取消" okButtonProps={{ 'aria-label': consent ? `确认开启${PERMISSIONS[consent.permission].label}` : '确认开启权限' }}>
-      {consent?.permission === 'selection.read' ? <p>{consent.plugin.name}：{SELECTION_CONSENT}</p> : consent && isHostCredentialPermission(consent.permission) ? <p>{consent.plugin.name}：{HOST_CREDENTIALS[consent.permission].label}。{HOST_CREDENTIAL_CONSENT}</p> : <><p>确认允许 UiPilot Host 访问以下 HTTPS 主机和完整凭据绑定：</p>{consent ? <NetworkScope plugin={consent.plugin} /> : null}</>}
+      {consent?.permission === 'speech.speak' ? <p>{consent.plugin.name}：{SPEECH_CONSENT}</p> : consent?.permission === 'selection.read' ? <p>{consent.plugin.name}：{SELECTION_CONSENT}</p> : consent && isHostCredentialPermission(consent.permission) ? <p>{consent.plugin.name}：{HOST_CREDENTIALS[consent.permission].label}。{HOST_CREDENTIAL_CONSENT}</p> : <><p>确认允许 UiPilot Host 访问以下 HTTPS 主机和完整凭据绑定：</p>{consent ? <NetworkScope plugin={consent.plugin} /> : null}</>}
     </Modal>
   </section>
 }

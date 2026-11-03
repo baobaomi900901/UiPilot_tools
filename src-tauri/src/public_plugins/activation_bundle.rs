@@ -157,6 +157,7 @@ struct ActivationStoreState {
 
 #[derive(Default)]
 struct ActivationSlot {
+    speech_lease: Option<crate::panel_effects::EffectLease>,
     reservation: Option<(u64, Arc<AtomicU8>)>,
     bundle: Option<Arc<ActivationBundle>>,
 }
@@ -196,6 +197,7 @@ impl ActivationReservationBook {
         if slot.reservation.is_some() {
             return Err(ReservationError::Busy);
         }
+        if let Some(lease) = slot.speech_lease.take() { lease.revoke(); }
         let phase = Arc::new(AtomicU8::new(RESERVED));
         slot.reservation = Some((id, Arc::clone(&phase)));
         Ok(ActivationReservation {
@@ -204,6 +206,36 @@ impl ActivationReservationBook {
             id,
             phase,
         })
+    }
+
+    // The manager holds mutation and has checked the confirmed authorized bundle.
+    pub(super) fn speech_lease(
+        &self,
+        plugin_id: &str,
+    ) -> Result<crate::panel_effects::EffectLease, ReservationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ReservationError::Unavailable)?;
+        if self.is_terminal() {
+            return Err(ReservationError::Terminal);
+        }
+        let slot = state.slots.entry(plugin_id.into()).or_default();
+        if slot.reservation.is_some() {
+            return Err(ReservationError::Busy);
+        }
+        Ok(slot
+            .speech_lease
+            .get_or_insert_with(crate::panel_effects::EffectLease::new)
+            .clone())
+    }
+    pub(super) fn revoke_speech(&self, plugin_id: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(slot) = state.slots.get_mut(plugin_id) {
+            if let Some(lease) = slot.speech_lease.take() {
+                lease.revoke();
+            }
+        }
     }
 
     pub(super) fn is_terminal(&self) -> bool {
@@ -343,10 +375,12 @@ impl Drop for ActivationReservation {
         let phase = self.phase.load(Ordering::Acquire);
         if matches!(phase, COMMITTING | DURABLE) {
             self.book.terminal.store(true, Ordering::Release);
+            self.book.revoke_speech(&self.plugin_id);
             return;
         }
         let Ok(mut state) = self.book.state.lock() else {
             self.book.terminal.store(true, Ordering::Release);
+            self.book.revoke_speech(&self.plugin_id);
             return;
         };
         if let Some(slot) = state.slots.get_mut(&self.plugin_id) {
@@ -425,6 +459,21 @@ mod tests {
     use super::{
         ActivationIdAllocator, ActivationReservationBook, AdmissionEpochAllocator, ReservationError,
     };
+
+    #[test]
+    fn speech_reservation_cancellation_never_resurrects_old_authorization() {
+        let book = Arc::new(ActivationReservationBook::default());
+        let old = book.speech_lease("com.example.speech").unwrap();
+        let reservation = book.reserve("com.example.speech").unwrap();
+        assert!(!old.valid());
+        assert!(book.speech_lease("com.example.speech").is_err());
+        drop(reservation);
+        let fresh = book.speech_lease("com.example.speech").unwrap();
+        assert!(fresh.valid());
+        assert!(!old.valid());
+        book.revoke_speech("com.example.speech");
+        assert!(!fresh.valid());
+    }
 
     #[test]
     fn activation_ids_are_monotonic_allow_holes_and_never_wrap() {

@@ -8,6 +8,7 @@ export type PublicPermission =
   | 'selection.read'
   | 'ui.window'
   | 'ui.panel'
+  | 'speech.speak'
   | 'clipboard.write'
   | 'clipboard.paste'
   | 'credentials.youdaoTranslation'
@@ -446,7 +447,7 @@ function permissionAvailable(permission: PublicPermission, platform: PluginPlatf
     permission === 'ui.panel' ||
     permission === 'clipboard.write' ||
     ((permission === 'clipboard.history.read' || permission === 'clipboard.history.paste' || permission === 'clipboard.history.copy') && platform === 'windows') ||
-    ((permission === 'selection.read' || permission.startsWith('credentials.') || permission === 'clipboard.paste' || permission === 'network.https' || permission === 'url.open' || permission === 'files.openText') && platform === 'windows') ||
+    ((permission === 'speech.speak' || permission === 'selection.read' || permission.startsWith('credentials.') || permission === 'clipboard.paste' || permission === 'network.https' || permission === 'url.open' || permission === 'files.openText') && platform === 'windows') ||
     ((permission === 'notifications.publish' || permission === 'timer.control') && platform === 'windows')
   )
 }
@@ -506,6 +507,7 @@ function validateParsedManifest(
     manifest.apiVersion !== 1 ||
     !minimumHost ||
     (manifest.permissions.includes('files.openText') && (versionGreater([0, 13, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.window') || !manifest.window || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'window' || manifest.commands !== undefined)) ||
+    (manifest.permissions.includes('speech.speak') && (versionGreater([0, 18, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.panel') || !manifest.panel || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'panel' || manifest.commands !== undefined)) ||
     (manifest.permissions.includes('clipboard.history.copy') && (versionGreater([0, 17, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.permissions.includes('selection.read') && (versionGreater([0, 16, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.permissions.some(permission => permission.startsWith('credentials.')) && (versionGreater([0, 15, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||

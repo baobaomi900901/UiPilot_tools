@@ -370,6 +370,32 @@ export interface PluginPanelContextAction {
   run(): void | Promise<void>
 }
 
+/** Windows Host 0.18.0+. Exact local system languages; voice selection is Host-owned. */
+export type SpeechLanguage = 'en' | 'zh-CHS'
+export interface SpeechVoice { readonly id: string; readonly name: string; readonly language: SpeechLanguage }
+export interface SpeechState {
+  readonly playbackId: string | null
+  readonly status: 'idle' | 'playing' | 'completed' | 'stopped' | 'error'
+  readonly language: SpeechLanguage | null
+  readonly errorCode?: string
+}
+export type PanelTextEffectErrorName = 'PermissionDenied' | 'ExpiredPanelSession' | 'InvalidPanelText' | 'ClipboardWriteFailed' | 'SpeechUnavailable' | 'SpeechBusy' | 'SpeechVoiceUnavailable' | 'SpeechFailed'
+export interface UiPilotPluginPanelClipboardApiV1 {
+  /** Current session + clipboard.write grant. Nonempty, no NUL, <=16384 UTF-8 bytes; whitespace preserved.
+   * Resolves after OS write; no read, paste, hide, focus change or retry. Errors use PanelTextEffectErrorName.
+   */
+  writeText(input: Readonly<{ text: string }>): Promise<void>
+}
+export interface UiPilotPluginPanelSpeechApiV1 {
+  voices(): Promise<readonly Readonly<SpeechVoice>[]>
+  /** Explicit user action only. Same text bounds as clipboard; no voiceId, SSML, file or URL interpretation. */
+  play(input: Readonly<{ text: string; language: SpeechLanguage }>): Promise<Readonly<SpeechState>>
+  /** An old ID cannot stop a replacement playback. Returns this session's current state. */
+  stop(input: Readonly<{ playbackId: string }>): Promise<Readonly<SpeechState>>
+  state(): Promise<Readonly<SpeechState>>
+  onState(handler: (state: Readonly<SpeechState>) => void | Promise<void>): () => void
+}
+
 export interface UiPilotPluginPanelApiV1 {
   /** Host 0.16.0+. One synchronous provider, evaluated before the menu takes focus.
    * Up to 12 actions per group. Return null while a plugin modal owns focus.
@@ -395,6 +421,10 @@ export interface UiPilotPluginPanelApiV1 {
   requestHide(): Promise<void>
   readonly storage: Readonly<UiPilotPluginPanelStorageApiV1>
   readonly clipboardHistory: Readonly<UiPilotPluginPanelClipboardHistoryApiV1>
+  /** Windows Host 0.18.0+ legal submit Panel declaring clipboard.write; grant checked on every call. */
+  readonly clipboard?: Readonly<UiPilotPluginPanelClipboardApiV1>
+  /** Windows Host 0.18.0+ legal submit Panel declaring speech.speak. Independent opt-in; stops on owner revocation. */
+  readonly speech?: Readonly<UiPilotPluginPanelSpeechApiV1>
 }
 
 declare global {

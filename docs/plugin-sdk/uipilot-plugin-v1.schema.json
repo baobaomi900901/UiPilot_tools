@@ -208,6 +208,7 @@
         "ui.window",
         "ui.panel",
         "clipboard.write",
+        "speech.speak",
         "clipboard.paste",
         "files.openText",
         "url.open",
@@ -508,6 +509,7 @@
               "enum": [
                 "ui.window",
                 "ui.panel",
+                "speech.speak",
                 "timer.control",
                 "clipboard.history.read",
                 "clipboard.history.paste",

@@ -2210,7 +2210,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 17, 0],
+            version: [0, 18, 0],
             api_version: 1,
         }
     }

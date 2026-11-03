@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.16.1'
+    tooNewHost.minimumHostVersion = '0.18.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -697,6 +697,7 @@ it('selection.read requires Windows Host 0.16 and is independent of clipboard pe
 
 it('requires Host 0.16.0 for Delete host keys', async () => {
   const manifest = JSON.parse(await readFile(resolve('../../examples/public-plugins/com.uipilot.clipboard-history/package/plugin.json'), 'utf8'))
+  manifest.permissions = manifest.permissions.filter((permission: string) => permission !== 'clipboard.history.copy')
   manifest.panel.hostKeys = ['Delete', 'Tab']
   manifest.minimumHostVersion = '0.16.0'
   const accepted = validate(manifest)
@@ -719,3 +720,14 @@ it('requires Host 0.16.0 for Delete host keys', async () => {
    expect(validate({ ...value, command: { ...value.command, activationMode: 'live' } })).toMatchObject({ ok: false })
    expect(validate({ ...value, command: { ...value.command, outputMode: 'mainResult' }, panel: undefined })).toMatchObject({ ok: false })
  })
+
+it('requires speech to be a Windows Host 0.18 submit Panel capability', () => {
+  const value = { ...timerManifest(), minimumHostVersion: '0.18.0', window: undefined,
+    command: { defaultName: 'speak', activationMode: 'submit', outputMode: 'panel', inputRequired: false },
+    panel: { entry: 'dist/panel.html' }, permissions: ['ui.panel', 'speech.speak'] }
+  const validate = (v: unknown) => validateManifest(new TextEncoder().encode(JSON.stringify(v)), 'windows')
+  expect(validate(value)).toMatchObject({ ok: true })
+  expect(validate({ ...value, minimumHostVersion: '0.17.0' })).toMatchObject({ ok: false })
+  expect(validate({ ...value, supportedPlatforms: ['windows', 'macos'] })).toMatchObject({ ok: false })
+  expect(validate({ ...value, command: { ...value.command, outputMode: 'mainResult' } })).toMatchObject({ ok: false })
+})
