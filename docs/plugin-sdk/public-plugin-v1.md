@@ -525,3 +525,22 @@ Fixed sanitized errors: `PermissionDenied`, `ExpiredPanelSession`,
 `SpeechVoiceUnavailable`, `SpeechFailed`. Missing local matching voices report
 `SpeechVoiceUnavailable`; no fallback to another language or automatic retry.
 Native diagnostics, text and OS errors are never returned to plugin code.
+
+
+### Panel settled readiness (Host 0.18.0+)
+
+The optional `panel.onReady(handler)` returns an unsubscribe function. Register
+one receiver at boot, before the first `onUpdate` registration; registration
+later is rejected and there is no replay. Capability-detect this additive API.
+The receiver gets a frozen `{sessionEpoch: U64Decimal, requestId: string}` once
+per current update, only after `onUpdate` returns, its ACK settles, and the Host
+has restored Ready. Use `onUpdate` only to install state/DOM, and initiate an
+automatic initial Runtime request from `onReady`. A timer or microtask scheduled
+inside `onUpdate` cannot establish Host settlement. Requests during update/ACK
+still reject Busy; existing permissions, ownership and Runtime slot checks apply.
+
+Buffered or promoted newer input suppresses an older notification. A new
+update, PREPARE (even with the same epoch), teardown or unsubscribe invalidates
+queued callbacks. The Host does not await the receiver; thrown/rejected errors
+are contained without exposing exception details, retrying, or ACKing again.
+The hook grants no effect permission and does not authorize automatic speech.

@@ -5,7 +5,8 @@ import { describe, expect, it, vi } from 'vitest'
 
 interface BootstrapPanelApi {
   setStatus(input: { message: string; tone?: 'info' | 'success' | 'error' }): Promise<void>
-  onUpdate(handler: (update: unknown) => void): () => void
+  onReady(handler: (event: { sessionEpoch: string; requestId: string }) => void | Promise<void>): () => void
+  onUpdate(handler: (update: unknown) => void | Promise<void>): () => void
   onHostKey(handler: (event: unknown) => void): () => void
   readonly clipboardHistory: {
     list(input?: { query?: string }): Promise<unknown>
@@ -36,9 +37,11 @@ function panelBootstrapSource(capabilities = { clipboard: true, speech: true }):
 function executePanelBootstrap(
   invoke = vi.fn(async (_command: string, _args?: unknown): Promise<unknown> => undefined),
   capabilities = { clipboard: true, speech: true },
+  enqueue = queueMicrotask,
 ) {
   const hostWindow: Record<string, unknown> = {
     __TAURI_INTERNALS__: { invoke },
+    addEventListener: vi.fn(),
   }
   const document = {
     documentElement: { style: { setProperty: vi.fn() } },
@@ -49,7 +52,7 @@ function executePanelBootstrap(
     document,
     TextEncoder,
     clearInterval,
-    queueMicrotask,
+    queueMicrotask: enqueue,
     setInterval,
     setTimeout,
     window: hostWindow,
@@ -374,5 +377,76 @@ describe('Panel text effects', () => {
     await expect(speech.play({ text: 'hello', language: 'en', voiceId: 'x' })).rejects.toMatchObject({ name: 'InvalidPanelText' })
     await expect(speech.play({ text: 'hello', language: 'en' })).rejects.toMatchObject({ name: 'SpeechUnavailable', message: 'SpeechUnavailable' })
     expect(invoke).toHaveBeenCalledTimes(1)
+  })
+})
+
+
+describe('Panel settled readiness', () => {
+  const update = (id: string, epoch = '7') => ({ requestId: id, sessionEpoch: epoch, theme: 'light' })
+  it('requires boot registration and delivers a frozen notice once only after host settlement', async () => {
+    const { hostWindow, invoke } = executePanelBootstrap()
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+    const ready = vi.fn()
+    api.onReady(ready)
+    expect(() => api.onReady(ready)).toThrow()
+    api.onUpdate(() => undefined)
+    const deliver = hostWindow.__UIPILOT_PLUGIN_PANEL_UPDATE__ as Function
+    const notify = hostWindow.__UIPILOT_PLUGIN_PANEL_READY__ as Function
+    await deliver(update('a'))
+    await new Promise(resolve => setTimeout(resolve, 510))
+    expect(ready).not.toHaveBeenCalled()
+    notify(update('wrong'))
+    notify(update('a', '8'))
+    notify(update('a'))
+    notify(update('a'))
+    await Promise.resolve()
+    expect(ready).toHaveBeenCalledExactlyOnceWith({ sessionEpoch: '7', requestId: 'a' })
+    expect(Object.isFrozen(ready.mock.calls[0]![0])).toBe(true)
+    expect(invoke.mock.calls.filter(([c]) => c === 'plugin_panel_content_ack')).toHaveLength(1)
+    expect(() => api.onReady(() => undefined)).toThrow()
+  })
+  it.each(['update', 'prepare', 'unsubscribe', 'teardown'])('invalidates a queued notice on %s', async kind => {
+    const queue: (() => void)[] = []
+    const { hostWindow } = executePanelBootstrap(undefined, undefined, callback => queue.push(callback))
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+    const ready = vi.fn()
+    const unsubscribe = api.onReady(ready)
+    api.onUpdate(() => undefined)
+    await (hostWindow.__UIPILOT_PLUGIN_PANEL_UPDATE__ as Function)(update('a'))
+    ;(hostWindow.__UIPILOT_PLUGIN_PANEL_READY__ as Function)(update('a'))
+    if (kind === 'update') await (hostWindow.__UIPILOT_PLUGIN_PANEL_UPDATE__ as Function)(update('b'))
+    if (kind === 'prepare') (hostWindow.__UIPILOT_PLUGIN_PANEL_PREPARE__ as Function)({ sessionEpoch: '7' })
+    if (kind === 'unsubscribe') unsubscribe()
+    if (kind === 'teardown') (hostWindow.addEventListener as ReturnType<typeof vi.fn>).mock.calls.find(([name]) => name === 'pagehide')![1]()
+    queue.forEach(callback => callback())
+    expect(ready).not.toHaveBeenCalled()
+  })
+  it.each([false, true])('contains ready receiver errors (async=%s) without ACK or retries', async asyncFailure => {
+    const { hostWindow, invoke } = executePanelBootstrap()
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+    const ready = vi.fn(() => { if (asyncFailure) return Promise.reject(new Error('secret')); throw new Error('secret') })
+    api.onReady(ready)
+    api.onUpdate(() => undefined)
+    await (hostWindow.__UIPILOT_PLUGIN_PANEL_UPDATE__ as Function)(update('a'))
+    const count = invoke.mock.calls.length
+    ;(hostWindow.__UIPILOT_PLUGIN_PANEL_READY__ as Function)(update('a'))
+    await Promise.resolve(); await Promise.resolve()
+    expect(ready).toHaveBeenCalledOnce()
+    expect(invoke.mock.calls).toHaveLength(count)
+  })
+  it('assigns new update ownership before its asynchronous handler settles', async () => {
+    const queue: (() => void)[] = []
+    const { hostWindow } = executePanelBootstrap(undefined, undefined, callback => queue.push(callback))
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+    const ready = vi.fn()
+    let release!: () => void
+    api.onReady(ready)
+    api.onUpdate((value: any) => value.requestId === 'b' ? new Promise<void>(resolve => { release = resolve }) : undefined)
+    await (hostWindow.__UIPILOT_PLUGIN_PANEL_UPDATE__ as Function)(update('a'))
+    ;(hostWindow.__UIPILOT_PLUGIN_PANEL_READY__ as Function)(update('a'))
+    const b = (hostWindow.__UIPILOT_PLUGIN_PANEL_UPDATE__ as Function)(update('b'))
+    queue.forEach(callback => callback())
+    expect(ready).not.toHaveBeenCalled()
+    release(); await b
   })
 })

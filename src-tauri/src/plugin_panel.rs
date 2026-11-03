@@ -378,6 +378,7 @@ struct LiveSession {
     current_request_id: String,
     current_submission_token: String,
     pending: Option<PendingDispatch>,
+    ready_notification: Option<PanelDeliveryTicket>,
     content_focused: bool,
     actions_focus_blur_expected: bool,
     content_visible: bool,
@@ -444,6 +445,11 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   __CONTEXT_ACTIONS_UI__
   const runtimeActions = __RUNTIME_ACTIONS__;
   let handler = null;
+  let updateRegistered = false;
+  let readyReceiver = null;
+  let readyUpdate = null;
+  let readyGeneration = 0;
+  let documentActive = true;
   let hostKeyHandler = null;
   let hostKeyRegistrationViolation = false;
   let invoke = null;
@@ -794,7 +800,14 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
         });
       };
     },
+    onReady(next) {
+      if (updateRegistered || readyReceiver || typeof next !== 'function') throw new TypeError('register one onReady handler before onUpdate');
+      const receiver = { handler: next };
+      readyReceiver = receiver;
+      return () => { if (readyReceiver === receiver) readyReceiver = null; };
+    },
     onUpdate(next) {
+      updateRegistered = true;
       if (handler || typeof next !== 'function') throw new TypeError('one onUpdate handler required');
       handler = next;
       void sendReady();
@@ -859,6 +872,8 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       }
       if (storageSession && storageSession.sessionEpoch !== sessionEpoch) storageSession.active = false;
       if (clipboardHistorySession && clipboardHistorySession.sessionEpoch !== sessionEpoch) clipboardHistorySession.close();
+      readyGeneration++;
+      readyUpdate = null;
       liveSessionEpoch = sessionEpoch;
       panelEffects.reset(sessionEpoch);
       if (!storageSession || storageSession.sessionEpoch !== sessionEpoch) {
@@ -874,6 +889,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     value: async (update) => {
       contextActions.reset();
       if (!handler || !invoke) throw new Error('content not ready');
+      readyUpdate = { sessionEpoch: update.sessionEpoch, requestId: update.requestId, generation: ++readyGeneration, notified: false };
       const root = document.documentElement;
       const dark = update.theme === 'dark';
       const tokens = dark
@@ -888,6 +904,29 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
         sessionEpoch: update.sessionEpoch,
       });
     },
+  });
+  Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_READY__', {
+    configurable: false,
+    value: (notice) => {
+      const current = readyUpdate;
+      if (!documentActive || !current || !notice || current.notified ||
+          notice.sessionEpoch !== liveSessionEpoch || notice.sessionEpoch !== current.sessionEpoch ||
+          notice.requestId !== current.requestId) return;
+      current.notified = true;
+      const receiver = readyReceiver;
+      if (!receiver) return;
+      const event = deepFreeze({ sessionEpoch: current.sessionEpoch, requestId: current.requestId });
+      queueMicrotask(() => {
+        if (!documentActive || readyUpdate !== current || current.generation !== readyGeneration || readyReceiver !== receiver) return;
+        try { Promise.resolve(receiver.handler(event)).catch(() => undefined); } catch (_) {}
+      });
+    },
+  });
+  window.addEventListener?.('pagehide', () => {
+    documentActive = false;
+    readyGeneration++;
+    readyUpdate = null;
+    readyReceiver = null;
   });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_HOST_KEY__', {
     configurable: false,
@@ -1171,6 +1210,7 @@ impl PluginPanelController {
             current_request_id: owner.request_id,
             current_submission_token: owner.submission_token,
             pending: None,
+            ready_notification: None,
             content_focused: false,
             actions_focus_blur_expected: false,
             content_visible: false,
@@ -1951,6 +1991,36 @@ impl PluginPanelController {
         }
         session.phase = PanelPhase::AwaitingAck;
         Ok(())
+    }
+
+    // Publish under the same gate as replacement/teardown. eval only queues JS;
+    // it must not wait for a callback or acquire this controller again.
+    fn publish_settled_ready(
+        &self,
+        identity: &PanelSessionIdentity,
+        ticket: &PanelDeliveryTicket,
+        publish: impl FnOnce() -> Result<(), ()>,
+    ) -> Result<bool, PanelSettlementError> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| PanelSettlementError::Unavailable)?;
+        let Some(session) = core.session.as_mut() else {
+            return Ok(false);
+        };
+        if session.identity != *identity
+            || session.identity.session_epoch != ticket.session_epoch
+            || session.current_request_id != ticket.request_id
+            || session.current_submission_token != ticket.submission_token
+            || session.phase != PanelPhase::Ready
+            || session.pending.is_some()
+            || session.ready_notification.as_ref() == Some(ticket)
+        {
+            return Ok(false);
+        }
+        session.ready_notification = Some(ticket.clone());
+        publish().map_err(|()| PanelSettlementError::Unavailable)?;
+        Ok(true)
     }
 
     fn classify_delivery_failure(&self, ticket: &PanelDeliveryTicket) -> PanelSettlementError {
@@ -3426,7 +3496,20 @@ fn deliver_update(
         identity.session_epoch,
         &update.request_id,
         CONTENT_ACK_TIMEOUT,
-    )
+    )?;
+    let ready_payload = serde_json::to_string(&serde_json::json!({
+        "sessionEpoch": identity.session_epoch.to_string(),
+        "requestId": update.request_id,
+    }))
+    .map_err(|_| PanelSettlementError::Unavailable)?;
+    controller.publish_settled_ready(identity, ticket, || {
+        content
+            .eval(format!(
+                "window.__UIPILOT_PLUGIN_PANEL_READY__({ready_payload});"
+            ))
+            .map_err(|_| ())
+    })?;
+    Ok(())
 }
 
 pub(crate) fn claim_panel_delivery(
@@ -5433,6 +5516,149 @@ mod tests {
     }
 
     #[test]
+    fn settled_ready_requires_ack_settlement_and_claims_exact_ticket_once() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        let ticket =
+            claim_panel_delivery(&controller, identity.session_epoch, "a", "token-a").unwrap();
+        let emitted = std::cell::Cell::new(0);
+        let publish = || {
+            emitted.set(emitted.get() + 1);
+            Ok::<_, ()>(())
+        };
+        assert!(!controller
+            .publish_settled_ready(&identity, &ticket, publish)
+            .unwrap());
+        assert!(content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "a"
+        ));
+        assert!(!controller
+            .publish_settled_ready(&identity, &ticket, publish)
+            .unwrap());
+        controller
+            .wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1))
+            .unwrap();
+        let mut wrong = ticket.clone();
+        wrong.submission_token = "wrong".into();
+        assert!(!controller
+            .publish_settled_ready(&identity, &wrong, publish)
+            .unwrap());
+        let mut wrong_owner = identity.clone();
+        wrong_owner.generation += 1;
+        assert!(!controller
+            .publish_settled_ready(&wrong_owner, &ticket, publish)
+            .unwrap());
+        assert!(controller
+            .publish_settled_ready(&identity, &ticket, publish)
+            .unwrap());
+        controller
+            .wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1))
+            .unwrap();
+        assert!(!controller
+            .publish_settled_ready(&identity, &ticket, publish)
+            .unwrap());
+        assert_eq!(emitted.get(), 1);
+        controller.teardown_session(None);
+        assert!(!controller
+            .publish_settled_ready(&identity, &ticket, publish)
+            .unwrap());
+    }
+
+    #[test]
+    fn settled_ready_waits_for_delayed_ack_and_serializes_publication_with_teardown() {
+        let controller = Arc::new(PluginPanelController::default());
+        let identity = content_ready_session(&controller);
+        let ticket =
+            claim_panel_delivery(&controller, identity.session_epoch, "a", "token-a").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = controller.clone();
+        let worker_identity = identity.clone();
+        let join = std::thread::spawn(move || {
+            worker
+                .wait_until_acked(worker_identity.session_epoch, "a", Duration::from_secs(3))
+                .unwrap();
+            worker
+                .publish_settled_ready(&worker_identity, &ticket, || {
+                    // Replacement/teardown takes the same gate; no gap after claim.
+                    assert!(worker.core.try_lock().is_err());
+                    tx.send(()).unwrap();
+                    Ok(())
+                })
+                .unwrap()
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(510)).is_err());
+        content_ack(
+            &controller,
+            &identity.content_label,
+            identity.session_epoch,
+            "a",
+        );
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(join.join().unwrap());
+    }
+
+    #[test]
+    fn settled_ready_suppresses_buffered_and_promoted_replacements() {
+        for promote in [false, true] {
+            let controller = PluginPanelController::default();
+            let identity = content_ready_session(&controller);
+            let a =
+                claim_panel_delivery(&controller, identity.session_epoch, "a", "token-a").unwrap();
+            controller
+                .queue_dispatch(
+                    identity.session_epoch,
+                    pending_dispatch("b", "two", PluginInvocationTheme::Light),
+                )
+                .unwrap();
+            content_ack(
+                &controller,
+                &identity.content_label,
+                identity.session_epoch,
+                "a",
+            );
+            controller
+                .wait_until_acked(identity.session_epoch, "a", Duration::from_secs(1))
+                .unwrap();
+            if promote {
+                controller
+                    .promote_pending_dispatch(identity.session_epoch)
+                    .unwrap();
+            }
+            assert!(!controller
+                .publish_settled_ready(&identity, &a, || panic!("stale A published"))
+                .unwrap());
+            if !promote {
+                controller
+                    .promote_pending_dispatch(identity.session_epoch)
+                    .unwrap();
+            }
+            let b =
+                claim_panel_delivery(&controller, identity.session_epoch, "b", "token-b").unwrap();
+            content_ack(
+                &controller,
+                &identity.content_label,
+                identity.session_epoch,
+                "b",
+            );
+            controller
+                .wait_until_acked(identity.session_epoch, "b", Duration::from_secs(1))
+                .unwrap();
+            assert!(controller
+                .publish_settled_ready(&identity, &b, || Ok::<_, ()>(()))
+                .unwrap());
+            controller.teardown_plugin(&identity.plugin_id);
+            let replacement = controller.open_session(owner("c")).unwrap();
+            assert_ne!(replacement.session_epoch, identity.session_epoch);
+            assert!(!controller
+                .publish_settled_ready(&identity, &b, || panic!("revoked published"))
+                .unwrap());
+        }
+    }
+
+    #[test]
     fn pending_buffered_during_ack_survives_until_runtime_dispatch() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
@@ -6056,6 +6282,7 @@ mod tests {
             vec![
                 "onActions(next) { return contextActions.register(next); },",
                 "get setStatus() {",
+                "onReady(next) {",
                 "onUpdate(next) {",
                 "onHostKey(next) {",
                 "async focusHostInput() {",

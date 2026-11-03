@@ -2531,6 +2531,40 @@ fn panel_action_input() -> super::panel_action::PanelActionRequest {
 }
 
 #[test]
+fn panel_action_update_and_ack_remain_busy_until_host_settlement() {
+    let (_root, service, _manager, controller, identity) =
+        panel_action_fixture("panel-action-settled-ready");
+    controller
+        .claim_delivery_settlement(identity.session_epoch, "initial", "initial-command")
+        .unwrap();
+    let admit = || {
+        controller.admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+    };
+    assert_eq!(
+        admit().err(),
+        Some(super::panel_action::PanelActionError::PanelRequestBusyError)
+    );
+    assert!(controller.mark_ack(&identity.content_label, identity.session_epoch, "initial"));
+    assert_eq!(
+        admit().err(),
+        Some(super::panel_action::PanelActionError::PanelRequestBusyError)
+    );
+    controller
+        .wait_until_acked(identity.session_epoch, "initial", Duration::from_secs(1))
+        .unwrap();
+    let (_dispatch, _receiver) = admit().unwrap();
+    assert_eq!(
+        admit().err(),
+        Some(super::panel_action::PanelActionError::PanelRequestBusyError)
+    );
+}
+
+#[test]
 fn panel_action_busy_does_not_replace_running_command_or_waiter() {
     let (_root, service, manager, controller, identity) = panel_action_fixture("panel-action-busy");
     let now = Instant::now();

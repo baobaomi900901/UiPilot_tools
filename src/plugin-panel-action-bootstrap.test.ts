@@ -19,7 +19,7 @@ const panel = (actions = true, result: () => Promise<unknown> = async () => ({ o
     .replace('__CLIPBOARD_ENABLED__', 'false').replace('__SPEECH_ENABLED__', 'false')
     .replace('__PANEL_JSON__', jsonSource).replace('__RUNTIME_ACTIONS__', String(actions))
     .replaceAll('__SESSION_EPOCH__', '7').replace('__HOST_KEYS__', '[]')
-  vm.runInNewContext(source, { ...env, window, document: { addEventListener() {}, querySelector() { return null } } })
+  vm.runInNewContext(source, { ...env, window, document: { documentElement: { style: { setProperty() {} } }, addEventListener() {}, querySelector() { return null } } })
   return { window, invoke, api: window.uipilotPluginPanel }
 }
 async function runtime(module: any, optedIn = true, windowActions = false) {
@@ -39,6 +39,21 @@ const context = { pluginId: 'com.example.panel', pluginGeneration: 1, requestId:
 const invocation = { apiVersion: 1, requestId: context.requestId, action: 'preview', payload: { body: 'Hi', values: [1, 2] }, context: { platform: 'windows', theme: 'dark', invokedAt: '2026-10-24T00:00:00Z' } }
 
 describe('panel action executable bridges', () => {
+  it('can start one Runtime request from a settled-ready receiver without another ACK', async () => {
+    const p = panel()
+    let response: Promise<unknown> | undefined
+    p.api.onReady(() => { response = p.api.request({ action: 'translate', payload: { text: 'hello' } }) })
+    p.api.onUpdate(() => undefined)
+    await p.window.__UIPILOT_PLUGIN_PANEL_UPDATE__({ sessionEpoch: '7', requestId: 'a', theme: 'light' })
+    expect(p.invoke.mock.calls.filter(([command]) => command === 'plugin_panel_request')).toHaveLength(0)
+    p.window.__UIPILOT_PLUGIN_PANEL_READY__({ sessionEpoch: '7', requestId: 'a' })
+    p.window.__UIPILOT_PLUGIN_PANEL_READY__({ sessionEpoch: '7', requestId: 'a' })
+    await Promise.resolve()
+    await expect(response).resolves.toEqual({ ok: true })
+    expect(p.invoke.mock.calls.filter(([command]) => command === 'plugin_panel_request')).toHaveLength(1)
+    expect(p.invoke.mock.calls.filter(([command]) => command === 'plugin_panel_content_ack')).toHaveLength(1)
+  })
+
   it('exposes only opted-in request, snapshots before IPC, freezes response and expires retained references', async () => {
     expect(panel(false).api.request).toBeUndefined()
     let release!: (value: unknown) => void

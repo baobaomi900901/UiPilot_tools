@@ -411,6 +411,11 @@ export interface UiPilotPluginPanelApiV1 {
    * Do not await inside onUpdate/onHostKey. Cancellation may follow a committed write: reload.
    */
   readonly request?: (input: Readonly<PluginPanelRequest>) => Promise<JsonValue>
+  /** Host 0.18.0+. Register before first onUpdate; one receiver, no replay.
+   * Called once per current settled update after Host ACK/Ready. Safe to request here.
+   * Supersession/teardown/unsubscribe drops queued callbacks. Errors are contained.
+   */
+  onReady?(handler: (event: Readonly<{ sessionEpoch: U64Decimal; requestId: string }>) => void | Promise<void>): () => void
   onUpdate(
     handler: (update: Readonly<PluginPanelUpdate>) => void | Promise<void>,
   ): () => void

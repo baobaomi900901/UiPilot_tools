@@ -44,3 +44,27 @@
 - Microsoft SPEAKFLAGS：https://learn.microsoft.com/en-us/previous-versions/office/developer/speech-technologies/jj127460(v=msdn.10)
 
 实施顺序：H1/H4服务及划词→专项评审→H2/H3复制朗读和版本交付→专项评审→插件状态/Runtime/UI/能力接入→集成评审。实施代理可按此拆分能力请求Task1；插件包形态最后切换。
+
+
+## Additive settled Panel readiness
+
+Host 0.18.0 exposes optional `panel.onReady(handler): () => void`. Register one
+receiver at boot **before the first call registering `onUpdate`**; later
+registration rejects and never replays prior updates. `onUpdate` installs state
+and DOM only. Initial translation starts from the ready receiver, not a timer or
+microtask scheduled by `onUpdate`.
+
+After successful update delivery and `wait_until_acked`, the Host checks the
+exact content label, complete current owner, epoch, request ID and submission
+token under the controller gate, requires Ready with no pending submission,
+and claims one notification for that ticket before publishing under the same
+gate. Neither ACK handling nor initial content-ready handling emits this event.
+Initial mount and resubmission use the same delivery path.
+
+The deeply frozen notice contains only `{sessionEpoch: U64Decimal, requestId}`.
+The bootstrap owns a new generation before awaiting each update handler and
+invalidates ready ownership on every PREPARE, even with unchanged epoch.
+Wrong identities, duplicates and queued callbacks superseded by a new update,
+PREPARE, teardown or unsubscribe are dropped. Receiver completion is not awaited;
+errors are contained without stacks, retries, extra ACKs or unrelated faults.
+Existing request admission, Busy behavior, permissions and effect rules remain.
