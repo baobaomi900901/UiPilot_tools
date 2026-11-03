@@ -1,0 +1,8 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>操作面板滚动验证</title><style>
+body{margin:0;background:#07080a;color:#eee;font:14px system-ui;--uipilot-ui-surface:#0d0d0d;--uipilot-ui-foreground:#eee;--uipilot-ui-border:#343434;--uipilot-ui-muted-foreground:#999;--uipilot-ui-scrollbar:#656565}footer{position:fixed;bottom:0;left:0;right:0;display:flex;padding:10px;gap:16px;border-top:1px solid #343434}button{color:inherit;background:transparent;border:0;font:inherit}#status{flex:1}h1{font-size:18px;padding:16px}
+</style><h1>操作面板 · 合成数据验证</h1><footer><span id="status">长列表滚动验证</span><button id="open">操作 Ctrl+K</button></footer><script type="module">
+import {createContextActionsMenu} from '/src/context-actions-ui.js';
+const menu=createContextActionsMenu(document);const open=document.querySelector('#open');
+const groups={context:Array.from({length:12},(_,i)=>({id:'context-'+i,title:'当前对象操作 '+(i+1),shortcut:i===0?'Enter':undefined,run(){}})),global:Array.from({length:12},(_,i)=>({id:'global-'+i,title:'通用操作 '+(i+1),run(){}}))};
+open.addEventListener('click',()=>menu.open(groups,{bottom:44}));open.addEventListener('pointerdown',e=>e.preventDefault());
+</script></html>

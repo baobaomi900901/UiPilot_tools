@@ -17,8 +17,9 @@ use crate::{
     apps::{self, AppCache, Application},
     clipboard_history::{
         paste_clipboard_history_record, send_ctrl_v_to_foreground_target,
-        ClipboardHistoryBridgeError, ClipboardHistoryPasteError, ClipboardHistoryPasteOutcome,
-        ClipboardHistoryPasteStatus, ClipboardHistorySnapshot,
+        ClipboardHistoryBridgeError, ClipboardHistoryCopyOutcome, ClipboardHistoryCopyStatus,
+        ClipboardHistoryPasteError, ClipboardHistoryPasteOutcome, ClipboardHistoryPasteStatus,
+        ClipboardHistorySnapshot,
     },
     file_index::{FileIndex, OpenIndexedPath},
     file_search::{
@@ -677,6 +678,8 @@ pub(crate) enum CompletionOriginPhase {
 pub(crate) struct CompletionOriginInput {
     phase: CompletionOriginPhase,
     plugin_id: String,
+    #[serde(default)]
+    command_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -689,6 +692,8 @@ pub(crate) struct PluginCommandCompletionResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct OpenPluginPanelInput {
     plugin_id: String,
+    #[serde(default)]
+    command_id: Option<String>,
     argument: String,
     #[serde(default)]
     stable_command_target: Option<crate::command_hotkeys::CommandEntry>,
@@ -805,6 +810,27 @@ fn reset_plugin_panel(app: &AppHandle, controller: &PluginPanelController, plugi
             session_epoch: identity.session_epoch.to_string(),
         },
     );
+}
+
+fn reset_plugin_panel_checked(
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    plugin_id: &str,
+) -> Result<(), CommandError> {
+    let (identity, closed) = plugin_panel::teardown_plugin_checked(app, controller, plugin_id);
+    let reset = if let Some(identity) = identity {
+        app.emit_to(
+            "main",
+            "uipilot-plugin-panel-reset",
+            PluginPanelErrorEvent {
+                session_epoch: identity.session_epoch.to_string(),
+            },
+        )
+        .map_err(|_| CommandError::from(PublicPluginManagementError::Unavailable))
+    } else {
+        Ok(())
+    };
+    closed.map_err(CommandError::from).and(reset)
 }
 
 fn require_main_label(label: &str) -> Result<(), CommandError> {
@@ -1489,6 +1515,36 @@ pub(crate) async fn set_hotkey_recording(
 }
 
 #[tauri::command]
+pub(crate) fn cancel_translation_selection(window: WebviewWindow) -> Result<(), CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    app.state::<Arc<LifecycleCoordinator>>()
+        .cancel_selection_capture();
+    Ok(())
+}
+#[tauri::command]
+pub(crate) fn get_translation_selection_settings(
+    window: WebviewWindow,
+) -> Result<crate::selection_translation::TranslationSelectionSettings, CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    Ok(app
+        .state::<Arc<LifecycleCoordinator>>()
+        .translation_selection_settings(&app))
+}
+#[tauri::command]
+pub(crate) async fn set_translation_selection_hotkey(
+    window: WebviewWindow,
+    hotkey: Option<String>,
+) -> Result<crate::selection_translation::TranslationSelectionSettings, CommandError> {
+    let app = command_hotkey_access(window.label(), || window.app_handle().clone())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Arc<LifecycleCoordinator>>()
+            .edit_selection_hotkey(&app, hotkey)
+            .map_err(|_| CommandError::settings_failed())
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+}
+#[tauri::command]
 pub(crate) async fn set_public_plugin_command_hotkey(
     window: WebviewWindow,
     input: CommandHotkeyInput,
@@ -1585,9 +1641,14 @@ pub(crate) fn resolve_public_plugin_command_entry(
 pub(crate) struct BuiltinFeatureView {
     feature: ManagedBuiltinFeature,
     name: &'static str,
-    command: &'static str,
+    command: String,
+    default_command: String,
+    favorite: bool,
+    hotkey: Option<String>,
+    hotkey_status: &'static str,
+    directory: Option<String>,
     description: &'static str,
-    examples: Vec<&'static str>,
+    examples: Vec<String>,
     version: &'static str,
     enabled: bool,
 }
@@ -1596,7 +1657,7 @@ fn builtin_feature_views(settings: &Settings) -> Vec<BuiltinFeatureView> {
     ManagedBuiltinFeature::ALL
         .into_iter()
         .map(|feature| {
-            let (name, command, description, examples) = match feature {
+            let (name, command, description, _examples) = match feature {
                 ManagedBuiltinFeature::Screenshot => (
                     "截图",
                     "/screenshot",
@@ -1619,9 +1680,26 @@ fn builtin_feature_views(settings: &Settings) -> Vec<BuiltinFeatureView> {
             BuiltinFeatureView {
                 feature,
                 name,
-                command,
+                command: settings.builtin_command(feature),
+                default_command: command.into(),
+                favorite: settings
+                    .favorite_builtin_features
+                    .contains(&feature.favorite_feature()),
+                hotkey: settings.builtin_hotkey(feature).map(str::to_owned),
+                hotkey_status: if settings.builtin_hotkey(feature).is_none() {
+                    "unset"
+                } else if !settings.builtin_feature_enabled(feature) {
+                    "suspended"
+                } else {
+                    "unavailable"
+                },
+                directory: None,
                 description,
-                examples,
+                examples: if feature == ManagedBuiltinFeature::WebSearch {
+                    vec![format!("{} UiPilot", settings.builtin_command(feature))]
+                } else {
+                    vec![settings.builtin_command(feature)]
+                },
                 version: env!("CARGO_PKG_VERSION"),
                 enabled: settings.builtin_feature_enabled(feature),
             }
@@ -1642,13 +1720,111 @@ fn with_managed_builtin<T>(
     operation(feature)
 }
 
+fn normalized_builtin_name(value: &str, reserved: &[String]) -> Result<String, CommandError> {
+    let value = value.trim().strip_prefix('/').unwrap_or(value.trim());
+    if !(1..=32).contains(&value.len())
+        || !value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        || matches!(value, "find" | "math")
+        || reserved.iter().any(|name| name.eq_ignore_ascii_case(value))
+    {
+        return Err(CommandError::settings_failed());
+    }
+    Ok(value.to_owned())
+}
+
+#[tauri::command]
+pub(crate) fn set_builtin_feature_name(
+    window: WebviewWindow,
+    feature: String,
+    name_override: Option<String>,
+) -> Result<(), CommandError> {
+    let feature = with_managed_builtin(window.label(), &feature, Ok)?;
+    let app = window.app_handle();
+    let name = name_override
+        .as_deref()
+        .map(|value| normalized_builtin_name(value, &[]))
+        .transpose()?;
+    app.state::<SettingsStore>()
+        .set_builtin_feature_name_checked(feature, name, |value| {
+            !app.state::<Arc<QuicklinksStore>>()
+                .commands()
+                .iter()
+                .any(|command| command.eq_ignore_ascii_case(value))
+        })
+        .map_err(|_| CommandError::settings_failed())?;
+    let _ = app.emit_to("main", "builtin-features://changed", ());
+    Ok(())
+}
+#[tauri::command]
+pub(crate) async fn set_builtin_feature_hotkey(
+    window: WebviewWindow,
+    feature: String,
+    hotkey: Option<String>,
+) -> Result<(), CommandError> {
+    let feature = with_managed_builtin(window.label(), &feature, Ok)?;
+    let app = window.app_handle().clone();
+    let replacement = hotkey
+        .as_deref()
+        .map(crate::hotkey::command_chord)
+        .transpose()
+        .map_err(|_| CommandError::settings_failed())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let coordinator = app.state::<Arc<LifecycleCoordinator>>();
+        let _critical = coordinator
+            .reserve_critical()
+            .map_err(|_| CommandError::settings_failed())?;
+        let _operation = coordinator
+            .lock_hotkey_operation()
+            .map_err(|_| CommandError::settings_failed())?;
+        let settings = app.state::<SettingsStore>();
+        let saved = settings.snapshot();
+        let canonical = replacement.map(|s| s.to_string());
+        if canonical
+            .as_deref()
+            .is_some_and(|s| crate::screenshot::hotkey::builtin_conflicts(&saved, feature, s))
+        {
+            return Err(CommandError::hotkey_conflict());
+        }
+        let desired = replacement.filter(|_| saved.builtin_feature_enabled(feature));
+        let native = app.global_shortcut();
+        coordinator
+            .builtin_hotkeys(feature)
+            .edit(
+                desired,
+                &mut |s| native.register(s).map_err(|_| ()),
+                &mut |s| native.unregister(s).map_err(|_| ()),
+                || {
+                    settings
+                        .set_builtin_hotkey(feature, canonical)
+                        .map_err(|_| ())
+                },
+            )
+            .map_err(|_| CommandError::settings_failed())?;
+        let _ = app.emit_to("main", "builtin-features://changed", ());
+        Ok(())
+    })
+    .await
+    .map_err(|_| CommandError::settings_failed())?
+}
 #[tauri::command]
 pub(crate) fn list_builtin_features(
     window: WebviewWindow,
 ) -> Result<Vec<BuiltinFeatureView>, CommandError> {
     require_main_window(&window)?;
     let settings = window.app_handle().state::<SettingsStore>();
-    Ok(builtin_feature_views(&settings.snapshot()))
+    let mut views = builtin_feature_views(&settings.snapshot());
+    let coordinator = window.app_handle().state::<Arc<LifecycleCoordinator>>();
+    for view in &mut views {
+        if view.enabled {
+            view.hotkey_status = coordinator
+                .builtin_hotkeys(view.feature)
+                .status(view.hotkey.as_deref());
+        }
+    }
+    Ok(views)
 }
 
 fn set_builtin_enabled_with(
@@ -1663,19 +1839,15 @@ fn set_builtin_enabled_with(
     if saved.builtin_feature_enabled(feature) == enabled {
         return Ok(());
     }
-    if feature != ManagedBuiltinFeature::Screenshot {
-        return settings
-            .set_builtin_feature_enabled(feature, enabled)
-            .map_err(|_| CommandError::settings_failed());
-    }
     let desired = saved
-        .screenshot_hotkey
-        .as_deref()
+        .builtin_hotkey(feature)
         .filter(|_| enabled)
         .map(crate::hotkey::command_chord)
         .transpose()
         .map_err(|_| CommandError::settings_failed())?;
-    if desired.is_some_and(|s| crate::screenshot::hotkey::conflicts(&saved, &s.to_string())) {
+    if desired.is_some_and(|s| {
+        crate::screenshot::hotkey::builtin_conflicts(&saved, feature, &s.to_string())
+    }) {
         return Err(CommandError::hotkey_conflict());
     }
     keys.edit(desired, register, unregister, || {
@@ -1706,13 +1878,20 @@ pub(crate) async fn set_builtin_feature_enabled(
         let native = app.global_shortcut();
         set_builtin_enabled_with(
             &settings,
-            &coordinator.screenshot_hotkeys,
+            coordinator.builtin_hotkeys(feature),
             feature,
             enabled,
             &mut |s| native.register(s).map_err(|_| ()),
             &mut |s| native.unregister(s).map_err(|_| ()),
         )?;
-        let views = builtin_feature_views(&settings.snapshot());
+        let mut views = builtin_feature_views(&settings.snapshot());
+        for view in &mut views {
+            if view.enabled {
+                view.hotkey_status = coordinator
+                    .builtin_hotkeys(view.feature)
+                    .status(view.hotkey.as_deref());
+            }
+        }
         let _ = app.emit_to("main", "builtin-features://changed", ());
         Ok(views)
     })
@@ -1762,6 +1941,16 @@ pub(crate) fn list_quicklinks(
         .map_err(|_| CommandError::plugin_query_failed())
 }
 
+fn quicklink_external_names(settings: &Settings, mut public_names: Vec<String>) -> Vec<String> {
+    public_names.extend(ManagedBuiltinFeature::ALL.into_iter().map(|feature| {
+        settings
+            .builtin_command(feature)
+            .trim_start_matches('/')
+            .to_owned()
+    }));
+    public_names
+}
+
 #[tauri::command]
 pub(crate) fn save_quicklink(
     window: WebviewWindow,
@@ -1775,8 +1964,9 @@ pub(crate) fn save_quicklink(
     let saved = window
         .app_handle()
         .state::<SettingsStore>()
-        .with_enabled_builtin(ManagedBuiltinFeature::Quicklinks, || {
-            store.save_with_external_conflicts(input, &public_commands)
+        .with_enabled_builtin_settings(ManagedBuiltinFeature::Quicklinks, |settings| {
+            let conflicts = quicklink_external_names(settings, public_commands);
+            store.save_with_external_conflicts(input, &conflicts)
         })
         .map_err(|_| CommandError::plugin_query_failed())?
         .map_err(CommandError::quicklink)?;
@@ -2040,6 +2230,65 @@ pub(crate) async fn set_plugin_enabled(
 }
 
 #[tauri::command]
+pub(crate) fn set_public_plugin_permission_access(
+    window: WebviewWindow,
+    plugin_id: String,
+    permission: PublicPermission,
+    granted: bool,
+    expected_inventory_revision: String,
+) -> Result<(), CommandError> {
+    // Authorize before resolving any application state, including on malformed
+    // or forged calls from a plugin WebView.
+    require_main_window(&window)?;
+    let app = window.app_handle();
+    let service = app.state::<Arc<PublicPluginService>>();
+    let registries = app.state::<ResultRegistries>();
+    let plugins = app.state::<Arc<PluginManager>>();
+    let outcome = service.set_permission_access_outcome(
+        &plugin_id,
+        permission,
+        granted,
+        &expected_inventory_revision,
+    );
+    let failed_closed = outcome.changed && outcome.result.is_err();
+    let mut cleanup_error = None;
+    let result = finish_public_plugin_management(
+        service.inner().as_ref(),
+        outcome,
+        registries.main(),
+        plugins.inner(),
+        || {
+            if failed_closed || (!granted && permission == PublicPermission::UiWindow) {
+                if let Err(error) = plugin_window::teardown_current_checked(
+                    app,
+                    app.state::<Arc<PluginWindowController>>().inner().as_ref(),
+                    &plugin_id,
+                ) {
+                    cleanup_error = Some(CommandError::from(error));
+                }
+            }
+            if failed_closed || (!granted && permission == PublicPermission::UiPanel) {
+                if let Err(error) = reset_plugin_panel_checked(
+                    app,
+                    app.state::<Arc<PluginPanelController>>().inner().as_ref(),
+                    &plugin_id,
+                ) {
+                    cleanup_error = Some(error);
+                }
+            }
+            if app
+                .emit_to("main", "public-plugin-permissions-changed", ())
+                .is_err()
+            {
+                cleanup_error = Some(PublicPluginManagementError::Unavailable.into());
+            }
+        },
+    );
+    result?;
+    cleanup_error.map_or(Ok(()), Err)
+}
+
+#[tauri::command]
 pub(crate) fn set_public_plugin_network_access(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
@@ -2059,7 +2308,11 @@ pub(crate) fn set_public_plugin_network_access(
         ),
         registries.main(),
         plugins.inner(),
-        || {},
+        || {
+            let _ = window
+                .app_handle()
+                .emit_to("main", "public-plugin-permissions-changed", ());
+        },
     )
 }
 
@@ -2143,9 +2396,13 @@ pub(crate) fn set_plugin_effective_name(
     })?;
     let manager = service.manager()?;
     manager.replace_external_reserved_names(quicklinks.commands())?;
+    let normalized = name_override.as_deref().map(|value| {
+        let value = value.trim();
+        value.strip_prefix('/').unwrap_or(value)
+    });
     finish_public_plugin_management(
         service.inner().as_ref(),
-        service.rename_command(&plugin_id, &command_id, name_override.as_deref()),
+        service.rename_command(&plugin_id, &command_id, normalized),
         registries.main(),
         plugins.inner(),
         || {
@@ -2266,6 +2523,32 @@ pub(crate) fn uninstall_plugin(
 }
 
 #[tauri::command]
+pub(crate) async fn plugin_youdao_translate(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    store: State<'_, crate::credentials::CredentialStore>,
+    input: serde_json::Value,
+) -> Result<
+    crate::public_plugins::host_services::YoudaoResponse,
+    crate::public_plugins::host_services::ServiceError,
+> {
+    use crate::public_plugins::host_services::{ServiceError, YoudaoCommandInput};
+    let input: YoudaoCommandInput =
+        serde_json::from_value(input).map_err(|_| ServiceError::from("invalidServiceRequest"))?;
+    let caller = crate::public_plugins::parse_runtime_label(window.label())
+        .ok_or(ServiceError::from("expiredRequest"))?;
+    if caller.plugin_id != input.context.plugin_id
+        || caller.generation != input.context.plugin_generation
+    {
+        return Err(ServiceError::from("expiredRequest"));
+    }
+    let manager = service
+        .manager()
+        .map_err(|_| ServiceError::from("networkFailure"))?;
+    manager.youdao_translate(caller, input, store.inner()).await
+}
+
+#[tauri::command]
 pub(crate) async fn plugin_network_request(
     window: WebviewWindow,
     service: State<'_, Arc<PublicPluginService>>,
@@ -2304,11 +2587,18 @@ pub(crate) fn complete_plugin_command(
     service: State<'_, Arc<PublicPluginService>>,
     settings: State<'_, SettingsStore>,
     completion: PluginCommandCompletion,
+    credentials: State<'_, crate::credentials::CredentialStore>,
 ) -> Result<PluginCommandCompletionResult, CommandError> {
     let now = Instant::now();
-    let outcome = service
-        .manager()?
-        .complete(window.label(), &completion, now)?;
+    let outcome = credentials
+        .with_completion(&completion.context, |revision| {
+            let mut outcome = service
+                .manager()?
+                .complete(window.label(), &completion, now)?;
+            outcome.credential_publication = revision;
+            Ok::<_, CommandError>(outcome)
+        })
+        .map_err(|_| CommandError::plugin_query_failed())??;
     let accepted = outcome.accepted;
     if let Some(next) = service.complete_submission(&app, &completion, outcome, now)? {
         service.dispatch(
@@ -3025,6 +3315,97 @@ pub(crate) async fn plugin_panel_request(
 }
 
 #[tauri::command]
+pub(crate) fn plugin_panel_set_status(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    sequence: String,
+    status: crate::panel_status::PanelStatus,
+) -> Result<(), CommandError> {
+    let epoch = parse_panel_storage_session_epoch(&session_epoch)?;
+    parse_panel_storage_session_epoch(&sequence)?;
+    controller
+        .begin_content_call(webview.label(), epoch, true)
+        .map_err(map_storage_panel_call_error)?;
+    if !status.valid() {
+        return Err(CommandError::window_failed());
+    }
+    app.emit_to(
+        "main",
+        "uipilot-plugin-panel-status",
+        crate::panel_status::PanelStatusEvent {
+            session_epoch,
+            sequence,
+            status,
+        },
+    )
+    .map_err(|_| CommandError::window_failed())
+}
+
+#[tauri::command]
+pub(crate) fn open_plugin_panel_actions(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    source: String,
+    ticket: String,
+) -> Result<(), CommandError> {
+    require_main_label(webview.label())?;
+    let epoch = parse_panel_session_epoch(&session_epoch)?;
+    if !matches!(source.as_str(), "hostInput" | "content") || ticket.len() > 64 {
+        return Err(CommandError::window_failed());
+    }
+    let identity = controller
+        .claim_bounds_identity(epoch)
+        .map_err(map_panel_bounds_error)?;
+    let content = app
+        .get_webview(&identity.content_label)
+        .ok_or_else(CommandError::window_failed)?;
+    let payload =
+        serde_json::json!({ "sessionEpoch": session_epoch, "source": source, "ticket": ticket });
+    controller
+        .expect_actions_focus(epoch, true)
+        .map_err(map_panel_bounds_error)?;
+    if content.set_focus().is_err() {
+        let _ = controller.expect_actions_focus(epoch, false);
+        return Err(CommandError::window_failed());
+    }
+    controller
+        .claim_bounds_identity(epoch)
+        .map_err(map_panel_bounds_error)?;
+    content
+        .eval(&format!(
+            "window.__UIPILOT_PLUGIN_PANEL_ACTIONS__({payload});"
+        ))
+        .map_err(|_| CommandError::window_failed())
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_actions_submit(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    session_epoch: String,
+    ticket: String,
+) -> Result<(), CommandError> {
+    let epoch = parse_panel_session_epoch(&session_epoch)?;
+    controller
+        .begin_content_call(webview.label(), epoch, true)
+        .map_err(map_storage_panel_call_error)?;
+    if ticket.is_empty() || ticket.len() > 64 {
+        return Err(CommandError::window_failed());
+    }
+    app.emit_to(
+        "main",
+        "uipilot-plugin-panel-actions-submit",
+        serde_json::json!({ "sessionEpoch": session_epoch, "ticket": ticket }),
+    )
+    .map_err(|_| CommandError::window_failed())
+}
+
+#[tauri::command]
 pub(crate) fn plugin_panel_storage_get(
     webview: tauri::Webview,
     controller: State<'_, Arc<PluginPanelController>>,
@@ -3101,6 +3482,7 @@ pub(crate) fn plugin_panel_clipboard_history_list(
     controller: State<'_, Arc<PluginPanelController>>,
     service: State<'_, Arc<PublicPluginService>>,
     session_epoch: String,
+    query: Option<String>,
 ) -> Result<ClipboardHistorySnapshot, CommandError> {
     let identity = begin_clipboard_history_panel_call(
         webview.label(),
@@ -3110,11 +3492,12 @@ pub(crate) fn plugin_panel_clipboard_history_list(
     )?;
     service
         .manager()?
-        .clipboard_history_snapshot_for_panel(
+        .clipboard_history_query_for_panel(
             &identity.plugin_id,
             identity.generation,
             identity.activation_id,
             identity.admission_epoch,
+            query.as_deref(),
         )
         .map_err(CommandError::from)
 }
@@ -3170,6 +3553,44 @@ pub(crate) fn plugin_panel_clipboard_history_clear(
 }
 
 #[tauri::command]
+pub(crate) fn plugin_panel_clipboard_history_copy(
+    webview: tauri::Webview,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+    id: String,
+) -> Result<ClipboardHistoryCopyOutcome, CommandError> {
+    let identity = begin_clipboard_history_panel_call(
+        webview.label(),
+        controller.inner().as_ref(),
+        &session_epoch,
+        true,
+    )?;
+    let manager = service.manager()?;
+    manager.with_clipboard_history_copy_authorization(
+        &identity.plugin_id,
+        identity.generation,
+        identity.activation_id,
+        identity.admission_epoch,
+        || {
+            controller.with_current_clipboard_history_copy(
+                webview.label(),
+                identity.session_epoch,
+                |current| {
+                    if current != &identity {
+                        return Err(ClipboardHistoryPasteError::ExpiredPanelSession);
+                    }
+                    manager.clipboard_history_write_copy_for_panel(&identity.plugin_id, &id)
+                },
+            )
+        },
+    )?;
+    Ok(ClipboardHistoryCopyOutcome {
+        outcome: ClipboardHistoryCopyStatus::Copied,
+    })
+}
+
+#[tauri::command]
 pub(crate) fn plugin_panel_clipboard_history_paste(
     webview: tauri::Webview,
     app: AppHandle,
@@ -3214,27 +3635,72 @@ pub(crate) fn plugin_panel_clipboard_history_paste(
         let _ = controller.cancel_enter_host_key_paste(paste_ticket);
         return Err(error.into());
     }
-    if let Err(error) = paste_clipboard_history_record(&record) {
-        manager.clipboard_history_cancel_paste_restore_for_panel();
-        let _ = controller.cancel_enter_host_key_paste(paste_ticket);
-        return Err(error.into());
-    }
+    let authority_revision = match manager.with_clipboard_history_paste_authorization(
+        &identity.plugin_id,
+        identity.generation,
+        identity.activation_id,
+        identity.admission_epoch,
+        None,
+        |revision| paste_clipboard_history_record(&record).map(|_| revision),
+    ) {
+        Ok(revision) => revision,
+        Err(error) => {
+            manager.clipboard_history_cancel_paste_restore_for_panel();
+            let _ = controller.cancel_enter_host_key_paste(paste_ticket);
+            return Err(error.into());
+        }
+    };
     if !controller.commit_enter_host_key_paste(paste_ticket) {
         return Err(ClipboardHistoryPasteError::ExpiredPanelSession.into());
     }
     manager
         .clipboard_history_complete_paste_for_panel(&identity.plugin_id, &id)
         .map_err(CommandError::from)?;
-    schedule_clipboard_history_paste_hide_and_send(app, target);
+    schedule_clipboard_history_paste_hide_and_send(
+        app,
+        target,
+        identity,
+        authority_revision,
+        Arc::clone(service.inner()),
+    );
     Ok(ClipboardHistoryPasteOutcome {
         outcome: ClipboardHistoryPasteStatus::Admitted,
     })
 }
 
-fn schedule_clipboard_history_paste_hide_and_send(app: AppHandle, target: ClipboardPasteTarget) {
+fn schedule_clipboard_history_paste_hide_and_send(
+    app: AppHandle,
+    target: ClipboardPasteTarget,
+    identity: PanelSessionIdentity,
+    authority_revision: u64,
+    service: Arc<PublicPluginService>,
+) {
     std::thread::spawn(move || {
         let dispatch_app = app.clone();
         let _ = app.run_on_main_thread(move || {
+            let controller = dispatch_app.state::<Arc<PluginPanelController>>();
+            if controller
+                .begin_content_call(&identity.content_label, identity.session_epoch, false)
+                .is_err()
+            {
+                return;
+            }
+            let Ok(manager) = service.manager() else {
+                return;
+            };
+            if manager
+                .with_clipboard_history_paste_authorization(
+                    &identity.plugin_id,
+                    identity.generation,
+                    identity.activation_id,
+                    identity.admission_epoch,
+                    Some(authority_revision),
+                    |_| Ok(()),
+                )
+                .is_err()
+            {
+                return;
+            }
             let Some(window) = dispatch_app.get_window("main") else {
                 return;
             };
@@ -3245,9 +3711,21 @@ fn schedule_clipboard_history_paste_hide_and_send(app: AppHandle, target: Clipbo
                 return;
             }
             let lifecycle = dispatch_app.state::<Arc<LifecycleCoordinator>>();
-            if lifecycle.clipboard_paste_target_is_foreground(target) {
-                let _ = send_ctrl_v_to_foreground_target(target);
-            }
+            // Hiding can retire the panel. Keep the original owner and recheck
+            // its grants at the actual native send, without locking across hide.
+            let _ = manager.with_clipboard_history_paste_authorization(
+                &identity.plugin_id,
+                identity.generation,
+                identity.activation_id,
+                identity.admission_epoch,
+                Some(authority_revision),
+                |_| {
+                    if lifecycle.clipboard_paste_target_is_foreground(target) {
+                        let _ = send_ctrl_v_to_foreground_target(target);
+                    }
+                    Ok(())
+                },
+            );
         });
     });
 }
@@ -3781,6 +4259,7 @@ async fn run_panel_submission(
         Ok(PublicPluginResponse::Panel(response)) => response,
         Ok(
             PublicPluginResponse::MainResults(_)
+            | PublicPluginResponse::ServiceMainResults { .. }
             | PublicPluginResponse::MainActionResults { .. }
             | PublicPluginResponse::Window(_),
         )
@@ -3889,6 +4368,15 @@ fn spawn_panel_submission(
     });
 }
 
+fn stable_command_argument(query: &str, preserve_selection: bool) -> &str {
+    let argument = query.split_once(' ').map_or("", |(_, argument)| argument);
+    if preserve_selection {
+        argument
+    } else {
+        argument.trim()
+    }
+}
+
 async fn open_plugin_panel_impl(
     app: AppHandle,
     public: State<'_, Arc<PublicPluginService>>,
@@ -3906,6 +4394,14 @@ async fn open_plugin_panel_impl(
         public
             .manager()?
             .route_by_id(&target.plugin_id, &target.command_id, &input.argument)?
+            .filter(|route| {
+                route.output_mode == PublicOutputMode::Panel
+                    && (!route.input_required || !route.input.is_empty())
+            })
+    } else if let Some(command_id) = &input.command_id {
+        public
+            .manager()?
+            .route_by_id(&input.plugin_id, command_id, &input.argument)?
             .filter(|route| {
                 route.output_mode == PublicOutputMode::Panel
                     && (!route.input_required || !route.input.is_empty())
@@ -4009,6 +4505,7 @@ pub(crate) async fn search_apps(
     submit: Option<bool>,
     completion_origin: Option<CompletionOriginInput>,
     stable_command_target: Option<crate::command_hotkeys::CommandEntry>,
+    stable_builtin_target: Option<ManagedBuiltinFeature>,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
     let submit = submit.unwrap_or(false);
@@ -4053,11 +4550,234 @@ pub(crate) async fn search_apps(
     let settings_snapshot = settings.snapshot();
     let web_search_engine = settings_snapshot.web_search_engine;
     let quicklink_items = quicklinks.list().items;
+    if let Some(feature) = stable_builtin_target {
+        if feature != ManagedBuiltinFeature::WebSearch
+            || !settings_snapshot.builtin_feature_enabled(feature)
+        {
+            return Err(CommandError::settings_failed());
+        }
+        let alias = settings_snapshot.builtin_command(feature);
+        let rest = normalized_query
+            .strip_prefix(&alias)
+            .ok_or_else(CommandError::settings_failed)?;
+        if !rest.is_empty() && !rest.starts_with(' ') {
+            return Err(CommandError::settings_failed());
+        }
+        let synthetic = format!("/web-search{}", rest);
+        return Ok(search_apps_with_catalog(
+            registry,
+            CatalogSearchRequest {
+                query: &synthetic,
+                invocation_id: &invocation_id,
+                query_sequence,
+                submit,
+                web_search_engine,
+                favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                disabled_builtin_features: &settings_snapshot.disabled_builtin_features,
+                quicklinks: &quicklink_items,
+            },
+            |_| Ok(Vec::new()),
+            Vec::new,
+            |_| {},
+        ));
+    }
+    let mut matched_public_identity = None;
+    if stable_command_target.is_none()
+        && completion_origin.is_none()
+        && normalized_query.starts_with('/')
+        && normalized_query != "/"
+    {
+        let body = &normalized_query[1..];
+        let (name, argument) = split_launcher_alias(body);
+        let (public_matches, builtin_matches) = exact_launch_aliases(
+            &settings_snapshot,
+            name,
+            public.manager()?.command_suggestions(name)?,
+        );
+        if public_matches.len() + builtin_matches.len() > 1 {
+            let token =
+                registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence);
+            return Ok(token.and_then(|token| {
+                let mut entries: Vec<_> = public_matches
+                    .into_iter()
+                    .filter_map(|suggestion| {
+                        public_plugin_completion_result(suggestion, Some(argument))
+                    })
+                    .collect();
+                for feature in builtin_matches {
+                    let favorite = settings_snapshot
+                        .favorite_builtin_features
+                        .contains(&feature.favorite_feature());
+                    let mut entry = match feature {
+                        ManagedBuiltinFeature::Screenshot => screenshot_result(favorite),
+                        ManagedBuiltinFeature::Quicklinks => quicklinks_result(favorite),
+                        ManagedBuiltinFeature::WebSearch if !argument.is_empty() => {
+                            web_search_result(web_search_engine, argument.to_owned(), favorite)
+                        }
+                        ManagedBuiltinFeature::WebSearch => {
+                            let mut entry = builtin_completion_result(
+                                name,
+                                "网页搜索".into(),
+                                ResultIconKind::WebSearch,
+                                BuiltinFeature::WebSearch,
+                                favorite,
+                            )?;
+                            entry.0.activation = LauncherResultActivation::BuiltinActivation {
+                                feature,
+                                initial_argument: String::new(),
+                            };
+                            entry
+                        }
+                    };
+                    entry.0.title = format!("/{name}");
+                    entries.push(entry);
+                }
+                registry.publish_if_latest(
+                    token,
+                    entries,
+                    || true,
+                    |request_id, items| {
+                        let mut response = search_response(request_id, items);
+                        response.replace_local_results = true;
+                        response
+                    },
+                )
+            }));
+        }
+        if !body.contains(' ')
+            && builtin_matches.is_empty()
+            && quicklink_query(&normalized_query, &quicklink_items).is_none()
+        {
+            let token =
+                registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence);
+            return Ok(token.and_then(|token| {
+                let mut entries: Vec<_> = public
+                    .manager()
+                    .ok()?
+                    .command_suggestions(name)
+                    .ok()?
+                    .into_iter()
+                    .filter_map(|suggestion| public_plugin_completion_result(suggestion, None))
+                    .collect();
+                if "find".starts_with(name) {
+                    entries.push(find_result(
+                        String::new(),
+                        "搜索文件".into(),
+                        settings_snapshot
+                            .favorite_builtin_features
+                            .contains(&BuiltinFeature::Find),
+                    ));
+                }
+                for feature in ManagedBuiltinFeature::ALL {
+                    let command = settings_snapshot.builtin_command(feature);
+                    if !settings_snapshot.builtin_feature_enabled(feature)
+                        || !command[1..].starts_with(name)
+                    {
+                        continue;
+                    }
+                    let favorite = settings_snapshot
+                        .favorite_builtin_features
+                        .contains(&feature.favorite_feature());
+                    let mut entry = match feature {
+                        ManagedBuiltinFeature::Screenshot => screenshot_result(favorite),
+                        ManagedBuiltinFeature::Quicklinks => quicklinks_result(favorite),
+                        ManagedBuiltinFeature::WebSearch => {
+                            let mut entry = builtin_completion_result(
+                                &command[1..],
+                                "网页搜索".into(),
+                                ResultIconKind::WebSearch,
+                                BuiltinFeature::WebSearch,
+                                favorite,
+                            )?;
+                            entry.0.activation = LauncherResultActivation::BuiltinActivation {
+                                feature,
+                                initial_argument: String::new(),
+                            };
+                            entry
+                        }
+                    };
+                    entry.0.title = command;
+                    entries.push(entry);
+                }
+                registry.publish_if_latest(
+                    token,
+                    entries,
+                    || true,
+                    |request_id, items| {
+                        let mut response = search_response(request_id, items);
+                        response.replace_local_results = true;
+                        response
+                    },
+                )
+            }));
+        }
+        if public_matches.is_empty()
+            && builtin_matches.is_empty()
+            && ManagedBuiltinFeature::ALL
+                .iter()
+                .any(|feature| feature.default_name() == name)
+            && quicklink_query(&normalized_query, &quicklink_items).is_none()
+        {
+            let token =
+                registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence);
+            return Ok(token.and_then(|token| {
+                registry.publish_if_latest(
+                    token,
+                    Vec::<(crate::model::ResultItem, Option<ResultAction>)>::new(),
+                    || true,
+                    search_response,
+                )
+            }));
+        }
+        matched_public_identity = sole_public_match(&public_matches, argument);
+        if public_matches.is_empty() && builtin_matches.len() == 1 {
+            let feature = builtin_matches[0];
+            let synthetic = format!(
+                "/{}{}",
+                feature.default_name(),
+                if argument.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {argument}")
+                }
+            );
+            let mut response = search_apps_with_catalog(
+                registry,
+                CatalogSearchRequest {
+                    query: &synthetic,
+                    invocation_id: &invocation_id,
+                    query_sequence,
+                    submit,
+                    web_search_engine,
+                    favorite_builtin_features: &settings_snapshot.favorite_builtin_features,
+                    disabled_builtin_features: &settings_snapshot.disabled_builtin_features,
+                    quicklinks: &quicklink_items,
+                },
+                |_| Ok(Vec::new()),
+                Vec::new,
+                |_| {},
+            );
+            if let Some(response) = &mut response {
+                for item in &mut response.items {
+                    if argument.is_empty() {
+                        item.title = settings_snapshot.builtin_command(feature);
+                        if feature == ManagedBuiltinFeature::WebSearch {
+                            item.activation = LauncherResultActivation::BuiltinActivation {
+                                feature,
+                                initial_argument: String::new(),
+                            };
+                        }
+                    }
+                }
+            }
+            return Ok(response);
+        }
+    }
     if stable_command_target.is_none()
         && completion_origin.is_none()
         && (!normalized_query.starts_with('/') || normalized_query == "/")
     {
-        return Ok(search_apps_with_catalog(
+        let mut response = search_apps_with_catalog(
             registry,
             CatalogSearchRequest {
                 query: &normalized_query,
@@ -4072,16 +4792,38 @@ pub(crate) async fn search_apps(
             |plain_query| public.manager()?.launcher_command_suggestions(plain_query),
             || cache.snapshot(),
             |applications| settings.decorate_applications(applications),
-        ));
+        );
+        if let Some(response) = &mut response {
+            for item in &mut response.items {
+                let feature = match item.icon_kind {
+                    Some(ResultIconKind::Screenshot) => Some(ManagedBuiltinFeature::Screenshot),
+                    Some(ResultIconKind::Quicklinks) => Some(ManagedBuiltinFeature::Quicklinks),
+                    Some(ResultIconKind::WebSearch)
+                        if matches!(
+                            item.activation,
+                            LauncherResultActivation::Completion { .. }
+                        ) =>
+                    {
+                        Some(ManagedBuiltinFeature::WebSearch)
+                    }
+                    _ => None,
+                };
+                if let Some(feature) = feature {
+                    item.title = settings_snapshot.builtin_command(feature);
+                    if feature == ManagedBuiltinFeature::WebSearch {
+                        item.activation = LauncherResultActivation::BuiltinActivation {
+                            feature,
+                            initial_argument: String::new(),
+                        };
+                    }
+                }
+            }
+        }
+        return Ok(response);
     }
     if stable_command_target.is_none()
         && completion_origin.is_none()
-        && (normalized_query == "/find"
-            || normalized_query.starts_with("/find ")
-            || normalized_query == "/quicklinks"
-            || normalized_query == "/web-search"
-            || normalized_query.starts_with("/web-search ")
-            || quicklink_query(&normalized_query, &quicklink_items).is_some())
+        && reserved_catalog_query(&normalized_query, &quicklink_items)
     {
         return Ok(search_apps_with_catalog(
             registry,
@@ -4136,12 +4878,32 @@ pub(crate) async fn search_apps(
             .route_by_id(
                 &target.plugin_id,
                 &target.command_id,
-                route_query
-                    .split_once(' ')
-                    .map_or("", |(_, argument)| argument.trim()),
+                stable_command_argument(
+                    &query,
+                    app.state::<Arc<LifecycleCoordinator>>()
+                        .selection_entry_current(app, target),
+                ),
             )?
             .ok_or_else(CommandError::plugin_query_failed)
             .map(Some)?
+    } else if let Some(origin) = &completion_origin {
+        if let Some(command_id) = &origin.command_id {
+            let argument = route_query
+                .split_once(' ')
+                .map_or("", |(_, value)| value.trim());
+            public
+                .manager()?
+                .route_by_id(&origin.plugin_id, command_id, argument)?
+        } else {
+            public.manager()?.route(route_query)?
+        }
+    } else if let Some((plugin_id, command_id, argument)) = &matched_public_identity {
+        Some(
+            public
+                .manager()?
+                .route_by_id(plugin_id, command_id, argument)?
+                .ok_or_else(CommandError::plugin_query_failed)?,
+        )
     } else {
         public.manager()?.route(route_query)?
     };
@@ -4240,6 +5002,33 @@ pub(crate) async fn search_apps(
                     .ok_or_else(CommandError::plugin_query_failed)??;
                 public.cleanup_retired_result_actions(registry);
                 Ok(published)
+            }
+            PublicPluginResponse::ServiceMainResults {
+                results,
+                credential_revision,
+                publication,
+            } => {
+                if route.output_mode != PublicOutputMode::MainResult {
+                    return Err(CommandError::plugin_query_failed());
+                }
+                app.state::<crate::credentials::CredentialStore>()
+                    .with_revision(credential_revision, || {
+                        public
+                            .manager()
+                            .map_err(|_| "expiredRequest")?
+                            .scheduler()
+                            .with_result_publication(&route.plugin_id, &publication, || {
+                                publish_public_main_results(
+                                    registry,
+                                    registry_token,
+                                    &route,
+                                    results,
+                                    submitted_main_result_command(&route, submit),
+                                )
+                            })
+                            .map_err(|_| "expiredRequest")
+                    })
+                    .map_err(|_| CommandError::plugin_query_failed())
             }
             PublicPluginResponse::MainResults(results) => {
                 if route.output_mode != PublicOutputMode::MainResult {
@@ -4345,6 +5134,51 @@ pub(crate) async fn search_apps(
     ))
 }
 
+pub(crate) fn sole_public_match(
+    matches: &[crate::public_plugins::PublicCommandSuggestion],
+    argument: &str,
+) -> Option<(String, String, String)> {
+    let [matched] = matches else {
+        return None;
+    };
+    Some((
+        matched.plugin_id.clone(),
+        matched.command_id.clone(),
+        argument.to_owned(),
+    ))
+}
+
+fn split_launcher_alias(body: &str) -> (&str, &str) {
+    body.split_once(' ')
+        .map_or((body, ""), |(name, arg)| (name, arg.trim()))
+}
+
+fn exact_launch_aliases(
+    settings: &Settings,
+    name: &str,
+    suggestions: Vec<crate::public_plugins::PublicCommandSuggestion>,
+) -> (
+    Vec<crate::public_plugins::PublicCommandSuggestion>,
+    Vec<ManagedBuiltinFeature>,
+) {
+    let public = suggestions
+        .into_iter()
+        .filter(|item| item.effective_name == name)
+        .collect();
+    let builtins = ManagedBuiltinFeature::ALL
+        .into_iter()
+        .filter(|feature| {
+            settings.builtin_feature_enabled(*feature)
+                && settings.builtin_command(*feature) == format!("/{name}")
+        })
+        .collect();
+    (public, builtins)
+}
+
+fn reserved_catalog_query(query: &str, quicklinks: &[QuicklinkView]) -> bool {
+    query == "/find" || query.starts_with("/find ") || quicklink_query(query, quicklinks).is_some()
+}
+
 fn plugin_discovery_prefix(query: &str) -> Option<&str> {
     let command = query.strip_prefix('/')?;
     (!command.is_empty() && !command.contains(' ')).then_some(command)
@@ -4379,6 +5213,10 @@ fn public_plugin_search_decision(
     if let Some(origin) = completion_origin {
         if !crate::public_plugins::valid_plugin_id(&origin.plugin_id)
             || origin.plugin_id != route.plugin_id
+            || origin
+                .command_id
+                .as_ref()
+                .is_some_and(|id| id != &route.command_id)
             || matches!(origin.phase, CompletionOriginPhase::Preview) == submit
         {
             return Err(());
@@ -4941,16 +5779,18 @@ fn public_plugin_completion_result(
     argument: Option<&str>,
 ) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
     let title = format!("/{}", suggestion.effective_name);
+    let identity = format!("{} · {}", suggestion.display_name, suggestion.command_id);
     let subtitle = Some(
         suggestion
             .summary
             .as_ref()
-            .map(|summary| format!("{} · {}", suggestion.display_name, summary))
-            .unwrap_or_else(|| suggestion.display_name.clone()),
+            .map(|summary| format!("{identity} · {summary}"))
+            .unwrap_or(identity),
     );
     let activation = match suggestion.output_mode {
         PublicOutputMode::Panel => LauncherResultActivation::panel_activation(
             suggestion.plugin_id.clone(),
+            suggestion.command_id.clone(),
             argument.unwrap_or("").to_owned(),
             suggestion.favorite,
         )?,
@@ -4963,6 +5803,7 @@ fn public_plugin_completion_result(
         )?,
         PublicOutputMode::Window => LauncherResultActivation::window_activation(
             suggestion.plugin_id.clone(),
+            suggestion.command_id.clone(),
             suggestion.effective_name.clone(),
             argument.unwrap_or("").to_owned(),
             suggestion.favorite,
@@ -5644,6 +6485,7 @@ pub(crate) fn load_settings(
     public_plugins: State<'_, Arc<PublicPluginService>>,
 ) -> Result<SettingsView, CommandError> {
     require_main_window(&window)?;
+    crate::dev_startup::stage("收到前端 load_settings，读取设置");
     let mut view = load_settings_ready_with(
         || {
             coordinator
@@ -5652,6 +6494,7 @@ pub(crate) fn load_settings(
         },
         || load_settings_core(&settings),
     )?;
+    crate::dev_startup::stage("调度公开插件运行时");
     public_plugins.inner().start_enabled_runtimes(&app)?;
     view.screenshot_hotkey_status = coordinator
         .screenshot_hotkeys
@@ -5664,6 +6507,7 @@ pub(crate) fn load_settings(
     {
         static READY_LOG: std::sync::Once = std::sync::Once::new();
         READY_LOG.call_once(|| {
+            crate::dev_startup::ready();
             eprintln!("[UiPilot dev] 主程序已就绪：主窗口前端已连接，设置已加载，可使用启动器。");
         });
     }
@@ -6757,6 +7601,9 @@ pub(crate) fn clear_and_hide_window(
     reason: HideReason,
 ) -> Result<(), CommandError> {
     let settings = window.state::<SettingsStore>();
+    window
+        .state::<Arc<LifecycleCoordinator>>()
+        .cancel_selection_capture();
     let lifecycle = Arc::clone(window.state::<Arc<LifecycleCoordinator>>().inner());
     if lifecycle.settings_pinned() && reason != HideReason::ExplicitReturn {
         return Ok(());
@@ -6837,6 +7684,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selection_stable_route_preserves_exact_argument_whitespace() {
+        assert_eq!(
+            super::stable_command_argument("/translate   hello\n ", true),
+            "  hello\n "
+        );
+        assert_eq!(
+            super::stable_command_argument("/translate   hello\n ", false),
+            "hello"
+        );
+    }
+
     #[test]
     fn screenshot_toggle_save_failure_restores_registration_and_enabled_state() {
         let dir = TestDir::new();
@@ -7389,6 +8248,40 @@ mod tests {
     }
 
     #[test]
+    fn permission_access_command_is_main_only_before_state_and_requires_all_fields() {
+        for label in [
+            "plugin-runtime-com.example.timer-1",
+            "plugin-window-com.example.timer",
+            "find",
+        ] {
+            assert!(super::require_main_label(label).is_err());
+        }
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("pub(crate) fn set_public_plugin_permission_access(")
+            .unwrap();
+        let tail = &source[start..];
+        let command = &tail[..tail.find("\n#[tauri::command]").unwrap()];
+        assert!(
+            command.find("require_main_window(&window)?;").unwrap()
+                < command.find("app.state::<").unwrap()
+        );
+        for required in [
+            "plugin_id: String",
+            "permission: PublicPermission",
+            "granted: bool",
+            "expected_inventory_revision: String",
+        ] {
+            assert!(command.contains(required));
+        }
+        assert!(command.contains("Result<(), CommandError>"));
+        assert!(command.contains("public-plugin-permissions-changed"));
+        assert!(command.contains("failed_closed"));
+        assert!(command.contains("reset_plugin_panel_checked("));
+        assert!(command.contains("plugin_window::teardown_current_checked("));
+    }
+
+    #[test]
     fn find_ready_outcome_uses_camel_case_fields() {
         assert_eq!(
             serde_json::to_value(FindReadyOutcome::Ready {
@@ -7524,10 +8417,14 @@ mod tests {
             vec![
                 (
                     "/alpha-return",
-                    Some("Public Plugin Alpha Return · 返回示例文本到主界面"),
+                    Some("Public Plugin Alpha Return · default · 返回示例文本到主界面"),
                     false,
                 ),
-                ("/alpha-window", Some("Public Plugin Alpha Window"), false,),
+                (
+                    "/alpha-window",
+                    Some("Public Plugin Alpha Window · default"),
+                    false,
+                ),
             ]
         );
         assert!(matches!(
@@ -7544,6 +8441,7 @@ mod tests {
         assert!(matches!(
             &response.items[1].activation,
             crate::model::LauncherResultActivation::WindowActivation {
+                command_id: _,
                 plugin_id,
                 command_label,
                 initial_argument,
@@ -7697,6 +8595,7 @@ mod tests {
                 Some(&CompletionOriginInput {
                     phase: CompletionOriginPhase::Commit,
                     plugin_id: "com.example.demo".into(),
+                    command_id: None,
                 }),
             ),
             Ok(PublicPluginSearchDecision::Dispatch)
@@ -7756,10 +8655,12 @@ mod tests {
         let preview = CompletionOriginInput {
             phase: CompletionOriginPhase::Preview,
             plugin_id: route.plugin_id.clone(),
+            command_id: None,
         };
         let commit = CompletionOriginInput {
             phase: CompletionOriginPhase::Commit,
             plugin_id: route.plugin_id.clone(),
+            command_id: None,
         };
 
         assert_eq!(
@@ -7785,6 +8686,7 @@ mod tests {
         let mismatch = CompletionOriginInput {
             phase: CompletionOriginPhase::Commit,
             plugin_id: "com.example.other".into(),
+            command_id: None,
         };
         assert_eq!(
             public_plugin_search_decision(&route, true, Some(&mismatch)),
@@ -7824,6 +8726,148 @@ mod tests {
             created_at: "1".into(),
             updated_at: "1".into(),
         }
+    }
+
+    #[test]
+    fn quicklink_and_builtin_alias_conflicts_are_rejected_in_both_creation_orders() {
+        let dir = TestDir::new();
+        let store = super::QuicklinksStore::new(dir.path().to_path_buf());
+        let input = || super::QuicklinkSaveInput {
+            id: None,
+            name: "Shared".into(),
+            command: "shared".into(),
+            template: "https://example.com/?q={Query}".into(),
+            icon_token: None,
+        };
+        let mut settings = Settings::default();
+        settings
+            .builtin_names
+            .insert(ManagedBuiltinFeature::Screenshot, "shared".into());
+        let reserved = super::quicklink_external_names(&settings, vec!["public".into()]);
+        assert_eq!(
+            store
+                .save_with_external_conflicts(input(), &reserved)
+                .unwrap_err(),
+            super::QuicklinkErrorCode::CommandConflict
+        );
+        settings.builtin_names.clear();
+        store
+            .save_with_external_conflicts(
+                input(),
+                &super::quicklink_external_names(&settings, vec![]),
+            )
+            .unwrap();
+        let settings_store = SettingsStore::load(dir.path()).unwrap();
+        assert!(settings_store
+            .set_builtin_feature_name_checked(
+                ManagedBuiltinFeature::Screenshot,
+                Some("shared".into()),
+                |name| !store.commands().iter().any(|command| command == name),
+            )
+            .is_err());
+        assert_eq!(
+            settings_store
+                .snapshot()
+                .builtin_command(ManagedBuiltinFeature::Screenshot),
+            "/screenshot"
+        );
+    }
+
+    #[test]
+    fn sole_public_match_captures_stable_identity_and_argument() {
+        let mut suggestion = command_suggestion("shared");
+        suggestion.plugin_id = "com.example.eligible".into();
+        suggestion.command_id = "second".into();
+        let captured = super::sole_public_match(&[suggestion], "hello  world").unwrap();
+        assert_eq!(
+            captured,
+            (
+                "com.example.eligible".into(),
+                "second".into(),
+                "hello  world".into()
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_public_rows_show_distinct_command_identifiers() {
+        let mut first = command_suggestion("shared");
+        first.command_id = "first".into();
+        let mut second = first.clone();
+        second.command_id = "second".into();
+        let first = super::public_plugin_completion_result(first, Some("hello"))
+            .unwrap()
+            .0;
+        let second = super::public_plugin_completion_result(second, Some("hello"))
+            .unwrap()
+            .0;
+        assert!(first.subtitle.as_deref().unwrap().contains("first"));
+        assert!(second.subtitle.as_deref().unwrap().contains("second"));
+        assert_ne!(first.subtitle, second.subtitle);
+    }
+
+    #[test]
+    fn renamed_builtin_old_alias_with_public_argument_falls_through_to_public_route() {
+        let mut settings = Settings::default();
+        settings
+            .builtin_names
+            .insert(ManagedBuiltinFeature::WebSearch, "search".into());
+        settings
+            .builtin_names
+            .insert(ManagedBuiltinFeature::Quicklinks, "links".into());
+        settings
+            .builtin_names
+            .insert(ManagedBuiltinFeature::Screenshot, "capture".into());
+        for name in ["web-search", "quicklinks", "screenshot"] {
+            let query = format!("/{name} hello  world");
+            let (matched, builtins) =
+                super::exact_launch_aliases(&settings, name, vec![command_suggestion(name)]);
+            assert_eq!(matched.len(), 1);
+            assert!(builtins.is_empty());
+            assert!(
+                !super::reserved_catalog_query(&query, &[]),
+                "{query} must reach the public route"
+            );
+            assert_eq!(super::split_launcher_alias(&query[1..]).1, "hello  world");
+        }
+        assert!(super::reserved_catalog_query("/find document", &[]));
+    }
+
+    #[test]
+    fn exact_alias_choices_disambiguate_public_and_builtins_and_preserve_argument() {
+        let mut settings = Settings::default();
+        settings
+            .builtin_names
+            .insert(ManagedBuiltinFeature::Screenshot, "shared".into());
+        settings
+            .builtin_names
+            .insert(ManagedBuiltinFeature::Quicklinks, "shared".into());
+        let (name, argument) = super::split_launcher_alias("shared hello  world");
+        let mut public = command_suggestion("shared");
+        public.command_id = "other".into();
+        let (public_matches, builtin_matches) =
+            super::exact_launch_aliases(&settings, name, vec![public]);
+        assert_eq!(argument, "hello  world");
+        assert_eq!(public_matches[0].command_id, "other");
+        assert_eq!(
+            builtin_matches,
+            vec![
+                ManagedBuiltinFeature::Screenshot,
+                ManagedBuiltinFeature::Quicklinks
+            ]
+        );
+        settings
+            .disabled_builtin_features
+            .insert(ManagedBuiltinFeature::Screenshot);
+        assert_eq!(
+            super::exact_launch_aliases(&settings, "shared", Vec::new()).1,
+            vec![ManagedBuiltinFeature::Quicklinks]
+        );
+        assert!(
+            super::exact_launch_aliases(&settings, "screenshot", Vec::new())
+                .1
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7874,6 +8918,7 @@ mod tests {
         let (empty, _) = super::public_plugin_completion_result(panel.clone(), None).unwrap();
         match empty.activation {
             crate::model::LauncherResultActivation::PanelActivation {
+                command_id: _,
                 plugin_id,
                 initial_argument,
                 favorite,
@@ -7905,6 +8950,7 @@ mod tests {
         assert!(matches!(
             window.activation,
             crate::model::LauncherResultActivation::WindowActivation {
+                command_id: _,
                 plugin_id,
                 command_label,
                 initial_argument,
@@ -7929,6 +8975,7 @@ mod tests {
             serde_json::to_value(item.activation).unwrap(),
             serde_json::json!({
                 "kind": "windowActivation",
+                "commandId": "default",
                 "pluginId": "com.example.pomodoro",
                 "commandLabel": "pomodoro",
                 "initialArgument": "focus",
@@ -7949,6 +8996,7 @@ mod tests {
             serde_json::to_value(required.activation).unwrap(),
             serde_json::json!({
                 "kind": "windowActivation",
+                "commandId": "default",
                 "pluginId": "com.example.demo-win",
                 "commandLabel": "demo-win",
                 "initialArgument": "",
@@ -8362,6 +9410,7 @@ mod tests {
         assert!(matches!(
             &response.items[1].activation,
             crate::model::LauncherResultActivation::WindowActivation {
+                command_id: _,
                 plugin_id,
                 command_label,
                 initial_argument,
@@ -8378,6 +9427,7 @@ mod tests {
         assert!(matches!(
             &response.items[4].activation,
             crate::model::LauncherResultActivation::WindowActivation {
+                command_id: _,
                 plugin_id,
                 command_label,
                 initial_argument,
@@ -8595,6 +9645,9 @@ mod tests {
             plugin_window_positions: BTreeMap::new(),
             public_plugin_command_hotkeys: BTreeMap::new(),
             screenshot_hotkey: None,
+            translation_selection_hotkey: Some("Alt+A".into()),
+            builtin_hotkeys: BTreeMap::new(),
+            builtin_names: BTreeMap::new(),
             screenshot_save_directory: None,
         };
         fs::write(
@@ -8631,7 +9684,10 @@ mod tests {
             ManagedBuiltinFeature::ALL
         );
         assert_eq!(
-            value.iter().map(|item| item.command).collect::<Vec<_>>(),
+            value
+                .iter()
+                .map(|item| item.command.as_str())
+                .collect::<Vec<_>>(),
             ["/screenshot", "/quicklinks", "/web-search"]
         );
         assert_eq!(value[1].examples, vec!["/quicklinks"]);

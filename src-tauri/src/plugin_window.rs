@@ -2127,6 +2127,37 @@ pub(crate) fn teardown_current(
     }
 }
 
+fn teardown_current_checked_with(
+    controller: &PluginWindowController,
+    plugin_id: &str,
+    destroy: impl FnOnce() -> Result<(), PublicPluginManagementError>,
+) -> Result<(), PublicPluginManagementError> {
+    let retired = controller.close_for_uninstall(plugin_id);
+    // Always attempt native cleanup, including retries after authority was retired.
+    let destroyed = destroy();
+    if !retired {
+        return Err(PublicPluginManagementError::Unavailable);
+    }
+    destroyed
+}
+
+pub(crate) fn teardown_current_checked(
+    app: &AppHandle,
+    controller: &PluginWindowController,
+    plugin_id: &str,
+) -> Result<(), PublicPluginManagementError> {
+    teardown_current_checked_with(controller, plugin_id, || {
+        let label =
+            plugin_shell_label(plugin_id).ok_or(PublicPluginManagementError::Unavailable)?;
+        if let Some(window) = app.get_window(&label) {
+            window
+                .destroy()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        }
+        Ok(())
+    })
+}
+
 pub(crate) fn destroy_current(app: &AppHandle, plugin_id: &str) {
     if let Some(label) = plugin_shell_label(plugin_id) {
         if let Some(window) = app.get_window(&label) {
@@ -2174,6 +2205,34 @@ mod tests {
             request_id: request.into(),
             control_value: format!("/demo {token}"),
         }
+    }
+
+    #[test]
+    fn permission_access_window_teardown_reports_native_failure_after_retiring_authority() {
+        let controller = PluginWindowController::default();
+        let owner = owner("permission-close", 1, "request");
+        controller.submit(owner.clone()).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = teardown_current_checked_with(&controller, &owner.plugin_id, || {
+            calls.set(calls.get() + 1);
+            assert!(!controller.owns_plugin(&owner.plugin_id));
+            Err(PublicPluginManagementError::Unavailable)
+        });
+        assert!(matches!(
+            result,
+            Err(PublicPluginManagementError::Unavailable)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(!controller.owns_plugin(&owner.plugin_id));
+        // A retry still attempts physical cleanup after the owner was removed.
+        assert!(
+            teardown_current_checked_with(&controller, &owner.plugin_id, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .is_ok()
+        );
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

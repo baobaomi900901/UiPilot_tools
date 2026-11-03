@@ -1,4 +1,5 @@
 import { parsePublicPluginDiagnostics } from './protocol'
+import { createCredentialClient } from './credential-client'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -47,10 +48,15 @@ export const client: LauncherClient = {
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
   listenHidden: (handler) => listen('launcher://hidden', () => handler()),
   listenBuiltinFeaturesChanged: (handler) => listen('builtin-features://changed', () => handler()),
+  listenPublicPluginPermissionsChanged: (handler) => listen('public-plugin-permissions-changed', () => handler()),
   listenMessageStateChanged: (handler) =>
     listen('message-center://state-changed', (event) => handler(event.payload)),
   listenPluginPanelError: (handler) =>
     listen('uipilot-plugin-panel-error', (event) => handler(event.payload)),
+  listenPluginPanelStatus: (handler) =>
+    listen('uipilot-plugin-panel-status', (event) => handler(event.payload)),
+  listenPluginPanelActionsSubmit: (handler) => listen('uipilot-plugin-panel-actions-submit', (event) => handler(event.payload)),
+  openPluginPanelActions: (input) => invoke('open_plugin_panel_actions', input),
   listenPluginPanelReset: (handler) =>
     listen('uipilot-plugin-panel-reset', (event) => handler(event.payload)),
   listenPluginPanelFocusHostInput: (handler) =>
@@ -115,6 +121,9 @@ export const client: LauncherClient = {
   },
   commitPluginWindowTransfer: (input) => invoke<void>('commit_plugin_window_transfer', input),
   setPublicPluginCommandHotkey: (input) => invoke('set_public_plugin_command_hotkey', { input }),
+  cancelTranslationSelection: () => invoke('cancel_translation_selection'),
+  getTranslationSelectionSettings: () => invoke('get_translation_selection_settings'),
+  setTranslationSelectionHotkey: (input) => invoke('set_translation_selection_hotkey', input),
   resolvePublicPluginCommandEntry: async (input) => {
     const resolved = parseCommandEntryResolution(await invoke('resolve_public_plugin_command_entry', input))
     if (!resolved) throw { code: 'pluginQueryFailed' }
@@ -125,6 +134,8 @@ export const client: LauncherClient = {
     if (!items) throw { code: 'builtinFeatureListFailed', message: 'builtin feature list failed' }
     return items
   },
+  setBuiltinFeatureName: (input) => invoke('set_builtin_feature_name', input),
+  setBuiltinFeatureHotkey: (input) => invoke('set_builtin_feature_hotkey', input),
   setBuiltinFeatureEnabled: async (input) => {
     const items = parseBuiltinFeatures(await invoke<unknown>('set_builtin_feature_enabled', input))
     if (!items) throw { code: 'builtinFeatureListFailed', message: 'builtin feature list failed' }
@@ -161,6 +172,7 @@ export const client: LauncherClient = {
   cancelPublicPlugin: async (input) => { await invoke('cancel_public_plugin_install', input) },
   setPublicPluginEnabled: async (input) => { await invoke('set_plugin_enabled', input) },
   setPublicPluginNetworkAccess: async (input) => { await invoke('set_public_plugin_network_access', input) },
+  setPublicPluginPermissionAccess: async (input) => { await invoke('set_public_plugin_permission_access', input) },
   setPublicPluginFavorite: async (input) => { await invoke('set_plugin_favorite', input) },
   setBuiltinFeatureFavorite: async (input) => { await invoke('set_builtin_feature_favorite', { input }) },
   setPublicPluginEffectiveName: async (input) => { await invoke('set_plugin_effective_name', input) },
@@ -214,6 +226,7 @@ export const client: LauncherClient = {
     ),
   hideLauncher: () => invoke<void>('hide_launcher'),
   validateYoudaoTranslation: (input) => invoke('validate_youdao_translation', { input }),
+  credentials: createCredentialClient(invoke),
 }
 
 export const pluginWindowClient: PluginWindowClient = {

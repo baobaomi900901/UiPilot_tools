@@ -13,12 +13,12 @@ const core = createPluginWindowCore({
 const host = document.querySelector<HTMLElement>('#app')!
 const root = createRoot(host)
 root.render(
-  <div style={{ display: 'grid', gridTemplateRows: '44px minmax(0, 1fr)', height: '100%' }}>
+  <div className="browser-preview-plugin-window">
     <PluginWindowView core={core} />
     <iframe
       title="JSON 工作台"
       src={`/dev/plugin-window-content-preview.html?theme=${scheme}`}
-      style={{ width: '100%', height: '100%', border: 0, display: 'block' }}
+      className="browser-preview-frame"
     />
   </div>,
 )

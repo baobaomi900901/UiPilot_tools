@@ -20,6 +20,10 @@
 
 完整字段、上限和安全合同见 [`Public Plugin API v1`](./public-plugin-v1.md)、[`plugin.json` Schema](./uipilot-plugin-v1.schema.json) 和 [TypeScript API 类型](./uipilot-plugin-api-v1.d.ts)。
 
+主结果列表的底栏由宿主管理：右下固定“操作 Ctrl+K”，左侧显示结果数量和状态反馈。操作列表与快捷键收进动态面板；结果 `subtitle` 仅描述内容或状态。插件无需自行绘制底栏。
+
+用户可在「设置 → 权限」按能力分类调整插件授权（包括网络），因此插件安装成功不代表权限始终有效。调用能力时应处理权限不足；关闭权限会使相关旧请求或会话失效，重新开启后需要发起新的操作。普通重载、更新和重启会保留仍然申报的权限的关闭状态；新增权限仍需安装确认。撤销权限不会删除插件数据或已有剪贴板历史。
+
 ## 1. 选择插件类型
 
 | 需求 | `activationMode` | `outputMode` | 权限 | 参考 Demo |
@@ -91,7 +95,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - 旧 `command.defaultName` 不包含 `/`；新 `commands` 每项也使用相同名称规则。`command` / `commands` 必须二选一，显式 null 无效。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read`、`clipboard.history.paste`、`url.open` 和 `files.openText`。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
+- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read`、`clipboard.history.paste`、`url.open` 、`files.openText` 和 Host 0.15.0+ 的 `credentials.youdaoTranslation`、`credentials.baiduOcr`、`credentials.deepseek`，以及 Host 0.16.0+ 的 `selection.read`（用户主动触发划词翻译时获取选区；宿主可临时复制并有条件恢复剪贴板）。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -141,7 +145,7 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
 这是字段片段；完整离线包见 [demo-multi](../../examples/public-plugins/com.uipilot.demo-multi/README.md)。数组限 1–16 项，每项必填唯一 id，匹配 `^[a-z][a-z0-9-]{0,31}$`；defaultName 也须包内唯一。合法 ID 包含 constructor，勿用继承属性进行分派。每项只支持 mainResult，不能声明 window/panel 及 ui.window、ui.panel、timer.control、clipboard.history.* 权限。任一项无效则整包拒绝，不能忽略或退回第一项。
 
-Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.13.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
+Manifest schemaVersion、Runtime apiVersion 仍为 1；内部 state schema 为 2，inventory 和 CLI report schema 仍为 1。插件 version、Host 版本、CLI npm 包版本（当前 0.1.0）各自独立。current Host 和 CLI Host target 已同步为 0.17.0，可验证合法 commands 包（含单项数组）；本地发布准备的最终独立评审与真实 Windows Host 人工验收单独登记。旧示例的最低版本及凭据功能的 0.4.0 门槛不变。
 
 ### 分支 B：子窗口型 Manifest
 
@@ -677,7 +681,7 @@ Panel 首次打开成功后，宿主会自动把光标放到命令 tag 后的参
 
 `focusHostInput()` 不接收参数，只把焦点交回当前会话带命令 tag 的参数输入框；它不会关闭面板、删除 tag、提交或改写参数与选择区。输入框已经聚焦时可以重复调用。会话已经隐藏、替换或销毁时调用会安静地无操作完成；当前会话的宿主聚焦失败会拒绝 Promise。
 
-非空 `panel.hostKeys` 要求页面在 ready 前恰好注册一次 `onHostKey(handler)`。声明只允许 `ArrowDown`、`ArrowUp`、`Primary+N`、`Tab`、`Shift+Tab`、`Enter`，并按 `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter` 规范化。方向键和 `Tab` 只匹配无修饰键；`Shift+Tab` 只匹配仅带 Shift 的 Tab；`Enter` 只匹配无修饰键且非 IME composing；Windows 的 `Primary+N` 只匹配 Ctrl+N，macOS 只匹配 Meta+N。未声明按键、普通字符和其他组合不会路由。handler 串行执行；抛错或拒绝会 ack 但不重试，超过 2 秒未完成会隐藏并销毁会话。调用 unsubscribe 也会结束会话。
+非空 `panel.hostKeys` 要求页面在 ready 前恰好注册一次 `onHostKey(handler)`。声明只允许 `ArrowDown`、`ArrowUp`、`Primary+N`、`Tab`、`Shift+Tab`、`Enter`、`Delete`，并按 `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter < Delete` 规范化。方向键和 `Tab` 只匹配无修饰键；`Shift+Tab` 只匹配仅带 Shift 的 Tab；`Enter` 只匹配无修饰键且非 IME composing；Windows 的 `Primary+N` 只匹配 Ctrl+N，macOS 只匹配 Meta+N。未声明按键、普通字符和其他组合不会路由。handler 串行执行；抛错或拒绝会 ack 但不重试，超过 2 秒未完成会隐藏并销毁会话。调用 unsubscribe 也会结束会话。
 
 `panel.hostKeyFocus` 可省略或设为 `content` / `host`。省略等价于 `content`：每次 Host Key 投递前，宿主把原生焦点交给 Panel WebView，适合需要打开对话框或继续接收内容键盘输入的面板。`host` 保持带命令 tag 的宿主输入框焦点，适合只用 Host Key 切换分类或移动选择的面板；插件不需要在 handler 后调用 `focusHostInput()`。显式字段要求 `minimumHostVersion >= 0.3.4`；错误类型、`null` 和未知值都会被拒绝。焦点策略不改变串行队列、ack、超时、会话销毁或 Enter 粘贴权限。
 
@@ -1111,3 +1115,44 @@ Windows `mainResult` 插件可声明 `clipboard.paste` 与 `clipboard.write`，�
 与复制相比，粘贴会先写入剪贴板，然后隐藏 UiPilot，返回本次唤起前捕获的原应用并请求一次 Ctrl+V。请从目标编辑器唤起 UiPilot，再通过动作菜单主动选择“粘贴到原应用”，并松开触发键。成功“已请求粘贴”只表示 Windows 接受输入批次；不会确认目标已插入或自动保存文档。关闭目标、变更焦点/剪贴板或仍按住按键会阻止发送；不自动重试或重新显示抢焦点。写入后失败仍保留本次文本，绝不恢复覆盖后来复制的内容。所有兄弟动作一次消费；需核对目标后显式重新运行。
 
 [文本片段 1.2](../../examples/public-plugins/com.uipilot.text-snippet/README.md) 保留 Enter 默认复制，在非空原文、大写和最新片段上增加次级粘贴。保存、URL、重读及 `snippet.latest` 记录合同保持。真实系统效果需用户从记事本自行验收；代理测试只使用注入 driver 和假存储。
+
+
+## Host 0.15.0：主程序密钥业务服务
+
+当前有道业务调用仅支持旧 `command` 形态的 `mainResult` 包，且 `runtime.resultActions` 必须省略或为 `false`。`commands` 多命令包、Panel、子窗口及启用结果动作的包均不能调用有道业务方法；即使权限已授予，也会拒绝 `InvalidServiceRequestError`。其他插件形态仍可声明和管理三项服务授权，以供未来能力使用。`api.services` 当前随 Runtime 网络能力提供，其存在不代表服务已授权，也不代表插件命令/输出形态兼容。百度 OCR 与 DeepSeek 仍无公开业务方法。
+
+
+Windows Runtime 的 `api.services?.youdao.translate({text, from, to})` 使用宿主配置的有道翻译密钥；插件不接收密钥、签名、URL 或认证参数。声明 `credentials.youdaoTranslation`、`network.https`，最低版本 `0.15.0`，并声明 `network.httpsHosts: ["openapi.youdao.com"]`。用户在设置 → 权限单独授权，在设置 → 密钥配置中配置并启用服务；两者独立，关闭配置不会清除授权。
+
+仅允许 `en` → `zh-CHS` 或反向。text 不 trim，须为 1..8192 UTF-8 字节且不含 NUL。只接受三个自有可枚举数据属性，不执行 getter、不接受额外字段。返回深冻结的 `{translations: string[]}`；facade 与原请求绑定，处理结束后保留的方法拒绝 `ExpiredRequestError`，不能借用后续调用。
+
+固定错误名：`InvalidServiceRequestError`、`ServicePermissionDeniedError`、`CredentialNotConfiguredError`、`CredentialDisabledError`、`CredentialUnavailableError`、`PermissionDeniedError`、`NetworkTargetDeniedError`、`NetworkTimeoutError`、`NetworkFailureError`、`NetworkResponseTooLargeError`、`NetworkResponseInvalidError`、`NetworkLimitExceededError`、`ExpiredRequestError`、`ProviderAuthenticationError`、`ProviderQuotaError`、`ProviderFailureError`。错误不包含真实凭据或供应商原始响应。
+
+`credentials.baiduOcr` 和 `credentials.deepseek` 是独立的默认关闭授权，目前没有公开业务 API，也不能替代有道授权。声明服务权限仅支持 Windows，最低 Host 为 0.15.0。翻译示例申报三项服务权限，但仅调用有道服务。
+
+## Panel 操作提示
+
+Host 0.16.0 起，Panel 保留宿主底部状态栏。调用 `uipilotPluginPanel.setStatus({ message: "已保存", tone: "success" })` 显示反馈，`tone: "error"` 显示失败，空消息清除。成功清除计时器应绑定操作修订号；不要另建面板内提示气泡。SDK 的方法绑定当前面板会话，异步任务应保存方法引用并遵守自身的会话取消规则。
+
+
+### Panel 动态操作（Host 0.16.0+）
+
+使用 `uipilotPluginPanel.onActions(({ source }) => ({ context, global }))` 注册一个同步提供器，返回解除注册函数。source 为 hostInput/content，提供器在菜单抢焦点前调用，可据 document.activeElement 区分列表和编辑框。对话框打开时返回 null。
+
+每组最多 12 项；每项是 id/title/run，可选 shortcut/icon/disabledReason。id 唯一且匹配 `[a-z][a-z0-9-]{0,63}`，host- 前缀保留；title、shortcut、disabledReason 上限分别 80、32、160 个 Unicode 字符且不得含控制符。图标为 SDK 枚举，禁用项有原因且不会执行。run 在原本焦点恢复后调用，执行前须再次核对捕获的笔记/对象和会话。菜单关闭或 Panel 更新后的旧回调自动作废。权限仍由原 API 检查，此注册不增加系统权限。
+
+宿主为主输入框补充搜索动作，内容区才补充“返回主输入框”（Ctrl+F）。插件自行提供返回动作时也应仅在 source 为 content 时返回，避免主输入框中出现多余的返回操作；该动作使用单次票据，输入或会话变更后失效。菜单只显示分组与操作项，不显示点击、方向键说明；Esc/Ctrl+K 关闭菜单，原有功能快捷键保持不变。
+
+### Panel Delete Host Key（Host 0.16.0+）
+
+`panel.hostKeys` 新增 `Delete`，规范排序位于 `Enter` 之后；声明它需要 `minimumHostVersion >= 0.16.0`。SDK 的 `PluginPanelHostKeyEvent.key` 相应增加 `Delete`。
+
+仅对声明此键的当前 Panel，在主输入框为空、无 Ctrl/Meta/Shift/Alt、非 IME composing 且非重复 keydown 时转发。主输入框含文字时保留原生 Delete 编辑行为。Ctrl+K 菜单拥有输入时不投递给背后列表。既有串行投递、会话/序号、ack、超时和焦点策略保持不变，Delete 不授予 Enter 粘贴票据。
+
+`onActions` 的 `shortcut` 仍只负责展示，不注册快捷键；插件需要声明 hostKeys 并通过 onHostKey 执行相同动作。内容区直接处理 Delete 时同样保护可编辑控件、IME、修饰键、长按及已消费事件。删除回调必须捕获并复核选中对象/会话，进行中禁用重复操作。不可用时用 disabledReason 解释，反馈用 setStatus。
+
+### Clipboard history search and copy (Windows Host 0.17.0+)
+
+`clipboardHistory.list(input?: { query?: string })` accepts only the optional `query` field. No argument and empty/whitespace queries return all summaries. Queries are limited to 512 Unicode characters before trimming; invalid input rejects with `TypeError`. The Host matches a case-insensitive contiguous substring against the complete text or any file name (including extension, excluding parent directories). Nonempty queries exclude images. Results preserve recent-first ordering and the history revision. A filtered result never replaces the unfiltered `onChanged` snapshot cache; when history changes, query again and discard stale requests using the Panel session and a request generation.
+
+`clipboardHistory.copy({ id })` requires declared and granted `clipboard.history.read` plus `clipboard.history.copy`, exact Windows support, `submit + panel + ui.panel`, and `minimumHostVersion >= 0.17.0`. New copy permission is never implicitly granted by an upgrade. It uses the current active Panel session and resolves to `{ outcome: 'copied' }` only after the Host writes the complete text, original image, or file list to the system clipboard. It preserves the Panel and focus and does not simulate paste. Unknown fields are rejected. Stable errors are `PermissionDenied`, `ExpiredPanelSession`, `RecordNotFound`, `RecordUnavailable`, and `ClipboardWriteFailed`; error messages are redacted. There is no retry and no routed Enter ticket requirement. The existing `paste` API and permission retain their behavior.

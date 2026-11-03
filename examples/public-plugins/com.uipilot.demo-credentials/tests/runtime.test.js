@@ -45,6 +45,7 @@ test('stable credential failures expose no provider error text or accidental err
   for (const name of ['CredentialUnavailableError', 'PermissionDeniedError', 'InvalidNetworkRequestError', 'NetworkTargetDeniedError', 'ExpiredRequestError', 'NetworkTimeoutError', 'unknown']) {
     const result = await onCommand(invocation(), { network: { async request() { throw Object.assign(new Error('synthetic-private-error'), { name }) } } })
     assert.equal(result.results[0].title, name === 'unknown' ? 'NetworkFailureError' : name)
+    if (name === 'PermissionDeniedError') assert.match(result.results[0].detail, /Settings → Permissions/)
     assert.doesNotMatch(JSON.stringify(result), /synthetic-private-error/)
   }
 })

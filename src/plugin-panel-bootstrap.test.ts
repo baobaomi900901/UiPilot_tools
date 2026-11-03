@@ -4,10 +4,12 @@ import vm from 'node:vm'
 import { describe, expect, it, vi } from 'vitest'
 
 interface BootstrapPanelApi {
+  setStatus(input: { message: string; tone?: 'info' | 'success' | 'error' }): Promise<void>
   onUpdate(handler: (update: unknown) => void): () => void
   onHostKey(handler: (event: unknown) => void): () => void
   readonly clipboardHistory: {
-    list(): Promise<unknown>
+    list(input?: { query?: string }): Promise<unknown>
+    copy(input: { id: string }): Promise<unknown>
     onChanged(handler: (snapshot: unknown) => void | Promise<void>): () => void
     paste(input: { id: string, routeSequence: string }): Promise<unknown>
     remove(input: { id: string }): Promise<void>
@@ -21,6 +23,7 @@ function panelBootstrapSource(): string {
   const template = rust.match(/PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"([\s\S]*?)"#;/u)?.[1]
   if (!template) throw new Error('panel bootstrap template is missing')
   return template
+    .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
     .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
     .replace('__PANEL_ACTIONS__', 'false')
     .replace('__RUNTIME_ACTIONS__', 'false')
@@ -52,6 +55,94 @@ function executePanelBootstrap(
 }
 
 describe('public plugin panel bootstrap', () => {
+  it('keeps query snapshots separate from the full-history cache at the same revision', async () => {
+    const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
+      if (command !== 'plugin_panel_clipboard_history_list') return undefined
+      const query = (args as { query?: string }).query
+      return { revision: '4', entries: [{ id: query ?? 'all', kind: 'text', capturedAt: 'now', textPreview: query ?? 'all' }] }
+    })
+    const { hostWindow } = executePanelBootstrap(invoke)
+    const history = (hostWindow.uipilotPluginPanel as BootstrapPanelApi).clipboardHistory
+    await expect(history.list()).resolves.toMatchObject({ entries: [{ id: 'all' }] })
+    await expect(history.list({ query: 'alpha' })).resolves.toMatchObject({ entries: [{ id: 'alpha' }] })
+    await expect(history.list({ query: 'beta' })).resolves.toMatchObject({ entries: [{ id: 'beta' }] })
+    await expect(history.list()).resolves.toMatchObject({ entries: [{ id: 'all' }] })
+    expect(invoke).toHaveBeenCalledWith('plugin_panel_clipboard_history_list', { sessionEpoch: '7', query: 'beta' })
+  })
+
+  it('validates query code-point length and unknown fields before invoking', async () => {
+    const invoke = vi.fn(async () => ({ revision: '1', entries: [] }))
+    const { hostWindow } = executePanelBootstrap(invoke)
+    const history = (hostWindow.uipilotPluginPanel as BootstrapPanelApi).clipboardHistory
+    await history.list({ query: '🙂'.repeat(512) })
+    expect(invoke).toHaveBeenCalledTimes(1)
+    await expect(history.list({ query: '🙂'.repeat(513) })).rejects.toMatchObject({ name: 'InvalidQuery' })
+    // @ts-expect-error unknown query fields must not cross the bridge
+    await expect(history.list({ pluginId: 'another' })).rejects.toThrow()
+    // @ts-expect-error query must be text
+    await expect(history.list({ query: 1 })).rejects.toThrow()
+    expect(invoke).toHaveBeenCalledTimes(1)
+  })
+
+  it('copies by id without an Enter ticket or a hide/paste side effect', async () => {
+    const invoke = vi.fn(async () => ({ outcome: 'copied' }))
+    const { hostWindow } = executePanelBootstrap(invoke)
+    const history = (hostWindow.uipilotPluginPanel as BootstrapPanelApi).clipboardHistory
+    const result = await history.copy({ id: 'text-1' })
+    expect(result).toEqual({ outcome: 'copied' })
+    expect(Object.isFrozen(result)).toBe(true)
+    expect(invoke.mock.calls).toEqual([['plugin_panel_clipboard_history_copy', { sessionEpoch: '7', id: 'text-1' }]])
+    // @ts-expect-error copy cannot accept paste authority
+    await expect(history.copy({ id: 'text-1', routeSequence: '1' })).rejects.toThrow()
+  })
+
+  it('rejects copy and query completions from a superseded panel session', async () => {
+    let complete: (value: unknown) => void = () => undefined
+    const invoke = vi.fn(() => new Promise(resolve => { complete = resolve }))
+    const { hostWindow } = executePanelBootstrap(invoke)
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+    const prepare = hostWindow.__UIPILOT_PLUGIN_PANEL_PREPARE__ as (input: { sessionEpoch: string }) => void
+    const oldHistory = api.clipboardHistory
+    const copy = oldHistory.copy({ id: 'text-1' })
+    prepare({ sessionEpoch: '8' })
+    complete({ outcome: 'copied' })
+    await expect(copy).rejects.toMatchObject({ name: 'ExpiredPanelSession' })
+    await expect(oldHistory.copy({ id: 'text-1' })).rejects.toMatchObject({ name: 'ExpiredPanelSession' })
+    const list = api.clipboardHistory.list({ query: 'x' })
+    prepare({ sessionEpoch: '9' })
+    complete({ revision: '1', entries: [] })
+    await expect(list).rejects.toMatchObject({ name: 'ExpiredPanelSession' })
+  })
+
+  it('maps copy permission errors and rejects admitted-only responses', async () => {
+    const invoke = vi.fn(async () => { throw { code: 'permissionDenied' } })
+    const { hostWindow } = executePanelBootstrap(invoke)
+    const history = (hostWindow.uipilotPluginPanel as BootstrapPanelApi).clipboardHistory
+    await expect(history.copy({ id: 'text-1' })).rejects.toMatchObject({ name: 'PermissionDenied' })
+    const other = executePanelBootstrap(vi.fn(async () => ({ outcome: 'admitted' })))
+    await expect((other.hostWindow.uipilotPluginPanel as BootstrapPanelApi).clipboardHistory.copy({ id: 'text-1' })).rejects.toThrow('invalid clipboard history copy outcome')
+  })
+  it('publishes bounded status with document ordering and the captured session', async () => {
+    const { hostWindow, invoke } = executePanelBootstrap()
+    const api = hostWindow.uipilotPluginPanel as BootstrapPanelApi
+    await api.setStatus({ message: '保存成功', tone: 'success' })
+    await api.setStatus({ message: '' })
+    expect(invoke).toHaveBeenCalledWith('plugin_panel_set_status', {
+      sessionEpoch: '7', sequence: '1', status: { message: '保存成功', tone: 'success' },
+    })
+    expect(invoke).toHaveBeenCalledWith('plugin_panel_set_status', {
+      sessionEpoch: '7', sequence: '2', status: { message: '', tone: 'info' },
+    })
+    await expect(api.setStatus({ message: 'x'.repeat(513) })).rejects.toThrow()
+    const oldSetStatus = api.setStatus
+    const prepare = hostWindow.__UIPILOT_PLUGIN_PANEL_PREPARE__ as (input: { sessionEpoch: string }) => void
+    prepare({ sessionEpoch: '8' })
+    await expect(oldSetStatus({ message: 'old save' })).rejects.toThrow('ExpiredPanelSession')
+    await api.setStatus({ message: 'new save' })
+    expect(invoke).toHaveBeenLastCalledWith('plugin_panel_set_status', {
+      sessionEpoch: '8', sequence: '3', status: { message: 'new save', tone: 'info' },
+    })
+  })
   it('executes the generated Host-key bridge and reaches content ready', async () => {
     const { hostWindow, invoke } = executePanelBootstrap()
 

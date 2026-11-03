@@ -1,0 +1,32 @@
+.plugin-permissions-panel { width: 100%; min-width: 0; color: var(--uipilot-ui-foreground); }
+.permissions-heading { display: flex; align-items: center; justify-content: space-between; }
+.permissions-heading h2 { margin: 0; font-size: 16px; font-weight: 500; }
+.permissions-heading .ant-btn { width: 28px; height: 28px; padding: 0; }
+.permissions-search .ant-input-affix-wrapper { height: 36px; background: var(--uipilot-ui-surface-elevated); border-color: var(--uipilot-ui-border); border-radius: 8px; box-shadow: none; }
+.permissions-search .ant-input-affix-wrapper:focus-within { border-color: var(--uipilot-ui-hairline-strong); box-shadow: none; }
+.permissions-search .ant-input-prefix { color: var(--uipilot-ui-muted-foreground); margin-inline-end: 8px; }
+.permission-group { margin: 0 0 16px; border: 1px solid var(--uipilot-ui-border); border-radius: 6px; background: var(--uipilot-ui-surface); }
+.permission-group-heading { padding: 10px 12px; border-bottom: 1px solid var(--uipilot-ui-border); }
+.permission-group h3 { margin: 0; font-size: 13px; line-height: 1.5; font-weight: 500; overflow-wrap: anywhere; }
+.permission-group h3 span { color: var(--uipilot-ui-muted-foreground); font-size: 12px; font-weight: 400; }
+.permission-group-heading p { margin: 4px 0 0; font-size: 12px; line-height: 1.5; color: var(--uipilot-ui-muted-foreground); }
+.permission-group > ul { list-style: none; padding: 0; margin: 0; }
+.permission-row { margin: 0 10px; padding: 0 2px; border-bottom: 1px solid var(--uipilot-ui-border); min-width: 0; }
+.permission-row:last-child { border-bottom: 0; }
+.permission-row-main { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; min-width: 0; min-height: 44px; }
+.permission-plugin-name { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 400; color: var(--uipilot-ui-foreground); }
+.permission-row-main .ant-switch-checked:not(.ant-switch-disabled) { background: var(--uipilot-ui-icon-green); }
+.permission-scope-toggle { border: 0; padding: 0; background: transparent; font-family: inherit; text-align: left; cursor: pointer; }
+.permission-scope-toggle:hover { text-decoration: underline; text-underline-offset: 3px; }
+.permission-row > .permission-network-scope { margin: 0 0 10px 38px; }
+.permission-network-scope { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; color: var(--uipilot-ui-body); }
+.permission-network-scope > span { font-weight: 500; }
+.permission-network-scope ul { margin: 4px 0 8px; padding-left: 18px; }
+.permission-network-scope p { color: var(--uipilot-ui-muted-foreground); margin: 4px 0; }
+.permissions-error { color: var(--uipilot-ui-destructive); font-size: 12px; line-height: 1.5; padding-top: 8px; overflow-wrap: anywhere; }
+.permissions-empty { min-height: 180px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 12px; color: var(--uipilot-ui-muted-foreground); text-align: center; }
+.permissions-empty strong { color: var(--uipilot-ui-foreground); font-size: 14px; font-weight: 500; }
+.permissions-empty > span { font-size: 12px; }
+.permissions-footer { margin: 20px 0 0; color: var(--uipilot-ui-muted-foreground); font-size: 12px; line-height: 1.5; }
+.plugin-permissions-panel button:focus-visible { outline: 2px solid var(--uipilot-ui-hairline-strong); outline-offset: 2px; }
+@media (forced-colors: active) { .permission-row-main .ant-switch { border: 1px solid ButtonText; } .permissions-error { color: Mark; } }

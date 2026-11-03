@@ -5,15 +5,20 @@ import { StrictJsonError, parseStrictJson } from './strict-json.js'
 import { PLUGIN_CLI_HOST_VERSION, type PluginPlatform, type PluginValidationIssueCode } from './contracts.js'
 
 export type PublicPermission =
+  | 'selection.read'
   | 'ui.window'
   | 'ui.panel'
   | 'clipboard.write'
   | 'clipboard.paste'
+  | 'credentials.youdaoTranslation'
+  | 'credentials.baiduOcr'
+  | 'credentials.deepseek'
   | 'url.open'
   | 'files.openText'
   | 'clipboard.read'
   | 'clipboard.history.read'
   | 'clipboard.history.paste'
+  | 'clipboard.history.copy'
   | 'network.https'
   | 'files.userSelected'
   | 'files.index.readAll'
@@ -21,7 +26,7 @@ export type PublicPermission =
   | 'timer.control'
   | 'background.schedule'
 
-export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter'
+export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter' | 'Delete'
 export type PanelHostKeyFocus = 'content' | 'host'
 
 export interface PluginNetworkCredential {
@@ -196,6 +201,7 @@ const panelHostKeyOrder: Readonly<Record<PanelHostKeyDeclaration, number>> = {
   Tab: 3,
   'Shift+Tab': 4,
   Enter: 5,
+  Delete: 6,
 }
 
 function canonicalPanelHostKeys(values: readonly PanelHostKeyDeclaration[]): PanelHostKeyDeclaration[] {
@@ -312,6 +318,7 @@ function semanticValid(manifest: PublicManifestV1): boolean {
   const permissions = manifest.permissions
   const hasClipboardHistoryRead = permissions.includes('clipboard.history.read')
   const hasClipboardHistoryPaste = permissions.includes('clipboard.history.paste')
+  const hasClipboardHistoryCopy = permissions.includes('clipboard.history.copy')
   if (sharedSemanticPointers(manifest).length > 0 ||
     normalizedCommands(manifest).some(({ command }) => !validCommand(command))) return false
   const command = manifest.command
@@ -358,14 +365,14 @@ function semanticValid(manifest: PublicManifestV1): boolean {
       return false
     }
     if (
-      (hasClipboardHistoryRead || hasClipboardHistoryPaste) &&
+      (hasClipboardHistoryRead || hasClipboardHistoryPaste || hasClipboardHistoryCopy) &&
       (command.activationMode !== 'submit' ||
         command.outputMode !== 'panel' ||
         manifest.panel == null ||
         manifest.window != null ||
         !permissions.includes('ui.panel') ||
         permissions.includes('ui.window') ||
-        (hasClipboardHistoryPaste && !hasClipboardHistoryRead))
+        ((hasClipboardHistoryPaste || hasClipboardHistoryCopy) && !hasClipboardHistoryRead))
     ) {
       return false
     }
@@ -438,8 +445,8 @@ function permissionAvailable(permission: PublicPermission, platform: PluginPlatf
     permission === 'ui.window' ||
     permission === 'ui.panel' ||
     permission === 'clipboard.write' ||
-    ((permission === 'clipboard.history.read' || permission === 'clipboard.history.paste') && platform === 'windows') ||
-    ((permission === 'clipboard.paste' || permission === 'network.https' || permission === 'url.open' || permission === 'files.openText') && platform === 'windows') ||
+    ((permission === 'clipboard.history.read' || permission === 'clipboard.history.paste' || permission === 'clipboard.history.copy') && platform === 'windows') ||
+    ((permission === 'selection.read' || permission.startsWith('credentials.') || permission === 'clipboard.paste' || permission === 'network.https' || permission === 'url.open' || permission === 'files.openText') && platform === 'windows') ||
     ((permission === 'notifications.publish' || permission === 'timer.control') && platform === 'windows')
   )
 }
@@ -499,6 +506,9 @@ function validateParsedManifest(
     manifest.apiVersion !== 1 ||
     !minimumHost ||
     (manifest.permissions.includes('files.openText') && (versionGreater([0, 13, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.window') || !manifest.window || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'window' || manifest.commands !== undefined)) ||
+    (manifest.permissions.includes('clipboard.history.copy') && (versionGreater([0, 17, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
+    (manifest.permissions.includes('selection.read') && (versionGreater([0, 16, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
+    (manifest.permissions.some(permission => permission.startsWith('credentials.')) && (versionGreater([0, 15, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.permissions.includes('clipboard.paste') && (versionGreater([0, 14, 0], minimumHost) || !manifest.runtime.resultActions || !manifest.permissions.includes('clipboard.write') || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.permissions.includes('url.open') && (versionGreater([0, 12, 0], minimumHost) || !manifest.runtime.resultActions || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.runtime.resultActions === true && (versionGreater([0, 10, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || normalizedCommands(manifest).some(({ command }) => command.outputMode !== 'mainResult'))) ||
@@ -510,6 +520,7 @@ function validateParsedManifest(
     ((manifest.panel?.hostKeys?.length ?? 0) > 0 && versionGreater([0, 3, 1], minimumHost)) ||
     ((manifest.panel?.hostKeys ?? []).some((key) => key === 'Tab' || key === 'Shift+Tab' || key === 'Enter') &&
       versionGreater([0, 3, 3], minimumHost)) ||
+    ((manifest.panel?.hostKeys ?? []).includes('Delete') && versionGreater([0, 16, 0], minimumHost)) ||
     (manifest.panel?.hostKeyFocus !== undefined && versionGreater([0, 3, 4], minimumHost)) ||
     ((manifest.permissions.includes('clipboard.history.read') ||
       manifest.permissions.includes('clipboard.history.paste')) &&

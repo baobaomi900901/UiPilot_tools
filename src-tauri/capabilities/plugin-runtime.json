@@ -6,6 +6,7 @@
   "permissions": [
     "allow-plugin-api-call",
     "allow-plugin-network-request",
+    "allow-plugin-youdao-translate",
     "allow-complete-plugin-command",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

@@ -47,4 +47,17 @@ describe('readDirectorySnapshot', () => {
       code: 'SOURCE_INVALID',
     })
   })
+
+  it('rechecks attributes after reading a file instead of caching a safe result', async () => {
+    const root = await packageRoot()
+    let reads = 0
+    const probe: WindowsAttributeProbe = async (_root, paths) => new Map(paths.map((path) => {
+      if (path === 'dist/runtime.js') reads += 1
+      return [path, path === 'dist/runtime.js' && reads > 1 ? 0x400 : 0x20]
+    }))
+    await expect(readDirectorySnapshot(root, { hostPlatform: 'win32', probe })).rejects.toMatchObject({
+      code: 'SOURCE_INVALID',
+    })
+    expect(reads).toBe(2)
+  })
 })

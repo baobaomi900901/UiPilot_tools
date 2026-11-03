@@ -9,6 +9,8 @@ class Progress:
         self.mode, self.verbose, self.emit, self.clock = mode, verbose, emit, clock
         self.started = self.changed = self.last_update = clock()
         self.stage = None
+        self.activity = None
+        self.last_output = self.started
         self.pending = ''
         self.tail = deque(maxlen=18)
         self.warnings = set()
@@ -21,6 +23,7 @@ class Progress:
         if self.stage:
             self.emit(f'  完成 {self.stage} · {now - self.changed:.1f} 秒')
         self.stage, self.changed, self.last_update = name, now, now
+        self.activity = None
         self.emit(f'▶ {name}')
 
     def feed(self, text):
@@ -34,6 +37,13 @@ class Progress:
         if not line:
             return
         self.tail.append(raw)
+        self.last_output = self.clock()
+        if re.match(r'(Compiling|Checking|Linking|Finished)\s', line):
+            self.activity = line[:200]
+        elif 'Blocking waiting for file lock' in line:
+            self.activity = line[:200]
+            if not self.verbose:
+                self.emit('  等待 Cargo 构建目录锁：其他构建任务仍占用此目录。')
         if self.verbose:
             self.emit(raw)
         if line.startswith('UIPILOT_PROVIDER_BUILD'):
@@ -42,7 +52,7 @@ class Progress:
             self.set_stage('校验截图 Provider 与构建前端')
         elif line.startswith('UIPILOT_PROVIDER_VALIDATED'):
             self.set_stage('校验 Provider 并准备安装资源')
-        elif re.match(r'> \S+@\S+ build$', line):
+        elif self.mode == 'setup' and re.match(r'> \S+@\S+ build$', line):
             self.set_stage('构建前端（类型检查与资源生成）')
         elif re.match(r'> \S+@\S+ build:managed-everything$', line):
             self.set_stage('构建 Everything 安装助手')
@@ -72,6 +82,8 @@ class Progress:
         now = self.clock()
         if now - self.last_update >= 15:
             self.emit(f'  {self.stage} · 已用 {now - self.changed:.0f} 秒（总计 {now - self.started:.0f} 秒）')
+            if self.activity:
+                self.emit(f'    最近编译输出：{self.activity} · {now - self.last_output:.0f} 秒无新输出')
             self.last_update = now
 
     def finish(self, success):

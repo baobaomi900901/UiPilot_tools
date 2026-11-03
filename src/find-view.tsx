@@ -1,10 +1,11 @@
-import { App, Button, ConfigProvider, Input, Spin, Switch, Tooltip } from 'antd'
+import { App, Button, ConfigProvider, Input, Spin, Tooltip } from 'antd'
 import { File, FileSearch, Folder, ImageOff, Pin, X } from 'lucide-react'
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 
 import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
 import type { FileCategory, FileResultKind } from './protocol'
 import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
+import { createContextActionsMenu, type ContextActionsMenu } from './context-actions-ui'
 import { isWindowPinShortcut } from './window-pin-shortcut'
 
 const CATEGORY_LABELS: Record<FileCategory, string> = {
@@ -56,6 +57,10 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   const [systemDark, setSystemDark] = useState(media.matches)
   const [failedThumbnail, setFailedThumbnail] = useState<string>()
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const menuRef = useRef<ContextActionsMenu | null>(null)
+  const menuOrigin = useRef<{ element: Element | null; invocationId: string } | null>(null)
+  const restoreMenuFocus = useRef(false)
+  const [actionsOpen, setActionsOpen] = useState(false)
   const optionRefs = useRef(new Map<number, HTMLElement>())
   const disabled = !snapshot.ready || snapshot.executePending
   const selected = snapshot.selectedIndex >= 0 ? snapshot.results[snapshot.selectedIndex] : undefined
@@ -64,6 +69,107 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
     : undefined
   const showThumbnail = thumbnailKey !== undefined && failedThumbnail !== thumbnailKey
   const scheme = resolveUiColorScheme(snapshot.theme, systemDark)
+
+  useLayoutEffect(() => {
+    const previous = document.documentElement.dataset.colorScheme
+    document.documentElement.dataset.colorScheme = scheme
+    return () => {
+      if (previous === undefined) delete document.documentElement.dataset.colorScheme
+      else document.documentElement.dataset.colorScheme = previous
+    }
+  }, [scheme])
+
+  const cycleCategory = useCallback((direction: 'next' | 'previous') => {
+    const state = core.getSnapshot()
+    if (!state.ready || !state.invocationId || state.executePending || state.hidePending) return
+    core.cycleCategory(direction)
+    const index = FIND_CATEGORY_ORDER.indexOf(core.getSnapshot().category)
+    inputRef.current?.closest('.find-surface')
+      ?.querySelectorAll<HTMLButtonElement>('.find-category')[index]?.focus({ preventScroll: true })
+  }, [core])
+
+  const openActions = useCallback(() => {
+    const menu = menuRef.current
+    if (!menu) return
+    if (menu.isOpen) { menu.close(); return }
+    const owner = core.getSnapshot()
+    if (!owner.ready || !owner.invocationId || owner.hidePending) return
+    const origin = document.activeElement
+    menuOrigin.current = { element: origin, invocationId: owner.invocationId }
+    const fromInput = origin === inputRef.current
+    const item = owner.results[owner.selectedIndex]
+    const current = () => {
+      const now = core.getSnapshot()
+      return now.ready && !now.hidePending && now.invocationId === owner.invocationId &&
+        now.query === owner.query && now.category === owner.category &&
+        now.results[now.selectedIndex]?.key === item?.key
+    }
+    const busy = owner.executePending ? '正在打开文件位置' : undefined
+    menu.open({
+      context: fromInput ? [{
+        id: 'find-search', title: '搜索', shortcut: 'Enter', icon: 'search',
+        disabledReason: busy ?? (owner.searchPending ? '正在搜索' : !owner.query ? '请输入搜索内容' : undefined),
+        run() { if (current()) { inputRef.current?.focus(); core.submitSearch() } },
+      }] : [{
+        id: 'find-reveal', title: '打开所在的文件夹', shortcut: 'Enter', icon: 'arrow',
+        disabledReason: busy ?? (owner.searchPending ? '正在搜索' : !item ? '没有选中的文件' : undefined),
+        run() { if (current() && item) core.keyDown('Enter', false) },
+      }],
+      global: [
+        { id: 'find-category', title: '下一分类', shortcut: 'Tab', icon: 'arrow-right-to-line',
+          disabledReason: busy,
+          run() { if (current()) cycleCategory('next') } },
+        { id: 'find-previous-category', title: '上一分类', shortcut: 'Shift+Tab', icon: 'arrow-left-to-line',
+          disabledReason: busy,
+          run() { if (current()) cycleCategory('previous') } },
+        { id: 'find-pin', title: owner.pinned ? '取消固定窗口' : '固定窗口', shortcut: 'Ctrl+T', icon: 'pin',
+          disabledReason: busy ?? (owner.pinPending ? '正在更新固定状态' : undefined),
+          run() { if (current()) core.setPinned(!owner.pinned) } },
+        { id: 'find-preview', title: owner.previewEnabled ? '关闭预览' : '打开预览', icon: 'eye',
+          disabledReason: busy ?? (owner.previewPending ? '正在更新预览状态' : undefined),
+          run() { if (current()) core.setPreviewEnabled(!owner.previewEnabled) } },
+        { id: 'find-input', title: '返回搜索框', shortcut: 'Ctrl+F', icon: 'search',
+          run() { if (current()) inputRef.current?.focus() } },
+      ],
+    }, { origin, bottom: 42, onClose: () => setActionsOpen(false) })
+    setActionsOpen(menu.isOpen)
+  }, [core, cycleCategory])
+
+  useEffect(() => {
+    const menu = createContextActionsMenu(document)
+    menuRef.current = menu
+    const stamp = () => {
+      const state = core.getSnapshot()
+      return JSON.stringify([state.ready, state.invocationId, state.query, state.category,
+        state.results[state.selectedIndex]?.key, state.searchPending, state.executePending,
+        state.hidePending, state.pinned, state.pinPending, state.previewEnabled, state.previewPending])
+    }
+    let previous = stamp()
+    const unsubscribe = core.subscribe(() => {
+      const next = stamp()
+      if (next !== previous && menu.isOpen) {
+        restoreMenuFocus.current = true
+        menu.close(false)
+      }
+      previous = next
+    })
+    return () => { unsubscribe(); menu.close(false); menuRef.current = null }
+  }, [core])
+
+  useLayoutEffect(() => {
+    if (!restoreMenuFocus.current) return
+    const origin = menuOrigin.current
+    if (!origin || !snapshot.ready || snapshot.hidePending || origin.invocationId !== snapshot.invocationId) {
+      restoreMenuFocus.current = false
+      return
+    }
+    if (snapshot.executePending) return
+    restoreMenuFocus.current = false
+    const target = origin.element
+    if (target instanceof HTMLElement && target.isConnected && !target.matches(':disabled')) {
+      target.focus({ preventScroll: true })
+    } else inputRef.current?.focus({ preventScroll: true })
+  }, [snapshot])
 
   useEffect(() => {
     const changed = (event: MediaQueryListEvent) => setSystemDark(event.matches)
@@ -78,6 +184,28 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
+      const menuShortcut = event.key.toLowerCase() === 'k' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey
+      if (menuShortcut && (event.repeat || event.isComposing)) {
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
+      // Shared menu must receive arrows/Escape before the background Find list.
+      if (menuRef.current?.isOpen) return
+      if (event.defaultPrevented) return
+      if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
+        event.preventDefault()
+        event.stopPropagation()
+        if (!event.repeat) cycleCategory(event.shiftKey ? 'previous' : 'next')
+        return
+      }
+      if (menuShortcut) {
+        if (event.isComposing) return
+        event.preventDefault()
+        event.stopPropagation()
+        if (!event.repeat) openActions()
+        return
+      }
       if (isWindowPinShortcut(event)) {
         event.preventDefault()
         event.stopPropagation()
@@ -95,10 +223,11 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
       event.preventDefault()
       event.stopPropagation()
       core.keyDown(event.key, false)
+      optionRefs.current.get(core.getSnapshot().selectedIndex)?.focus({ preventScroll: true })
     }
     window.addEventListener('keydown', onWindowKeyDown, true)
     return () => window.removeEventListener('keydown', onWindowKeyDown, true)
-  }, [core])
+  }, [core, openActions, cycleCategory])
 
   useLayoutEffect(() => {
     const option = snapshot.selectedIndex >= 0 ? optionRefs.current.get(snapshot.selectedIndex) : undefined
@@ -106,9 +235,11 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   }, [snapshot.selectedIndex])
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (!['Enter', 'Escape'].includes(event.key)) return
-    if (event.key === 'Escape' && !event.nativeEvent.isComposing) event.preventDefault()
-    core.keyDown(event.key as 'Enter' | 'Escape', event.nativeEvent.isComposing)
+    if (!['Enter', 'Escape'].includes(event.key) || event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
+    event.preventDefault()
+    if (event.repeat) return
+    if (event.key === 'Enter') core.submitSearch()
+    else core.keyDown('Escape', false)
   }
 
   return (
@@ -186,30 +317,13 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                   disabled={disabled || !snapshot.invocationId}
                   onClick={() => core.setCategory(category)}
                   onKeyDown={(event) => {
-                    if (event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey || (event.shiftKey && event.key !== 'Tab')) return
+                    if (event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
                     if (event.key === 'Enter' || event.key === 'Escape') {
                       event.preventDefault()
                       event.stopPropagation()
                       if (!event.repeat) core.keyDown(event.key, false)
                       return
                     }
-                    if (
-                      event.key !== 'Tab' ||
-                      event.ctrlKey ||
-                      event.altKey ||
-                      event.metaKey
-                    ) return
-                    const offset = event.shiftKey ? -1 : 1
-                    const nextIndex = (
-                      FIND_CATEGORY_ORDER.indexOf(category) + offset + FIND_CATEGORY_ORDER.length
-                    ) % FIND_CATEGORY_ORDER.length
-                    const nextCategory = FIND_CATEGORY_ORDER[nextIndex]!
-                    const next = event.currentTarget.parentElement
-                      ?.querySelectorAll<HTMLButtonElement>('.find-category')[nextIndex]
-                    if (!next || next.disabled) return
-                    event.preventDefault()
-                    next.focus()
-                    core.setCategory(nextCategory)
                   }}
                 >
                   {CATEGORY_LABELS[category]}
@@ -226,6 +340,14 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                     key={item.key}
                     id={`find-result-${index}`}
                     role="option"
+                    tabIndex={-1}
+                    onKeyDown={(event) => {
+                      if (event.nativeEvent.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+                      if (event.key !== 'Enter' && event.key !== 'Escape') return
+                      event.preventDefault()
+                      event.stopPropagation()
+                      if (!event.repeat) core.keyDown(event.key, false)
+                    }}
                     aria-selected={snapshot.selectedIndex === index}
                     className={snapshot.selectedIndex === index ? 'result-row file-result-row is-selected' : 'result-row file-result-row'}
                     ref={(element) => {
@@ -233,7 +355,10 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                       else optionRefs.current.delete(index)
                     }}
                     onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => core.select(index)}
+                    onClick={(event) => {
+                      core.select(index)
+                      if (core.getSnapshot().selectedIndex === index) event.currentTarget.focus({ preventScroll: true })
+                    }}
                     onDoubleClick={() => {
                       core.select(index)
                       core.keyDown('Enter', false)
@@ -300,15 +425,12 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             <footer className="find-footer file-toolbar">
               <span>{snapshot.indexStatus === 'building' ? `正在索引，已有 ${snapshot.total} 条结果` : `共 ${snapshot.total} 条结果`}</span>
               <div className="status-region" role="status" aria-live="polite" aria-atomic="true">{snapshot.status}</div>
-              <span className="find-preview-label" aria-hidden="true">预览</span>
-              <Switch
-                aria-label="文件预览"
-                checked={snapshot.previewEnabled}
-                loading={snapshot.previewPending}
-                tabIndex={-1}
-                disabled={disabled || snapshot.previewPending || !snapshot.invocationId}
-                onChange={(checked) => core.setPreviewEnabled(checked)}
-              />
+              <button type="button" className="launcher-operations-trigger" tabIndex={-1} aria-label="操作 Ctrl+K"
+                aria-haspopup="dialog" aria-expanded={actionsOpen} aria-keyshortcuts="Control+k"
+                disabled={!snapshot.ready || !snapshot.invocationId || snapshot.hidePending}
+                onMouseDown={(event) => event.preventDefault()} onClick={openActions}>
+                操作 <kbd>Ctrl+K</kbd>
+              </button>
             </footer>
           </div>
         </main>

@@ -115,7 +115,7 @@ describe('public plugin timer protocol', () => {
         name: 'Timer',
         description: null,
         version: '1.0.0',
-        source: 'localPackage',
+        source: 'localPackage', installationDirectory: 'C:/UiPilot/plugins/example',
         commands: [{ commandId: 'default', defaultName: 'timer', effectiveName: 'timer', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
         enabled: true,
         fault: null,
@@ -127,6 +127,10 @@ describe('public plugin timer protocol', () => {
       }],
     }
     expect(parsePublicPluginInventory(inventory)).toEqual(inventory)
+    const services = ['credentials.youdaoTranslation', 'credentials.baiduOcr', 'credentials.deepseek']
+    const withCredentials = { ...inventory, items: [{ ...inventory.items[0], permissions: services.map((permission) => ({ permission, supported: true, granted: false })) }] }
+    expect(parsePublicPluginInventory(withCredentials)).toEqual(withCredentials)
+    expect(parsePublicPluginInventory({ ...withCredentials, items: [{ ...withCredentials.items[0], permissions: [{ permission: 'credentials.unknown', supported: true, granted: false }] }] })).toBeNull()
   })
 
   it('accepts ui.panel in public plugin inventory permissions', () => {
@@ -137,7 +141,7 @@ describe('public plugin timer protocol', () => {
         name: 'Panel',
         description: null,
         version: '1.0.0',
-        source: 'localPackage',
+        source: 'localPackage', installationDirectory: 'C:/UiPilot/plugins/example',
         commands: [{ commandId: 'default', defaultName: 'panel', effectiveName: 'panel', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
         enabled: true,
         fault: null,
@@ -157,7 +161,7 @@ describe('public plugin timer protocol', () => {
       name: 'Network',
       description: null,
       version: '1.0.0',
-      source: 'localPackage',
+      source: 'localPackage', installationDirectory: 'C:/UiPilot/plugins/example',
       commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
       enabled: true,
       fault: null,
@@ -231,7 +235,7 @@ describe('public plugin timer protocol', () => {
 
 it('parses the full command inventory with constructor and rejects malformed command identities', () => {
   const command = { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }
-  const item = { pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage', commands: [command, { ...command, commandId: 'upper', defaultName: 'upper', effectiveName: 'custom', nameOverride: 'custom', favorite: true, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
+  const item = { pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage', installationDirectory: 'C:/UiPilot/plugins/example', commands: [command, { ...command, commandId: 'upper', defaultName: 'upper', effectiveName: 'custom', nameOverride: 'custom', favorite: true, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
   const inventory = (commands: unknown) => ({ revision: '1', hotkeyRevision: '0', items: [{ ...item, commands }] })
   expect(parsePublicPluginInventory(inventory(item.commands))).toEqual(inventory(item.commands))
   for (const commandId of [undefined, null, '', 'Upper', 'bad id']) {
@@ -246,6 +250,13 @@ it('parses the full command inventory with constructor and rejects malformed com
 
 
 describe('command hotkey protocol', () => {
+  it('accepts builtin entry only on launcher and never alongside a public command', () => {
+    const event = { invocationId: 'invocation-3', target: 'launcher', notice: null, builtinEntry: 'webSearch' }
+    expect(parseLauncherShown(event)).toEqual(event)
+    expect(parseLauncherShown({ ...event, target: 'settings' })).toBeNull()
+    expect(parseLauncherShown({ ...event, builtinEntry: 'find' })).toBeNull()
+    expect(parseLauncherShown({ ...event, commandEntry: { pluginId: 'com.example.notes', commandId: 'default', hotkey: 'Ctrl+N', bindingRevision: '1' } })).toBeNull()
+  })
   it('preserves an exact stable entry on the same shown invocation', () => {
     const commandEntry = { pluginId: 'com.example.notes', commandId: 'default', hotkey: 'Ctrl+N', bindingRevision: '1' }
     const shown = { invocationId: 'invocation-2', target: 'launcher', notice: null, commandEntry }
@@ -258,11 +269,40 @@ describe('command hotkey protocol', () => {
 })
 
 describe('managed builtins protocol', () => {
-  const items = ['screenshot', 'quicklinks', 'webSearch'].map((feature) => ({ feature, name: feature, command: '/test', description: 'Description', examples: ['/test'], version: '1.0.0', enabled: true }))
+  const items = ['screenshot', 'quicklinks', 'webSearch'].map((feature) => ({ feature, name: feature, command: '/test', defaultCommand: '/test', favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: 'C:/UiPilot', description: 'Description', examples: ['/test'], version: '1.0.0', enabled: true }))
   it('accepts the complete fixed ordered host metadata', () => {
     expect(parseBuiltinFeatures(items)).toEqual(items)
   })
   it('rejects unmanaged identities, duplicates, wrong fields and malformed metadata', () => {
     for (const value of [[], items.slice(1), [...items].reverse(), [items[0], items[0], items[2]], items.map((item, i) => i ? item : { ...item, feature: 'find' }), items.map((item, i) => i ? item : { ...item, pluginId: 'fake' }), items.map((item, i) => i ? item : { ...item, enabled: 1 }), items.map((item, i) => i ? item : { ...item, examples: [1] })]) expect(parseBuiltinFeatures(value)).toBeNull()
+  })
+})
+
+
+describe('plugin detail configuration protocol', () => {
+  const builtins = ['screenshot', 'quicklinks', 'webSearch'].map((feature) => ({
+    feature, name: feature, command: '/shared', defaultCommand: '/default', favorite: true,
+    hotkey: 'Ctrl+Alt+P', hotkeyStatus: 'active', directory: 'C:/UiPilot',
+    description: 'Description', examples: ['/shared'], version: '1.0.0', enabled: true,
+  }))
+  it('accepts duplicate builtin labels while keeping distinct identities and shortcut state', () => {
+    expect(parseBuiltinFeatures(builtins)).toEqual(builtins)
+  })
+  it('rejects malformed shortcut states, commands, directories and missing detail fields', () => {
+    for (const override of [
+      { hotkey: null }, { hotkeyStatus: 'unknown' }, { hotkeyStatus: 'unset' },
+      { hotkey: 'DoubleCtrl' }, { favorite: 1 }, { directory: 1 },
+      { command: 'missing-slash' }, { defaultCommand: '/invalid command' },
+    ]) expect(parseBuiltinFeatures(builtins.map((item, i) => i ? item : { ...item, ...override }))).toBeNull()
+    const { defaultCommand: _, ...missing } = builtins[0]!
+    expect(parseBuiltinFeatures([missing, ...builtins.slice(1)])).toBeNull()
+  })
+  it('accepts shared public names but rejects duplicate stable command ids and invalid directories', () => {
+    const command = { commandId: 'one', defaultName: 'shared', effectiveName: 'shared', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' }
+    const item = { pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage', installationDirectory: 'C:/UiPilot/plugins/example', commands: [command, { ...command, commandId: 'two' }], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [] }
+    const inventory = { revision: '1', hotkeyRevision: '0', items: [item] }
+    expect(parsePublicPluginInventory(inventory)).toEqual(inventory)
+    expect(parsePublicPluginInventory({ ...inventory, items: [{ ...item, commands: [command, command] }] })).toBeNull()
+    expect(parsePublicPluginInventory({ ...inventory, items: [{ ...item, installationDirectory: 42 }] })).toBeNull()
   })
 })

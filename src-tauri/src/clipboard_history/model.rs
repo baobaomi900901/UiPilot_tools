@@ -136,11 +136,13 @@ impl Default for ClipboardHistorySnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClipboardHistoryError {
     InvalidCapture,
+    InvalidQuery,
     Storage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClipboardHistoryBridgeError {
+    InvalidQuery,
     PermissionDenied,
     ExpiredPanelSession,
     Unavailable,
@@ -149,6 +151,7 @@ pub(crate) enum ClipboardHistoryBridgeError {
 impl ClipboardHistoryBridgeError {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::InvalidQuery => "InvalidQuery",
             Self::PermissionDenied => "PermissionDenied",
             Self::ExpiredPanelSession => "ExpiredPanelSession",
             Self::Unavailable => "ClipboardHistoryUnavailable",
@@ -264,4 +267,15 @@ pub(super) enum HistoryEntryPayload {
     Files {
         paths: Vec<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClipboardHistoryCopyOutcome {
+    pub(crate) outcome: ClipboardHistoryCopyStatus,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ClipboardHistoryCopyStatus {
+    Copied,
 }

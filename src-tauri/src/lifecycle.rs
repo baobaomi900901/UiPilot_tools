@@ -89,6 +89,10 @@ struct LauncherShown {
     notice: Option<LifecycleNotice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     command_entry: Option<CommandEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_translation: Option<crate::selection_translation::SelectionTranslation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builtin_entry: Option<crate::settings::ManagedBuiltinFeature>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,7 +174,7 @@ pub(crate) enum LifecycleError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShowOutcome {
+pub(crate) enum ShowOutcome {
     Shown,
     Ignored,
 }
@@ -179,6 +183,10 @@ enum ShowOutcome {
 struct ShowRequest {
     target: ShowTarget,
     command_entry: Option<CommandEntry>,
+    builtin_entry: Option<(
+        crate::settings::ManagedBuiltinFeature,
+        crate::screenshot::hotkey::Binding,
+    )>,
 }
 
 #[derive(Debug, Default)]
@@ -197,6 +205,24 @@ impl Readiness {
         let request = ShowRequest {
             target,
             command_entry,
+            builtin_entry: None,
+        };
+        if self.setup_ready && self.frontend_ready {
+            Some(request)
+        } else {
+            self.pending_target = Some(request);
+            None
+        }
+    }
+    fn request_builtin(
+        &mut self,
+        feature: crate::settings::ManagedBuiltinFeature,
+        binding: crate::screenshot::hotkey::Binding,
+    ) -> Option<ShowRequest> {
+        let request = ShowRequest {
+            target: ShowTarget::Launcher,
+            command_entry: None,
+            builtin_entry: Some((feature, binding)),
         };
         if self.setup_ready && self.frontend_ready {
             Some(request)
@@ -520,6 +546,10 @@ pub(crate) struct NativeHotkeyEvent {
     pub(crate) shortcut: Shortcut,
     epoch: u64,
     screenshot_epoch: u64,
+    selection_target: Result<
+        crate::selection_capture::CaptureTarget,
+        crate::selection_capture::SelectionCaptureError,
+    >,
 }
 
 pub(crate) struct HotkeyOperationGuard<'a> {
@@ -549,7 +579,11 @@ pub(crate) struct LifecycleCoordinator {
     hotkey_operation: Mutex<()>,
     hotkey_event_epoch: AtomicU64,
     pub(crate) command_hotkeys: CommandHotkeys,
+    pub(crate) selection_hotkeys: CommandHotkeys,
+    pub(crate) selection_cancel: Mutex<Arc<AtomicBool>>,
     pub(crate) screenshot_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys,
+    quicklinks_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys,
+    web_search_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys,
     hotkey_recording: AtomicBool,
     hotkey_hook: Mutex<Option<HotkeyHook>>,
     foreground_capture: Mutex<ForegroundCaptureState>,
@@ -573,7 +607,11 @@ impl Default for LifecycleCoordinator {
             hotkey_operation: Mutex::new(()),
             hotkey_event_epoch: AtomicU64::new(0),
             command_hotkeys: CommandHotkeys::default(),
+            selection_hotkeys: CommandHotkeys::default(),
+            selection_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             screenshot_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys::default(),
+            quicklinks_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys::default(),
+            web_search_hotkeys: crate::screenshot::hotkey::ScreenshotHotkeys::default(),
             hotkey_recording: AtomicBool::new(false),
             hotkey_hook: Mutex::new(None),
             foreground_capture: Mutex::new(ForegroundCaptureState::default()),
@@ -640,6 +678,74 @@ pub(crate) fn place_main_window(
         }
     }
     window.center().map_err(|_| ())
+}
+
+fn restore_main_window_geometry(window: &WebviewWindow) -> Result<(), ()> {
+    let config = window.app_handle().config();
+    let configured = config
+        .app
+        .windows
+        .iter()
+        .find(|entry| entry.label == "main")
+        .ok_or(())?;
+    let monitor = window.current_monitor().map_err(|_| ())?.ok_or(())?;
+    // Read native DPI: a remote reconnect may leave the toolkit's cached scale stale.
+    #[cfg(windows)]
+    let scale = {
+        let dpi =
+            unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd().map_err(|_| ())?) };
+        if dpi == 0 {
+            return Err(());
+        }
+        f64::from(dpi) / 96.0
+    };
+    #[cfg(not(windows))]
+    let scale = window.scale_factor().map_err(|_| ())?;
+    let inner = window.inner_size().map_err(|_| ())?;
+    let outer = window.outer_size().map_err(|_| ())?;
+    let area = *monitor.work_area();
+    let (width, height) = crate::window_geometry::main_client_size(
+        (configured.width, configured.height),
+        scale,
+        (area.size.width, area.size.height),
+        (
+            outer.width.saturating_sub(inner.width),
+            outer.height.saturating_sub(inner.height),
+        ),
+    )
+    .ok_or(())?;
+    let target = PhysicalSize::new(width, height);
+    if inner != target {
+        window.set_size(target).map_err(|_| ())?;
+    }
+    // Keep the enlarged window on the current display without changing normal placement.
+    let outer = window.outer_size().map_err(|_| ())?;
+    let position = window.outer_position().map_err(|_| ())?;
+    let saved = WindowPosition {
+        x: position.x,
+        y: position.y,
+    };
+    if !position_fits_work_area(saved, outer, area) {
+        if let Some(position) = centered_position(outer, area) {
+            window
+                .set_position(PhysicalPosition::new(position.x, position.y))
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn schedule_main_window_geometry_restore(window: &WebviewWindow) {
+    let window = window.clone();
+    // Queue from a worker so this runs after WM_DPICHANGED's own final resize.
+    tauri::async_runtime::spawn(async move {
+        let target = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            if restore_main_window_geometry(&target).is_err() {
+                eprintln!("UiPilot: main window DPI resize deferred until next activation");
+            }
+        });
+    });
 }
 
 struct ShowMainClosures<'a> {
@@ -1096,7 +1202,7 @@ impl LifecycleCoordinator {
         Some(lease)
     }
 
-    // Called under the plugin's own shortcut mutex: only copy atomics, never take a host lock.
+    // Called under the plugin's own shortcut mutex: copy atomics and a lock-free native foreground identity; never take a host lock.
     pub(crate) fn capture_native_hotkey(&self, shortcut: Shortcut) -> Option<NativeHotkeyEvent> {
         let screenshot_epoch = self.screenshot_display.ticket()?;
         let epoch = self.hotkey_event_epoch.load(Ordering::Acquire);
@@ -1104,6 +1210,7 @@ impl LifecycleCoordinator {
             shortcut,
             epoch,
             screenshot_epoch,
+            selection_target: crate::selection_capture::capture_target(),
         })
     }
 
@@ -1129,7 +1236,7 @@ impl LifecycleCoordinator {
         if self.observe_exit() != ExitState::Running {
             return;
         }
-        self.dispatch_native_hotkey(app, &event.shortcut);
+        self.dispatch_native_hotkey(app, &event.shortcut, event.selection_target);
     }
 
     pub(crate) fn with_launcher_hotkey_save<S, P>(
@@ -1292,16 +1399,55 @@ impl LifecycleCoordinator {
         uninstall_slot_with(&self.hotkey_hook, HotkeyHook::uninstall)
     }
 
+    pub(crate) fn builtin_hotkeys(
+        &self,
+        feature: crate::settings::ManagedBuiltinFeature,
+    ) -> &crate::screenshot::hotkey::ScreenshotHotkeys {
+        use crate::settings::ManagedBuiltinFeature as F;
+        match feature {
+            F::Screenshot => &self.screenshot_hotkeys,
+            F::Quicklinks => &self.quicklinks_hotkeys,
+            F::WebSearch => &self.web_search_hotkeys,
+        }
+    }
+
+    fn builtin_entry_current(
+        &self,
+        app: &AppHandle,
+        feature: crate::settings::ManagedBuiltinFeature,
+        binding: crate::screenshot::hotkey::Binding,
+    ) -> bool {
+        let saved = app.state::<SettingsStore>().snapshot();
+        !self.hotkey_recording.load(Ordering::Acquire)
+            && saved.builtin_feature_enabled(feature)
+            && saved
+                .builtin_hotkey(feature)
+                .and_then(|s| crate::hotkey::command_chord(s).ok())
+                == Some(binding.shortcut)
+            && self
+                .builtin_hotkeys(feature)
+                .candidate(binding.shortcut.id())
+                == Some(binding)
+    }
+
     pub(crate) fn unregister_command_hotkeys_for_exit(&self, app: &AppHandle) {
         // Exit must never wait behind a worker that needs the main thread.
         let Ok(_operation) = self.hotkey_operation.try_lock() else {
             return;
         };
-        for binding in self.command_hotkeys.entries() {
+        self.cancel_selection_capture();
+        for binding in self
+            .command_hotkeys
+            .entries()
+            .into_iter()
+            .chain(self.selection_hotkeys.entries())
+        {
             let _ = app.global_shortcut().unregister(binding.shortcut);
         }
-        for shortcut in self.screenshot_hotkeys.registrations() {
-            let _ = app.global_shortcut().unregister(shortcut);
+        for feature in crate::settings::ManagedBuiltinFeature::ALL {
+            for shortcut in self.builtin_hotkeys(feature).registrations() {
+                let _ = app.global_shortcut().unregister(shortcut);
+            }
         }
     }
 
@@ -1412,6 +1558,9 @@ impl LifecycleCoordinator {
     }
 
     pub(crate) fn command_entry_current(&self, app: &AppHandle, entry: &CommandEntry) -> bool {
+        if self.selection_entry_current(app, entry) {
+            return true;
+        }
         if !self.command_hotkeys.matches(entry) {
             return false;
         }
@@ -1429,7 +1578,15 @@ impl LifecycleCoordinator {
             .is_some()
     }
 
-    pub(crate) fn dispatch_native_hotkey(self: &Arc<Self>, app: &AppHandle, shortcut: &Shortcut) {
+    pub(crate) fn dispatch_native_hotkey(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        shortcut: &Shortcut,
+        selection_target: Result<
+            crate::selection_capture::CaptureTarget,
+            crate::selection_capture::SelectionCaptureError,
+        >,
+    ) {
         let Some(screenshot_epoch) = self.screenshot_display.ticket() else {
             return;
         };
@@ -1441,6 +1598,10 @@ impl LifecycleCoordinator {
             );
             return;
         }
+        if self.dispatch_selection_hotkey(app, shortcut, selection_target) {
+            return;
+        }
+        self.cancel_selection_capture();
         if self.screenshot_hotkeys.candidate(shortcut.id()).is_some() {
             let saved = app.state::<SettingsStore>().snapshot().screenshot_hotkey;
             if saved
@@ -1457,6 +1618,40 @@ impl LifecycleCoordinator {
                     );
             }
             return;
+        }
+        for feature in [
+            crate::settings::ManagedBuiltinFeature::Quicklinks,
+            crate::settings::ManagedBuiltinFeature::WebSearch,
+        ] {
+            if let Some(binding) = self.builtin_hotkeys(feature).candidate(shortcut.id()) {
+                if !self.builtin_entry_current(app, feature, binding) {
+                    return;
+                }
+                let dispatcher = app.clone();
+                let show_app = app.clone();
+                let coordinator = Arc::clone(self);
+                let _ = dispatcher.run_on_main_thread(move || {
+                    if !coordinator.screenshot_display.accepts(screenshot_epoch)
+                        || !coordinator.builtin_entry_current(&show_app, feature, binding)
+                    {
+                        return;
+                    }
+                    let request = coordinator
+                        .readiness
+                        .lock()
+                        .unwrap()
+                        .request_builtin(feature, binding);
+                    if let Some(request) = request {
+                        let _ = coordinator.show_main_entry(
+                            &show_app,
+                            request.target,
+                            request.command_entry,
+                            request.builtin_entry,
+                        );
+                    }
+                });
+                return;
+            }
         }
         if let Some(entry) = self.command_hotkeys.candidate(shortcut.id()) {
             if !self.command_entry_current(app, &entry) {
@@ -1485,6 +1680,7 @@ impl LifecycleCoordinator {
                             &show_app,
                             request.target,
                             request.command_entry,
+                            request.builtin_entry,
                         );
                     }
                 });
@@ -1513,6 +1709,7 @@ impl LifecycleCoordinator {
     }
 
     pub(crate) fn reconcile_command_hotkeys(self: &Arc<Self>, app: &AppHandle) -> Result<(), ()> {
+        let selection_failed = self.reconcile_selection_hotkey(app).is_err();
         let _critical = self.reserve_critical().map_err(|_| ())?;
         let _operation = self.lock_hotkey_operation()?;
         let service = app.state::<Arc<PublicPluginService>>();
@@ -1530,7 +1727,7 @@ impl LifecycleCoordinator {
             }
         }
         let native = app.global_shortcut();
-        let mut failed = false;
+        let mut failed = selection_failed;
         for (plugin, command) in targets {
             let eligible = inventory
                 .items
@@ -1623,11 +1820,58 @@ impl LifecycleCoordinator {
         )
     }
 
+    pub(crate) fn reconcile_builtin_hotkeys(self: &Arc<Self>, app: &AppHandle) -> Result<(), ()> {
+        let _critical = self.reserve_critical().map_err(|_| ())?;
+        let _operation = self.lock_hotkey_operation()?;
+        let saved = app.state::<SettingsStore>().snapshot();
+        let native = app.global_shortcut();
+        let mut failed = false;
+        for feature in [
+            crate::settings::ManagedBuiltinFeature::Quicklinks,
+            crate::settings::ManagedBuiltinFeature::WebSearch,
+        ] {
+            let desired = saved
+                .builtin_hotkey(feature)
+                .filter(|_| saved.builtin_feature_enabled(feature));
+            let replacement = match desired.map(crate::hotkey::command_chord).transpose() {
+                Ok(value) => value,
+                Err(()) => {
+                    failed = true;
+                    continue;
+                }
+            };
+            if replacement.is_some_and(|s| {
+                crate::screenshot::hotkey::builtin_conflicts(&saved, feature, &s.to_string())
+            }) {
+                failed = true;
+                continue;
+            }
+            if self
+                .builtin_hotkeys(feature)
+                .edit(
+                    replacement,
+                    &mut |s| native.register(s).map_err(|_| ()),
+                    &mut |s| native.unregister(s).map_err(|_| ()),
+                    || Ok(()),
+                )
+                .is_err()
+            {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn request_show(
         self: &Arc<Self>,
         app: &AppHandle,
         target: ShowTarget,
     ) -> Result<(), LifecycleError> {
+        self.cancel_selection_capture();
         let Some(screenshot_epoch) = self.screenshot_display.ticket() else {
             return Ok(());
         };
@@ -1655,10 +1899,15 @@ impl LifecycleCoordinator {
             readiness.take_request_if_ready()
         };
         if let Some(request) = request {
-            if request.command_entry.is_none() {
+            if request.command_entry.is_none() && request.builtin_entry.is_none() {
                 self.show_main(app, request.target)?;
             } else {
-                self.show_main_entry(app, request.target, request.command_entry)?;
+                self.show_main_entry(
+                    app,
+                    request.target,
+                    request.command_entry,
+                    request.builtin_entry,
+                )?;
             }
         }
         Ok(())
@@ -1674,10 +1923,15 @@ impl LifecycleCoordinator {
             readiness.take_request_if_ready()
         };
         if let Some(request) = request {
-            if request.command_entry.is_none() {
+            if request.command_entry.is_none() && request.builtin_entry.is_none() {
                 self.show_main(app, request.target)?;
             } else {
-                self.show_main_entry(app, request.target, request.command_entry)?;
+                self.show_main_entry(
+                    app,
+                    request.target,
+                    request.command_entry,
+                    request.builtin_entry,
+                )?;
             }
         }
         Ok(())
@@ -1706,7 +1960,12 @@ impl LifecycleCoordinator {
             readiness.request_command(target, None)
         };
         if let Some(request) = target {
-            let _ = self.show_main_entry(app, request.target, request.command_entry);
+            let _ = self.show_main_entry(
+                app,
+                request.target,
+                request.command_entry,
+                request.builtin_entry,
+            );
         }
     }
 
@@ -1782,7 +2041,7 @@ impl LifecycleCoordinator {
         app: &AppHandle,
         target: ShowTarget,
     ) -> Result<ShowOutcome, LifecycleError> {
-        self.show_main_entry(app, target, None)
+        self.show_main_entry(app, target, None, None)
     }
 
     fn show_main_entry(
@@ -1790,7 +2049,31 @@ impl LifecycleCoordinator {
         app: &AppHandle,
         target: ShowTarget,
         command_entry: Option<CommandEntry>,
+        builtin_entry: Option<(
+            crate::settings::ManagedBuiltinFeature,
+            crate::screenshot::hotkey::Binding,
+        )>,
     ) -> Result<ShowOutcome, LifecycleError> {
+        self.cancel_selection_capture();
+        self.show_main_selection_entry(app, target, command_entry, None, builtin_entry)
+    }
+
+    pub(crate) fn show_main_selection_entry(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        target: ShowTarget,
+        command_entry: Option<CommandEntry>,
+        selection_translation: Option<crate::selection_translation::SelectionTranslation>,
+        builtin_entry: Option<(
+            crate::settings::ManagedBuiltinFeature,
+            crate::screenshot::hotkey::Binding,
+        )>,
+    ) -> Result<ShowOutcome, LifecycleError> {
+        if builtin_entry
+            .is_some_and(|(feature, binding)| !self.builtin_entry_current(app, feature, binding))
+        {
+            return Ok(ShowOutcome::Ignored);
+        }
         if self.screenshot_display.ticket().is_none() {
             return Ok(ShowOutcome::Ignored);
         }
@@ -1811,7 +2094,15 @@ impl LifecycleCoordinator {
         self.capture_foreground_for_show(window.is_visible().unwrap_or(false));
         let saved_position = app.state::<SettingsStore>().window_position();
         let panel_controller = Arc::clone(app.state::<Arc<PluginPanelController>>().inner());
-        let mut place_window = || place_main_window(&window, saved_position);
+        let mut place_window = || {
+            place_main_window(&window, saved_position)?;
+            // Display/session changes can occur while the launcher is hidden.
+            // Correct before showing it; a transient display query failure must not block launch.
+            if restore_main_window_geometry(&window).is_err() {
+                eprintln!("UiPilot: could not reconcile main window DPI on activation");
+            }
+            Ok(())
+        };
         let mut always_on_top = || window.set_always_on_top(true).map_err(|_| ());
         let mut show = || window.show().map_err(|_| ());
         let mut focus = || {
@@ -1846,6 +2137,8 @@ impl LifecycleCoordinator {
         let mut emit = |payload: &LauncherShown| {
             let mut payload = payload.clone();
             payload.command_entry = command_entry.clone();
+            payload.selection_translation = selection_translation.clone();
+            payload.builtin_entry = builtin_entry.map(|(feature, _)| feature);
             window.emit("launcher://shown", payload).map_err(|_| ())
         };
         let mut clear_window = || {
@@ -1912,7 +2205,9 @@ impl LifecycleCoordinator {
             invocation_id,
             target,
             notice,
+            selection_translation: None,
             command_entry: None,
+            builtin_entry: None,
         };
         if (operations.emit)(&payload).is_err() {
             (operations.clear_and_hide)();
@@ -3125,9 +3420,37 @@ mod tests {
             state.take_request_if_ready(),
             Some(ShowRequest {
                 target: ShowTarget::Settings,
-                command_entry: None
+                command_entry: None,
+                builtin_entry: None
             })
         );
+    }
+
+    #[test]
+    fn builtin_hotkey_readiness_preserves_identity_and_serializes_atomic_show() {
+        use crate::settings::ManagedBuiltinFeature as F;
+        let shortcut = crate::hotkey::command_chord("Ctrl+Q").unwrap();
+        let binding = crate::screenshot::hotkey::Binding {
+            shortcut,
+            revision: 1,
+        };
+        let mut state = Readiness::default();
+        assert!(state.request_builtin(F::Quicklinks, binding).is_none());
+        state.setup_ready = true;
+        state.frontend_ready = true;
+        let request = state.take_request_if_ready().unwrap();
+        assert_eq!(request.builtin_entry, Some((F::Quicklinks, binding)));
+        let payload = LauncherShown {
+            invocation_id: "1".into(),
+            target: request.target,
+            notice: None,
+            selection_translation: None,
+            command_entry: None,
+            builtin_entry: request.builtin_entry.map(|(feature, _)| feature),
+        };
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["builtinEntry"], "quicklinks");
+        assert!(json.get("commandEntry").is_none());
     }
 
     #[test]
@@ -4008,7 +4331,9 @@ mod tests {
             (ShowTarget::Messages, "messages"),
         ] {
             let value = serde_json::to_value(LauncherShown {
+                selection_translation: None,
                 command_entry: None,
+                builtin_entry: None,
                 invocation_id: "invocation-1".into(),
                 target,
                 notice: Some(LifecycleNotice::SettingsFailed),

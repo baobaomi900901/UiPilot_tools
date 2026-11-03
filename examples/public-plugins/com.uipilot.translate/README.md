@@ -1,27 +1,13 @@
-# UiPilot Youdao Translate Plugin
+# 翻译 1.2.1
 
-This independently removable public plugin translates English to Simplified Chinese and Simplified Chinese to English through the Host-managed HTTPS API.
+Windows UiPilot 0.16.0+ 主结果插件，使用 `/translate hello` 中英互译，Enter 复制译文。输入含汉字时中译英，否则英译中。
 
-## Development Credential Notice
+底栏遵循宿主统一规范：左侧显示结果数量或状态反馈，翻译方向保留在结果行，右侧独立显示 `Enter 复制`。副标题只包含翻译方向，失败结果不提供复制提示。更新到 1.2.1 时，在设置里重新选择 `package/` 开发目录更新插件，保留原数据与授权。
 
-The MVP Runtime intentionally contains development-only provider credentials. Anyone who can inspect the plugin package can read and reuse them. Do not distribute this build as a production plugin. UiPilot Public Plugin API v1 does not currently expose production secret injection.
+划词翻译：在设置 → 权限中为“翻译”开启“读取选中文字”，并开启有道和网络授权；在其他应用中选择文字后按 Alt+A。主程序读取选区、打开翻译并自动提交一次。插件详情中的“划词翻译快捷键”可录制或清除，原启动快捷键不变。权限关闭时不会捕获选区；没有选区或捕获失败时不使用旧剪贴板内容。优先读取 Windows 可访问性选区；控件未提供该接口时，宿主可临时模拟 Ctrl+C、缓存并有条件恢复原剪贴板，同时排除 UiPilot 临时历史并定向处理 Win+V 新增记录。期间新的复制会保留；不能安全备份或完成清理时显示具体提示，允许手动输入。缓存只留在宿主内存，不传给插件。
 
-## Install And Use
+安装 `package/` 或 CLI 打包产物。在设置 → 密钥配置配置并启用有道翻译，在设置 → 权限授权有道翻译和网络。插件申报有道翻译、百度 OCR、DeepSeek 三项独立权限，默认不授予；本版本仅使用有道，其余两项没有业务 API。密钥由宿主保管和签名，插件不读取密钥、签名或供应商原始响应。
 
-1. In UiPilot's public plugin panel, choose **Development directory**.
-2. Select the `package` directory beside this README.
-3. Confirm clipboard access and Host-managed HTTPS access to `openapi.youdao.com`.
-4. Run `/translate Hello` or `/translate 你好` and press Enter.
-5. Press Enter again on a successful result to copy the translation.
+离线验证：`node --test examples/public-plugins/com.uipilot.translate/tests/runtime.test.js`。测试使用假宿主服务，无真实密钥或网络。真实供应商行为须用户在 Host 中手动验收。升级保持插件 ID、命令和复制动作，旧权限记录不自动扩大授权。
 
-The plugin stores no translation history and performs no background requests.
-
-## Verify
-
-```powershell
-node --test examples/public-plugins/com.uipilot.translate/tests/runtime.test.js
-npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.translate/tests/sdk-contract.ts
-node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.translate/package --platform windows
-```
-
-The Runtime uses only `api.network.request(...)`. The provider endpoint and V3 signing algorithm follow the official [Youdao text translation API documentation](https://ai.youdao.com/DOCSIRMA/html/trans/api/wbfy/index.html).
+本插件使用旧 `command` + `mainResult` 且未启用 `runtime.resultActions`，符合 Host 0.15.0 当前有道业务调用边界。多命令、Panel、子窗口和结果动作插件即使已获授权也不能调用该方法；facade 存在不表示已授权或形态兼容。

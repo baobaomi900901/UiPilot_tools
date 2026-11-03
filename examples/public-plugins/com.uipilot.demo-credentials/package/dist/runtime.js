@@ -43,6 +43,8 @@ export async function onCommand(invocation, api) {
     return result(invocation.requestId, `HTTP ${response.status}`, responseDetail(response.body))
   } catch (error) {
     const name = error && ERROR_NAMES.has(error.name) ? error.name : 'NetworkFailureError'
-    return result(invocation.requestId, name, 'Check Host credential configuration and network consent; start a new command to retry.')
+    return result(invocation.requestId, name, name === 'PermissionDeniedError'
+      ? 'Network access is off. Enable it for this plugin in Settings → Permissions, then run the command again.'
+      : 'Check Host credential configuration and network consent; start a new command to retry.')
   }
 }

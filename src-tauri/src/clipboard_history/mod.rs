@@ -11,10 +11,11 @@ mod service;
 mod store;
 
 pub(crate) use model::{
-    CaptureOutcome, ClipboardCapture, ClipboardHistoryBridgeError, ClipboardHistoryEntrySummary,
-    ClipboardHistoryError, ClipboardHistoryPasteError, ClipboardHistoryPasteOutcome,
-    ClipboardHistoryPasteStatus, ClipboardHistoryRecord, ClipboardHistoryRecordPayload,
-    ClipboardHistorySnapshot, IgnoredCaptureReason,
+    CaptureOutcome, ClipboardCapture, ClipboardHistoryBridgeError, ClipboardHistoryCopyOutcome,
+    ClipboardHistoryCopyStatus, ClipboardHistoryEntrySummary, ClipboardHistoryError,
+    ClipboardHistoryPasteError, ClipboardHistoryPasteOutcome, ClipboardHistoryPasteStatus,
+    ClipboardHistoryRecord, ClipboardHistoryRecordPayload, ClipboardHistorySnapshot,
+    IgnoredCaptureReason,
 };
 pub(crate) use observer::{
     normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
@@ -24,7 +25,7 @@ pub(crate) use paste::{
     paste_clipboard_history_record, send_ctrl_v_to_foreground_target, ClipboardHistoryPasteDriver,
     ClipboardHistoryPasteWrite,
 };
-pub(crate) use service::ClipboardHistoryService;
+pub(crate) use service::{ClipboardHistoryService, TemporaryClipboardCopy};
 pub(crate) use store::ClipboardHistoryStore;
 
 #[cfg(test)]
@@ -186,6 +187,66 @@ mod tests {
             pixels.push(0xff);
         }
         pixels
+    }
+
+    #[test]
+    fn query_searches_full_text_and_every_filename_without_exposing_payloads() {
+        let dir = TestDir::new("query-full-record");
+        let store = ClipboardHistoryStore::load(dir.path()).unwrap();
+        let id = capture_text(
+            &store,
+            &format!("{} HiddenNeedle", "x".repeat(150)),
+            "2026-08-30T01:00:00Z",
+        );
+        store
+            .capture(ClipboardCapture::files(
+                vec![
+                    dir.path().join("first.txt"),
+                    dir.path().join("SecondNeedle.PDF"),
+                ],
+                "2026-08-30T01:00:01Z",
+            ))
+            .unwrap();
+        store
+            .capture(ClipboardCapture::image(
+                vec![255, 0, 0, 255],
+                1,
+                1,
+                "2026-08-30T01:00:02Z",
+            ))
+            .unwrap();
+        let all = store.snapshot().unwrap();
+        assert_eq!(store.snapshot_query(None).unwrap(), all);
+        assert_eq!(store.snapshot_query(Some("  ")).unwrap(), all);
+        let text = store.snapshot_query(Some(" hiddenneedle ")).unwrap();
+        assert_eq!(text.revision, all.revision);
+        assert_eq!(text.entries.len(), 1);
+        assert_eq!(text.entries[0].id(), id);
+        assert!(!serde_json::to_string(&text)
+            .unwrap()
+            .contains("HiddenNeedle"));
+        let files = store.snapshot_query(Some("secondneedle.pdf")).unwrap();
+        assert_eq!(files.entries.len(), 1);
+        assert!(matches!(
+            files.entries[0],
+            ClipboardHistoryEntrySummary::Files { .. }
+        ));
+        assert!(store
+            .snapshot_query(Some(&dir.path().to_string_lossy()))
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(store
+            .snapshot_query(Some("image"))
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(
+            store.snapshot_query(Some(&"界".repeat(513))),
+            Err(ClipboardHistoryError::InvalidQuery)
+        );
+        assert!(store.snapshot_query(Some(&"😀".repeat(512))).is_ok());
+        assert_eq!(store.snapshot().unwrap(), all);
     }
 
     #[test]

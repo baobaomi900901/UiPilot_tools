@@ -22,13 +22,12 @@ const emptyState = document.querySelector('#empty-state')
 const editorPanel = document.querySelector('#editor-panel')
 const editorTitle = document.querySelector('#editor-title')
 const editorTime = document.querySelector('#editor-time')
-const editorSaveState = document.querySelector('#editor-save-state')
 const editorSurface = document.querySelector('.editor-surface')
 const editorContent = document.querySelector('#editor-content')
 const editorScrollbar = document.querySelector('#editor-scrollbar')
 const editorScrollbarThumb = document.querySelector('#editor-scrollbar-thumb')
 const copyBtn = document.querySelector('#editor-copy-btn')
-const editorStatus = document.querySelector('#editor-status')
+let statusRevision = 0
 const noteActionsMenu = document.querySelector('#note-actions-menu')
 
 const newDialog = document.querySelector('#new-dialog')
@@ -106,30 +105,22 @@ function updateEditorMeta(note = getSelectedNote()) {
   editorTitle.textContent = note?.title ?? ''
   editorTime.textContent = note ? formatNoteTime(note.createdAt) : ''
   editorTime.dateTime = note?.createdAt ?? ''
-  const dirty = Boolean(note) && isDirty()
-  editorSaveState.classList.toggle('is-dirty', dirty)
-  editorSaveState.querySelector('span').textContent = dirty ? '未保存' : '已保存'
 }
 
 function filteredNotes() {
   return filterNotes(notes, searchQuery)
 }
 
-function setStatus(message, tone = '') {
-  editorStatus.textContent = message
-  if (message && tone) {
-    editorStatus.dataset.tone = tone
-  } else {
-    delete editorStatus.dataset.tone
-  }
+function setStatus(message, tone = 'info') {
+  statusRevision += 1
+  void window.uipilotPluginPanel.setStatus({ message, tone: tone || 'info' }).catch(() => {})
 }
 
 function clearStatusLater(message, delayMs = 2000) {
   setStatus(message, 'success')
+  const revision = statusRevision
   window.setTimeout(() => {
-    if (editorStatus.textContent === message) {
-      setStatus('')
-    }
+    if (revision === statusRevision) setStatus('')
   }, delayMs)
 }
 
@@ -413,7 +404,7 @@ async function persistNotes(token) {
     await storage.set(STORAGE_KEY, notes)
     return token === sessionToken
   } catch (error) {
-    if (isSessionError(error)) {
+    if (token !== sessionToken || isSessionError(error)) {
       return false
     }
     setStatus('保存失败', 'error')
@@ -701,16 +692,25 @@ function copyEditorContent({ onSuccess, preferSync = false } = {}) {
   }
 
   function copyWithExecCommand() {
+    const origin = document.activeElement
+    const selection = typeof origin?.selectionStart === 'number'
+      ? [origin.selectionStart, origin.selectionEnd, origin.selectionDirection] : null
     const helper = document.createElement('textarea')
     helper.value = text
     helper.setAttribute('readonly', 'true')
     helper.style.position = 'fixed'
     helper.style.left = '-9999px'
     document.body.append(helper)
-    helper.select()
-    const copied = document.execCommand('copy')
-    helper.remove()
-    return copied
+    try {
+      helper.select()
+      return document.execCommand('copy')
+    } finally {
+      helper.remove()
+      if (origin?.isConnected) {
+        origin.focus({ preventScroll: true })
+        if (selection) origin.setSelectionRange(...selection)
+      }
+    }
   }
 
   try {
@@ -996,6 +996,39 @@ function handleHostKey(event) {
 
 window.uipilotPluginPanel.onHostKey(handleHostKey)
 
+window.uipilotPluginPanel.onActions(({ source }) => {
+  if (isDialogOpen() || escapeHideInFlight) return null
+  const token = sessionToken
+  const noteId = selectedId
+  const current = (run, needsNote = false) => () => {
+    if (token !== sessionToken || isDialogOpen() || needsNote && (selectedId !== noteId || !getSelectedNote())) return
+    return run()
+  }
+  const disabledReason = getSelectedNote() ? undefined : '没有选中笔记'
+  const context = source === 'hostInput'
+    ? [{ id: 'notes-list', title: '进入目录', shortcut: '↓', icon: 'arrow',
+        disabledReason: filteredNotes().length ? undefined : '没有匹配的笔记',
+        run: current(() => moveListSelection(1)) }]
+    : isFocusInEditor(document.activeElement)
+    ? [{ id: 'notes-save', title: '保存笔记', shortcut: 'Ctrl+S', icon: 'save', disabledReason,
+        run: current(async () => { await saveCurrentNote() }, true) },
+       { id: 'notes-copy-text', title: '复制正文', icon: 'copy', disabledReason,
+        run: current(() => { copyEditorContent({ preferSync: true }) }, true) }]
+    : [{ id: 'notes-edit', title: '编辑正文', shortcut: '→', icon: 'edit', disabledReason,
+        run: current(() => { listHasFocus = false; editorContent.focus() }, true) },
+       { id: 'notes-copy', title: '复制并隐藏', shortcut: 'Enter', icon: 'copy', disabledReason,
+        run: current(() => { if (copyEditorContent({ preferSync: true })) hidePanelAfterListCopy() }, true) },
+       { id: 'notes-rename', title: '重命名笔记', icon: 'edit', disabledReason,
+        run: current(() => openRenameDialog(noteId), true) },
+       { id: 'notes-delete', title: '删除笔记', icon: 'trash', disabledReason,
+        run: current(() => openDeleteDialog(noteId), true) }]
+  return { context, global: [
+    { id: 'notes-new', title: '新建笔记', shortcut: 'Ctrl+N', icon: 'plus', run: current(openNewDialog) },
+    ...(source === 'content' ? [{ id: 'notes-input', title: '返回主输入框', shortcut: 'Ctrl+F', icon: 'search',
+      run: current(() => window.uipilotPluginPanel.focusHostInput()) }] : []),
+  ] }
+})
+
 window.addEventListener('keydown', (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
     event.preventDefault()
@@ -1206,6 +1239,7 @@ for (const [id, cancelButton] of [
 window.uipilotPluginPanel.onUpdate(async (update) => {
   document.documentElement.dataset.theme = update.theme
   sessionToken += 1
+  setStatus('')
   const token = sessionToken
   storage = window.uipilotPluginPanel.storage
   searchQuery = typeof update.input === 'string' ? update.input : ''

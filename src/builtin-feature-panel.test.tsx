@@ -1,20 +1,23 @@
 // @vitest-environment jsdom
 import { act, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PublicPluginPanel } from './public-plugin-panel'
 import { BuiltinFeatureDetail } from './builtin-feature-panel'
 import type { BuiltinFeatureView, LauncherClient } from './protocol'
 
 const features: readonly BuiltinFeatureView[] = [
-  { feature: 'screenshot', name: '截图', command: '/screenshot', description: '区域和窗口捕获', examples: ['/screenshot'], version: '0.14.0', enabled: true },
-  { feature: 'quicklinks', name: '快捷链接', command: '/quicklinks', description: '打开保存的链接', examples: ['/quicklinks'], version: '0.14.0', enabled: true },
-  { feature: 'webSearch', name: '网页搜索', command: '/web-search', description: '搜索互联网', examples: ['/web-search cats'], version: '0.14.0', enabled: true },
+  { feature: 'screenshot', name: '截图', command: '/screenshot', defaultCommand: '/screenshot', description: '区域和窗口捕获', examples: ['/screenshot'], version: '0.14.0', enabled: true, favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: null },
+  { feature: 'quicklinks', name: '快捷链接', command: '/quicklinks', defaultCommand: '/quicklinks', description: '打开保存的链接', examples: ['/quicklinks'], version: '0.14.0', enabled: true, favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: null },
+  { feature: 'webSearch', name: '网页搜索', command: '/web-search', defaultCommand: '/web-search', description: '搜索互联网', examples: ['/web-search cats'], version: '0.14.0', enabled: true, favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: null },
 ]
 function fixture() {
   let current = features.map((item) => ({ ...item }))
   const listeners = new Set<() => void>()
   return {
+    setBuiltinFeatureName: vi.fn(async ({ feature, nameOverride }: Parameters<LauncherClient['setBuiltinFeatureName']>[0]) => { current = current.map((item) => item.feature === feature ? { ...item, command: nameOverride ? `/${nameOverride}` : item.defaultCommand } : item) }),
+    setBuiltinFeatureHotkey: vi.fn(async ({ feature, hotkey }: Parameters<LauncherClient['setBuiltinFeatureHotkey']>[0]) => { current = current.map((item) => item.feature === feature ? { ...item, hotkey, hotkeyStatus: hotkey ? 'active' : 'unset' } : item) }),
+    setBuiltinFeatureFavorite: vi.fn(async ({ feature, favorite }: Parameters<LauncherClient['setBuiltinFeatureFavorite']>[0]) => { current = current.map((item) => item.feature === feature ? { ...item, favorite } : item) }),
     listBuiltinFeatures: vi.fn(async () => current),
     setBuiltinFeatureEnabled: vi.fn(async ({ feature, enabled }) => { current = current.map((item) => item.feature === feature ? { ...item, enabled } : item); return current }),
     listenBuiltinFeaturesChanged: vi.fn(async (handler: () => void) => { listeners.add(handler); return () => { listeners.delete(handler) } }),
@@ -24,6 +27,7 @@ function fixture() {
     uninstallPublicPlugin: vi.fn(),
   }
 }
+beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); window.matchMedia = vi.fn().mockImplementation(() => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} })) })
 let cleanup = () => {}
 afterEach(() => { cleanup() })
 async function render(element: React.ReactNode) {
@@ -36,18 +40,18 @@ async function render(element: React.ReactNode) {
 function click(element: Element | null) { expect(element).not.toBeNull(); act(() => (element as HTMLElement).click()) }
 
 describe('managed builtin settings', () => {
-  it('shows fixed builtin order, shared command/description filter and details without uninstall', async () => {
+  it('shows compact builtin rows and filters by name and command without list metadata or uninstall', async () => {
     const api = fixture(); const details = vi.fn()
     const container = await render(<PublicPluginPanel client={api as unknown as LauncherClient} onOpenBuiltinDetails={details} />)
     await vi.waitFor(() => expect(container.querySelectorAll('[data-builtin-feature]')).toHaveLength(3))
     expect([...container.querySelectorAll('[data-builtin-feature]')].map((row) => row.getAttribute('data-builtin-feature'))).toEqual(['screenshot', 'quicklinks', 'webSearch'])
     const row = container.querySelector('[data-builtin-feature="quicklinks"]')!
-    expect(row.textContent).toContain('内置'); expect(row.textContent).not.toMatch(/删除|卸载|重新加载/)
+    expect(row.textContent).not.toMatch(/内置|0\.14\.0|打开保存的链接|删除|卸载|重新加载/)
     click(row.querySelector('[aria-label="查看 快捷链接 详情"]'))
     expect(details).toHaveBeenCalledWith(features[1])
-    const input = container.querySelector<HTMLInputElement>('[aria-label="筛选插件名称"]')!
+    const input = container.querySelector<HTMLInputElement>('[aria-label="搜索插件名称或启动命令"]')!
     await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '互联网')
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '网页')
       input.dispatchEvent(new Event('input', { bubbles: true }))
       input.dispatchEvent(new Event('change', { bubbles: true }))
     })
@@ -60,6 +64,68 @@ describe('managed builtin settings', () => {
     await vi.waitFor(() => expect(container.querySelector('[data-builtin-feature="quicklinks"]')).not.toBeNull())
     expect(container.querySelectorAll('[data-builtin-feature]')).toHaveLength(1)
     expect(api.uninstallPublicPlugin).not.toHaveBeenCalled()
+  })
+
+  it('edits startup, resets only the command and exposes no plugin removal actions', async () => {
+    const api = fixture()
+    const container = await render(<BuiltinFeatureDetail client={api as unknown as LauncherClient} feature={features[0]!} />)
+    const input = container.querySelector<HTMLInputElement>('[aria-label="启动键"]')!
+    expect(input).not.toBeNull()
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, ' /capture ')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => input.dispatchEvent(new FocusEvent('focusout', { bubbles: true })))
+    expect(api.setBuiltinFeatureName).toHaveBeenCalledWith({ feature: 'screenshot', nameOverride: 'capture' })
+    expect(input.value).toBe('/capture')
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="恢复默认启动键"]')!.click())
+    await vi.waitFor(() => expect(api.setBuiltinFeatureName).toHaveBeenLastCalledWith({ feature: 'screenshot', nameOverride: null }))
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="设为常用"]')!.click())
+    await vi.waitFor(() => expect(api.setBuiltinFeatureFavorite).toHaveBeenCalledWith({ feature: 'screenshot', favorite: true }))
+    expect(container.querySelector('[aria-label="取消常用"]')?.getAttribute('aria-pressed')).toBe('true')
+    expect(container.textContent).toContain('宿主内置')
+    expect(container.textContent).not.toMatch(/查看诊断|删除|重新载入/)
+    expect(api.setBuiltinFeatureHotkey).not.toHaveBeenCalled()
+  })
+
+  it.each(features)('clears only the $feature hotkey and cancels recording through the host phase callback', async (feature) => {
+    const api = fixture(), phase = vi.fn(async () => {})
+    api.setCurrent(features.map(item => item.feature === feature.feature ? { ...item, hotkey: 'Ctrl+Alt+P', hotkeyStatus: 'active' } : item))
+    const container = await render(<BuiltinFeatureDetail client={api as unknown as LauncherClient} feature={feature} onRecordingPhase={phase} />)
+    const clear = container.querySelector<HTMLButtonElement>('[aria-label="清除命令快捷键"]')!
+    expect(clear.disabled).toBe(false)
+    await act(async () => clear.click())
+    expect(api.setBuiltinFeatureHotkey).toHaveBeenCalledWith({ feature: feature.feature, hotkey: null })
+    const input = container.querySelector<HTMLInputElement>('[aria-label="命令快捷键"]')!
+    expect(input.value).toBe(''); expect(input.placeholder).toBe('未设置')
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="录制命令快捷键"]')!.click())
+    expect(phase).toHaveBeenCalledWith('recording')
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(phase).toHaveBeenCalledWith('idle')
+    expect(api.setBuiltinFeatureHotkey).toHaveBeenCalledTimes(1)
+    expect(api.setBuiltinFeatureName).not.toHaveBeenCalled()
+  })
+
+  it('keeps startup controls gated when a change event supersedes the mutation read', async () => {
+    const api = fixture()
+    const container = await render(<BuiltinFeatureDetail client={api as unknown as LauncherClient} feature={features[0]!} />)
+    let olderResolve!: (items: readonly BuiltinFeatureView[]) => void, newerResolve!: (items: readonly BuiltinFeatureView[]) => void
+    const older = new Promise<readonly BuiltinFeatureView[]>(resolve => { olderResolve = resolve })
+    const newer = new Promise<readonly BuiltinFeatureView[]>(resolve => { newerResolve = resolve })
+    api.listBuiltinFeatures.mockImplementationOnce(() => older as never).mockImplementationOnce(() => newer as never)
+    const input = container.querySelector<HTMLInputElement>('[aria-label="启动键"]')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '/capture')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await act(async () => api.emitChanged())
+    await act(async () => olderResolve(features))
+    expect(input.readOnly).toBe(true)
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="设为常用"]')!.disabled).toBe(true)
+    await act(async () => newerResolve(features.map(item => item.feature === 'screenshot' ? { ...item, command: '/capture' } : item)))
+    expect(input.readOnly).toBe(false)
+    expect(input.value).toBe('/capture')
   })
 
   it('disables and re-enables from authoritative replies and prevents duplicate pending toggles', async () => {
@@ -77,7 +143,7 @@ describe('managed builtin settings', () => {
     click(toggle)
     await vi.waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'))
     expect(container.textContent).toContain('0.14.0')
-    expect(container.textContent).not.toMatch(/权限列表|插件所在目录|凭据设置/)
+    expect(container.textContent).toContain('宿主内置'); expect(container.textContent).not.toMatch(/凭据设置|查看诊断|删除/)
   })
 
   it('ignores an older initial read that arrives after a successful toggle', async () => {

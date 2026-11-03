@@ -22,7 +22,7 @@ export async function onCommand(invocation, api) {
     }
   }
   if (command !== 'request') return result(invocation.requestId, '请输入 status 或 request', 'status 检查本地配置；request 发起一次认证测试。')
-  if (!api.network) return result(invocation.requestId, '网络能力不可用', '需要 Windows Host 0.4.0 或更高版本及网络授权。')
+  if (!api.network) return result(invocation.requestId, '网络能力不可用', '请检查 Host 版本是否支持网络能力，以及插件是否申报网络访问权限。')
   try {
     const response = await api.network.request({
       url: 'https://httpbun.com/bearer/uipilot-acceptance-token',
@@ -37,6 +37,8 @@ export async function onCommand(invocation, api) {
   } catch (error) {
     const name = error?.name
     return result(invocation.requestId, ERROR_NAMES.has(name) ? name : 'NetworkFailureError',
-      '请检查 Host 测试凭据和网络授权，重新运行 request；勿填真实密钥。')
+      name === 'PermissionDeniedError'
+        ? '网络访问已关闭，可在「设置 → 权限」中开启后重新运行 request。'
+        : '请检查 Host 测试凭据和网络授权，重新运行 request；勿填真实密钥。')
   }
 }

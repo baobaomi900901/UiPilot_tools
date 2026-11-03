@@ -71,10 +71,10 @@ it('provides a browser-only launcher preview outside the production entry', () =
   expect(previewSource).toContain('core.activateResult')
   expect(previewSource).toContain('/examples/public-plugins/${contentPreview.path}/preview.html?theme=${previewTheme}')
   expect(previewSource).toContain("querySelector<HTMLElement>('.panel-host-region')")
-  expect(previewSource).toContain("frame.style.width = '100%'")
-  expect(previewSource).toContain("frame.style.height = '100%'")
+  expect(previewHtml).toContain('/src/browser-preview.css')
+  expect(previewSource).toContain("frame.className = 'browser-preview-frame browser-preview-panel-frame'")
   expect(previewSource).toContain('region.replaceChildren(frame)')
-  expect(previewSource).not.toContain("frame.style.left = '12px'")
+  expect(previewSource).not.toContain('frame.style.')
   expect(previewSource).not.toContain('@tauri-apps')
   expect(readFileSync('index.html', 'utf8')).not.toContain('launcher-browser-preview')
 })
@@ -229,7 +229,7 @@ describe('plugin protocol', () => {
   it('strictly parses public inventory settings and rejects output mode or secret value leaks', () => {
     const item = {
       pluginId: 'com.example.demo', name: 'Demo', description: null, version: '1.0.0',
-      source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+      source: 'localPackage', installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
       fault: null, generation: 1,
       iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
       network: null,
@@ -368,6 +368,7 @@ function fakeClient() {
   let hiddenHandler: (() => void) | undefined
   let builtinFeaturesChangedHandler: (() => void) | undefined
   let messageStateHandler: ((payload: unknown) => void) | undefined
+  let panelStatusHandler: ((payload: unknown) => void) | undefined
   let panelErrorHandler: ((payload: unknown) => void) | undefined
   let panelResetHandler: ((payload: unknown) => void) | undefined
   let panelFocusHandler: ((payload: unknown) => void) | undefined
@@ -390,6 +391,7 @@ function fakeClient() {
       messageStateHandler = handler
       return vi.fn()
     }),
+    listenPluginPanelStatus: vi.fn(async (handler) => { panelStatusHandler = handler; return vi.fn() }),
     listenPluginPanelError: vi.fn(async (handler) => {
       panelErrorHandler = handler
       return vi.fn()
@@ -449,6 +451,8 @@ function fakeClient() {
     resolvePublicPluginCommandEntry: vi.fn(async () => ({ pluginId: 'com.example.hotkey', commandId: 'default', commandLabel: 'hotkey', outputMode: 'mainResult', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })),
     setPublicPluginCommandHotkey: vi.fn(async () => undefined),
     listBuiltinFeatures: vi.fn(async () => []),
+    setBuiltinFeatureName: vi.fn(async () => undefined),
+    setBuiltinFeatureHotkey: vi.fn(async () => undefined),
     setBuiltinFeatureEnabled: vi.fn(async () => []),
     listPublicPlugins: vi.fn(async () => ({ revision: '0', hotkeyRevision: '0', items: [] })),
     selectPublicPluginArchive: vi.fn(async () => null),
@@ -460,6 +464,7 @@ function fakeClient() {
     copyPublicPluginDiagnostics: vi.fn(async () => undefined),
     setPublicPluginEnabled: vi.fn(async () => undefined),
     setPublicPluginNetworkAccess: vi.fn(async () => undefined),
+    setPublicPluginPermissionAccess: vi.fn(async () => undefined),
     setPublicPluginFavorite: vi.fn(async () => undefined),
     setBuiltinFeatureFavorite: vi.fn(async () => undefined),
     setPublicPluginEffectiveName: vi.fn(async () => undefined),
@@ -498,6 +503,7 @@ function fakeClient() {
       if (!messageStateHandler) throw new Error('message state listener is not installed')
       messageStateHandler(payload)
     },
+    emitPanelStatus(payload: unknown) { panelStatusHandler?.(payload) },
     emitPanelError(payload: unknown) {
       if (!panelErrorHandler) throw new Error('panel error listener is not installed')
       panelErrorHandler(payload)
@@ -539,6 +545,69 @@ describe('main result actions', () => {
     await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
     return { ...fake, core }
   }
+
+  it('keeps the operations entry stable and moves action shortcuts into the menu', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client } = await setup()
+    const mounted = await mountLauncherView(core)
+    try {
+      const footer = mounted.host.querySelector('.launcher-status-region')!
+      const trigger = footer.querySelector<HTMLButtonElement>('[aria-label="操作 Ctrl+K"]')!
+      expect(footer.textContent).not.toContain('Enter')
+      await act(async () => trigger.click())
+      const menu = document.querySelector('.uipilot-context-actions')!
+      expect(menu.textContent).toContain('复制Enter')
+      expect(menu.textContent).not.toMatch(/点击执行|↑↓选择/)
+      await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
+      vi.mocked(client.executeResultAction).mockResolvedValueOnce({ kind: 'copied' })
+      await act(async () => core.keyDown('Enter', false))
+      expect(footer.querySelector('[role="status"]')?.textContent).toBe('已复制')
+      expect(trigger.disabled).toBe(false)
+      await act(async () => trigger.click())
+      expect(document.querySelector('.uipilot-context-actions')?.textContent).toContain('重新运行')
+      expect(document.querySelector('.uipilot-context-action[aria-disabled="true"]')).not.toBeNull()
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+
+  it('invalidates menu callbacks when results refresh with reused action identifiers', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client } = await setup()
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('.launcher-operations-trigger')!.click())
+      const old = document.querySelector<HTMLButtonElement>('.uipilot-context-action')!
+      vi.mocked(client.executeResultAction).mockResolvedValueOnce({ kind: 'resultsUpdated', response: { ...response(), requestId: 'refreshed-request' } })
+      await act(async () => core.executeResultAction(0, 'save-req-actions-0'))
+      expect(document.querySelector('.uipilot-context-actions')).toBeNull()
+      await act(async () => old.click())
+      expect(client.executeResultAction).toHaveBeenCalledOnce()
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+
+  it.each([true, false])('separates legacy main-result status and executable hints: %s', async (executable) => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchApps).mockImplementation(async (input) => input.submit ? {
+      requestId: 'legacy-footer', mainResultCommand: command,
+      items: [{ resultId: 'legacy', activation: executeActivation, title: executable ? 'Method' : '翻译失败', subtitle: executable ? '中译英' : '请稍后重试', hasDefaultAction: executable }],
+    } : null)
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('legacy-footer'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/actions hello', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    const mounted = await mountLauncherView(core)
+    try {
+      const footer = mounted.host.querySelector('.launcher-status-region')!
+      expect(footer.querySelector('[role="status"]')?.textContent).toBe('1 个结果')
+      expect(footer.querySelector('[aria-label="操作 Ctrl+K"]')).not.toBeNull()
+      expect(footer.textContent).not.toContain('Enter')
+    } finally { await mounted.unmount(); core.destroy() }
+  })
 
   it('opens the menu for a no-default row and executes only the explicitly chosen action once', async () => {
     const { core, client } = await setup(false)
@@ -699,23 +768,24 @@ describe('main result actions', () => {
     try {
       const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
       await act(async () => input.focus())
-      const actions = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="动作 Ctrl+K"]')
+      const actions = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="操作 Ctrl+K"]')
       expect(actions).not.toBeNull()
-      if (entry === 'footer') await act(async () => { actions!.focus(); actions!.click() })
+      expect(mounted.host.querySelector('.launcher-operation-hint')).toBeNull()
+      if (entry === 'footer') await act(async () => actions!.click())
       else if (entry === 'context') await act(async () => mounted.host.querySelectorAll<HTMLElement>('[role="option"]')[1]!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })))
       else await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', {
         key: entry === 'keyboard' ? 'k' : 'Enter', ctrlKey: entry === 'keyboard', bubbles: true, cancelable: true,
       })))
-      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull())
+      await vi.waitFor(() => expect(document.querySelector('[role="menu"], .uipilot-context-actions')).not.toBeNull())
       expect(client.executeResult).not.toHaveBeenCalled()
       expect(client.executeResultAction).not.toHaveBeenCalled()
-      const save = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((element) => element.textContent === '保存')!
+      const save = [...document.querySelectorAll<HTMLElement>('[role="menuitem"], .uipilot-context-action')].find((element) => element.textContent === '保存')!
       await act(async () => save.click())
       const selected = entry === 'context' ? 1 : 0
       await vi.waitFor(() => expect(client.executeResultAction).toHaveBeenCalledExactlyOnceWith({ requestId: 'req-actions', resultId: `item-req-actions-${selected}`, actionId: `save-req-actions-${selected}` }))
       expect(client.executeResult).not.toHaveBeenCalled()
-      expect(mounted.host.querySelector<HTMLButtonElement>('button[aria-label="动作 Ctrl+K"]')!.disabled).toBe(true)
-      expect([...mounted.host.querySelectorAll('button')].some((button) => button.textContent === '重新运行')).toBe(true)
+      expect(mounted.host.querySelector<HTMLButtonElement>('button[aria-label="操作 Ctrl+K"]')!.disabled).toBe(false)
+      expect(core.getSnapshot().resultActionRerun).toBe(true)
       if (entry === 'footer') await vi.waitFor(() => expect(document.activeElement).toBe(input))
     } finally { core.destroy(); await mounted.unmount() }
   })
@@ -727,7 +797,7 @@ describe('main result actions', () => {
     const mounted = await mountLauncherView(core)
     try {
       const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
-      const actions = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="动作 Ctrl+K"]')!
+      const actions = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="操作 Ctrl+K"]')!
       const settings = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="打开设置"]')!
       expect(settings).not.toBeNull()
       await act(async () => { input.focus(); input.setSelectionRange(2, 2) })
@@ -738,8 +808,8 @@ describe('main result actions', () => {
       await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true })))
       expect(core.getSnapshot().resultActionMenu).toBeUndefined()
       await act(async () => { input.focus(); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })) })
-      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull())
-      await act(async () => document.querySelector<HTMLElement>('[role="menu"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
+      await vi.waitFor(() => expect(document.querySelector('.uipilot-context-actions')).not.toBeNull())
+      await act(async () => document.querySelector<HTMLElement>('.uipilot-context-actions')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
       expect(core.getSnapshot().resultActionMenu).toBeUndefined()
       expect(client.hideLauncher).not.toHaveBeenCalled()
       await vi.waitFor(() => expect(document.activeElement).toBe(input))
@@ -756,22 +826,18 @@ describe('main result actions', () => {
       const input = mounted.host.querySelector<HTMLInputElement>('[role="combobox"]')!
       const key = async (element: Element, value: string, keyCode: number) => act(async () => element.dispatchEvent(new KeyboardEvent('keydown', { key: value, keyCode, which: keyCode, bubbles: true, cancelable: true })))
       await act(async () => { input.focus(); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })) })
-      await vi.waitFor(() => expect(document.querySelector('[role="menu"]')).not.toBeNull())
-      const menu = document.querySelector<HTMLElement>('[role="menu"]')!
+      await vi.waitFor(() => expect(document.querySelector('.uipilot-context-actions')).not.toBeNull())
+      const menu = document.querySelector<HTMLElement>('.uipilot-context-actions')!
       await key(menu, 'End', 35)
-      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('保存'))
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('隐藏窗口Esc'))
       await key(document.activeElement!, 'Home', 36)
-      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('复制'))
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('复制Enter'))
       await key(document.activeElement!, 'ArrowDown', 40)
       await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('保存'))
       await key(document.activeElement!, 'ArrowUp', 38)
-      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('复制'))
+      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe('复制Enter'))
       await key(document.activeElement!, 'Tab', 9)
-      expect(core.getSnapshot().resultActionMenu).toBeUndefined()
-      expect(document.activeElement).toBe(mounted.host.querySelector('button[aria-label="动作 Ctrl+K"]'))
-      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })))
-      const reopened = document.querySelector<HTMLElement>('[role="menu"]')!
-      await key(reopened, 'End', 35)
+      expect(document.activeElement?.textContent).toBe('保存')
       await key(document.activeElement!, 'Enter', 13)
       await vi.waitFor(() => expect(client.executeResultAction).toHaveBeenCalledExactlyOnceWith({ requestId: 'req-actions', resultId: 'item-req-actions-0', actionId: 'save-req-actions-0' }))
       expect(client.executeResult).not.toHaveBeenCalled()
@@ -861,7 +927,7 @@ function panelItem(initialArgument: string, pluginId = 'com.uipilot.demo-panel')
     title: '/demo-panel',
     subtitle: '打开面板',
     activation: {
-      kind: 'panelActivation' as const,
+      kind: 'panelActivation' as const, commandId: 'default',
       pluginId,
       initialArgument,
       favorite: false,
@@ -1026,7 +1092,7 @@ async function mountLauncherView(core: ReturnType<typeof createLauncherCore>, se
   }
 }
 
-function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | '密钥配置'): HTMLElement {
+function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | '权限' | '密钥配置'): HTMLElement {
   const tab = [...host.querySelectorAll<HTMLElement>('[role="tab"]')].find(
     (candidate) => label === '消息'
       ? candidate.querySelector('.settings-message-tab-badge') !== null
@@ -1036,7 +1102,7 @@ function settingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | 
   return tab
 }
 
-async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | '密钥配置'): Promise<HTMLElement> {
+async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息' | '插件' | '权限' | '密钥配置'): Promise<HTMLElement> {
   const tab = settingsTab(host, label)
   await act(async () => {
     tab.focus()
@@ -2077,7 +2143,7 @@ describe('shown and search ownership', () => {
         favorite: true,
       },
       {
-        kind: 'windowActivation',
+        kind: 'windowActivation', commandId: 'default',
         pluginId: 'com.uipilot.pomodoro',
         commandLabel: 'pomodoro',
         initialArgument: 'focus',
@@ -2092,7 +2158,7 @@ describe('shown and search ownership', () => {
         favorite: false,
       },
       {
-        kind: 'panelActivation',
+        kind: 'panelActivation', commandId: 'default',
         pluginId: 'com.uipilot.demo-panel',
         initialArgument: 'hello',
         favorite: true,
@@ -2126,17 +2192,17 @@ describe('shown and search ownership', () => {
       { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: 1 },
       { kind: 'pluginCompletion', completionText: '/demo win ', pluginId: 'com.uipilot.demo-win', favorite: false },
       { kind: 'pluginCompletion', completionText: '/demo-win value', pluginId: 'com.uipilot.demo-win', favorite: true, extra: false },
-      { kind: 'windowActivation', pluginId: 'Invalid Plugin', commandLabel: 'pomodoro', initialArgument: '', favorite: false },
-      { kind: 'windowActivation', pluginId: 'com.uipilot.pomodoro', commandLabel: 'Pomodoro', initialArgument: '', favorite: false },
-      { kind: 'windowActivation', pluginId: 'com.uipilot.pomodoro', commandLabel: 'pomodoro', initialArgument: ' bad', favorite: false },
-      { kind: 'windowActivation', pluginId: 'com.uipilot.pomodoro', commandLabel: 'pomodoro', initialArgument: '', favorite: false, extra: true },
+      { kind: 'windowActivation', commandId: 'default', pluginId: 'Invalid Plugin', commandLabel: 'pomodoro', initialArgument: '', favorite: false },
+      { kind: 'windowActivation', commandId: 'default', pluginId: 'com.uipilot.pomodoro', commandLabel: 'Pomodoro', initialArgument: '', favorite: false },
+      { kind: 'windowActivation', commandId: 'default', pluginId: 'com.uipilot.pomodoro', commandLabel: 'pomodoro', initialArgument: ' bad', favorite: false },
+      { kind: 'windowActivation', commandId: 'default', pluginId: 'com.uipilot.pomodoro', commandLabel: 'pomodoro', initialArgument: '', favorite: false, extra: true },
       { kind: 'mainResultActivation', pluginId: 'Invalid Plugin', commandLabel: 'demo-return', initialArgument: '', favorite: false },
       { kind: 'mainResultActivation', pluginId: 'com.uipilot.demo-return', commandLabel: 'Demo-return', initialArgument: '', favorite: false },
       { kind: 'mainResultActivation', pluginId: 'com.uipilot.demo-return', commandLabel: 'demo-return', initialArgument: ' bad', favorite: false },
       { kind: 'mainResultActivation', pluginId: 'com.uipilot.demo-return', commandLabel: 'demo-return', initialArgument: '', favorite: false, extra: true },
-      { kind: 'panelActivation', pluginId: 'Invalid Plugin', initialArgument: '', favorite: true },
-      { kind: 'panelActivation', pluginId: 'com.uipilot.demo-panel', initialArgument: 'bad\narg', favorite: false },
-      { kind: 'panelActivation', pluginId: 'com.uipilot.demo-panel', initialArgument: ' hello', favorite: false },
+      { kind: 'panelActivation', commandId: 'default', pluginId: 'Invalid Plugin', initialArgument: '', favorite: true },
+      { kind: 'panelActivation', commandId: 'default', pluginId: 'com.uipilot.demo-panel', initialArgument: 'bad\narg', favorite: false },
+      { kind: 'panelActivation', commandId: 'default', pluginId: 'com.uipilot.demo-panel', initialArgument: ' hello', favorite: false },
     ]
     for (const activation of invalid) expect(safeLauncherActivation(activation)).toBeUndefined()
   })
@@ -2252,7 +2318,7 @@ describe('shown and search ownership', () => {
         resultId: 'pomodoro-window',
         title: '/pomodoro',
         activation: {
-          kind: 'windowActivation',
+          kind: 'windowActivation', commandId: 'default',
           pluginId: 'com.uipilot.pomodoro',
           commandLabel: 'pomodoro',
           initialArgument: 'focus',
@@ -2285,7 +2351,7 @@ describe('shown and search ownership', () => {
       invocationId: 'window-direct',
       querySequence: 3,
       submit: true,
-      completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.pomodoro' },
+      completionOrigin: { phase: 'commit', pluginId: 'com.uipilot.pomodoro', commandId: 'default' },
     }))
     expect(core.getSnapshot().query).toBe('/pomodoro focus')
     expect(fake.client.searchApps).toHaveBeenCalledTimes(2)
@@ -2798,7 +2864,7 @@ describe('shown and search ownership', () => {
 
     await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('7'))
     expect(client.openPluginPanel).toHaveBeenCalledWith({
-      pluginId: 'com.uipilot.demo-panel',
+      commandId: 'default', pluginId: 'com.uipilot.demo-panel',
       argument: 'hello',
     })
     expect(client.submitPluginPanel).toHaveBeenCalledWith({
@@ -3023,6 +3089,78 @@ describe('shown and search ownership', () => {
     expect(core.getSnapshot().panel).toBeUndefined()
   })
 
+  it('keeps the panel footer and rejects stale or out-of-order status updates', async () => {
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client, emit, emitPanelStatus, emitPanelReset } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'panel-status', items: [panelItem('')] } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({ sessionEpoch: u64('22'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [] })
+    emit(shown('panel-status-entry'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo-panel', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('22'))
+    installMatchMedia(false)
+    const mounted = await mountLauncherView(core)
+    const send = (sessionEpoch: string, sequence: string, message: string) => act(() => emitPanelStatus({ sessionEpoch, sequence, status: { message, tone: 'success' } }))
+    const footer = mounted.host.querySelector('.launcher-status-region')!
+    const operations = footer.querySelector('.launcher-operations-trigger')
+    expect(operations?.textContent).toContain('操作 Ctrl+K')
+    expect(footer.querySelector('[role="status"]')?.textContent).toBe('')
+    await send('22', '2', '保存成功')
+    expect(footer.querySelector('[role="status"]')?.textContent).toBe('保存成功')
+    expect(footer.querySelector('.launcher-operations-trigger')).toBe(operations)
+    expect(operations?.textContent).toContain('操作 Ctrl+K')
+    expect(mounted.host.querySelector('.launcher-status-region .status-region')?.classList.contains('is-action-success')).toBe(true)
+    await send('21', '99', '旧面板')
+    await send('22', '1', '乱序')
+    expect(core.getSnapshot().panel?.feedback?.status.message).toBe('保存成功')
+    await send('22', '3', '')
+    expect(footer.querySelector('[role="status"]')?.textContent).toBe('')
+    expect(mounted.host.querySelector('.launcher-status-region')?.textContent).toContain('Ctrl+K')
+    await act(() => emitPanelStatus({ sessionEpoch: '22', sequence: '4', status: { message: '保存失败'.repeat(100), tone: 'error' } }))
+    expect(footer.querySelector('[role="status"]')?.textContent).toBe('保存失败'.repeat(100))
+    expect(operations?.textContent).toBe('操作 Ctrl+K')
+    expect(footer.querySelector('.status-region')?.classList.contains('is-action-error')).toBe(true)
+    await act(() => emitPanelReset({ sessionEpoch: '22' }))
+    await send('22', '5', '已退出')
+    expect(mounted.host.querySelector('.launcher-status-region')?.textContent).not.toContain('已退出')
+    expect(stylesSource).not.toMatch(/is-panel-active[^{}]*>[^{}]*launcher-status-region[^{}]*\{[^}]*display:\s*none/)
+    await mounted.unmount()
+    core.destroy()
+  })
+
+  it('accepts only the current single-use operations ticket with an unchanged panel input', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    let receive: (payload: unknown) => void = () => {}
+    client.listenPluginPanelActionsSubmit = vi.fn(async handler => { receive = handler; return vi.fn() })
+    client.openPluginPanelActions = vi.fn(async () => {})
+    vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'menu-panel', items: [panelItem('')] } as unknown as SearchResponse)
+    emit(shown('menu-panel'))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo-panel', inputType: 'insertText' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel).toBeDefined())
+    const mounted = await mountLauncherView(core)
+    vi.mocked(client.submitPluginPanel).mockClear()
+    try {
+      const trigger = mounted.host.querySelector<HTMLButtonElement>('[aria-label="操作 Ctrl+K"]')!
+      await act(async () => trigger.click())
+      const first = vi.mocked(client.openPluginPanelActions).mock.lastCall![0]
+      expect(first.source).toBe('hostInput')
+      await act(async () => { receive({ ...first, ticket: 'wrong' }); receive({ ...first, sessionEpoch: '999' }) })
+      expect(client.submitPluginPanel).not.toHaveBeenCalled()
+      await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().panel!.suffixControl, value: 'updated', inputType: 'insertText' }))
+      await act(async () => receive(first))
+      expect(client.submitPluginPanel).not.toHaveBeenCalled()
+      await act(async () => trigger.click())
+      const second = vi.mocked(client.openPluginPanelActions).mock.lastCall![0]
+      await act(async () => { receive(second); receive(second) })
+      expect(client.submitPluginPanel).toHaveBeenCalledOnce()
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+
   it('silently resets only the matching panel session after a host-driven plugin mutation', async () => {
     const { core, client, emit, emitPanelReset } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValue({
@@ -3154,6 +3292,9 @@ describe('shown and search ownership', () => {
       ctrlKey: true, metaKey: false, shiftKey: false, altKey: false,
     })
 
+    const undeclaredDelete = new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true })
+    input.dispatchEvent(undeclaredDelete)
+    expect(undeclaredDelete.defaultPrevented).toBe(false)
     const undeclared = new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })
     const shifted = new KeyboardEvent('keydown', { key: 'ArrowDown', shiftKey: true, bubbles: true, cancelable: true })
     const composing = new KeyboardEvent('keydown', { key: 'ArrowDown', isComposing: true, bubbles: true, cancelable: true })
@@ -3164,6 +3305,43 @@ describe('shown and search ownership', () => {
     expect(shifted.defaultPrevented).toBe(false)
     expect(composing.defaultPrevented).toBe(false)
     expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(2)
+    await mounted.unmount()
+  })
+
+  it('routes Delete only for a declared empty Panel input and ignores IME modifiers and repeat', async () => {
+    const { core, client, emit } = await startedCore()
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'delete-key', items: [panelItem('')] } as unknown as SearchResponse)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('32'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: ['Delete'],
+    })
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce({
+      sessionEpoch: u64('32'), pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: ['Delete'],
+    })
+    const mounted = await mountLauncherView(core)
+    await act(async () => emit(shown('delete-key')))
+    await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'hello', inputType: 'insertText' }))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('32'))
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="demo-panel argument"]')!
+    for (const extra of [{ isComposing: true }, { repeat: true }, { ctrlKey: true }, { altKey: true }, { shiftKey: true }, { metaKey: true }]) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true, ...extra }))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(client.enqueuePluginPanelHostKey).not.toHaveBeenCalled()
+    const del = new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true })
+    input.dispatchEvent(del)
+    expect(del.defaultPrevented).toBe(true)
+    await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(1))
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledWith(expect.objectContaining({ declaration: 'Delete', key: 'Delete' }))
+    await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().panel!.suffixControl, value: 'text', inputType: 'insertText' }))
+    const edit = new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true })
+    input.dispatchEvent(edit)
+    expect(edit.defaultPrevented).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(1)
     await mounted.unmount()
   })
 
@@ -3518,8 +3696,8 @@ describe('shown and search ownership', () => {
         return value.trim()
       }
       expect(declaredProperty(shell!, 'border')).toContain('1px solid')
-      expect(declaredProperty(statusRegion!, 'display')).toBe('none')
-      expect(declaredProperty(surface!, 'grid-template-rows')).toBe('minmax(52px, 1fr)')
+      expect(declaredProperty(statusRegion!, 'display')).not.toBe('none')
+      expect(declaredProperty(surface!, 'grid-template-rows')).toBe('minmax(52px, 1fr) minmax(0, auto)')
       expect(declaredProperty(tag!, 'background')).toContain('color-mix')
       expect(declaredProperty(tag!, 'border')).toContain('1px solid')
       expect(declaredProperty(input!, 'border')).toMatch(/^0(?:px)?$/)
@@ -3623,10 +3801,11 @@ describe('shown and search ownership', () => {
         bounds: physical({ x: 12, y: 64, width: 696, height: 320 }),
       })
 
+      const framesBeforeResize = requestFrame.mock.calls.length
       observer!.callback([], observer as unknown as ResizeObserver)
       observer!.callback([], observer as unknown as ResizeObserver)
       window.dispatchEvent(new Event('resize'))
-      expect(requestFrame).toHaveBeenCalledTimes(2)
+      expect(requestFrame).toHaveBeenCalledTimes(framesBeforeResize + 1)
       await flushFrames()
       expect(client.setPluginPanelBounds).toHaveBeenCalledTimes(1)
 
@@ -3782,7 +3961,7 @@ describe('shown and search ownership', () => {
         submit: false,
         completionOrigin: {
           phase: 'preview',
-          pluginId: 'com.uipilot.demo-return',
+          pluginId: 'com.uipilot.demo-return', commandId: 'default',
         },
       }))
     },
@@ -5311,7 +5490,7 @@ describe('settings ownership', () => {
     const mounted = await mountLauncherView(core)
     const input = mounted.host.querySelector<HTMLInputElement>('input[aria-label="截图快捷键"]')
     expect(input).not.toBeNull()
-    expect(input?.value).toBe('未设置')
+    expect(input?.value).toBe(''); expect(input?.placeholder).toBe('未设置')
     expect(mounted.host.textContent).toContain('截图快捷键')
     await mounted.unmount()
   })
@@ -6381,7 +6560,7 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
-  it('cycles launcher Tab focus only between the query input and settings button', async () => {
+  it('cycles launcher Tab focus through query, operations and settings', async () => {
     installMatchMedia(false)
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     const fake = fakeClient()
@@ -6422,6 +6601,9 @@ describe('React view and accessibility', () => {
       const tabToSettings = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
       await act(async () => query.dispatchEvent(tabToSettings))
       expect(tabToSettings.defaultPrevented).toBe(true)
+      const operations = mounted.host.querySelector<HTMLButtonElement>('.launcher-operations-trigger')!
+      expect(document.activeElement).toBe(operations)
+      await act(async () => operations.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })))
       expect(document.activeElement).toBe(settings)
 
       const tabToQuery = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
@@ -6793,7 +6975,9 @@ describe('React view and accessibility', () => {
     expect(document.activeElement).toBe(argument)
     expect(mounted.host.querySelector('[role="option"]')?.textContent).toContain('str')
     expect(mounted.host.querySelector('.status-region')?.textContent)
-      .toBe('1 个结果 · 英译中 · 按 Enter 复制')
+      .toBe('1 个结果')
+    expect(mounted.host.querySelector('[aria-label="操作 Ctrl+K"]')).not.toBeNull()
+    expect(mounted.host.querySelector('[role="option"]')?.textContent).toContain('英译中 · 按 Enter 复制')
     expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({
       query: '/demo-return str',
       submit: true,
@@ -7055,6 +7239,8 @@ describe('React view and accessibility', () => {
     ])
     expect(regions[0]?.firstElementChild?.tagName).toBe('SECTION')
     expect(regions[1]?.firstElementChild?.classList.contains('status-region')).toBe(true)
+    expect(regions[1]?.lastElementChild?.lastElementChild?.classList.contains('launcher-operations-trigger')).toBe(true)
+    expect(regions[1]?.querySelector('.status-region')).not.toBeNull()
     const queryRegion = regions[0]?.querySelector<HTMLElement>('.launcher-query-region')
     expect(queryRegion?.tagName).toBe('DIV')
     expect(queryRegion?.children[0]?.matches('label.visually-hidden')).toBe(true)
@@ -7165,7 +7351,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelector('.settings-plugin-panel .settings-scroll-content')).toBeTruthy())
 
     expect(launcherViewSource).toContain("from 'overlayscrollbars-react'")
-    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(6)
+    expect(launcherViewSource.match(/<OverlayScrollbarsComponent/g)).toHaveLength(7)
     expect(launcherViewSource).toContain('className="quicklinks-list-scroll"')
     expect(launcherViewSource).toContain('className="quicklinks-editor-scroll"')
     expect(launcherViewSource).not.toContain('./overlay-scroll-area')
@@ -7438,7 +7624,7 @@ describe('React view and accessibility', () => {
     expect(option.querySelector('.result-favorite-star')).toBeNull()
     expect(core.getSnapshot().results[0]?.favorite).toBeUndefined()
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
-      `1 个结果。3.78541 L，${longSubtitle}`,
+      '1 个结果',
     )
 
     const contextEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
@@ -7498,7 +7684,7 @@ describe('React view and accessibility', () => {
     expect(fake.client.hideLauncher).not.toHaveBeenCalled()
     expect(option.getAttribute('aria-selected')).toBe('true')
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
-      '1 个结果。无法转换单位，源单位与目标单位的维度不同',
+      '1 个结果',
     )
     await mounted.unmount()
     core.destroy()
@@ -7537,7 +7723,7 @@ describe('React view and accessibility', () => {
     const option = mounted.host.querySelector<HTMLElement>('[role="option"]')!
     expect(option.getAttribute('aria-selected')).toBe('true')
     expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe(
-      '1 个结果。日期表达式无效，请使用 today 或 YYYY-MM-DD 加减非负整数日期单位',
+      '1 个结果',
     )
 
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
@@ -7702,7 +7888,7 @@ describe('React view and accessibility', () => {
     expect(input.disabled).toBe(false)
     await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: 'missing', inputType: 'insertText' }))
     await vi.waitFor(() =>
-      expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('1 个结果。/find，搜索文件：missing'),
+      expect(mounted.host.querySelector('[role="status"]')?.textContent).toBe('1 个结果'),
     )
     await act(async () =>
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, isComposing: true })),
@@ -7751,7 +7937,11 @@ describe('React view and accessibility', () => {
     expect(header.parentElement?.tagName).toBe('DIV')
     expect(header.parentElement?.className).toBe('settings-header-region')
     expect(header.parentElement?.parentElement?.matches('section.settings-view')).toBe(true)
-    expect(mounted.host.querySelector('.launcher-status-region')).toBeNull()
+    const footer = mounted.host.querySelector('.settings-status-region')!
+    expect(footer.querySelector('[role="status"]')?.textContent).toBe('')
+    expect(footer.querySelector('[aria-label="操作 Ctrl+K"]')).not.toBeNull()
+    expect(footer.querySelector('.settings-version')).not.toBeNull()
+    expect(header.querySelector('.settings-version')).toBeNull()
     const heading = mounted.host.querySelector<HTMLElement>('.settings-header h1')!
     expect(heading.textContent).toBe('设置')
     expect(heading.hasAttribute('tabindex')).toBe(false)
@@ -7760,6 +7950,7 @@ describe('React view and accessibility', () => {
       settingsTab(mounted.host, '通用'),
       settingsTab(mounted.host, '消息'),
       settingsTab(mounted.host, '插件'),
+      settingsTab(mounted.host, '权限'),
       settingsTab(mounted.host, '密钥配置'),
     ])
     expect(settingsTab(mounted.host, '通用').getAttribute('aria-selected')).toBe('true')
@@ -7773,6 +7964,10 @@ describe('React view and accessibility', () => {
     expect(mounted.host.textContent).not.toContain('保存')
     expect(mounted.host.textContent).not.toContain('重新加载设置')
     expect(mounted.host.querySelector('button[aria-label="关闭"]')).toBeNull()
+    await activateSettingsTab(mounted.host, '权限')
+    expect(core.getSnapshot().settingsTab).toBe('permissions')
+    expect(settingsTab(mounted.host, '权限').getAttribute('aria-selected')).toBe('true')
+    expect(mounted.host.querySelector('.plugin-permissions-panel')).not.toBeNull()
     await activateSettingsTab(mounted.host, '密钥配置')
     expect(core.getSnapshot().settingsTab).toBe('credentials')
     expect(mounted.host.querySelector('.credential-settings')).not.toBeNull()
@@ -7850,6 +8045,23 @@ describe('React view and accessibility', () => {
     expect(pin().getAttribute('aria-pressed')).toBe('true')
     await mounted.unmount()
     core.destroy()
+  })
+
+  it('isolates settings pin shortcuts while the operations menu is open', async () => {
+    installMatchMedia(false)
+    const { core, emit } = await startedCore(settingsFixture)
+    const setPinned = vi.fn<(active: boolean, pinned: boolean) => Promise<void>>().mockResolvedValue(undefined)
+    const mounted = await mountLauncherView(core, setPinned)
+    try {
+      await act(async () => emit(shown('settings-operation-pin', 'settings')))
+      await act(async () => mounted.host.querySelector<HTMLButtonElement>('.launcher-operations-trigger')!.click())
+      const calls = setPinned.mock.calls.length
+      await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true, cancelable: true })))
+      expect(setPinned).toHaveBeenCalledTimes(calls)
+      expect(document.querySelector('.uipilot-context-actions')).not.toBeNull()
+      await act(async () => window.dispatchEvent(new Event('blur')))
+      expect(document.querySelector('.uipilot-context-actions')).toBeNull()
+    } finally { await mounted.unmount(); core.destroy() }
   })
 
   it('leaves Ctrl+T to shortcut recording and ignores it outside settings', async () => {
@@ -8456,7 +8668,7 @@ describe('React view and accessibility', () => {
       revision: '1', hotkeyRevision: '0',
       items: [{
         pluginId: 'com.example.demo', name: 'Demo', description: 'A compact plugin description that stays on one row.', version: '1.0.0',
-        source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+        source: 'localPackage', installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'demo', effectiveName: 'demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
         fault: null, generation: 1,
         iconUrl: 'uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png',
         network: { httpsHosts: ['api.example.com'], credentials: [] },
@@ -8490,14 +8702,13 @@ describe('React view and accessibility', () => {
     expect(row.querySelector('.public-plugin-icon-cell .plugin-icon-image')?.getAttribute('src'))
       .toBe('uipilot-public-plugin://localhost/__uipilot_icon/installed/com.example.demo/1/icon.png')
     expect(row.querySelector('.plugin-title-line')?.textContent).toContain('Demo')
-    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('·')
-    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('v1.0.0')
+    expect(row.textContent).not.toContain('v1.0.0')
     expect(row.querySelector('.plugin-title-line')?.textContent).not.toContain('启动命令')
-    expect(row.querySelector('.plugin-title-line')?.textContent).toContain('/demo')
-    expect(row.querySelector('.plugin-description')?.textContent).toBe('A compact plugin description that stays on one row.')
+    expect(row.querySelector('.public-plugin-command')?.textContent).toContain('/demo')
+    expect(row.querySelector('.plugin-description')).toBeNull()
     expect(row.querySelector('.public-name-control')).toBeNull()
     expect(row.querySelector('button[aria-label="查看插件详情"]')).not.toBeNull()
-    expect(row.querySelector('button[aria-label="卸载插件"]')).not.toBeNull()
+    expect(row.querySelector('button[aria-label="卸载插件"]')).toBeNull()
     expect(row.querySelector('.public-plugin-actions .ant-switch')).not.toBeNull()
     expect(mounted.host.querySelector('.public-plugin-form')).toBeNull()
     expect(mounted.host.querySelector('.public-permissions')).toBeNull()
@@ -8515,20 +8726,20 @@ describe('React view and accessibility', () => {
     expect(backButton).not.toBeNull()
     await vi.waitFor(() => expect(document.activeElement).toBe(detailView))
     expect(mounted.host.querySelector('.public-plugin-detail-title')?.textContent).toBe('Demo')
-    expect(detail.textContent).toContain('启动键')
+    expect(detail.textContent).toContain('启动')
     expect(detail.textContent).not.toContain('启动名称')
     expect(detail.querySelector('.public-detail-name-term')).not.toBeNull()
     expect(detail.querySelector('.public-detail-name-value')).not.toBeNull()
-    expect(stylesSource).toMatch(/\.public-plugin-detail-list\s*\{[^}]*padding:\s*20px 0 0 42px;/s)
+    expect(stylesSource).toMatch(/\.public-plugin-detail-list\s*\{[^}]*padding:\s*8px 0 0;/s)
     expect(stylesSource).toMatch(/\.public-detail-name-term,\s*\.public-detail-name-value\s*\{[^}]*align-self:\s*center;/s)
     expect(detail.textContent).toContain('版本号')
     expect(detail.textContent).toContain('1.0.0')
     expect(detail.textContent).toContain('插件说明')
     expect(detail.textContent).toContain('A compact plugin description that stays on one row.')
     expect(detail.textContent).toContain('权限列表')
-    expect(detail.textContent).toContain('网络访问 · network.https · 未授权')
-    expect(detail.textContent).toContain('剪贴板历史读取 · clipboard.history.read · 已授权')
-    expect(detail.textContent).toContain('剪贴板历史粘贴 · clipboard.history.paste · 不支持')
+    expect(detail.textContent).toContain('网络访问 · network.https · 已关闭')
+    expect(detail.textContent).toContain('剪贴板历史读取 · clipboard.history.read · 已开启')
+    expect(detail.textContent).toContain('剪贴板历史粘贴 · clipboard.history.paste · 暂不支持')
     expect(detail.textContent).toContain('会在本机记录该插件可用的剪贴板历史摘要')
     expect(detail.textContent).not.toContain('clipboard.read 是 clipboard.history.read')
     expect(detail.textContent).toContain('网络 Host')
@@ -8537,7 +8748,7 @@ describe('React view and accessibility', () => {
     expect(detail.textContent).toContain('暂未提供插件目录')
 
     const nameInput = detail.querySelector<HTMLInputElement>('input[aria-label="启动键"]')!
-    expect(nameInput.value).toBe('demo')
+    expect(nameInput.value).toBe('/demo')
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
       setter.call(nameInput, 'demo-custom')
@@ -8574,7 +8785,7 @@ describe('React view and accessibility', () => {
     core.destroy()
   })
 
-  it('filters public plugins by name after a short debounce', async () => {
+  it('filters public plugins by name and startup command after a short debounce', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
@@ -8583,12 +8794,12 @@ describe('React view and accessibility', () => {
       items: [
         {
           pluginId: 'com.example.notes', name: 'Notes', description: null, version: '1.0.0',
-          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+          source: 'localPackage', installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
           fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
         },
         {
           pluginId: 'com.example.translate', name: 'Translate', description: null, version: '1.0.0',
-          source: 'localPackage', commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+          source: 'localPackage', installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
           fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [],
         },
       ],
@@ -8601,7 +8812,7 @@ describe('React view and accessibility', () => {
     await vi.waitFor(() => expect(mounted.host.querySelectorAll('.public-plugin-item')).toHaveLength(2))
     vi.useFakeTimers()
     try {
-      const filter = mounted.host.querySelector<HTMLInputElement>('input[aria-label="筛选插件名称"]')
+      const filter = mounted.host.querySelector<HTMLInputElement>('input[aria-label="搜索插件名称或启动命令"]')
       expect(filter).toBeInstanceOf(HTMLInputElement)
       await act(async () => {
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
@@ -8617,6 +8828,12 @@ describe('React view and accessibility', () => {
       await act(async () => { vi.advanceTimersByTime(1) })
       await vi.waitFor(() => expect(mounted.host.querySelectorAll('.public-plugin-item')).toHaveLength(1))
       expect(mounted.host.querySelector('.plugin-title-line h3')?.textContent).toBe('Translate')
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(filter!, '/notes')
+        filter!.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () => { vi.advanceTimersByTime(150) })
+      await vi.waitFor(() => expect(mounted.host.querySelector('.plugin-title-line h3')?.textContent).toBe('Notes'))
     } finally {
       vi.useRealTimers()
       await mounted.unmount()
@@ -8635,7 +8852,7 @@ describe('React view and accessibility', () => {
     try {
       await act(async () => fake.emit(shown('public-filter-shortcut', 'settings')))
       await activateSettingsTab(mounted.host, '插件')
-      const filter = mounted.host.querySelector<HTMLInputElement>('input[aria-label="筛选插件名称"]')!
+      const filter = mounted.host.querySelector<HTMLInputElement>('input[aria-label="搜索插件名称或启动命令"]')!
       const focusSearch = new KeyboardEvent('keydown', {
         key: 'f', ctrlKey: true, bubbles: true, cancelable: true,
       })
@@ -8650,23 +8867,19 @@ describe('React view and accessibility', () => {
     }
   })
 
-  it('treats pending public owner cleanup as a committed uninstall', async () => {
+  it('keeps the compact public row toggle usable without exposing deletion', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const item = {
       pluginId: 'com.example.cleanup', name: 'Cleanup', description: null, version: '1.0.0',
-      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'cleanup', effectiveName: 'cleanup', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+      source: 'localPackage' as const, installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'cleanup', effectiveName: 'cleanup', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
       fault: null, generation: 1, iconUrl: null, permissions: [], settings: [],
       network: null,
     }
     vi.mocked(fake.client.listPublicPlugins)
       .mockResolvedValueOnce({ revision: '1', hotkeyRevision: '0', items: [item] })
-      .mockResolvedValueOnce({ revision: '2', hotkeyRevision: '0', items: [] })
-    vi.mocked(fake.client.uninstallPublicPlugin).mockRejectedValueOnce({
-      code: 'dataCleanupPending',
-      message: 'private cleanup path',
-    })
+      .mockResolvedValue({ revision: '2', hotkeyRevision: '0', items: [{ ...item, enabled: false }] })
     const core = createLauncherCore(fake.client)
     await core.start()
     const mounted = await mountLauncherView(core)
@@ -8674,22 +8887,12 @@ describe('React view and accessibility', () => {
     await activateSettingsTab(mounted.host, '插件')
     await vi.waitFor(() => expect(mounted.host.querySelector('.public-plugin-item')).not.toBeNull())
 
-    const deleteButton = mounted.host
-      .querySelector<HTMLButtonElement>('button[aria-label="卸载插件"]')!
-    await act(async () => deleteButton.click())
-    let confirm: HTMLButtonElement | undefined
-    await vi.waitFor(() => {
-      confirm = [...document.querySelectorAll<HTMLButtonElement>('button')]
-        .find((button) => button.textContent?.replace(/\s/g, '') === '全部卸载')
-      expect(confirm).toBeTruthy()
-    })
-    await act(async () => confirm!.click())
-
+    expect(mounted.host.querySelector('button[aria-label="卸载插件"]')).toBeNull()
+    await act(async () => mounted.host.querySelector<HTMLButtonElement>('[aria-label="启用 Cleanup"]')!.click())
+    expect(fake.client.setPublicPluginEnabled).toHaveBeenCalledExactlyOnceWith({ pluginId: item.pluginId, enabled: false })
     await vi.waitFor(() => expect(fake.client.listPublicPlugins).toHaveBeenCalledTimes(2))
-    expect(mounted.host.querySelector('.public-plugin-item')).toBeNull()
-    expect(mounted.host.textContent).toContain('插件已卸载，数据清理将在下次启动时重试')
-    expect(mounted.host.textContent).not.toContain('操作不可用')
-    expect(mounted.host.textContent).not.toContain('private cleanup path')
+    expect(mounted.host.querySelector('[aria-label="启用 Cleanup"]')?.getAttribute('aria-checked')).toBe('false')
+    expect(fake.client.uninstallPublicPlugin).not.toHaveBeenCalled()
     await mounted.unmount()
     core.destroy()
   })
@@ -8859,7 +9062,7 @@ describe('React view and accessibility', () => {
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settingsFixture)
     const networkItem = {
       pluginId: 'com.example.network', name: 'Network', description: null, version: '1.0.0',
-      source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+      source: 'localPackage' as const, installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'network', effectiveName: 'network', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
       fault: null, generation: 1, iconUrl: null,
       network: { httpsHosts: ['api.example.com', 'auth.example.com'], credentials: [] },
       permissions: [{ permission: 'network.https' as const, supported: true, granted: true }],
@@ -9005,7 +9208,7 @@ describe('real adapter and startup', () => {
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://hidden', expect.any(Function)))
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 12)).toEqual([
+    expect(order.slice(0, 13)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
       'hotkey-recording://current',
       'command-hotkey://entry',
@@ -9013,6 +9216,7 @@ describe('real adapter and startup', () => {
       'launcher://hidden',
       'builtin-features://changed',
       'uipilot-plugin-panel-error',
+      'uipilot-plugin-panel-status',
       'uipilot-plugin-panel-reset',
       'screenshot://error',
       'message-center://state-changed',
@@ -9058,7 +9262,7 @@ describe('real adapter and startup', () => {
     await main.client.setPublicPluginFavorite({ pluginId: 'com.uipilot.demo-win', commandId: 'default', favorite: true })
     await main.client.setPublicPluginEffectiveName({ pluginId: 'com.example.multi', commandId: 'constructor', nameOverride: null })
     await main.client.setBuiltinFeatureFavorite({ feature: 'find', favorite: true })
-    await main.client.openPluginPanel({ pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
+    await main.client.openPluginPanel({ commandId: 'default', pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
     await main.client.enqueuePluginPanelHostKey({
       sessionEpoch: u64('7'), clientSequence: u64('1'), declaration: 'ArrowDown', key: 'ArrowDown',
@@ -9093,7 +9297,7 @@ describe('real adapter and startup', () => {
       ['set_plugin_favorite', [{ commandId: 'default', pluginId: 'com.uipilot.demo-win', favorite: true }]],
       ['set_plugin_effective_name', [{ pluginId: 'com.example.multi', commandId: 'constructor', nameOverride: null }]],
       ['set_builtin_feature_favorite', [{ input: { feature: 'find', favorite: true } }]],
-      ['open_plugin_panel', [{ input: { pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
+      ['open_plugin_panel', [{ input: { commandId: 'default', pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
       ['plugin_panel_host_key_enqueue', [{ input: {
         sessionEpoch: '7', clientSequence: '1', declaration: 'ArrowDown', key: 'ArrowDown',
@@ -9226,6 +9430,7 @@ describe('real adapter and startup', () => {
       }
       if (event === 'launcher://hidden') return hiddenUnlisten
       if (event === 'builtin-features://changed') return builtinFeaturesChangedUnlisten
+      if (event === 'uipilot-plugin-panel-status') return () => undefined
       if (event === 'uipilot-plugin-panel-error') return panelUnlisten
       if (event === 'uipilot-plugin-panel-reset') return panelResetUnlisten
       if (event === 'uipilot-plugin-panel-focus-host-input') return panelFocusUnlisten
@@ -9869,7 +10074,7 @@ describe('credential consent and settings', () => {
   const credential = { id: 'service-token', settingKey: 'api-token', host: 'api.example.com', type: 'bearer' as const }
   const item = {
     pluginId: 'com.example.credentials', name: 'Credentials', description: null, version: '1.0.0',
-    source: 'localPackage' as const, commands: [{ commandId: 'default', defaultName: 'credentials', effectiveName: 'credentials', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
+    source: 'localPackage' as const, installationDirectory: null, commands: [{ commandId: 'default', defaultName: 'credentials', effectiveName: 'credentials', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
     fault: null, generation: 1, iconUrl: null,
     network: { httpsHosts: ['api.example.com'], credentials: [credential] },
     permissions: [{ permission: 'network.https' as const, supported: true, granted: false }],
@@ -9945,7 +10150,8 @@ describe('credential consent and settings', () => {
       expect(consent.textContent).not.toContain('Current API token')
       await act(async () => button('取消安装').click())
       expect(ui.client.commitPublicPlugin).not.toHaveBeenCalled()
-      expect(ui.host.querySelector('.public-plugin-item')?.textContent).toContain('1.0.0')
+      await ui.open()
+      expect(ui.host.querySelector('.public-plugin-detail')?.textContent).toContain('1.0.0')
     } finally { await ui.cleanup() }
   })
 
@@ -10255,7 +10461,7 @@ describe('independent command management', () => {
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValueOnce({ ...settingsFixture, theme: dark ? 'dark' : 'light' })
     let inventory = { revision: '10', hotkeyRevision: '0', items: [{
-      pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage' as const,
+      pluginId: 'com.example.multi', name: 'Multi', description: null, version: '1.0.0', source: 'localPackage' as const, installationDirectory: null,
       commands: [
         { commandId: 'upper', defaultName: 'upper', effectiveName: 'upper', nameOverride: null as string | null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const },
         { commandId: 'constructor', defaultName: 'lower', effectiveName: 'lower', nameOverride: null as string | null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const },
@@ -10279,7 +10485,7 @@ describe('independent command management', () => {
     await activateSettingsTab(mounted.host, '插件')
     const open = async () => { await act(async () => mounted.host.querySelector<HTMLButtonElement>('button[aria-label="查看插件详情"]')!.click()) }
     await open()
-    return { ...fake, ...mounted, core, open, update, snapshot: () => structuredClone(inventory), async cleanup() { await mounted.unmount(); core.destroy() } }
+    return { ...fake, ...mounted, core, open, update, remove: () => { inventory = { ...inventory, revision: String(Number(inventory.revision) + 1), items: [] } }, snapshot: () => structuredClone(inventory), async cleanup() { await mounted.unmount(); core.destroy() } }
   }
   const button = (host: HTMLElement, label: string) => host.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!
   const input = (host: HTMLElement, id: string) => host.querySelector<HTMLInputElement>(`input[aria-label="启动键 ${id}"]`)!
@@ -10290,374 +10496,178 @@ describe('independent command management', () => {
       element.dispatchEvent(new Event('input', { bubbles: true }))
     })
   }
-  it.each([false, true])('saves and favorites constructor independently with per-row pending state, dark=%s', async (dark) => {
+  const select = async (host: HTMLElement, commandId: string) => {
+    await act(async () => {
+      const selector = host.querySelector<HTMLSelectElement>('[aria-label="选择启动命令"]')!
+      selector.value = commandId
+      selector.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+  }
+  const submit = async (element: HTMLInputElement) => {
+    await act(async () => element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })))
+  }
+  it.each([false, true])('selects command ownership for the header favorite and startup fields, dark=%s', async (dark) => {
     const ui = await setup(dark)
     try {
-      const pending = deferred<void>()
-      vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(() => pending.promise)
-      await enter(input(ui.host, 'upper'), 'changed')
-      await act(async () => input(ui.host, 'upper').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })))
-      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'changed' })
-      expect(input(ui.host, 'upper').readOnly).toBe(true)
-      expect(input(ui.host, 'constructor').readOnly).toBe(false)
-      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
-      await act(async () => button(ui.host, '设为常用 constructor').click())
+      expect(ui.host.querySelector('button[aria-label="保存启动键 upper"]')).toBeNull()
+      await select(ui.host, 'constructor')
+      expect(input(ui.host, 'constructor').value).toBe('/lower')
+      const star = button(ui.host, '设为常用 constructor')
+      expect(star.closest('.settings-header')).not.toBeNull()
+      expect(star.getAttribute('aria-pressed')).toBe('false')
+      await act(async () => star.click())
       expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'constructor', favorite: true })
-      await vi.waitFor(() => expect(button(ui.host, '取消常用 constructor')).not.toBeNull())
+      expect(button(ui.host, '取消常用 constructor')?.getAttribute('aria-pressed')).toBe('true')
+      await select(ui.host, 'upper')
       expect(button(ui.host, '设为常用 upper')).not.toBeNull()
-      await act(async () => pending.resolve())
-      expect(input(ui.host, 'constructor').value).toBe('lower')
     } finally { await ui.cleanup() }
   })
-  it.each([false, true])('preserves a conflicted draft, Escape resets editing, and dirty restore sends only null, dark=%s', async (dark) => {
-    const ui = await setup(dark)
+  it.each([false, true])('keeps cleanup-pending removal feedback on the list and refreshes only reads, readFailure=%s', async (readFailure) => {
+    const ui = await setup()
     try {
-      vi.mocked(ui.client.setPublicPluginEffectiveName).mockRejectedValueOnce(new Error('conflict'))
-      await enter(input(ui.host, 'upper'), 'lower')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      await vi.waitFor(() => expect(ui.host.querySelector('[role="alert"]')?.textContent).toContain('无法保存启动键'))
-      expect(input(ui.host, 'upper').value).toBe('lower')
-      expect(ui.host.querySelector('[data-command-id="constructor"] [role="alert"]')).toBeNull()
-      const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
-      await act(async () => input(ui.host, 'upper').dispatchEvent(escape))
-      expect(escape.defaultPrevented).toBe(true)
-      expect(input(ui.host, 'upper').value).toBe('upper')
-      expect(ui.host.querySelector('.public-plugin-detail')).not.toBeNull()
-      await enter(input(ui.host, 'upper'), 'dirty')
-      const restore = button(ui.host, '恢复默认启动键 upper')
-      await act(async () => {
-        input(ui.host, 'upper').dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: restore }))
-        restore.click()
+      vi.mocked(ui.client.uninstallPublicPlugin).mockImplementationOnce(async () => {
+        ui.remove()
+        throw { code: 'dataCleanupPending', message: 'PRIVATE_SENTINEL' }
       })
-      // Current stored null is a no-op; dirty draft is still restored without a competing blur write.
-      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(1)
-      expect(input(ui.host, 'upper').value).toBe('upper')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      await vi.waitFor(() => expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'upper' }))
-      await act(async () => button(ui.host, '恢复默认启动键 upper').click())
-      await vi.waitFor(() => expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null }))
+      if (readFailure) vi.mocked(ui.client.listPublicPlugins).mockRejectedValueOnce(new Error('read failed'))
+      await act(async () => button(ui.host, '删除插件').click())
+      await act(async () => document.querySelector<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')!.click())
+      await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="确认删除插件"]')!.click())
+      expect(ui.host.querySelector('.public-plugin-detail')).toBeNull()
+      const list = ui.host.querySelector('.public-plugin-inventory')!
+      expect(list.textContent).toContain('插件已删除，但部分插件数据尚未清理')
+      expect(list.textContent).not.toContain('PRIVATE_SENTINEL')
+      if (readFailure) {
+        expect(list.querySelector('[role="alert"]')).not.toBeNull()
+        await act(async () => list.querySelector<HTMLButtonElement>('[aria-label="刷新"]')!.click())
+        expect(list.querySelector('[role="alert"]')).toBeNull()
+        expect(list.textContent).toContain('插件已删除，但部分插件数据尚未清理')
+      }
+      expect(ui.client.uninstallPublicPlugin).toHaveBeenCalledExactlyOnceWith({ pluginId: 'com.example.multi', retainData: false })
     } finally { await ui.cleanup() }
   })
-  it.each(['rename', 'favorite'] as const)('keeps %s controls gated until the committed inventory arrives', async (kind) => {
+  it('favorites on the first click while keeping an edited command draft', async () => {
+    const ui = await setup()
+    try {
+      await enter(input(ui.host, 'upper'), '/my-draft')
+      const star = button(ui.host, '设为常用 upper')
+      await act(async () => {
+        input(ui.host, 'upper').dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: star }))
+        star.click()
+      })
+      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', favorite: true })
+      expect(ui.client.setPublicPluginEffectiveName).not.toHaveBeenCalled()
+      expect(input(ui.host, 'upper').value).toBe('/my-draft')
+      expect(button(ui.host, '取消常用 upper')).not.toBeNull()
+    } finally { await ui.cleanup() }
+  })
+  it('normalizes a full command once on blur and does not rewrite unchanged input', async () => {
+    const ui = await setup()
+    try {
+      await enter(input(ui.host, 'upper'), '  /renamed  ')
+      await act(async () => input(ui.host, 'upper').dispatchEvent(new FocusEvent('focusout', { bubbles: true })))
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'renamed' })
+      expect(input(ui.host, 'upper').value).toBe('/renamed')
+      await submit(input(ui.host, 'upper'))
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(1)
+    } finally { await ui.cleanup() }
+  })
+  it('saves before switching and retains the current draft and selection when saving fails', async () => {
+    const ui = await setup()
+    try {
+      vi.mocked(ui.client.setPublicPluginEffectiveName).mockRejectedValueOnce(new Error('invalid'))
+      await enter(input(ui.host, 'upper'), '/draft')
+      await select(ui.host, 'constructor')
+      expect(ui.host.querySelector<HTMLSelectElement>('[aria-label="选择启动命令"]')!.value).toBe('upper')
+      expect(input(ui.host, 'upper').value).toBe('/draft')
+      expect(ui.host.querySelector('[role="alert"]')?.textContent).toContain('无法保存')
+      await select(ui.host, 'constructor')
+      expect(input(ui.host, 'constructor').value).toBe('/lower')
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: 'draft' })
+    } finally { await ui.cleanup() }
+  })
+  it('rejects an empty command inline and resets a dirty draft without a competing blur write', async () => {
+    const ui = await setup()
+    try {
+      await enter(input(ui.host, 'upper'), ' ')
+      await submit(input(ui.host, 'upper'))
+      expect(ui.client.setPublicPluginEffectiveName).not.toHaveBeenCalled()
+      expect(ui.host.querySelector('[role="alert"]')?.textContent).toContain('不能为空')
+      await enter(input(ui.host, 'upper'), '/dirty')
+      const reset = button(ui.host, '恢复默认启动键 upper')
+      await act(async () => {
+        input(ui.host, 'upper').dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: reset }))
+        reset.click()
+      })
+      expect(ui.client.setPublicPluginEffectiveName).not.toHaveBeenCalled()
+      expect(input(ui.host, 'upper').value).toBe('/upper')
+      await enter(input(ui.host, 'upper'), '/custom'); await submit(input(ui.host, 'upper'))
+      await act(async () => reset.click())
+      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null })
+    } finally { await ui.cleanup() }
+  })
+  it.each(['rename', 'favorite'] as const)('gates command switching and all current controls until %s reconciliation completes', async (kind) => {
     const ui = await setup()
     try {
       const refresh = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
       vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(refresh.promise)
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
+      if (kind === 'rename') { await enter(input(ui.host, 'upper'), '/custom'); await submit(input(ui.host, 'upper')) }
+      else await act(async () => button(ui.host, '设为常用 upper').click())
       expect(input(ui.host, 'upper').readOnly).toBe(true)
       expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
       expect(button(ui.host, '设为常用 upper').disabled).toBe(true)
-      await act(async () => { button(ui.host, '恢复默认启动键 upper').click(); button(ui.host, '设为常用 upper').click() })
-      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
-      const authoritative = ui.snapshot()
-      await act(async () => refresh.resolve(authoritative))
+      expect(ui.host.querySelector<HTMLSelectElement>('[aria-label="选择启动命令"]')!.disabled).toBe(true)
+      await select(ui.host, 'constructor')
+      expect(ui.host.querySelector<HTMLSelectElement>('[aria-label="选择启动命令"]')!.value).toBe('upper')
+      await act(async () => refresh.resolve(ui.snapshot()))
       expect(input(ui.host, 'upper').readOnly).toBe(false)
-      if (kind === 'rename') {
-        expect(input(ui.host, 'upper').value).toBe('custom')
-        await act(async () => button(ui.host, '恢复默认启动键 upper').click())
-        expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null })
-        expect(input(ui.host, 'upper').value).toBe('upper')
-      } else {
-        await act(async () => button(ui.host, '取消常用 upper').click())
-        expect(ui.client.setPublicPluginFavorite).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', favorite: false })
-        expect(button(ui.host, '设为常用 upper')).not.toBeNull()
-      }
+      await select(ui.host, 'constructor')
+      expect(input(ui.host, 'constructor').value).toBe('/lower')
     } finally { await ui.cleanup() }
   })
-  it.each([
-    ['rename', false], ['favorite', false], ['rename', true], ['favorite', true],
-  ] as const)('tracks pending %s through a sibling revision and reconciles its actual outcome, failure=%s', async (kind, fails) => {
+  it('retries only the authoritative read after a write outcome cannot be reconciled', async () => {
     const ui = await setup()
     try {
-      const pending = deferred<void>()
-      if (kind === 'rename') vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(async ({ commandId, nameOverride }) => {
-        await pending.promise
-        ui.update(commandId, { nameOverride, effectiveName: nameOverride! })
-      })
-      else vi.mocked(ui.client.setPublicPluginFavorite).mockImplementationOnce(async ({ commandId, favorite }) => {
-        await pending.promise
-        ui.update(commandId, { favorite })
-      })
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
-      await act(async () => button(ui.host, '设为常用 constructor').click())
-      await enter(input(ui.host, 'constructor'), 'sibling-draft')
+      vi.mocked(ui.client.listPublicPlugins).mockRejectedValueOnce(new Error('read failed'))
+      await enter(input(ui.host, 'upper'), '/custom'); await submit(input(ui.host, 'upper'))
+      expect(button(ui.host, '刷新命令状态 upper')).not.toBeNull()
       expect(input(ui.host, 'upper').readOnly).toBe(true)
-      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
-      await act(async () => {
-        button(ui.host, '恢复默认启动键 upper').click()
-        button(ui.host, '设为常用 upper').click()
-        input(ui.host, 'upper').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
-      })
-      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
-      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 2 : 1)
-      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
-      await act(async () => fails ? pending.reject(new Error('synthetic outcome')) : pending.resolve())
-      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads + 1)
-      expect(input(ui.host, 'upper').readOnly).toBe(false)
-      expect(input(ui.host, 'constructor').value).toBe('sibling-draft')
-      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
-      expect(ui.host.querySelector('[data-command-id="upper"] [role="alert"]')).toBeNull()
-      expect(input(ui.host, 'upper').value).toBe(kind === 'rename' ? 'custom' : 'upper')
-      expect(button(ui.host, `${kind === 'favorite' && !fails ? '取消常用' : '设为常用'} upper`)).not.toBeNull()
-      expect(ui.snapshot().items[0]!.commands.find(({ commandId }) => commandId === 'upper')).toMatchObject({
-        nameOverride: kind === 'rename' && !fails ? 'custom' : null,
-        favorite: kind === 'favorite' && !fails,
-      })
-      expect(ui.host.querySelectorAll('.public-plugin-detail')).toHaveLength(1)
-    } finally { await ui.cleanup() }
-  })
-  it.each([['rename', 'older-success'], ['favorite', 'older-success'], ['rename', 'older-failure'], ['favorite', 'older-failure'], ['rename', 'newer-first'], ['favorite', 'newer-first']] as const)('does not release %s when its refresh is superseded by a pending newer refresh: %s', async (kind, order) => {
-    const ui = await setup()
-    try {
-      const older = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
-      const newer = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
-      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise)
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
-      await act(async () => button(ui.host, '设为常用 constructor').click())
-      const authoritative = ui.snapshot()
-      if (order !== 'newer-first') {
-        await act(async () => order === 'older-failure' ? older.reject(new Error('discarded refresh')) : older.resolve(authoritative))
-        expect(input(ui.host, 'upper').readOnly).toBe(true)
-        expect(input(ui.host, 'constructor').readOnly).toBe(true)
-      }
-      await act(async () => newer.resolve(authoritative))
-      expect(input(ui.host, 'upper').readOnly).toBe(false)
-      expect(input(ui.host, 'constructor').readOnly).toBe(false)
-      if (order === 'newer-first') await act(async () => older.resolve({ ...authoritative, revision: '10', hotkeyRevision: '0', items: [] }))
-      expect(button(ui.host, '取消常用 constructor')).not.toBeNull()
-      expect(kind === 'rename' ? input(ui.host, 'upper').value : button(ui.host, '取消常用 upper')?.getAttribute('aria-pressed')).toBe(kind === 'rename' ? 'custom' : 'true')
-    } finally { await ui.cleanup() }
-  })
-  it.each(['rename', 'favorite'] as const)('recovers a committed %s refresh failure without repeating the mutation or using stale equality', async (kind) => {
-    const ui = await setup()
-    try {
-      vi.mocked(ui.client.listPublicPlugins).mockRejectedValueOnce(new Error('refresh failed'))
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
-      expect(ui.host.querySelector('[data-command-id="upper"]')?.getAttribute('aria-busy')).toBe('false')
-      expect(ui.host.querySelector('[data-command-id="upper"] [role="alert"]')?.textContent).toContain('无法刷新')
-      expect(button(ui.host, '恢复默认启动键 upper').disabled).toBe(true)
       expect(button(ui.host, '设为常用 upper').disabled).toBe(true)
       await act(async () => button(ui.host, '刷新命令状态 upper').click())
-      expect(input(ui.host, 'upper').readOnly).toBe(false)
-      expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
-      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
-      if (kind === 'rename') {
-        await act(async () => button(ui.host, '恢复默认启动键 upper').click())
-        expect(ui.client.setPublicPluginEffectiveName).toHaveBeenLastCalledWith({ pluginId: 'com.example.multi', commandId: 'upper', nameOverride: null })
-      } else await act(async () => button(ui.host, '取消常用 upper').click())
-    } finally { await ui.cleanup() }
-  })
-  it.each([['rename', false], ['favorite', false], ['rename', true], ['favorite', true]] as const)('returns failed %s refresh focus to recovery without stealing a deliberate move=%s', async (kind, moved) => {
-    const ui = await setup()
-    try {
-      const refresh = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
-      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(refresh.promise)
-      if (kind === 'rename') await enter(input(ui.host, 'upper'), 'custom')
-      const origin = button(ui.host, kind === 'rename' ? '保存启动键 upper' : '设为常用 upper')
-      await act(async () => { origin.focus(); origin.click() })
-      // Browsers blur an action disabled by the in-flight state; reproduce that real focus loss.
-      await act(async () => origin.blur())
-      if (moved) await act(async () => input(ui.host, 'constructor').focus())
-      await act(async () => refresh.reject(new Error('refresh failed')))
-      const retry = button(ui.host, '刷新命令状态 upper')
-      expect(document.activeElement).toBe(moved ? input(ui.host, 'constructor') : retry)
-      if (!moved) {
-        await act(async () => retry.click())
-        // The removed recovery action returns focus to this row's live recorder.
-        const recorder = button(ui.host, '录制命令快捷键 upper')
-        expect(recorder.disabled).toBe(false)
-        expect(document.activeElement).toBe(recorder)
-        expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(kind === 'rename' ? 1 : 0)
-        expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(kind === 'favorite' ? 1 : 0)
-      }
-    } finally { await ui.cleanup() }
-  })
-  it('shares a latest refresh failure with older waiters and retries only the read', async () => {
-    const ui = await setup()
-    try {
-      const older = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
-      const newer = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
-      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise)
-      await enter(input(ui.host, 'upper'), 'custom')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      await act(async () => button(ui.host, '设为常用 constructor').click())
-      await act(async () => newer.reject(new Error('latest refresh failed')))
-      for (const id of ['upper', 'constructor']) {
-        expect(ui.host.querySelector(`[data-command-id="${id}"]`)?.getAttribute('aria-busy')).toBe('false')
-        expect(button(ui.host, `恢复默认启动键 ${id}`).disabled).toBe(true)
-        expect(button(ui.host, `刷新命令状态 ${id}`)).not.toBeNull()
-      }
-      await act(async () => button(ui.host, '刷新命令状态 upper').click())
-      // The accepted snapshot reconciles both rows, including the sibling's recovery state.
-      expect(input(ui.host, 'upper').readOnly).toBe(false)
-      expect(input(ui.host, 'constructor').readOnly).toBe(false)
-      expect(button(ui.host, '取消常用 constructor')).not.toBeNull()
       expect(ui.client.setPublicPluginEffectiveName).toHaveBeenCalledTimes(1)
-      expect(ui.client.setPublicPluginFavorite).toHaveBeenCalledTimes(1)
-      await act(async () => older.reject(new Error('discarded old failure')))
-      expect(ui.host.querySelector('[role="alert"]')).toBeNull()
-    } finally { await ui.cleanup() }
-  })
-  it.each(['rename', 'favorite'] as const)('rejects an old %s refresh after close and reopen', async (kind) => {
-    const ui = await setup()
-    try {
-      const refresh = deferred<Awaited<ReturnType<LauncherClient['listPublicPlugins']>>>()
-      vi.mocked(ui.client.listPublicPlugins).mockReturnValueOnce(refresh.promise)
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
-      const authoritative = ui.snapshot()
-      await act(async () => button(ui.host, '返回插件列表').click())
-      await ui.open()
-      await enter(input(ui.host, 'constructor'), 'reopened-draft')
-      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
-      await act(async () => refresh.resolve(authoritative))
-      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
-      expect(input(ui.host, 'constructor').value).toBe('reopened-draft')
-      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+      expect(input(ui.host, 'upper').value).toBe('/custom')
       expect(input(ui.host, 'upper').readOnly).toBe(false)
     } finally { await ui.cleanup() }
   })
-  it.each(['rename', 'favorite'] as const)('does not refresh a removed command when its pending %s settles', async (kind) => {
-    const ui = await setup()
-    try {
-      const pending = deferred<void>()
-      if (kind === 'rename') vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(async ({ commandId, nameOverride }) => {
-        await pending.promise
-        ui.update(commandId, { nameOverride, effectiveName: nameOverride! })
-      })
-      else vi.mocked(ui.client.setPublicPluginFavorite).mockImplementationOnce(async ({ commandId, favorite }) => {
-        await pending.promise
-        ui.update(commandId, { favorite })
-      })
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
-      const inventory = ui.snapshot()
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValueOnce({ ...inventory, revision: '99', hotkeyRevision: '0', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'constructor') })) })
-      await act(async () => button(ui.host, '设为常用 constructor').click())
-      expect(ui.host.querySelector('[data-command-id="upper"]')).toBeNull()
-      const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
-      await act(async () => pending.resolve())
-      expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
-      expect(ui.host.querySelector('[data-command-id="upper"]')).toBeNull()
-    } finally { await ui.cleanup() }
-  })
-  it.each(['rename', 'favorite'] as const)('does not refresh after detail unmount while %s is pending', async (kind) => {
-    const ui = await setup()
-    const pending = deferred<void>()
-    if (kind === 'rename') vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(async ({ commandId, nameOverride }) => {
-      await pending.promise
-      ui.update(commandId, { nameOverride, effectiveName: nameOverride! })
-    })
-    else vi.mocked(ui.client.setPublicPluginFavorite).mockImplementationOnce(async ({ commandId, favorite }) => {
-      await pending.promise
-      ui.update(commandId, { favorite })
-    })
-    try {
-      if (kind === 'rename') {
-        await enter(input(ui.host, 'upper'), 'custom')
-        await act(async () => button(ui.host, '保存启动键 upper').click())
-      } else await act(async () => button(ui.host, '设为常用 upper').click())
-    } finally { await ui.cleanup() }
-    const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
-    await act(async () => pending.resolve())
-    expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
-  })
-  it.each(['save', 'restore', 'error'] as const)('returns legitimate current-row %s focus after reconciliation', async (action) => {
-    const ui = await setup()
-    try {
-      await enter(input(ui.host, 'upper'), 'custom')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      if (action === 'error') vi.mocked(ui.client.setPublicPluginEffectiveName).mockRejectedValueOnce(new Error('conflict'))
-      if (action !== 'restore') await enter(input(ui.host, 'upper'), 'next')
-      const origin = button(ui.host, action === 'restore' ? '恢复默认启动键 upper' : '保存启动键 upper')
-      await act(async () => { origin.focus(); origin.click() })
-      expect(document.activeElement).toBe(origin)
-      expect(origin.disabled).toBe(false)
-      expect(input(ui.host, 'upper').value).toBe(action === 'restore' ? 'upper' : 'next')
-      expect(ui.host.querySelector('[role="alert"]') === null).toBe(action !== 'error')
-    } finally { await ui.cleanup() }
-  })
-  it('bounds a sixteen-command package summary and exposes every identity in the single detail', async () => {
-    const ui = await setup(false, 16)
-    try {
-      expect(ui.host.querySelectorAll('.public-command-row')).toHaveLength(16)
-      expect(input(ui.host, 'constructor')).not.toBeNull()
-      expect(input(ui.host, 'command-16')?.value).toBe('long-command-name-number-16')
-      await act(async () => button(ui.host, '返回插件列表').click())
-      const row = ui.host.querySelector('.public-plugin-item')!
-      expect(row.querySelector('.plugin-title-line h3')?.textContent).toBe('Multi')
-      expect(row.querySelectorAll('.public-plugin-command code')).toHaveLength(1)
-      expect(row.querySelector('.public-plugin-command-count')?.textContent).toContain('16')
-      expect(row.querySelector('.public-plugin-command')?.getAttribute('title')).toContain('constructor: /lower')
-      expect(row.querySelector('.public-plugin-command')?.getAttribute('title')).toContain('command-16: /long-command-name-number-16')
-      expect(row.querySelectorAll('.public-plugin-actions .ant-switch')).toHaveLength(1)
-    } finally { await ui.cleanup() }
-  })
-  it('keeps a deliberate sibling focus move when a current save completes', async () => {
+  it('preserves moved focus when a pending command save completes', async () => {
     const ui = await setup()
     try {
       const pending = deferred<void>()
       vi.mocked(ui.client.setPublicPluginEffectiveName).mockReturnValueOnce(pending.promise)
-      await enter(input(ui.host, 'upper'), 'changed')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      await act(async () => input(ui.host, 'constructor').focus())
+      await enter(input(ui.host, 'upper'), '/custom'); await submit(input(ui.host, 'upper'))
+      const back = button(ui.host, '返回插件列表')
+      await act(async () => back.focus())
       await act(async () => pending.resolve())
-      await vi.waitFor(() => expect(input(ui.host, 'upper').readOnly).toBe(false))
-      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+      expect(document.activeElement).toBe(back)
     } finally { await ui.cleanup() }
   })
-  it('retires pending row focus ownership when a newer inventory revision arrives', async () => {
+  it('does not let an old completion reload or focus a reopened detail', async () => {
     const ui = await setup()
     try {
       const pending = deferred<void>()
       vi.mocked(ui.client.setPublicPluginEffectiveName).mockReturnValueOnce(pending.promise)
-      await enter(input(ui.host, 'upper'), 'changed')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      await act(async () => input(ui.host, 'upper').blur())
-      expect(document.activeElement).toBe(document.body)
-      const inventory = await ui.client.listPublicPlugins()
-      vi.mocked(ui.client.listPublicPlugins).mockResolvedValue({ ...inventory, revision: '99', hotkeyRevision: '0', items: inventory.items.map((plugin) => ({ ...plugin, commands: plugin.commands.filter((command) => command.commandId === 'upper') })) })
-      await act(async () => button(ui.host, '设为常用 constructor').click())
-      await vi.waitFor(() => expect(input(ui.host, 'constructor')).toBeNull())
-      expect(document.activeElement).toBe(document.body)
-      await act(async () => pending.resolve())
-      expect(document.activeElement).toBe(document.body)
-    } finally { await ui.cleanup() }
-  })
-  it('does not let an old completion reload or focus a reopened detail of the same package', async () => {
-    const ui = await setup()
-    try {
-      const pending = deferred<void>()
-      vi.mocked(ui.client.setPublicPluginEffectiveName).mockImplementationOnce(() => pending.promise)
-      await enter(input(ui.host, 'upper'), 'old-draft')
-      await act(async () => button(ui.host, '保存启动键 upper').click())
-      await act(async () => button(ui.host, '返回插件列表').click())
-      await ui.open()
-      await enter(input(ui.host, 'constructor'), 'new-draft')
+      await enter(input(ui.host, 'upper'), '/old'); await submit(input(ui.host, 'upper'))
+      await act(async () => button(ui.host, '返回插件列表').click()); await ui.open()
+      await enter(input(ui.host, 'upper'), '/new')
       const reads = vi.mocked(ui.client.listPublicPlugins).mock.calls.length
       await act(async () => pending.resolve())
       expect(ui.client.listPublicPlugins).toHaveBeenCalledTimes(reads)
-      expect(input(ui.host, 'constructor').value).toBe('new-draft')
-      expect(document.activeElement).toBe(input(ui.host, 'constructor'))
+      expect(input(ui.host, 'upper').value).toBe('/new')
+      expect(document.activeElement).toBe(input(ui.host, 'upper'))
     } finally { await ui.cleanup() }
   })
 })
+
 
 
 it.each(['pair', 'removed', 'empty', 'moved'] as const)('restores favorite focus to its exact pair or legal fallback without stealing moved focus: %s', async (scenario) => {
@@ -10802,7 +10812,7 @@ describe('command hotkey entry', () => {
       if (replyAt === 'before resolve') await reply()
       resolved.resolve({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: 'notes', outputMode: 'panel', activationMode: 'submit', inputRequired: false, inputPlaceholder: null })
       await resolved.promise
-      expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: entry.pluginId, argument: '', stableCommandTarget: entry })
+      expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: entry.pluginId, commandId: entry.commandId, argument: '', stableCommandTarget: entry })
       if (replyAt === 'during open') await reply()
       opened.resolve(identity)
       await opened.promise
@@ -10873,7 +10883,7 @@ describe('command hotkey entry', () => {
           expect(core.getSnapshot().mainResultCommand?.suffix).toBe('changed')
           vi.mocked(client.openPluginPanel).mockResolvedValueOnce({ ...identity, sessionEpoch: u64('72') })
           await act(async () => core.keyDown('Enter', false))
-          expect(client.openPluginPanel).toHaveBeenLastCalledWith({ pluginId: entry.pluginId, argument: 'changed', stableCommandTarget: entry })
+          expect(client.openPluginPanel).toHaveBeenLastCalledWith({ pluginId: entry.pluginId, commandId: entry.commandId, argument: 'changed', stableCommandTarget: entry })
         }
       }
     } finally { await mounted.unmount(); core.destroy() }
@@ -10919,7 +10929,7 @@ describe('command hotkey entry', () => {
         await next.promise
         await Promise.resolve()
         expect(core.getSnapshot().panel?.sessionEpoch).toBe('72')
-        expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: newer.pluginId, argument: '', stableCommandTarget: newer })
+        expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: newer.pluginId, commandId: newer.commandId, argument: '', stableCommandTarget: newer })
       } else expect(core.getSnapshot().view).toBe('settings')
     } finally { core.destroy(); vi.useRealTimers() }
   })
@@ -10990,7 +11000,7 @@ describe('command hotkey entry', () => {
     }
     await vi.waitFor(() => expect(fake.core.getSnapshot().panel?.sessionEpoch).toBe('71'))
     await vi.waitFor(() => expect(fake.core.getSnapshot().panel?.submitPending).toBe(false))
-    expect(fake.client.openPluginPanel).toHaveBeenCalledWith({ pluginId: entry.pluginId, argument: inputRequired ? 'initial' : '', stableCommandTarget: entry })
+    expect(fake.client.openPluginPanel).toHaveBeenCalledWith({ pluginId: entry.pluginId, commandId: entry.commandId, argument: inputRequired ? 'initial' : '', stableCommandTarget: entry })
     return fake
   }
 
@@ -11132,7 +11142,7 @@ describe('builtin feature detail navigation', () => {
     installMatchMedia(colorScheme === 'dark')
     const fake = fakeClient()
     vi.mocked(fake.client.loadSettings).mockResolvedValue({ ...settingsFixture, theme: colorScheme })
-    const feature = { feature: 'screenshot' as const, name: '截图', command: '/screenshot', description: '屏幕区域截图', examples: ['/screenshot'], version: '0.14.0', enabled: true }
+    const feature = { feature: 'screenshot' as const, name: '截图', command: '/screenshot', defaultCommand: '/screenshot', favorite: false, hotkey: null, hotkeyStatus: 'unset' as const, directory: null, description: '屏幕区域截图', examples: ['/screenshot'], version: '0.14.0', enabled: true }
     vi.mocked(fake.client.listBuiltinFeatures).mockResolvedValue([feature])
     const core = createLauncherCore(fake.client)
     await core.start()
@@ -11164,7 +11174,7 @@ describe('builtin settings query preservation', () => {
   it('keeps the current query and refreshes results after a settings toggle and local return', async () => {
     installMatchMedia(false)
     const fake = fakeClient()
-    const feature = { feature: 'screenshot' as const, name: '截图', command: '/screenshot', description: '屏幕区域截图', examples: ['/screenshot'], version: '0.14.0', enabled: true }
+    const feature = { feature: 'screenshot' as const, name: '截图', command: '/screenshot', defaultCommand: '/screenshot', favorite: false, hotkey: null, hotkeyStatus: 'unset' as const, directory: null, description: '屏幕区域截图', examples: ['/screenshot'], version: '0.14.0', enabled: true }
     vi.mocked(fake.client.listBuiltinFeatures).mockResolvedValue([feature])
     vi.mocked(fake.client.setBuiltinFeatureEnabled).mockResolvedValue([{ ...feature, enabled: false }])
     const core = createLauncherCore(fake.client)

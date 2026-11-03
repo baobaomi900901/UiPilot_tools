@@ -198,7 +198,7 @@ ui.discard.addEventListener('keydown', event => {
 const fileMessages = {
   FileOpenBusyError: '文件选择器正忙，请稍后重试。',
   ExpiredWindowSessionError: '窗口会话已失效，请重新打开工作台。',
-  FileOpenPermissionError: '缺少导入文件权限，请确认插件授权。',
+  FileOpenPermissionError: '读取文本文件权限不可用，请在「设置 → 权限」中检查。当前草稿已保留。',
   FileOpenUnsupportedError: '请选择本地普通文件（UTF-8，最多 8 KiB）。',
   FileOpenTooLargeError: '文件超过 8 KiB，当前草稿已保留。',
   FileOpenEncodingError: '文件须为 UTF-8 文本且不含 NUL，当前草稿已保留。',

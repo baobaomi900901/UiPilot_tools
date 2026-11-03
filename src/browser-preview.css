@@ -1,0 +1,24 @@
+/* Browser-only scaffolding; production views keep their own stylesheets. */
+.browser-preview-plugin-window {
+  display: grid;
+  grid-template-rows: 44px minmax(0, 1fr);
+  height: 100%;
+}
+
+.browser-preview-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.browser-preview-panel-frame {
+  background: var(--uipilot-ui-background);
+}
+
+:root.browser-preview-plugin-content {
+  --uipilot-color-background: var(--uipilot-ui-background);
+  --uipilot-color-text-muted: var(--uipilot-ui-muted-foreground);
+  --uipilot-color-danger: var(--uipilot-ui-destructive);
+  --uipilot-font-family: Inter, 'Microsoft YaHei UI', system-ui, sans-serif;
+}

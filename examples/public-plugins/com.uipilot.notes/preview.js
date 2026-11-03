@@ -1,3 +1,6 @@
+import { createContextActionsMenu } from '../../../src/context-actions-ui.js'
+import { installPanelContextActions } from '../../../src/panel-context-actions.js'
+
 const STORAGE_PREFIX = 'uipilot.notes.preview.'
 const STORAGE_KEY = 'notes.entries'
 
@@ -56,6 +59,15 @@ function installTheme(theme) {
 
 function installBridge(theme) {
   let hostKeyHandler = null
+  const actions = installPanelContextActions({ document, window, getEpoch: () => '1', createMenu: createContextActionsMenu,
+    invoke: async (_command, payload) => window.parent.postMessage({ type: 'notes-preview-actions-submit', ...payload }, window.location.origin),
+  })
+  document.addEventListener('keydown', event => actions.handleKey(event), true)
+  window.addEventListener('message', event => {
+    if (event.origin !== window.location.origin || event.source !== window.parent) return
+    if (event.data?.type === 'notes-preview-actions-open') window.__UIPILOT_PLUGIN_PANEL_ACTIONS__(event.data)
+  })
+  document.querySelector('#preview-operations')?.addEventListener('click', () => window.__UIPILOT_PLUGIN_PANEL_ACTIONS__({ sessionEpoch: '1' }))
   const update = Object.freeze({
     requestId: 'notes-preview-request',
     input: '',
@@ -66,6 +78,16 @@ function installBridge(theme) {
     data: Object.freeze({}),
   })
   const api = Object.freeze({
+    onActions: actions.register,
+    async setStatus(status) {
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: 'notes-preview-status', status }, window.location.origin)
+      } else {
+        const footer = document.querySelector('#preview-status')
+        footer.textContent = status.message
+        footer.dataset.tone = status.tone || 'info'
+      }
+    },
     onHostKey(handler) {
       hostKeyHandler = handler
       return () => {
@@ -76,7 +98,7 @@ function installBridge(theme) {
       queueMicrotask(() => void Promise.resolve(handler(update)).catch(console.error))
       return () => undefined
     },
-    async focusHostInput() {},
+    async focusHostInput() { window.parent.postMessage({ type: 'notes-preview-focus-input' }, window.location.origin) },
     async requestHide() {},
     storage,
   })
@@ -100,6 +122,29 @@ async function loadPanel() {
   document.head.append(stylesheet)
   document.title = `${source.title} Preview`
   document.body.replaceChildren(...Array.from(source.body.childNodes, (node) => document.importNode(node, true)))
+  if (window.parent === window) {
+    const footer = document.createElement('footer')
+    footer.id = 'preview-footer'
+    const status = document.createElement('span')
+    status.id = 'preview-status'
+    status.setAttribute('role', 'status')
+    status.setAttribute('aria-live', 'polite')
+    const operations = document.createElement('button')
+    operations.id = 'preview-operations'
+    operations.textContent = '操作 Ctrl+K'
+    operations.addEventListener('pointerdown', event => event.preventDefault())
+    footer.append(status, operations)
+    document.body.append(footer)
+    const style = document.createElement('style')
+    style.textContent = `body { display: flex; flex-direction: column; }
+      .app { flex: 1; min-height: 0; height: auto; }
+      #preview-footer { display: flex; align-items: center; gap: 12px; flex: none; min-height: 36px; padding: 6px 10px; border-top: 1px solid var(--uipilot-color-border); font-size: 12px; color: var(--uipilot-color-text-muted); }
+      #preview-status { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+      #preview-operations { flex: none; white-space: nowrap; text-align: right; }
+      #preview-status[data-tone=success] { color: #22a06b; }
+      #preview-status[data-tone=error] { color: var(--uipilot-color-danger); }`
+    document.head.append(style)
+  }
 
   installTheme(theme)
   installBridge(theme)

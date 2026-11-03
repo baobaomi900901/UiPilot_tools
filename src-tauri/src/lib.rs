@@ -1,5 +1,13 @@
+// The installer helper is a standalone binary and does not use the host library.
+#![cfg(not(feature = "installer-helper-build"))]
+
+mod dev_startup;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod command_hotkeys;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod selection_capture;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod selection_translation;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 use std::sync::Arc;
 
@@ -38,6 +46,9 @@ mod process_elevation;
 mod commands;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod credentials;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod quick_evaluation;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -45,6 +56,9 @@ mod browser_open;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod webview_reload_guard;
+
+#[cfg(any(test, not(feature = "test-instrumentation")))]
+mod window_geometry;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod web_search;
@@ -100,6 +114,7 @@ mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_panel;
+mod panel_status;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_window;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
@@ -146,13 +161,17 @@ fn setup_production_lifecycle(
     plugin_manager: &Arc<PluginManager>,
     public_plugin_service: &Arc<public_plugins::PublicPluginService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    dev_startup::stage("读取本地配置与旧版插件");
     let app_data_dir = app.path().app_data_dir()?;
+    app.manage(credentials::CredentialStore::for_app_data(&app_data_dir));
     let exchange_rate_service = load_exchange_rate_service(&app_data_dir);
     if !app.manage(Arc::clone(&exchange_rate_service)) {
         return Err(lifecycle_setup_error().into());
     }
     plugin_manager.load(&app_data_dir, Version::new(0, 3, 0))?;
+    dev_startup::stage("创建旧版插件运行时");
     plugin_manager.create_runtimes(app, &app_data_dir)?;
+    dev_startup::stage("读取消息、设置与快捷入口");
     let message_center = Arc::new(message_center::MessageCenterService::load(&app_data_dir));
     if !app.manage(Arc::clone(&message_center)) {
         return Err(lifecycle_setup_error().into());
@@ -187,6 +206,9 @@ fn setup_production_lifecycle(
     let event_coordinator = Arc::clone(coordinator);
     let event_panel_controller = Arc::clone(&panel_controller);
     window.on_window_event(move |event| match event {
+        tauri::WindowEvent::ScaleFactorChanged { .. } => {
+            lifecycle::schedule_main_window_geometry_restore(&event_window);
+        }
         tauri::WindowEvent::Focused(focused) => {
             if !*focused && event_coordinator.settings_pinned() {
                 return;
@@ -274,6 +296,7 @@ fn setup_production_lifecycle(
         _ => {}
     });
 
+    dev_startup::stage("创建托盘与通知服务");
     let open_launcher = tauri::menu::MenuItem::with_id(
         app,
         lifecycle::TRAY_OPEN_LAUNCHER,
@@ -334,14 +357,9 @@ fn setup_production_lifecycle(
     message_center
         .install_native_effects(toast, tray_attention, attention_audio)
         .map_err(|_| lifecycle_setup_error())?;
-    let mut reserved_plugin_names = vec![
-        "screenshot".into(),
-        "find".into(),
-        "math".into(),
-        "quicklinks".into(),
-        "web-search".into(),
-    ];
+    let mut reserved_plugin_names = vec!["find".into(), "math".into()];
     reserved_plugin_names.extend(quicklink_reserved_names);
+    dev_startup::stage("初始化公开插件与剪贴板服务");
     public_plugin_service.initialize(
         app.handle(),
         &app_data_dir,
@@ -350,6 +368,7 @@ fn setup_production_lifecycle(
         native_attention::attention_route(route_messages),
     )?;
 
+    dev_startup::stage("安装窗口钩子与注册快捷键");
     lifecycle::install_session_end_hook(app.handle(), &window)
         .map_err(|_| lifecycle_setup_error())?;
     lifecycle::install_find_position_hook(app.handle(), &find)
@@ -361,6 +380,7 @@ fn setup_production_lifecycle(
     let _ = coordinator.reconcile_runtime_settings(app.handle(), &persisted_settings);
     let _ = coordinator.reconcile_command_hotkeys(app.handle());
     let _ = coordinator.reconcile_screenshot_hotkey(app.handle());
+    let _ = coordinator.reconcile_builtin_hotkeys(app.handle());
     let _ = apps::start_initial_refresh(Arc::clone(app_cache))?;
     coordinator
         .mark_setup_ready(app.handle())
@@ -369,11 +389,13 @@ fn setup_production_lifecycle(
 }
 
 pub fn prepare_windows_identity() {
+    dev_startup::stage("初始化 Windows 进程标识");
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     native_attention::prepare_process_identity();
 }
 
 pub fn run() {
+    dev_startup::stage("创建宿主服务与 Tauri Builder");
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let app_cache = Arc::new(apps::AppCache::new());
 
@@ -443,12 +465,20 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Released {
-                        shortcut_coordinator.screenshot_hotkeys.release(*shortcut);
+                        for feature in settings::ManagedBuiltinFeature::ALL {
+                            shortcut_coordinator
+                                .builtin_hotkeys(feature)
+                                .release(*shortcut);
+                        }
                     }
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed
-                        && shortcut_coordinator
-                            .screenshot_hotkeys
-                            .accepts_press(*shortcut)
+                        && settings::ManagedBuiltinFeature::ALL
+                            .into_iter()
+                            .all(|feature| {
+                                shortcut_coordinator
+                                    .builtin_hotkeys(feature)
+                                    .accepts_press(*shortcut)
+                            })
                     {
                         if let Some(event) = shortcut_coordinator.capture_native_hotkey(*shortcut) {
                             let _ = shortcut_sender.send((app.clone(), event));
@@ -503,13 +533,23 @@ pub fn run() {
             commands::set_find_pinned,
             commands::set_settings_pinned,
             commands::validate_youdao_translation,
+            credentials::list_credentials,
+            credentials::add_credential,
+            credentials::save_credential,
+            credentials::set_credential_enabled,
+            credentials::delete_credential,
             commands::set_find_preview_preference,
             commands::load_find_thumbnail,
             commands::hide_find_window,
             commands::select_public_plugin_directory,
             commands::list_builtin_features,
             commands::set_builtin_feature_enabled,
+            commands::set_builtin_feature_name,
+            commands::set_builtin_feature_hotkey,
             commands::list_public_plugins,
+            commands::cancel_translation_selection,
+            commands::get_translation_selection_settings,
+            commands::set_translation_selection_hotkey,
             commands::set_public_plugin_command_hotkey,
             commands::resolve_public_plugin_command_entry,
             commands::list_quicklinks,
@@ -523,11 +563,13 @@ pub fn run() {
             commands::cancel_public_plugin_install,
             commands::set_plugin_enabled,
             commands::set_public_plugin_network_access,
+            commands::set_public_plugin_permission_access,
             commands::set_plugin_favorite,
             commands::set_plugin_effective_name,
             commands::save_plugin_settings,
             commands::uninstall_plugin,
             commands::plugin_network_request,
+            commands::plugin_youdao_translate,
             commands::plugin_api_call,
             commands::complete_plugin_command,
             commands::plugin_window_content_ready,
@@ -549,6 +591,8 @@ pub fn run() {
             commands::plugin_panel_request_hide_admit_observed,
             commands::plugin_panel_request_hide_commit,
             commands::plugin_panel_focus_host_input,
+            commands::plugin_panel_set_status,
+            commands::plugin_panel_actions_submit,
             commands::plugin_panel_focus_host_input_ack,
             commands::plugin_window_open_text,
             commands::plugin_window_request,
@@ -557,10 +601,12 @@ pub fn run() {
             commands::plugin_panel_storage_set,
             commands::plugin_panel_storage_remove,
             commands::plugin_panel_clipboard_history_list,
+            commands::plugin_panel_clipboard_history_copy,
             commands::plugin_panel_clipboard_history_paste,
             commands::plugin_panel_clipboard_history_remove,
             commands::plugin_panel_clipboard_history_clear,
             commands::open_plugin_panel,
+            commands::open_plugin_panel_actions,
             commands::submit_plugin_panel,
             commands::set_plugin_panel_bounds,
             commands::close_plugin_panel,
@@ -611,8 +657,18 @@ pub fn run() {
     #[cfg(any(test, not(feature = "test-instrumentation")))]
     let run_public_plugin_service = Arc::clone(&public_plugin_service);
 
+    dev_startup::stage("创建 Tauri 窗口与 WebView2");
     let app = builder
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" {
+                dev_startup::note(match payload.event() {
+                    tauri::webview::PageLoadEvent::Started => "主窗口页面开始加载",
+                    tauri::webview::PageLoadEvent::Finished => "主窗口页面加载完成（等待前端连接）",
+                });
+            }
+        })
         .setup(move |_app| {
+            dev_startup::stage("进入宿主 setup");
             #[cfg(all(not(test), feature = "test-instrumentation"))]
             security_probe::setup(_app)?;
 
@@ -642,6 +698,7 @@ pub fn run() {
                     &public_plugin_service,
                 )?;
                 everything_runtime.start_async();
+                dev_startup::stage("宿主 setup 完成，等待主窗口前端连接");
             }
             Ok(())
         })
@@ -879,7 +936,7 @@ mod tests {
             .expect("production handler block is not narrow");
         let production = &production[..production_end];
 
-        assert_eq!(production.matches("commands::").count(), 106);
+        assert_eq!(production.matches("commands::").count(), 110);
         for command in [
             "open_find_window",
             "prepare_find_initialization",
@@ -894,7 +951,12 @@ mod tests {
             "select_public_plugin_directory",
             "list_builtin_features",
             "set_builtin_feature_enabled",
+            "set_builtin_feature_name",
+            "set_builtin_feature_hotkey",
             "list_public_plugins",
+            "cancel_translation_selection",
+            "get_translation_selection_settings",
+            "set_translation_selection_hotkey",
             "set_public_plugin_command_hotkey",
             "resolve_public_plugin_command_entry",
             "list_quicklinks",
@@ -908,11 +970,13 @@ mod tests {
             "cancel_public_plugin_install",
             "set_plugin_enabled",
             "set_public_plugin_network_access",
+            "set_public_plugin_permission_access",
             "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
             "plugin_network_request",
+            "plugin_youdao_translate",
             "plugin_api_call",
             "complete_plugin_command",
             "plugin_window_content_ready",
@@ -940,12 +1004,16 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_copy",
             "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
             "plugin_panel_focus_host_input",
+            "plugin_panel_set_status",
+            "plugin_panel_actions_submit",
             "plugin_panel_focus_host_input_ack",
             "open_plugin_panel",
+            "open_plugin_panel_actions",
             "submit_plugin_panel",
             "set_plugin_panel_bounds",
             "close_plugin_panel",
@@ -1092,7 +1160,12 @@ mod tests {
         let resolved = Resolved::resolve(&manifests, capabilities, Target::Windows)
             .expect("production capabilities must resolve");
         assert!(resolved.has_app_acl);
-        for command in ["list_builtin_features", "set_builtin_feature_enabled"] {
+        for command in [
+            "list_builtin_features",
+            "set_builtin_feature_enabled",
+            "set_builtin_feature_name",
+            "set_builtin_feature_hotkey",
+        ] {
             let permissions = resolved
                 .allowed_commands
                 .get(command)
@@ -1135,6 +1208,9 @@ mod tests {
         let find = include_str!("../capabilities/find.json");
         for command in [
             "list_public_plugins",
+            "cancel_translation_selection",
+            "get_translation_selection_settings",
+            "set_translation_selection_hotkey",
             "set_public_plugin_command_hotkey",
             "resolve_public_plugin_command_entry",
             "prepare_public_plugin_install",
@@ -1142,11 +1218,13 @@ mod tests {
             "cancel_public_plugin_install",
             "set_plugin_enabled",
             "set_public_plugin_network_access",
+            "set_public_plugin_permission_access",
             "set_plugin_favorite",
             "set_plugin_effective_name",
             "save_plugin_settings",
             "uninstall_plugin",
             "open_plugin_panel",
+            "open_plugin_panel_actions",
             "submit_plugin_panel",
             "set_plugin_panel_bounds",
             "close_plugin_panel",
@@ -1159,6 +1237,7 @@ mod tests {
         for command in [
             "plugin_api_call",
             "plugin_network_request",
+            "plugin_youdao_translate",
             "complete_plugin_command",
         ] {
             assert!(build.contains(&format!("\"{command}\",")));
@@ -1223,10 +1302,13 @@ mod tests {
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
             "plugin_panel_clipboard_history_list",
+            "plugin_panel_clipboard_history_copy",
             "plugin_panel_clipboard_history_paste",
             "plugin_panel_clipboard_history_remove",
             "plugin_panel_clipboard_history_clear",
             "plugin_panel_focus_host_input",
+            "plugin_panel_set_status",
+            "plugin_panel_actions_submit",
         ] {
             let permission = format!("\"allow-{}\"", command.replace('_', "-"));
             assert!(build.contains(&format!("\"{command}\",")));

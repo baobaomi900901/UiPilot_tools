@@ -62,6 +62,8 @@ async function loadPanel({ notes = sampleNotes } = {}) {
   let hostKeyRegisterCount = 0
   let focusHostInputCalls = 0
   let requestHideCalls = 0
+  const statuses = []
+  let actionsProvider = null
   let panelReady = Promise.resolve()
   const store = new Map([['notes.entries', structuredClone(notes)]])
 
@@ -73,6 +75,8 @@ async function loadPanel({ notes = sampleNotes } = {}) {
   dom.window.document.execCommand = () => true
 
   dom.window.uipilotPluginPanel = {
+    onActions(provider) { actionsProvider = provider; return () => { actionsProvider = null } },
+    async setStatus(value) { statuses.push(structuredClone(value)) },
     onHostKey(handler) {
       hostKeyRegisterCount += 1
       hostKeyHandler = handler
@@ -127,6 +131,8 @@ async function loadPanel({ notes = sampleNotes } = {}) {
   await new Promise((resolve) => setImmediate(resolve))
 
   return {
+    actions(source = 'content') { return actionsProvider?.({ source }) },
+    statuses,
     window: dom.window,
     document: dom.window.document,
     hostKeyRegisterCount: () => hostKeyRegisterCount,
@@ -178,8 +184,8 @@ const invocation = Object.freeze({
 test('manifest declares the fixed panel notes contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.notes')
-  assert.equal(manifest.version, '1.2.5')
-  assert.equal(manifest.minimumHostVersion, '0.3.1')
+  assert.equal(manifest.version, '1.2.10')
+  assert.equal(manifest.minimumHostVersion, '0.16.0')
   assert.equal(manifest.command.defaultName, 'notes')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'panel')
@@ -373,7 +379,7 @@ test('sidebar toolbar renders a directory title and icon-only new action', async
   assert.match(css, /\.note-item\s*\{[^}]*padding:\s*0;/)
 })
 
-test('panel shell separates from the host and uses a distinct directory selection state', async (t) => {
+test('panel shell delegates the outer separator to Host and keeps directory selection styling', async (t) => {
   const panel = await loadPanel()
   t.after(panel.cleanup)
   await panel.flush()
@@ -384,7 +390,7 @@ test('panel shell separates from the host and uses a distinct directory selectio
   assert.equal(emptyIcon.textContent.trim(), '')
 
   const css = await readFile(new URL('../package/dist/panel.css', import.meta.url), 'utf8')
-  assert.match(css, /\.app\s*\{[^}]*border-top:\s*1px solid var\(--uipilot-color-border\);/s)
+  assert.doesNotMatch(css.match(/\.app\s*\{[^}]*\}/s)?.[0] ?? '', /border-top:/)
   assert.match(css, /:root\s*\{[^}]*--note-selection-surface:\s*var\(--note-surface\);/s)
   assert.match(css, /@supports[^}]*--note-selection-surface:\s*color-mix\(in srgb, var\(--uipilot-color-text[^)]*\) 13%, var\(--note-canvas\)\);/s)
   assert.match(css, /\.note-card\.is-active\s*\{[^}]*background:\s*var\(--note-selection-surface\);[^}]*box-shadow:\s*inset 0 0 0 1px var\(--note-selection-border\);/s)
@@ -812,10 +818,8 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
   const editorSaveState = panel.document.querySelector('#editor-save-state')
   assert.ok(editorHeader)
   assert.ok(editorTitle)
-  assert.ok(editorSaveState)
-  assert.equal(status.closest('footer'), null)
-  assert.equal(status.getAttribute('role'), 'status')
-  assert.equal(status.getAttribute('aria-atomic'), 'true')
+  assert.equal(editorSaveState, null)
+  assert.equal(status, null)
   assert.equal(panel.document.querySelector('.editor-actions'), null)
 
   panel.hostKey({
@@ -829,27 +833,22 @@ test('editor removes text actions and exposes a bottom-right copy icon', async (
   })
   await panel.flush()
   assert.equal(editorTitle.textContent, 'Project Plan')
-  assert.equal(editorSaveState.textContent.trim(), '已保存')
+  assert.equal(panel.document.querySelector('#editor-save-state'), null)
   panel.editor().value = 'changed'
   panel.editor().dispatchEvent(new panel.window.Event('input', { bubbles: true }))
-  assert.equal(editorSaveState.textContent.trim(), '未保存')
+  assert.equal(panel.document.querySelector('#editor-save-state'), null)
   copyButton.click()
   await panel.flush()
-  assert.equal(status.textContent, '已复制')
-  assert.equal(status.dataset.tone, 'success')
+  assert.deepEqual(panel.statuses.at(-1), { message: '已复制', tone: 'success' })
   assert.equal(panel.requestHideCalls(), 0)
 
   panel.document.execCommand = () => false
   copyButton.click()
   await panel.flush()
-  assert.equal(status.textContent, '复制失败')
-  assert.equal(status.dataset.tone, 'error')
+  assert.deepEqual(panel.statuses.at(-1), { message: '复制失败', tone: 'error' })
 
   const css = await readFile(new URL('../package/dist/panel.css', import.meta.url), 'utf8')
   assert.match(css, /\.editor-copy-button\s*\{[\s\S]*position:\s*absolute;[\s\S]*right:[^;]+;[\s\S]*bottom:[^;]+;/)
-  assert.match(css, /\.editor-status\s*\{[\s\S]*position:\s*absolute;[\s\S]*top:[^;]+;[\s\S]*left:\s*50%;[\s\S]*pointer-events:\s*none;/)
-  assert.match(css, /\.editor-status\[data-tone='success'\]/)
-  assert.match(css, /\.editor-status\[data-tone='error'\]/)
   assert.match(css, /\.editor-panel\s*\{[^}]*padding:\s*0;[^}]*gap:\s*0;/)
   assert.match(css, /\.editor-header\s*\{[^}]*border-bottom:\s*1px solid var\(--uipilot-color-border\);/s)
   assert.match(css, /\.editor-surface\s*\{[^}]*padding:\s*0;[^}]*border:\s*0;[^}]*border-radius:\s*0;/)
@@ -907,8 +906,73 @@ test('Ctrl+S in the editor saves and restores the selected list item context', a
 
   assert.equal(panel.document.activeElement?.id, 'note-list')
   assert.equal(noteList.getAttribute('aria-activedescendant'), 'note-option-2')
+  assert.deepEqual(panel.statuses.at(-1), { message: '已保存', tone: 'success' })
+  panel.window.uipilotPluginPanel.storage.set = async () => { throw new Error('storage failed') }
+  panel.editor().value = 'failed edit'
+  panel.editor().dispatchEvent(new panel.window.KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true, cancelable: true }))
+  await panel.flush()
+  assert.deepEqual(panel.statuses.at(-1), { message: '保存失败', tone: 'error' })
 })
 
+test('context actions follow input, list and editor focus and preserve note ownership', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+  const input = panel.actions('hostInput')
+  assert.equal(input.global.some(action => action.shortcut === 'Ctrl+F'), false)
+  assert.deepEqual(input.context.map(action => action.title), ['进入目录'])
+  assert.ok(input.global.some(action => action.shortcut === 'Ctrl+N'))
+  await input.context[0].run()
+  const selectedId = panel.selectedId()
+  const list = panel.actions()
+  assert.equal(list.global.filter(action => action.shortcut === 'Ctrl+F').length, 1)
+  assert.ok(list.context.some(action => action.title === '复制并隐藏'))
+  await list.context.find(action => action.title === '编辑正文').run()
+  assert.equal(panel.document.activeElement, panel.editor())
+  const editor = panel.actions()
+  assert.ok(editor.context.some(action => action.shortcut === 'Ctrl+S'))
+  panel.editor().setSelectionRange(1, 3)
+  await editor.context.find(action => action.title === '复制正文').run()
+  assert.equal(panel.document.activeElement, panel.editor())
+  assert.deepEqual([panel.editor().selectionStart, panel.editor().selectionEnd], [1, 3])
+  panel.editor().value = 'saved from actions'
+  await editor.context.find(action => action.shortcut === 'Ctrl+S').run()
+  await panel.flush()
+  assert.equal(panel.storedNotes().find(note => note.id === selectedId).content, 'saved from actions')
+  assert.equal(panel.document.activeElement.id, 'note-list')
+  const otherId = selectedId === '1' ? '2' : '1'
+  panel.document.querySelector(`[data-note-id="${otherId}"].note-select`).click()
+  await panel.flush()
+  await list.context.find(action => action.title === '删除笔记').run()
+  assert.equal(panel.dialogOpen('#delete-dialog'), false)
+  await panel.actions().global.find(action => action.shortcut === 'Ctrl+N').run()
+  assert.equal(panel.dialogOpen('#new-dialog'), true)
+  assert.equal(panel.actions(), null)
+})
+
+
+test('an older success timer cannot clear a newer identical message or an error', async (t) => {
+  const panel = await loadPanel()
+  t.after(panel.cleanup)
+  await panel.flush()
+  panel.document.querySelector('[data-note-id="1"].note-select').click()
+  await panel.flush()
+  const timers = []
+  panel.window.setTimeout = (callback) => { timers.push(callback); return timers.length }
+  const copyButton = panel.document.querySelector('#editor-copy-btn')
+  copyButton.click()
+  await panel.flush()
+  copyButton.click()
+  await panel.flush()
+  assert.equal(timers.length, 2)
+  timers[0]()
+  assert.deepEqual(panel.statuses.at(-1), { message: '已复制', tone: 'success' })
+  panel.document.execCommand = () => false
+  copyButton.click()
+  await panel.flush()
+  timers[1]()
+  assert.deepEqual(panel.statuses.at(-1), { message: '复制失败', tone: 'error' })
+})
 
 test('dialog close buttons follow cancellation without mutating notes or discarding the editor draft', async (t) => {
   const panel = await loadPanel()

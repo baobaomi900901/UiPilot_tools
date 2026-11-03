@@ -41,7 +41,9 @@ export function formatDuration(remainingMs) {
 }
 
 const legalDuration = (value) => Number.isInteger(value) && DURATION_OPTIONS.includes(value)
-const timerErrorText = (error) => error?.code || error?.message || '计时操作失败'
+const timerErrorText = (error) => [error?.code, error?.name].includes('PermissionDenied')
+  ? '计时器所需权限不可用，请在「设置 → 权限」中检查计时器控制、发送通知和独立窗口权限。'
+  : error?.code || error?.message || '计时操作失败'
 
 export function createPomodoroModel({
   timer,

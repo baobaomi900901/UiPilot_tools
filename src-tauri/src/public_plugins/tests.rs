@@ -79,6 +79,80 @@ pub(super) fn with_settings_service_for_test(
 }
 
 #[test]
+fn credential_completion_preserves_publication_guard_through_submission_receiver() {
+    let root = TestRoot::new("credential-completion-envelope");
+    let (service, manager) = settings_service(&root);
+    let now = Instant::now();
+    let submission = service
+        .schedule_command(
+            manager.route("/demo hello").unwrap().unwrap(),
+            1,
+            "/demo hello".into(),
+            now,
+        )
+        .unwrap();
+    let dispatch = submission.dispatch.as_ref().unwrap();
+    let publication = manager
+        .scheduler()
+        .capture_result_publication(
+            &dispatch.context.plugin_id,
+            dispatch.context.plugin_generation,
+            dispatch.candidate.activation_id,
+            dispatch.candidate.admission_epoch,
+        )
+        .unwrap();
+    let completion = PluginCommandCompletion {
+        context: dispatch.context.clone(),
+        failed: false,
+        response: Some(json!({
+            "requestId": dispatch.context.request_id,
+            "results": [{"id": "translation", "title": "translated"}]
+        })),
+    };
+    let mut outcome = manager
+        .scheduler()
+        .complete(&completion.context, now)
+        .unwrap();
+    assert!(outcome.accepted);
+    // Native service completion adds this metadata; it must survive the async receiver.
+    outcome.credential_publication = Some((42, publication.clone()));
+    service
+        .complete_submission_with(&completion, outcome, now, || panic!("must not fault"))
+        .unwrap();
+    let Some(Ok(PublicPluginResponse::ServiceMainResults {
+        results,
+        credential_revision,
+        publication: received_publication,
+    })) = submission
+        .receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+    else {
+        panic!("service completion must retain its native publication guard")
+    };
+    assert_eq!(results[0].title, "translated");
+    assert_eq!(credential_revision, 42);
+    assert_eq!(received_publication, publication);
+    assert!(manager
+        .scheduler()
+        .with_result_publication(&dispatch.context.plugin_id, &received_publication, || true)
+        .unwrap());
+
+    // Revocation may happen after completion and receipt, before registry publication.
+    service
+        .set_network_access("com.uipilot.demo", false, None)
+        .unwrap();
+    assert!(manager
+        .scheduler()
+        .with_result_publication(
+            &dispatch.context.plugin_id,
+            &received_publication,
+            || panic!("revoked service result must never reach the registry"),
+        )
+        .is_err());
+}
+
+#[test]
 fn save_plugin_settings_service_settles_exact_tokens_and_preserves_execution_slot() {
     use std::collections::BTreeMap;
     for case in [

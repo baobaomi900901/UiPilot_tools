@@ -50,6 +50,7 @@ pub(crate) struct LifecycleNetworkBarrier {
     pub(crate) release: tokio::sync::Notify,
     pub(crate) sends: std::sync::atomic::AtomicUsize,
     status: u16,
+    body: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -68,7 +69,7 @@ impl HttpsTransport for LifecycleNetworkBarrier {
                 } else {
                     vec![]
                 },
-                body: b"synthetic-response".to_vec(),
+                body: self.body.clone(),
             };
             self.reached.notify_one();
             self.release.notified().await;
@@ -160,7 +161,7 @@ impl PluginNetworkAuthorityGate {
         }
     }
 
-    pub(super) fn broker(&self) -> &Arc<PluginHttpsBroker> {
+    pub(crate) fn broker(&self) -> &Arc<PluginHttpsBroker> {
         &self.broker
     }
 
@@ -388,7 +389,15 @@ impl PluginNetworkAuthorityGate {
     pub(crate) fn paused_response_for_test(
         status: u16,
     ) -> (Arc<Self>, Arc<LifecycleNetworkBarrier>) {
+        Self::paused_body_for_test(status, b"synthetic-response".to_vec())
+    }
+    #[cfg(test)]
+    pub(crate) fn paused_body_for_test(
+        status: u16,
+        body: Vec<u8>,
+    ) -> (Arc<Self>, Arc<LifecycleNetworkBarrier>) {
         let barrier = Arc::new(LifecycleNetworkBarrier {
+            body,
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             sends: std::sync::atomic::AtomicUsize::new(0),

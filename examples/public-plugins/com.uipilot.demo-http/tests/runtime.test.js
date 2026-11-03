@@ -135,6 +135,16 @@ test('runtime exposes only the stable Host Error.name', async () => {
   assert.doesNotMatch(JSON.stringify(response), /must not be displayed/)
 })
 
+test('denied network permission points to Settings Permissions without raw error details', async () => {
+  const runtime = await loadRuntime()
+  const response = await runtime.onCommand(invocation('get'), networkApi([], async () => {
+    throw Object.assign(new Error('private failure'), { name: 'PermissionDeniedError' })
+  }))
+  assert.equal(response.results[0].title, 'PermissionDeniedError')
+  assert.match(response.results[0].subtitle, /Settings → Permissions/)
+  assert.doesNotMatch(JSON.stringify(response), /private failure/)
+})
+
 test('runtime reports usage without invoking Host for an unknown command', async () => {
   const runtime = await loadRuntime()
   const calls = []

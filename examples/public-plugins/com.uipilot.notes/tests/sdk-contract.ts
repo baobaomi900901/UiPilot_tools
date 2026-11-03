@@ -43,6 +43,21 @@ const consumeHostKeysAndHide = (api: Readonly<UiPilotPluginPanelApiV1>) => {
 }
 
 void notesHandler
+const reportPanelStatus = async (api: Readonly<UiPilotPluginPanelApiV1>) => {
+  await api.setStatus({ message: '已保存', tone: 'success' })
+  await api.setStatus({ message: '' })
+  // @ts-expect-error Status tones are a closed set.
+  await api.setStatus({ message: '保存失败', tone: 'danger' })
+  // @ts-expect-error The host owns the target panel identity.
+  await api.setStatus({ message: '已保存', sessionEpoch: '1' })
+}
+void reportPanelStatus
 void consumePanelApi
 void focusTaggedInput
 void consumeHostKeysAndHide
+
+const provideOperations = (api: Readonly<UiPilotPluginPanelApiV1>) => api.onActions(({ source }) => ({
+  context: source === 'content' ? [{ id: 'save', title: '保存', shortcut: 'Ctrl+S', icon: 'save', run: async () => {} }] : [],
+  global: [{ id: 'new', title: '新建笔记', shortcut: 'Ctrl+N', run() {} }],
+}))
+void provideOperations

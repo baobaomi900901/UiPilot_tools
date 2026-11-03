@@ -1,0 +1,34 @@
+{
+  "name": "@uipilot/plugin-cli",
+  "version": "0.1.0",
+  "description": "Validate UiPilot public plugin packages without installing UiPilot.",
+  "type": "module",
+  "bin": {
+    "uipilot-plugin": "dist/cli.mjs"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "check": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "verify": "npm run check && npm test && npm run build && node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/pngjs": "^6.0.5",
+    "ajv": "^8.20.0",
+    "esbuild": "^0.28.2",
+    "pngjs": "^7.0.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  },
+  "license": "MIT"
+}

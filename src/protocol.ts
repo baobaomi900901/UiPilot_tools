@@ -1,4 +1,5 @@
 import { safePublicPluginIconUrl } from './plugin-icon-url'
+import type { CredentialClient } from './credential-protocol'
 
 export type ResultIconKind = 'find' | 'quicklinks' | 'screenshot' | 'calculator' | 'currency' | 'date' | 'timeZone' | 'unit' | 'webSearch'
 export type BuiltinFeature = 'find' | 'quicklinks' | 'screenshot' | 'webSearch'
@@ -7,6 +8,11 @@ export interface BuiltinFeatureView {
   feature: ManagedBuiltinFeature
   name: string
   command: string
+  defaultCommand: string
+  favorite: boolean
+  hotkey: string | null
+  hotkeyStatus: 'unset' | 'active' | 'suspended' | 'unavailable'
+  directory: string | null
   description: string
   examples: readonly string[]
   version: string
@@ -19,8 +25,11 @@ export function parseBuiltinFeatures(value: unknown): readonly BuiltinFeatureVie
   const items: BuiltinFeatureView[] = []
   for (const [index, candidate] of value.entries()) {
     const item = plainRecord(candidate)
-    if (!item || !exactKeys(item, ['command', 'description', 'enabled', 'examples', 'feature', 'name', 'version']) || item.feature !== features[index] || typeof item.enabled !== 'boolean') return null
+    if (!item || !exactKeys(item, ['command', 'defaultCommand', 'description', 'directory', 'enabled', 'examples', 'favorite', 'feature', 'hotkey', 'hotkeyStatus', 'name', 'version']) || item.feature !== features[index] || typeof item.enabled !== 'boolean' || typeof item.favorite !== 'boolean') return null
     if (['name', 'command', 'description', 'version'].some((key) => typeof item[key] !== 'string' || (item[key] as string).length === 0)) return null
+    if (['command', 'defaultCommand'].some((key) => typeof item[key] !== 'string' || !/^\/[a-z][a-z0-9-]{0,31}$/u.test(item[key] as string))) return null
+    if (item.directory !== null && (typeof item.directory !== 'string' || !item.directory.length)) return null
+    if (!validCommandHotkeyState(item.hotkey, item.hotkeyStatus)) return null
     if (!Array.isArray(item.examples) || !exactDenseArray(item.examples) || item.examples.length === 0 || !item.examples.every((example) => typeof example === 'string' && example.length > 0)) return null
     items.push({ ...(item as unknown as BuiltinFeatureView), examples: [...item.examples] })
   }
@@ -37,6 +46,7 @@ export type LauncherResultActivation =
   | { kind: 'pluginCompletion'; completionText: string; pluginId: string; favorite: boolean }
   | {
       kind: 'windowActivation'
+      commandId: string
       pluginId: string
       commandLabel: string
       initialArgument: string
@@ -50,16 +60,18 @@ export type LauncherResultActivation =
       initialArgument: string
       favorite: boolean
     }
-  | { kind: 'panelActivation'; pluginId: string; initialArgument: string; favorite: boolean }
+  | { kind: 'panelActivation'; commandId: string; pluginId: string; initialArgument: string; favorite: boolean }
   | { kind: 'openFind'; query: string }
   | { kind: 'openQuicklinks' }
   | { kind: 'openScreenshot' }
+  | { kind: 'builtinActivation'; feature: 'webSearch'; initialArgument: string }
   | { kind: 'executeResult' }
   | { kind: 'informational' }
 
 export type CompletionOrigin = Readonly<{
   phase: 'preview' | 'commit'
   pluginId: string
+  commandId?: string
 }>
 
 export interface SearchAppsInput {
@@ -69,6 +81,7 @@ export interface SearchAppsInput {
   submit?: boolean
   completionOrigin?: CompletionOrigin
   stableCommandTarget?: CommandHotkeyEntry
+  stableBuiltinTarget?: ManagedBuiltinFeature
 }
 
 export interface ResultItem {
@@ -234,6 +247,10 @@ export interface PluginInventorySnapshot {
 
 export type PublicPluginFault = 'runtimeUnavailable' | 'consecutiveFailures'
 export type PublicPermission =
+  | 'selection.read'
+  | 'credentials.youdaoTranslation'
+  | 'credentials.baiduOcr'
+  | 'credentials.deepseek'
   | 'ui.window'
   | 'ui.panel'
   | 'clipboard.write'
@@ -243,6 +260,7 @@ export type PublicPermission =
   | 'clipboard.read'
   | 'clipboard.history.read'
   | 'clipboard.history.paste'
+  | 'clipboard.history.copy'
   | 'network.https'
   | 'files.userSelected'
   | 'files.index.readAll'
@@ -303,6 +321,7 @@ export interface PublicPluginInventoryItem {
   description: string | null
   version: string
   source: 'localPackage'
+  installationDirectory: string | null
   commands: readonly PublicPluginInventoryCommand[]
   enabled: boolean
   fault: PublicPluginFault | null
@@ -383,11 +402,16 @@ export type LifecycleNotice = 'settingsFailed'
 export interface CommandHotkeyEntry { pluginId: string; commandId: string; hotkey: string; bindingRevision: string }
 export interface CommandEntryResolution { pluginId: string; commandId: string; commandLabel: string; outputMode: 'mainResult' | 'window' | 'panel'; activationMode: 'live' | 'submit'; inputRequired: boolean; inputPlaceholder: string | null }
 
+export interface TranslationSelectionSettings { hotkey: string | null; status: 'active' | 'unset' | 'suspended' | 'unavailable' }
+export interface SelectionTranslation { id: string; text?: string; error?: string }
+
 export interface LauncherShown {
   invocationId: string
   target: ShowTarget
   notice: LifecycleNotice | null
   commandEntry?: CommandHotkeyEntry
+  selectionTranslation?: SelectionTranslation
+  builtinEntry?: 'quicklinks' | 'webSearch'
 }
 
 export interface MessageSummary {
@@ -426,12 +450,17 @@ export type ClassifiedTextRecord =
   | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
+  credentials?: CredentialClient
   validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
   listenHidden(handler: () => void): Promise<() => void>
   listenBuiltinFeaturesChanged?(handler: () => void): Promise<() => void>
+  listenPublicPluginPermissionsChanged?(handler: () => void): Promise<() => void>
   listenMessageStateChanged(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelError(handler: (payload: unknown) => void): Promise<() => void>
+  listenPluginPanelStatus?(handler: (payload: unknown) => void): Promise<() => void>
+  listenPluginPanelActionsSubmit?(handler: (payload: unknown) => void): Promise<() => void>
+  openPluginPanelActions?(input: { sessionEpoch: U64Decimal; source: 'hostInput' | 'content'; ticket: string }): Promise<void>
   listenPluginPanelReset(handler: (payload: unknown) => void): Promise<() => void>
   listenPluginPanelFocusHostInput(handler: (payload: unknown) => void): Promise<() => void>
   getMessageSummary(): Promise<unknown>
@@ -449,7 +478,7 @@ export interface LauncherClient {
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   executeResultAction(input: { requestId: string; resultId: string; actionId: string }): Promise<unknown>
   retireResultActions(input: { requestId: string }): Promise<void>
-  openPluginPanel(input: { pluginId: string; argument: string; stableCommandTarget?: CommandHotkeyEntry }): Promise<PluginPanelCommandResult>
+  openPluginPanel(input: { pluginId: string; commandId: string; argument: string; stableCommandTarget?: CommandHotkeyEntry }): Promise<PluginPanelCommandResult>
   submitPluginPanel(input: {
     sessionEpoch: U64Decimal
     argument: string
@@ -461,9 +490,14 @@ export interface LauncherClient {
   acknowledgePluginPanelFocusHostInput(input: PluginPanelFocusHostInputEvent & { focused: boolean }): Promise<void>
   commitPluginWindowTransfer(input: { transferToken: string }): Promise<void>
   setPublicPluginCommandHotkey(input: { pluginId: string; commandId: string; hotkey: string | null }): Promise<void>
+  cancelTranslationSelection?(): Promise<void>
+  getTranslationSelectionSettings?(): Promise<TranslationSelectionSettings>
+  setTranslationSelectionHotkey?(input: { hotkey: string | null }): Promise<TranslationSelectionSettings>
   resolvePublicPluginCommandEntry(input: { entry: CommandHotkeyEntry }): Promise<CommandEntryResolution>
   listBuiltinFeatures(): Promise<readonly BuiltinFeatureView[]>
   setBuiltinFeatureEnabled(input: { feature: ManagedBuiltinFeature; enabled: boolean }): Promise<readonly BuiltinFeatureView[]>
+  setBuiltinFeatureName(input: { feature: ManagedBuiltinFeature; nameOverride: string | null }): Promise<void>
+  setBuiltinFeatureHotkey(input: { feature: ManagedBuiltinFeature; hotkey: string | null }): Promise<void>
   listPublicPlugins(): Promise<PublicPluginInventory>
   selectPublicPluginArchive(): Promise<string | null>
   selectPublicPluginDirectory(): Promise<string | null>
@@ -474,6 +508,7 @@ export interface LauncherClient {
   cancelPublicPlugin(input: { token: string }): Promise<void>
   setPublicPluginEnabled(input: { pluginId: string; enabled: boolean }): Promise<void>
   setPublicPluginNetworkAccess(input: { pluginId: string; granted: boolean; expectedInventoryRevision?: U64Decimal }): Promise<void>
+  setPublicPluginPermissionAccess(input: { pluginId: string; permission: PublicPermission; granted: boolean; expectedInventoryRevision: U64Decimal }): Promise<void>
   setPublicPluginFavorite(input: { pluginId: string; commandId: string; favorite: boolean }): Promise<void>
   setBuiltinFeatureFavorite(input: { feature: BuiltinFeature; favorite: boolean }): Promise<void>
   setPublicPluginEffectiveName(input: { pluginId: string; commandId: string; nameOverride: string | null }): Promise<void>
@@ -582,7 +617,9 @@ export interface ViewResult {
   hasDefaultAction?: boolean
   favorite?: ResultFavorite
   actions?: readonly ResultActionDisplay[]
-  panelActivation?: Readonly<{ pluginId: string; initialArgument: string }>
+  defaultActionId?: string
+  defaultActionTitle?: string
+  panelActivation?: Readonly<{ pluginId: string; commandId: string; initialArgument: string }>
 }
 
 export interface PluginPanelCommandResult {
@@ -601,8 +638,8 @@ export interface PluginPanelBounds {
   height: number
 }
 
-export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter'
-export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter'
+export type PanelHostKeyDeclaration = 'ArrowDown' | 'ArrowUp' | 'Primary+N' | 'Tab' | 'Shift+Tab' | 'Enter' | 'Delete'
+export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter' | 'Delete'
 
 export interface PluginPanelHostKeyEnqueueInput {
   sessionEpoch: U64Decimal
@@ -629,6 +666,7 @@ export interface PluginPanelFocusHostInputEvent {
 }
 
 export interface PluginPanelSnapshot {
+  feedback?: PluginPanelStatusEvent
   pluginId: string
   commandLabel: string
   inputPlaceholder?: string
@@ -726,7 +764,7 @@ export interface FileSnapshot {
   selected?: FileResultView
 }
 
-export type SettingsTabKey = 'general' | 'plugins' | 'messages' | 'credentials'
+export type SettingsTabKey = 'general' | 'plugins' | 'permissions' | 'messages' | 'credentials'
 
 export interface MessageCenterStateSnapshot {
   readonly status: 'unknown' | 'ready' | 'unavailable'
@@ -778,13 +816,32 @@ export function parseLauncherShown(value: unknown): LauncherShown | null {
   const prototype = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) return null
   const candidate = value as Record<string, unknown>
-  const keys = Object.keys(candidate).filter((key) => key !== 'commandEntry').sort()
+  const keys = Object.keys(candidate).filter((key) => key !== 'commandEntry' && key !== 'builtinEntry' && key !== 'selectionTranslation').sort()
   if (keys.length !== shownKeys.length || keys.some((key, index) => key !== shownKeys[index])) return null
   if (Object.prototype.hasOwnProperty.call(candidate, 'commandEntry') && (candidate.target !== 'launcher' || !parseCommandHotkeyEntry(candidate.commandEntry))) return null
+  if (Object.prototype.hasOwnProperty.call(candidate, 'builtinEntry') &&
+      (candidate.target !== 'launcher' || !['quicklinks', 'webSearch'].includes(candidate.builtinEntry as string) || Object.prototype.hasOwnProperty.call(candidate, 'commandEntry'))) return null
+  if (Object.prototype.hasOwnProperty.call(candidate, 'selectionTranslation')) {
+    const selection = plainRecord(candidate.selectionTranslation)
+    if (candidate.target !== 'launcher' || !selection || typeof selection.id !== 'string' || !selection.id ||
+        !exactKeys(selection, typeof selection.text === 'string' ? ['id', 'text'] : ['error', 'id']) ||
+        (typeof selection.text !== 'string' && (typeof selection.error !== 'string' || !selection.error)) ||
+        (typeof selection.text === 'string' && !candidate.commandEntry)) return null
+  }
   if (typeof candidate.invocationId !== 'string') return null
   if (candidate.target !== 'launcher' && candidate.target !== 'settings' && candidate.target !== 'messages') return null
   if (candidate.notice !== null && candidate.notice !== 'settingsFailed') return null
   return candidate as unknown as LauncherShown
+}
+
+function validCommandHotkey(value: unknown): value is string {
+  return typeof value === 'string' && /^(?:(?:Ctrl|Control|Shift|Alt|Meta|Super)\+)*[A-Za-z][A-Za-z0-9]*$/iu.test(value) && !value.startsWith('Double')
+}
+
+function validCommandHotkeyState(hotkey: unknown, status: unknown): boolean {
+  return (hotkey === null || validCommandHotkey(hotkey)) &&
+    ['unset', 'active', 'suspended', 'unavailable'].includes(status as string) &&
+    ((hotkey === null) === (status === 'unset'))
 }
 
 export function parseCommandHotkeyEntry(value: unknown): CommandHotkeyEntry | null {
@@ -792,7 +849,7 @@ export function parseCommandHotkeyEntry(value: unknown): CommandHotkeyEntry | nu
   if (!entry || !exactKeys(entry, ['bindingRevision', 'commandId', 'hotkey', 'pluginId']) ||
     typeof entry.pluginId !== 'string' || !PUBLIC_PLUGIN_ID.test(entry.pluginId) ||
     typeof entry.commandId !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(entry.commandId) ||
-    typeof entry.hotkey !== 'string' || (!/^(?:(?:Ctrl|Control|Shift|Alt|Meta|Super)\+)*[A-Za-z][A-Za-z0-9]*$/iu.test(entry.hotkey) || entry.hotkey.startsWith('Double')) ||
+    !validCommandHotkey(entry.hotkey) ||
     !canonicalU64(entry.bindingRevision) || entry.bindingRevision === '0') return null
   return entry as unknown as CommandHotkeyEntry
 }
@@ -999,7 +1056,9 @@ export function parsePluginInventorySnapshot(value: unknown): PluginInventorySna
 }
 
 const publicPermissions = new Set<PublicPermission>([
-  'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.paste', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'network.https',
+  'selection.read',
+  'credentials.youdaoTranslation', 'credentials.baiduOcr', 'credentials.deepseek',
+  'files.openText', 'ui.window', 'ui.panel', 'clipboard.write', 'clipboard.paste', 'url.open', 'clipboard.read', 'clipboard.history.read', 'clipboard.history.paste', 'clipboard.history.copy', 'network.https',
   'files.userSelected', 'files.index.readAll', 'notifications.publish', 'timer.control', 'background.schedule',
 ])
 const publicFaults = new Set<PublicPluginFault>(['runtimeUnavailable', 'consecutiveFailures'])
@@ -1048,25 +1107,24 @@ function parsePublicSettingView(value: unknown): PublicSettingView | null {
 
 function parsePublicPluginItem(value: unknown): PublicPluginInventoryItem | null {
   const item = plainRecord(value)
-  const keys = ['commands', 'description', 'enabled', 'fault', 'generation', 'iconUrl', 'name', 'network', 'permissions', 'pluginId', 'settings', 'source', 'version']
+  const keys = ['commands', 'description', 'enabled', 'fault', 'generation', 'iconUrl', 'installationDirectory', 'name', 'network', 'permissions', 'pluginId', 'settings', 'source', 'version']
   if (!item || !exactKeys(item, keys) || typeof item.pluginId !== 'string' || item.pluginId.length === 0 || typeof item.name !== 'string' || typeof item.version !== 'string' || typeof item.enabled !== 'boolean' || item.source !== 'localPackage' || !Number.isSafeInteger(item.generation) || (item.description !== null && typeof item.description !== 'string') || (item.iconUrl !== null && safePublicPluginIconUrl(item.iconUrl) === undefined) || (item.fault !== null && (typeof item.fault !== 'string' || !publicFaults.has(item.fault as PublicPluginFault)))) return null
+  if (item.installationDirectory !== null && (typeof item.installationDirectory !== 'string' || !item.installationDirectory.length)) return null
   if (!Array.isArray(item.permissions) || !exactDenseArray(item.permissions) || !Array.isArray(item.settings) || !exactDenseArray(item.settings)) return null
   if (!Array.isArray(item.commands) || !exactDenseArray(item.commands) || item.commands.length < 1 || item.commands.length > 16) return null
   const commands: PublicPluginInventoryCommand[] = []
   const commandIds = new Set<string>()
-  const effectiveNames = new Set<string>()
   for (const valueCommand of item.commands) {
     const command = plainRecord(valueCommand)
     if (!command || !exactKeys(command, ['commandId', 'defaultName', 'effectiveName', 'favorite', 'hotkey', 'hotkeyStatus', 'nameOverride']) ||
       typeof command.commandId !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.commandId) || commandIds.has(command.commandId) ||
       typeof command.defaultName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.defaultName) ||
-      typeof command.effectiveName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.effectiveName) || effectiveNames.has(command.effectiveName) ||
+      typeof command.effectiveName !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.effectiveName) ||
       (command.nameOverride !== null && (typeof command.nameOverride !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/u.test(command.nameOverride))) ||
       command.effectiveName !== (command.nameOverride ?? command.defaultName) || typeof command.favorite !== 'boolean' ||
       (command.hotkey !== null && (typeof command.hotkey !== 'string' || !parseCommandHotkeyEntry({ pluginId: item.pluginId, commandId: command.commandId, hotkey: command.hotkey, bindingRevision: '1' }))) ||
       !['unset', 'active', 'suspended', 'unavailable'].includes(command.hotkeyStatus as string) || ((command.hotkey === null) !== (command.hotkeyStatus === 'unset'))) return null
     commandIds.add(command.commandId)
-    effectiveNames.add(command.effectiveName)
     commands.push(command as unknown as PublicPluginInventoryCommand)
   }
   const permissions: PublicPermissionView[] = []
@@ -1237,6 +1295,7 @@ export function parsePluginPanelCommandResult(value: unknown): PluginPanelComman
     Tab: 3,
     'Shift+Tab': 4,
     Enter: 5,
+    Delete: 6,
   }
   const hostKeys: PanelHostKeyDeclaration[] = []
   const seen = new Set<PanelHostKeyDeclaration>()
@@ -1286,6 +1345,25 @@ export function parsePluginPanelErrorEvent(value: unknown): PluginPanelErrorEven
   if (!record || !exactKeys(record, ['sessionEpoch'])) return null
   const sessionEpoch = parseU64Decimal(record.sessionEpoch)
   return sessionEpoch === null || sessionEpoch === '0' ? null : { sessionEpoch }
+}
+
+export interface PluginPanelStatusEvent {
+  sessionEpoch: U64Decimal
+  sequence: U64Decimal
+  status: { message: string; tone: 'info' | 'success' | 'error' }
+}
+
+export function parsePluginPanelStatusEvent(value: unknown): PluginPanelStatusEvent | null {
+  const record = plainRecord(value)
+  if (!record || !exactKeys(record, ['sequence', 'sessionEpoch', 'status'])) return null
+  const sessionEpoch = parseU64Decimal(record.sessionEpoch)
+  const sequence = parseU64Decimal(record.sequence)
+  const status = plainRecord(record.status)
+  if (!sessionEpoch || sessionEpoch === '0' || !sequence || sequence === '0' ||
+      !status || !exactKeys(status, ['message', 'tone']) || typeof status.message !== 'string' ||
+      [...status.message].length > 512 || status.message.includes('\0') ||
+      (status.tone !== 'info' && status.tone !== 'success' && status.tone !== 'error')) return null
+  return { sessionEpoch, sequence, status: { message: status.message, tone: status.tone } }
 }
 
 export function parsePluginPanelFocusHostInputEvent(value: unknown): PluginPanelFocusHostInputEvent | null {

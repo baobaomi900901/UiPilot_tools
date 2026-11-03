@@ -1,3 +1,4 @@
+import { parsePluginPanelStatusEvent } from './protocol'
 import {
   parseResultActionMetadata,
   parseResultActionOutcome,
@@ -156,6 +157,7 @@ export type HotkeyRecordingPhase = 'idle' | 'recording' | 'completed'
 const HOTKEY_RECORDING_SHOW_GRACE_MS = 1_000
 
 export interface PluginPanelHostKeyPhysicalInput {
+  repeat?: boolean
   key: string
   ctrlKey: boolean
   metaKey: boolean
@@ -166,6 +168,7 @@ export interface PluginPanelHostKeyPhysicalInput {
 }
 
 interface PrivatePanelState {
+  feedback?: import('./protocol').PluginPanelStatusEvent
   commandHotkeyTarget?: CommandHotkeyEntry
   pluginId: string
   commandLabel: string
@@ -328,7 +331,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   fileOpenFailed: '无法在资源管理器中打开。',
   webSearchFailed: '操作不可用，请重试。',
   clipboardWriteFailed: '无法复制到剪贴板。',
-  pluginPermissionDenied: '插件无权写入剪贴板。',
+  pluginPermissionDenied: '插件所需权限不可用，请在「设置 → 权限」中检查。',
   pluginListFailed: '无法加载插件清单。',
   pluginInstallFailed: '无法安装插件。',
   pluginReloadFailed: '无法重新加载插件。',
@@ -346,6 +349,7 @@ interface CompletionOriginOwner {
   value: string
   resultKey: number
   pluginId: string
+  commandId?: string
   command: string
 }
 
@@ -360,6 +364,7 @@ interface ApplicationSearchOwner {
     token: number
     phase: 'preview' | 'commit'
     pluginId: string
+    commandId?: string
   }
 }
 
@@ -564,6 +569,14 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
   if (candidate?.kind === 'openScreenshot') {
     return exactPlainRecord(value, ['kind']) ? { kind: 'openScreenshot' } : undefined
   }
+  if (candidate?.kind === 'builtinActivation') {
+    const record = exactPlainRecord(value, ['feature', 'initialArgument', 'kind'])
+    return record?.feature === 'webSearch' && typeof record.initialArgument === 'string' &&
+      record.initialArgument.length <= 65_536 && record.initialArgument.trim() === record.initialArgument &&
+      !/[\p{Cc}\u2028\u2029]/u.test(record.initialArgument)
+      ? { kind: 'builtinActivation', feature: 'webSearch', initialArgument: record.initialArgument }
+      : undefined
+  }
   if (candidate?.kind === 'completion') {
     const record = exactPlainRecord(value, ['completionText', 'kind'])
     return record && typeof record.completionText === 'string' && validLauncherCompletion(record.completionText)
@@ -586,10 +599,11 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
   if (candidate?.kind === 'windowActivation') {
     const record = exactPlainRecord(
       value,
-      ['commandLabel', 'favorite', 'initialArgument', 'kind', 'pluginId'],
+      ['commandId', 'commandLabel', 'favorite', 'initialArgument', 'kind', 'pluginId'],
     )
     return record &&
         typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.commandId === 'string' && LAUNCHER_COMMAND.test(record.commandId) &&
         typeof record.commandLabel === 'string' && LAUNCHER_COMMAND.test(record.commandLabel) &&
         typeof record.initialArgument === 'string' && record.initialArgument.length <= 65_536 &&
         record.initialArgument.trim() === record.initialArgument &&
@@ -601,6 +615,7 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
       ? {
           kind: 'windowActivation',
           pluginId: record.pluginId,
+          commandId: record.commandId,
           commandLabel: record.commandLabel,
           initialArgument: record.initialArgument,
           favorite: record.favorite,
@@ -634,11 +649,12 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
       : undefined
   }
   if (candidate?.kind === 'panelActivation') {
-    const record = exactPlainRecord(value, ['favorite', 'initialArgument', 'kind', 'pluginId'])
+    const record = exactPlainRecord(value, ['commandId', 'favorite', 'initialArgument', 'kind', 'pluginId'])
     return record &&
         typeof record.pluginId === 'string' &&
         record.pluginId.length <= 64 &&
         PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+        typeof record.commandId === 'string' && LAUNCHER_COMMAND.test(record.commandId) &&
         typeof record.initialArgument === 'string' &&
         record.initialArgument.length <= 65_536 &&
         record.initialArgument.trim() === record.initialArgument &&
@@ -650,6 +666,7 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
       ? {
           kind: 'panelActivation',
           pluginId: record.pluginId,
+          commandId: record.commandId,
           initialArgument: record.initialArgument,
           favorite: record.favorite,
         }
@@ -679,7 +696,7 @@ function favoriteMatchesResult(
 ): boolean {
   if (favorite.target.kind === 'publicPlugin') {
     const plugin = pluginFavoriteActivation(activation)
-    return plugin?.pluginId === favorite.target.pluginId && (plugin.kind === 'mainResultActivation' ? plugin.commandId : 'default') === favorite.target.commandId && plugin.favorite === favorite.favorite
+    return plugin?.pluginId === favorite.target.pluginId && (plugin.kind === 'pluginCompletion' ? 'default' : plugin.commandId) === favorite.target.commandId && plugin.favorite === favorite.favorite
   }
   if (favorite.target.feature === 'find') {
     return activation.kind === 'openFind' && iconKind === 'find'
@@ -691,7 +708,7 @@ function favoriteMatchesResult(
     return activation.kind === 'openScreenshot' && iconKind === 'screenshot'
   }
   return iconKind === 'webSearch' &&
-    (activation.kind === 'completion' || activation.kind === 'executeResult')
+    (activation.kind === 'completion' || activation.kind === 'executeResult' || activation.kind === 'builtinActivation')
 }
 
 function safeCommandHint(value: unknown): string | undefined {
@@ -731,7 +748,7 @@ function errorText(value: unknown): string {
 
 function projectSnapshot(model: Model): LauncherSnapshot {
   const results = Object.freeze(
-    model.results.filter((result) => !result.transientPanelEntry).map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation, actions }) =>
+    model.results.filter((result) => !result.transientPanelEntry).map(({ key, title, subtitle, icon, pluginIconUrl, iconKind, detail, favorite, hasDefaultAction, activation, actions, defaultActionId }) =>
       Object.freeze({
         key,
         title,
@@ -742,6 +759,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(detail === undefined ? {} : { detail }),
         ...(hasDefaultAction === undefined ? {} : { hasDefaultAction }),
         ...(actions === undefined ? {} : { actions }),
+        ...(defaultActionId === undefined ? {} : { defaultActionId, defaultActionTitle: actions?.find((action) => action.actionId === defaultActionId)?.title }),
         ...(favorite === undefined
           ? {}
           : {
@@ -754,6 +772,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
           ? {
               panelActivation: Object.freeze({
                 pluginId: activation.pluginId,
+                commandId: activation.commandId,
                 initialArgument: activation.initialArgument,
               }),
             }
@@ -807,6 +826,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   const panel = model.panel
     ? Object.freeze({
         pluginId: model.panel.pluginId,
+        ...(model.panel.feedback ? { feedback: model.panel.feedback } : {}),
         commandLabel: model.panel.commandLabel,
         ...(model.panel.inputPlaceholder === undefined ? {} : { inputPlaceholder: model.panel.inputPlaceholder }),
         sessionEpoch: model.panel.sessionEpoch,
@@ -932,6 +952,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let unlistenBuiltinFeaturesChanged: (() => void) | undefined
   let unlistenScreenshotError: (() => void) | undefined
   let unlistenPanelError: (() => void) | undefined
+  let unlistenPanelStatus: (() => void) | undefined
   let unlistenPanelReset: (() => void) | undefined
   let unlistenPanelFocusHostInput: (() => void) | undefined
   let panelFocusListenerRegistration: Promise<boolean> | undefined
@@ -982,6 +1003,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     sequence: number
     query: string
   } | undefined
+  let stableBuiltinTarget: { feature: 'webSearch'; command: string } | undefined
   let completionOrigin: CompletionOriginOwner | undefined
   let commandEntryToken = 0
   let stableCommandOutputMode: 'mainResult' | 'window' | 'panel' | undefined
@@ -1812,7 +1834,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function replaceCompletionOrigin(
-    source: Pick<CompletionOriginOwner, 'resultKey' | 'pluginId' | 'command'>,
+    source: Pick<CompletionOriginOwner, 'resultKey' | 'pluginId' | 'commandId' | 'command'>,
     phase: CompletionOriginOwner['phase'],
   ): void {
     const invocationId = model.invocationId
@@ -1830,6 +1852,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       value: model.query,
       resultKey: source.resultKey,
       pluginId: source.pluginId,
+      ...(source.commandId === undefined ? {} : { commandId: source.commandId }),
       command: source.command,
     }
   }
@@ -1953,9 +1976,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     let ownedOrigin: ApplicationSearchOwner['completionOrigin']
     if (ownsCompletionOrigin(completionOrigin)) {
       if (!submit && completionOrigin.phase === 'armed') {
-        ownedOrigin = { token: completionOrigin.token, phase: 'preview', pluginId: completionOrigin.pluginId }
+        ownedOrigin = { token: completionOrigin.token, phase: 'preview', pluginId: completionOrigin.pluginId, ...(completionOrigin.commandId === undefined ? {} : { commandId: completionOrigin.commandId }) }
       } else if (submit && completionOrigin.phase === 'committing') {
-        ownedOrigin = { token: completionOrigin.token, phase: 'commit', pluginId: completionOrigin.pluginId }
+        ownedOrigin = { token: completionOrigin.token, phase: 'commit', pluginId: completionOrigin.pluginId, ...(completionOrigin.commandId === undefined ? {} : { commandId: completionOrigin.commandId }) }
       } else {
         return
       }
@@ -1975,6 +1998,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     try {
       pending = client.searchApps({
         query: captured.query,
+        ...(stableBuiltinTarget ? { stableBuiltinTarget: stableBuiltinTarget.feature } : {}),
         ...(stableCommandTarget ? { stableCommandTarget: { ...stableCommandTarget } } : {}),
         invocationId,
         querySequence: captured.sequence,
@@ -1985,6 +2009,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
               completionOrigin: {
                 phase: captured.completionOrigin.phase,
                 pluginId: captured.completionOrigin.pluginId,
+                ...(captured.completionOrigin.commandId === undefined ? {} : { commandId: captured.completionOrigin.commandId }),
               },
             }),
       })
@@ -2276,6 +2301,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed || !command) return
     if (composition?.control === command.suffix.key) composition = undefined
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     commandEntryToken++
     model.mainResultCommand = undefined
     completionOrigin = undefined
@@ -2293,6 +2319,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function applyEdit(value: string): void {
     commandEntryToken++
+    if (stableBuiltinTarget && completionCommand(value) !== stableBuiltinTarget.command) stableBuiltinTarget = undefined
     if (!model.mainResultCommand) stableCommandTarget = undefined
     cancelMinuteRefresh()
     invalidateFavoriteInteraction()
@@ -2485,6 +2512,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   ): void {
     commandEntryToken++
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     retireResultActionSource()
     cancelMinuteRefresh()
     invalidateFavoriteInteraction()
@@ -2570,7 +2598,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return false
   }
 
-  function commandHotkeyEntry(payload: unknown): void {
+  const consumedSelectionIds = new Set<string>()
+  function commandHotkeyEntry(payload: unknown, selectionText?: string, selectionError?: string): void {
     const entry = parseCommandHotkeyEntry(payload)
     if (destroyed || !entry || consumeHotkeyRecording(entry) || !model.invocationId) return
     // A new entry owns the source immediately, including while its resolve is awaiting.
@@ -2579,11 +2608,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     searchToken = ++token
     panelActionToken++
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     completionOrigin = undefined
     model.searchPending = false
     model.executePending = false
-    const owner = { token: ++commandEntryToken, epoch: model.viewEpoch, invocation: model.invocationId }
-    const owns = () => !destroyed && owner.token === commandEntryToken && owner.epoch === model.viewEpoch && owner.invocation === model.invocationId
+    const owner = { token: ++commandEntryToken, epoch: model.viewEpoch, invocation: model.invocationId, compositionGeneration }
+    const owns = () => owner.compositionGeneration === compositionGeneration && !destroyed && owner.token === commandEntryToken && owner.epoch === model.viewEpoch && owner.invocation === model.invocationId
     void client.resolvePublicPluginCommandEntry({ entry }).then((value) => {
       const resolved = parseCommandEntryResolution(value)
       if (!owns() || !resolved || resolved.pluginId !== entry.pluginId || resolved.commandId !== entry.commandId) return
@@ -2595,32 +2625,59 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       }
       cancelSlashSearch()
       stableCommandTarget = { ...entry }
+      if ((selectionText !== undefined || selectionError !== undefined) && (entry.pluginId !== 'com.uipilot.translate' || resolved.outputMode !== 'mainResult')) { model.status = '划词翻译命令不可用。'; publish(true); return }
       stableCommandOutputMode = resolved.outputMode
       const key = resultKey++
       const base = { key, resultId: `command-hotkey-${key}`, kind: 'application' as const, title: `/${resolved.commandLabel}`, hasDefaultAction: false }
       if (resolved.outputMode === 'panel' && !resolved.inputRequired) {
         clearResults()
         activateMainResultCommand({ pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, argument: '' })
-        const result: PrivateApplicationResult = { ...base, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: entry.pluginId, initialArgument: '', favorite: false } }
+        const result: PrivateApplicationResult = { ...base, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: entry.pluginId, commandId: entry.commandId, initialArgument: '', favorite: false } }
         model.results = [result]
         openPanel(result)
       } else if (resolved.outputMode === 'window' && !resolved.inputRequired) {
-        applyWindowActivation({ ...base, activation: { kind: 'windowActivation', pluginId: entry.pluginId, commandLabel: resolved.commandLabel, initialArgument: '', favorite: false } })
+        applyWindowActivation({ ...base, activation: { kind: 'windowActivation', pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, initialArgument: '', favorite: false } })
       } else {
-        applyMainResultActivation({ ...base, activation: { kind: 'mainResultActivation', pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, initialArgument: '', favorite: false } })
-        if (resolved.inputRequired) { model.commandHint = resolved.inputPlaceholder ?? '请输入内容'; publish(true) }
+        applyMainResultActivation({ ...base, activation: { kind: 'mainResultActivation', pluginId: entry.pluginId, commandId: entry.commandId, commandLabel: resolved.commandLabel, initialArgument: selectionText ?? '', favorite: false } })
+        if (selectionError !== undefined) {
+          // Keep the failure visible until the user edits; no empty preview or translation request.
+          cancelSlashSearch()
+          model.status = selectionError
+          model.commandHint = resolved.inputPlaceholder ?? '请输入内容'
+          publish(true)
+        } else if (selectionText !== undefined) commitArmedPluginCompletion()
+        else if (resolved.inputRequired) { model.commandHint = resolved.inputPlaceholder ?? '请输入内容'; publish(true) }
         else commitArmedPluginCompletion()
       }
     }).catch(() => { if (owns()) { model.status = '命令快捷键不可用，请检查插件状态。'; publish(true) } })
+  }
+
+  function builtinHotkeyEntry(feature: 'quicklinks' | 'webSearch', argument = ''): void {
+    cancelSlashSearch()
+    searchToken = ++token
+    const owner = { token: ++commandEntryToken, epoch: model.viewEpoch, invocation: model.invocationId, compositionGeneration }
+    const owns = () => owner.compositionGeneration === compositionGeneration && !destroyed && owner.token === commandEntryToken && owner.epoch === model.viewEpoch && owner.invocation === model.invocationId
+    model.searchPending = false
+    void client.listBuiltinFeatures().then((items) => {
+      if (!owns()) return
+      const item = items.find((candidate) => candidate.feature === feature)
+      if (!item?.enabled) { model.status = '此功能已停用'; publish(true); return }
+      if (feature === 'quicklinks') { openQuicklinks(); return }
+      stableBuiltinTarget = { feature, command: item.command.slice(1) }
+      applyEdit(`${item.command} ${argument}`)
+    }).catch(() => { if (owns()) { model.status = '无法读取启动配置，请重试。'; publish(true) } })
   }
 
   function shown(payload: unknown): void {
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
+    if (event.selectionTranslation && consumedSelectionIds.has(event.selectionTranslation.id)) return
+    if (event.selectionTranslation) consumedSelectionIds.add(event.selectionTranslation.id)
     if (event.target === 'launcher' && (hotkeyRecording || (model.view === 'settings' && Date.now() <= hotkeyShowGraceUntil)) && consumeHotkeyRecording(event.commandEntry)) {
       commandEntryToken++
       stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
       model.invocationId = event.invocationId
       return
     }
@@ -2631,7 +2688,22 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       void client.closePluginPanel({ sessionEpoch: panelSessionEpoch }).catch(() => undefined)
     }
     transitionView(event.target, event.invocationId, event.notice, 'native')
-    if (event.commandEntry) commandHotkeyEntry(event.commandEntry)
+    if (event.selectionTranslation) {
+      // A capture outcome owns this show, even when no command can be resolved.
+      // Retire the default launcher search queued by transitionView.
+      commandEntryToken++
+      model.searchPending = false
+    }
+    if (event.selectionTranslation?.error || (event.selectionTranslation && !event.selectionTranslation.text?.trim())) {
+      model.status = event.selectionTranslation.error ?? '未选择文字'
+      commandHotkeyEntry(event.commandEntry, undefined, model.status)
+      publish(true)
+    } else if (event.selectionTranslation?.text && (event.selectionTranslation.text.includes('\0') || new TextEncoder().encode(event.selectionTranslation.text).length > 8192)) {
+      model.status = '选中文字无效或超过 8192 字节，请缩短后重试。'
+      commandHotkeyEntry(event.commandEntry, undefined, model.status)
+      publish(true)
+    } else if (event.commandEntry) commandHotkeyEntry(event.commandEntry, event.selectionTranslation?.text)
+    else if (event.builtinEntry) builtinHotkeyEntry(event.builtinEntry)
     void messageCenter.refresh()
   }
 
@@ -2651,6 +2723,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function selectSettingsTab(key: SettingsTabKey): void {
     commandEntryToken++
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     if (destroyed || model.view !== 'settings' || model.settingsTab === key) return
     messageCenter.leave()
     model.settingsTab = key
@@ -2666,6 +2739,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const settingsControl = findTextControl(record.control) !== undefined
     if (!queryControl && !mainResultControl && !panelControl && !settingsControl) return
     if (settingsControl && !settingsEditable()) return
+    if (record.kind === 'ordinaryInput' || record.kind === 'compositionStart') {
+      commandEntryToken++
+      void client.cancelTranslationSelection?.().catch(() => {})
+    }
     if (record.kind === 'ordinaryInput') {
       if (ownsComposition(composition, record.control)) composition = undefined
       commitControl(record.control, record.value)
@@ -3079,6 +3156,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const panelTarget = model.panel.commandHotkeyTarget
     if (panelTarget && stableCommandOutputMode === 'panel' && (!stableCommandTarget || stableCommandTarget === panelTarget)) {
       stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
       stableCommandOutputMode = undefined
     }
     if (composition?.control === model.panel?.suffix.key) composition = undefined
@@ -3125,6 +3203,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (destroyed) return
     commandEntryToken++
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     const retiredActions = retireResultActionSource()
     cancelMinuteRefresh()
     const discardedPanel = discardPanelUi()
@@ -3326,6 +3405,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       query: model.query,
       resultKey: result.key,
       pluginId: result.activation.pluginId,
+      commandId: result.activation.commandId,
       argument: result.activation.initialArgument,
     }
     model.executePending = true
@@ -3333,7 +3413,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: ReturnType<LauncherClient['openPluginPanel']>
     try {
-      pending = client.openPluginPanel({ pluginId: owner.pluginId, argument: owner.argument, ...(stableCommandTarget ? { stableCommandTarget: { ...stableCommandTarget } } : {}) })
+      pending = client.openPluginPanel({ pluginId: owner.pluginId, commandId: owner.commandId, argument: owner.argument, ...(stableCommandTarget ? { stableCommandTarget: { ...stableCommandTarget } } : {}) })
     } catch (error) {
       pending = Promise.reject(error)
     }
@@ -3345,6 +3425,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const releaseFailedHotkeyOpen = () => {
       if (!ownsQuery() || !owner.commandHotkeyTarget || stableCommandTarget !== owner.commandHotkeyTarget) return
       stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
       stableCommandOutputMode = undefined
       if (composition?.control === model.mainResultCommand?.suffix.key) composition = undefined
       model.mainResultCommand = undefined
@@ -3468,6 +3549,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     resetPanelUi(FALLBACK_ERROR)
   }
 
+  function handlePanelStatus(payload: unknown): void {
+    const event = parsePluginPanelStatusEvent(payload)
+    const panel = model.panel
+    if (destroyed || model.view !== 'launcher' || !event || !panel || panel.closePending ||
+        event.sessionEpoch !== panel.sessionEpoch ||
+        (panel.feedback && compareDecimalRevision(event.sequence, panel.feedback.sequence) <= 0)) return
+    panel.feedback = event
+    publish(true)
+  }
+
   function handlePanelReset(payload: unknown): void {
     const event = parsePluginPanelErrorEvent(payload)
     const panel = model.panel
@@ -3531,6 +3622,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     replaceCompletionOrigin({
       resultKey: result.key,
       pluginId: activation.pluginId,
+      commandId: activation.commandId,
       command: activation.commandLabel,
     }, 'armed')
     scheduleSearch()
@@ -3554,6 +3646,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     replaceCompletionOrigin({
       resultKey: result.key,
       pluginId: activation.pluginId,
+      commandId: activation.commandId,
       command: activation.commandLabel,
     }, 'committing')
     beginSearch(true)
@@ -3700,7 +3793,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           : stale ? '结果已过期，请重新运行'
           : outcome.sourceConsumed ? actionUncertain
           : outcome.code === 'actionBusy' ? '插件正忙，请稍后再试'
-          : outcome.code === 'pluginPermissionDenied' ? '插件无权执行此动作'
+          : outcome.code === 'pluginPermissionDenied' ? '此动作所需权限不可用，请在「设置 → 权限」中检查。'
           : '动作暂不可用，请稍后再试'
         failResultAction(owner, status, stale || outcome.sourceConsumed)
         return
@@ -3761,7 +3854,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         else openResultActionMenu()
         return
       }
-      if (selected.activation.kind !== 'executeResult' && selected.activation.kind !== 'informational') { stableCommandTarget = undefined; stableCommandOutputMode = undefined; commandEntryToken++ }
+      if (selected.activation.kind !== 'executeResult' && selected.activation.kind !== 'informational') { stableBuiltinTarget = undefined; stableCommandTarget = undefined; stableCommandOutputMode = undefined; commandEntryToken++ }
       if (selected.activation.kind === 'completion') {
         applyEdit(selected.activation.completionText)
         return
@@ -3780,6 +3873,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       }
       if (selected.activation.kind === 'panelActivation') {
         openPanel(selected)
+        return
+      }
+      if (selected.activation.kind === 'builtinActivation') {
+        builtinHotkeyEntry(selected.activation.feature, selected.activation.initialArgument)
         return
       }
       if (selected.activation.kind === 'openFind') {
@@ -3948,8 +4045,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function requestHide(): Promise<void> {
+    void client.cancelTranslationSelection?.().catch(() => {})
     commandEntryToken++
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     if (destroyed || model.hidePending) return
     retireResultActionSource()
     cancelMinuteRefresh()
@@ -3990,6 +4089,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       else if (input.key === 'ArrowUp') declaration = key = 'ArrowUp'
       else if (input.key === 'Tab') declaration = key = 'Tab'
       else if (input.key === 'Enter') declaration = key = 'Enter'
+      else if (input.key === 'Delete' && !input.repeat && panel.suffix.draft === '') declaration = key = 'Delete'
     } else if (
       input.key === 'Tab' &&
       input.shiftKey &&
@@ -4054,7 +4154,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         const argument = model.mainResultCommand.suffix.value.trim()
         if (!argument) return
         const key = resultKey++
-        const result: PrivateApplicationResult = { key, resultId: `command-hotkey-${key}`, kind: 'application', title: model.mainResultCommand.commandLabel, hasDefaultAction: false, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: stableCommandTarget.pluginId, initialArgument: argument, favorite: false } }
+        const result: PrivateApplicationResult = { key, resultId: `command-hotkey-${key}`, kind: 'application', title: model.mainResultCommand.commandLabel, hasDefaultAction: false, transientPanelEntry: true, activation: { kind: 'panelActivation', pluginId: stableCommandTarget.pluginId, commandId: stableCommandTarget.commandId, initialArgument: argument, favorite: false } }
         clearResults()
         model.results = [result]
         openPanel(result)
@@ -4161,6 +4261,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     let hiddenRegistered: (() => void) | undefined
     let builtinFeaturesChangedRegistered: (() => void) | undefined
     let panelErrorsRegistered: (() => void) | undefined
+    let panelStatusRegistered: (() => void) | undefined
     let panelResetsRegistered: (() => void) | undefined
     let screenshotErrorsRegistered: (() => void) | undefined
     try {
@@ -4168,6 +4269,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hiddenRegistered = await client.listenHidden(hidden)
       builtinFeaturesChangedRegistered = await client.listenBuiltinFeaturesChanged?.(builtinFeaturesChanged)
       panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
+      panelStatusRegistered = await client.listenPluginPanelStatus?.(handlePanelStatus)
       panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
       screenshotErrorsRegistered = await client.listenScreenshotError((payload) => {
         const error = exactPlainRecord(payload, ['code', 'invocationId', 'querySequence'])
@@ -4182,6 +4284,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hiddenRegistered?.()
       builtinFeaturesChangedRegistered?.()
       panelErrorsRegistered?.()
+      panelStatusRegistered?.()
       panelResetsRegistered?.()
       screenshotErrorsRegistered?.()
       unlistenPanelFocusHostInput?.()
@@ -4194,6 +4297,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       hiddenRegistered()
       builtinFeaturesChangedRegistered?.()
       panelErrorsRegistered()
+      panelStatusRegistered?.()
       panelResetsRegistered()
       screenshotErrorsRegistered()
       return
@@ -4202,6 +4306,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlistenHidden = hiddenRegistered
     unlistenBuiltinFeaturesChanged = builtinFeaturesChangedRegistered
     unlistenPanelError = panelErrorsRegistered
+    unlistenPanelStatus = panelStatusRegistered
     unlistenPanelReset = panelResetsRegistered
     unlistenScreenshotError = screenshotErrorsRegistered
     await messageCenter.start()
@@ -4238,6 +4343,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function destroy(): void {
     commandEntryToken++
     stableCommandTarget = undefined
+    stableBuiltinTarget = undefined
     if (destroyed) return
     retireResultActionSource()
     cancelMinuteRefresh()
@@ -4266,6 +4372,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlistenScreenshotError?.()
     unlistenScreenshotError = undefined
     unlistenPanelError?.()
+    unlistenPanelStatus?.()
+    unlistenPanelStatus = undefined
     unlistenPanelError = undefined
     unlistenPanelReset?.()
     unlistenPanelReset = undefined

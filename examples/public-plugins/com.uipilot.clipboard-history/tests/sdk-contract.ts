@@ -12,7 +12,7 @@ const handler: PluginHandler = async (invocation) => ({
 })
 
 const consumeClipboardHistory = async (api: Readonly<UiPilotPluginPanelApiV1>) => {
-  const snapshot: Readonly<ClipboardHistorySnapshot> = await api.clipboardHistory.list()
+  const snapshot: Readonly<ClipboardHistorySnapshot> = await api.clipboardHistory.list({ query: '关键词' })
   const revision: string = snapshot.revision
 
   for (const entry of snapshot.entries) {
@@ -43,17 +43,23 @@ const consumeClipboardHistory = async (api: Readonly<UiPilotPluginPanelApiV1>) =
     void nextRevision
   })
   const unsubscribeKeys = api.onHostKey(async (event: Readonly<PluginPanelHostKeyEvent>) => {
-    const key: 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter' = event.key
-    if (key === 'Enter') {
-      const result = await api.clipboardHistory.paste({
-        id: snapshot.entries[0]?.id ?? 'missing',
-        routeSequence: event.routeSequence,
-      })
-      const outcome: 'admitted' = result.outcome
-      void outcome
-    }
+    const key: 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter' | 'Delete' = event.key
+    void key
+
   })
 
+  const unsubscribeActions = api.onActions(() => ({
+    context: [{ id: 'delete-entry', title: '删除当前记录', shortcut: 'Delete', icon: 'trash', run: () => api.clipboardHistory.remove({ id: 'entry-1' }) }],
+    global: [
+      { id: 'next-category', title: '下一分类', shortcut: 'Tab', icon: 'arrow-right-to-line', run() {} },
+      { id: 'previous-category', title: '上一分类', shortcut: 'Shift+Tab', icon: 'arrow-left-to-line', run() {} },
+    ],
+  }))
+  await api.setStatus({ message: '已删除', tone: 'success' })
+  unsubscribeActions()
+
+  const copied: 'copied' = (await api.clipboardHistory.copy({ id: 'entry-1' })).outcome
+  void copied
   await api.clipboardHistory.remove({ id: 'entry-1' })
   await api.clipboardHistory.clear()
 

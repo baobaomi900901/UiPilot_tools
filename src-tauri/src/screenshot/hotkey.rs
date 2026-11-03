@@ -160,7 +160,28 @@ impl ScreenshotHotkeys {
 }
 
 pub(crate) fn conflicts(settings: &Settings, chord: &str) -> bool {
-    crate::hotkey::HotkeyKind::parse(&settings.hotkey).is_ok_and(|h| h.canonical() == chord)
+    builtin_conflicts(
+        settings,
+        crate::settings::ManagedBuiltinFeature::Screenshot,
+        chord,
+    )
+}
+
+pub(crate) fn builtin_conflicts(
+    settings: &Settings,
+    feature: crate::settings::ManagedBuiltinFeature,
+    chord: &str,
+) -> bool {
+    settings.translation_selection_hotkey.as_deref().is_some_and(|s| command_chord(s).is_ok_and(|s| s.to_string() == chord))
+        || crate::hotkey::HotkeyKind::parse(&settings.hotkey).is_ok_and(|h| h.canonical() == chord)
+        || crate::settings::ManagedBuiltinFeature::ALL
+            .into_iter()
+            .filter(|other| *other != feature)
+            .any(|other| {
+                settings
+                    .builtin_hotkey(other)
+                    .is_some_and(|saved| command_chord(saved).is_ok_and(|s| s.to_string() == chord))
+            })
         || settings
             .public_plugin_command_hotkeys
             .values()
@@ -179,6 +200,35 @@ mod tests {
         collections::BTreeSet,
     };
 
+    #[test]
+    fn builtin_chords_conflict_except_for_their_own_binding() {
+        use crate::settings::ManagedBuiltinFeature as F;
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "hotkey": "Alt+Space", "autostart": false, "screenshotHotkey": "Ctrl+S",
+            "builtinHotkeys": {"quicklinks": "Ctrl+Q", "webSearch": "Ctrl+W"}
+        }))
+        .unwrap();
+        assert!(!builtin_conflicts(
+            &settings,
+            F::Quicklinks,
+            &command_chord("Ctrl+Q").unwrap().to_string()
+        ));
+        assert!(builtin_conflicts(
+            &settings,
+            F::Quicklinks,
+            &command_chord("Ctrl+W").unwrap().to_string()
+        ));
+        assert!(builtin_conflicts(
+            &settings,
+            F::Screenshot,
+            &command_chord("Ctrl+Q").unwrap().to_string()
+        ));
+        assert!(builtin_conflicts(
+            &settings,
+            F::WebSearch,
+            &command_chord("Ctrl+S").unwrap().to_string()
+        ));
+    }
     #[test]
     fn screenshot_hotkey_unset_restore_clear_and_repeat() {
         let keys = ScreenshotHotkeys::default();

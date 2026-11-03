@@ -187,6 +187,7 @@ pub(crate) enum PluginPanelHostKey {
     N,
     Tab,
     Enter,
+    Delete,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -241,6 +242,10 @@ impl HostKeyEnqueueInput {
                     && !self.meta_key
                     && self.shift_key
                     && !self.alt_key
+            }
+            PanelHostKeyDeclaration::Delete => {
+                self.key == PluginPanelHostKey::Delete
+                    && !self.ctrl_key && !self.meta_key && !self.shift_key && !self.alt_key
             }
             PanelHostKeyDeclaration::Enter => {
                 self.key == PluginPanelHostKey::Enter
@@ -373,6 +378,7 @@ struct LiveSession {
     current_submission_token: String,
     pending: Option<PendingDispatch>,
     content_focused: bool,
+    actions_focus_blur_expected: bool,
     content_visible: bool,
     host_key_route: HostKeyRouteState,
     runtime_request: Option<crate::public_plugins::PanelActionRegistration>,
@@ -433,6 +439,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 (() => {
   'use strict';
   __PANEL_JSON__
+  __CONTEXT_ACTIONS_UI__
   const runtimeActions = __RUNTIME_ACTIONS__;
   let handler = null;
   let hostKeyHandler = null;
@@ -442,6 +449,8 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   let storageSession = null;
   let clipboardHistorySession = null;
   let liveSessionEpoch = '__SESSION_EPOCH__';
+  const contextActions = installPanelContextActions({ document, window, createMenu: createContextActionsMenu,
+    getEpoch: () => liveSessionEpoch, invoke: (...args) => invoke(...args) });
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
     seen.add(value);
@@ -468,6 +477,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     if (raw === 'RecordUnavailable') return namedError('RecordUnavailable');
     if (raw === 'PasteTargetUnavailable') return namedError('PasteTargetUnavailable');
     if (raw === 'ClipboardWriteFailed') return namedError('ClipboardWriteFailed');
+    if (raw === 'InvalidQuery') return namedError('InvalidQuery');
     return error;
   };
   const assertPlainObject = (value, message) => {
@@ -543,6 +553,13 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     }
     return deepFreeze({ outcome: 'admitted' });
   };
+  const normalizeClipboardHistoryCopyOutcome = (outcome) => {
+    const value = assertPlainObject(outcome, 'invalid clipboard history copy outcome');
+    if (Object.keys(value).sort().join(',') !== 'outcome' || value.outcome !== 'copied') {
+      throw new TypeError('invalid clipboard history copy outcome');
+    }
+    return deepFreeze({ outcome: 'copied' });
+  };
   const hostKeys = deepFreeze(__HOST_KEYS__);
   const expiredStorage = deepFreeze({
     get: async () => { throw new Error('ExpiredWindowSessionError'); },
@@ -553,6 +570,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     list: async () => { throw namedError('ExpiredPanelSession'); },
     onChanged: () => { throw namedError('ExpiredPanelSession'); },
     paste: async () => { throw namedError('ExpiredPanelSession'); },
+    copy: async () => { throw namedError('ExpiredPanelSession'); },
     remove: async () => { throw namedError('ExpiredPanelSession'); },
     clear: async () => { throw namedError('ExpiredPanelSession'); },
   });
@@ -592,7 +610,9 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     const call = async (command, args = {}) => {
       if (!session.active || clipboardHistorySession !== session || !invoke) throw namedError('ExpiredPanelSession');
       try {
-        return await invoke(command, { sessionEpoch, ...args });
+        const result = await invoke(command, { sessionEpoch, ...args });
+        if (!session.active || clipboardHistorySession !== session) throw namedError('ExpiredPanelSession');
+        return result;
       } catch (error) {
         throw mapClipboardHistoryError(error);
       }
@@ -641,7 +661,20 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     };
     session.close = close;
     session.facade = deepFreeze({
-      async list() {
+      async list(input) {
+        if (input !== undefined) {
+          const value = assertPlainObject(input, 'invalid clipboard history query');
+          if (Object.keys(value).some(key => key !== 'query') ||
+            (value.query !== undefined && typeof value.query !== 'string')) {
+            throw new TypeError('invalid clipboard history query');
+          }
+          if (value.query !== undefined && Array.from(value.query).length > 512) throw namedError('InvalidQuery');
+          if (value.query !== undefined) {
+            // Queries may share a revision but have different results. Never let
+            // them replace the unfiltered snapshot used by onChanged polling.
+            return normalizeClipboardHistorySnapshot(await call('plugin_panel_clipboard_history_list', { query: value.query }));
+          }
+        }
         const token = ++session.readToken;
         const snapshot = normalizeClipboardHistorySnapshot(await call('plugin_panel_clipboard_history_list'));
         const current = session.snapshot;
@@ -678,6 +711,13 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
           id: value.id,
           routeSequence: value.routeSequence,
         }));
+      },
+      async copy(input) {
+        const value = assertPlainObject(input, 'invalid clipboard history copy input');
+        if (Object.keys(value).sort().join(',') !== 'id' || typeof value.id !== 'string' || !value.id) {
+          throw new TypeError('invalid clipboard history copy input');
+        }
+        return normalizeClipboardHistoryCopyOutcome(await call('plugin_panel_clipboard_history_copy', { id: value.id }));
       },
       async remove(input) {
         const value = assertPlainObject(input, 'invalid clipboard history remove input');
@@ -729,7 +769,27 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       });
     });
   };
+  let statusSequence = 0n;
   const apiShape = {
+    onActions(next) { return contextActions.register(next); },
+    get setStatus() {
+      const epoch = liveSessionEpoch;
+      return async (input) => {
+        if (!invoke || epoch !== liveSessionEpoch) throw new Error('ExpiredPanelSession');
+        const value = assertPlainObject(input, 'invalid panel status');
+        const tone = value.tone ?? 'info';
+        if (Object.keys(value).some(key => key !== 'message' && key !== 'tone') ||
+            typeof value.message !== 'string' || [...value.message].length > 512 ||
+            value.message.includes('\u0000') || !['info', 'success', 'error'].includes(tone)) {
+          throw new TypeError('invalid panel status');
+        }
+        if (statusSequence >= 18446744073709551615n) throw new Error('ExpiredPanelSession');
+        await invoke('plugin_panel_set_status', {
+          sessionEpoch: epoch, sequence: String(++statusSequence),
+          status: { message: value.message, tone },
+        });
+      };
+    },
     onUpdate(next) {
       if (handler || typeof next !== 'function') throw new TypeError('one onUpdate handler required');
       handler = next;
@@ -787,6 +847,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_PREPARE__', {
     configurable: false,
     value: ({ sessionEpoch }) => {
+      contextActions.reset();
       if (typeof sessionEpoch !== 'string' || !/^(0|[1-9][0-9]*)$/.test(sessionEpoch) || sessionEpoch === '0') {
         throw new TypeError('invalid session epoch');
       }
@@ -804,6 +865,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_UPDATE__', {
     configurable: false,
     value: async (update) => {
+      contextActions.reset();
       if (!handler || !invoke) throw new Error('content not ready');
       const root = document.documentElement;
       const dark = update.theme === 'dark';
@@ -835,6 +897,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     },
   });
   document.addEventListener('keydown', (event) => {
+    if (contextActions.handleKey(event)) return;
     if (
       event.key.toLowerCase() === 'f' && event.ctrlKey !== event.metaKey &&
       !event.shiftKey && !event.altKey
@@ -869,6 +932,9 @@ fn panel_bootstrap_with_actions(
     actions: bool,
 ) -> String {
     PUBLIC_PANEL_BOOTSTRAP_TEMPLATE
+        .replace("__CONTEXT_ACTIONS_UI__", &format!("{}\n{}",
+            include_str!("../../src/context-actions-ui.js").replace("export function", "function"),
+            include_str!("../../src/panel-context-actions.js").replace("export function", "function")))
         .replace(
             "__PANEL_JSON__",
             crate::public_plugins::panel_action::JSON_BOOTSTRAP,
@@ -1035,6 +1101,14 @@ impl PluginPanelController {
             .ok_or(PanelBoundsError::Stale)
     }
 
+    pub(crate) fn expect_actions_focus(&self, epoch: u64, expected: bool) -> Result<(), PanelBoundsError> {
+        let mut core = self.core.lock().map_err(|_| PanelBoundsError::Unavailable)?;
+        let session = core.session.as_mut().filter(|session| session.identity.session_epoch == epoch)
+            .ok_or(PanelBoundsError::Stale)?;
+        session.actions_focus_blur_expected = expected && !session.content_focused;
+        Ok(())
+    }
+
     pub(crate) fn mark_content_visible(&self, session_epoch: u64) -> Result<(), PanelBoundsError> {
         let mut core = self
             .core
@@ -1077,6 +1151,7 @@ impl PluginPanelController {
             current_submission_token: owner.submission_token,
             pending: None,
             content_focused: false,
+            actions_focus_blur_expected: false,
             content_visible: false,
             host_key_route: HostKeyRouteState::default(),
             runtime_request: None,
@@ -1320,6 +1395,7 @@ impl PluginPanelController {
         core.main_content_focused = true;
         if let Some(session) = core.session.as_mut() {
             session.content_focused = false;
+            session.actions_focus_blur_expected = false;
         }
         if !current {
             self.changed.notify_all();
@@ -1482,6 +1558,7 @@ impl PluginPanelController {
             .map(|session| session.identity.session_epoch);
         if let Some(session) = core.session.as_mut() {
             session.content_focused = false;
+            session.actions_focus_blur_expected = false;
         }
         if let Some(ticket) = core.host_input_focus.as_mut() {
             if Some(ticket.identity.session_epoch) == live_epoch
@@ -1527,7 +1604,8 @@ impl PluginPanelController {
         core.focus_revision = revision;
         core.main_content_focused = false;
         let host_key_focus_transfer = core.session.as_mut().is_some_and(|session| {
-            std::mem::take(&mut session.host_key_route.native_focus_blur_expected)
+            let actions = std::mem::take(&mut session.actions_focus_blur_expected);
+            std::mem::take(&mut session.host_key_route.native_focus_blur_expected) || actions
         });
         if expected_transfer_blur
             || host_key_focus_transfer
@@ -1569,6 +1647,7 @@ impl PluginPanelController {
             .as_mut()
             .expect("validated panel focus session");
         session.content_focused = true;
+        session.actions_focus_blur_expected = false;
         session.host_key_route.native_focus_blur_expected = false;
         true
     }
@@ -2518,6 +2597,30 @@ impl PluginPanelController {
         self.begin_content_call(content_label, session_epoch, mutable)
     }
 
+    /// The caller holds the plugin authorization gate first. Keep the current
+    /// panel stable through the synchronous clipboard write; the effect must
+    /// not re-enter the controller or acquire plugin authorization locks.
+    pub(crate) fn with_current_clipboard_history_copy<T>(
+        &self,
+        content_label: &str,
+        session_epoch: u64,
+        effect: impl FnOnce(&PanelSessionIdentity) -> Result<T, crate::clipboard_history::ClipboardHistoryPasteError>,
+    ) -> Result<T, crate::clipboard_history::ClipboardHistoryPasteError> {
+        use crate::clipboard_history::ClipboardHistoryPasteError;
+        let plugin_id = plugin_id_from_panel_content_label(content_label)
+            .ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+        let core = self.core.lock().map_err(|_| ClipboardHistoryPasteError::ExpiredPanelSession)?;
+        let session = core.session.as_ref().ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+        if session.identity.content_label != content_label
+            || session.identity.plugin_id != plugin_id
+            || session.identity.session_epoch != session_epoch
+            || session.phase == PanelPhase::AwaitingReady
+        {
+            return Err(ClipboardHistoryPasteError::ExpiredPanelSession);
+        }
+        effect(&session.identity)
+    }
+
     pub(crate) fn teardown_session(
         &self,
         session_epoch: Option<u64>,
@@ -2691,6 +2794,44 @@ pub(crate) fn teardown_plugin(
     let identity = controller.teardown_plugin(plugin_id)?;
     destroy_content(app, &identity.content_label);
     Some(identity)
+}
+
+fn teardown_plugin_checked_with(
+    controller: &PluginPanelController,
+    plugin_id: &str,
+    close: impl FnOnce() -> Result<(), PublicPluginManagementError>,
+) -> (
+    Option<PanelSessionIdentity>,
+    Result<(), PublicPluginManagementError>,
+) {
+    let identity = controller.teardown_plugin(plugin_id);
+    // Keep the retired identity available for the host reset event even on failure.
+    let result = close();
+    (identity, result)
+}
+
+pub(crate) fn teardown_plugin_checked(
+    app: &AppHandle,
+    controller: &PluginPanelController,
+    plugin_id: &str,
+) -> (
+    Option<PanelSessionIdentity>,
+    Result<(), PublicPluginManagementError>,
+) {
+    teardown_plugin_checked_with(controller, plugin_id, || {
+        let mut result = Ok(());
+        // Failed native closes can outlive their retired session. Include those
+        // owned webviews on retries, without touching another plugin's panel.
+        for (label, webview) in app.webviews() {
+            if plugin_id_from_panel_content_label(&label).as_deref() == Some(plugin_id) {
+                controller.retire_content_request(&label);
+                if webview.close().is_err() {
+                    result = Err(PublicPluginManagementError::Unavailable);
+                }
+            }
+        }
+        result
+    })
 }
 
 fn main_physical_size(main: &tauri::Window) -> Result<(f64, f64), PanelBoundsError> {
@@ -3485,6 +3626,40 @@ mod tests {
     }
 
     #[test]
+    fn permission_access_panel_teardown_reports_native_failure_and_retires_bounds() {
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("permission-close")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let (retired, result) =
+            teardown_plugin_checked_with(&controller, &identity.plugin_id, || {
+                calls.set(calls.get() + 1);
+                assert!(controller.live_identity().is_none());
+                Err(PublicPluginManagementError::Unavailable)
+            });
+        assert_eq!(retired, Some(identity.clone()));
+        assert!(matches!(
+            result,
+            Err(PublicPluginManagementError::Unavailable)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(controller
+            .begin_content_call(&identity.content_label, identity.session_epoch, false)
+            .is_err());
+        assert!(matches!(
+            controller.claim_bounds_identity(identity.session_epoch),
+            Err(PanelBoundsError::Stale)
+        ));
+        let (retired, result) =
+            teardown_plugin_checked_with(&controller, &identity.plugin_id, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+        assert!(retired.is_none());
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
     fn panel_labels_are_hex_encoded_and_round_trip() {
         let label = plugin_panel_content_label("com.uipilot.demo-panel", 42).unwrap();
         assert!(label.starts_with("plugin-panel-content-"));
@@ -3638,6 +3813,21 @@ mod tests {
         assert!(controller.content_got_focus(&identity.content_label, identity.session_epoch));
 
         assert!(!controller.confirm_app_blur(&ticket));
+    }
+
+    #[test]
+    fn actions_focus_transfer_is_session_bound_consumed_once_and_cleared_on_failure() {
+        let controller = PluginPanelController::default();
+        let identity = host_key_session(&controller);
+        assert_content_visible(&controller, &identity);
+        assert!(controller.main_content_got_focus());
+        assert!(controller.expect_actions_focus(identity.session_epoch + 1, true).is_err());
+        controller.expect_actions_focus(identity.session_epoch, true).unwrap();
+        assert!(controller.main_content_lost_focus(false).is_none());
+        assert!(controller.main_content_got_focus());
+        controller.expect_actions_focus(identity.session_epoch, true).unwrap();
+        controller.expect_actions_focus(identity.session_epoch, false).unwrap();
+        assert!(controller.main_content_lost_focus(false).is_some());
     }
 
     #[test]
@@ -4269,6 +4459,20 @@ mod tests {
             shift_key,
             alt_key,
         }
+    }
+
+    #[test]
+    fn delete_host_key_requires_exact_chord() {
+        let valid = host_key_chord(PanelHostKeyDeclaration::Delete, PluginPanelHostKey::Delete, false, false, false, false);
+        assert!(valid.valid_chord());
+        for invalid in [
+            HostKeyEnqueueInput { ctrl_key: true, ..valid },
+            HostKeyEnqueueInput { meta_key: true, ..valid },
+            HostKeyEnqueueInput { shift_key: true, ..valid },
+            HostKeyEnqueueInput { alt_key: true, ..valid },
+            HostKeyEnqueueInput { key: PluginPanelHostKey::Enter, ..valid },
+            HostKeyEnqueueInput { declaration: PanelHostKeyDeclaration::Enter, ..valid },
+        ] { assert!(!invalid.valid_chord()); }
     }
 
     #[test]
@@ -5597,6 +5801,50 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_history_copy_requires_current_ready_session_and_serializes_effect() {
+        use crate::clipboard_history::ClipboardHistoryPasteError;
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        let called = std::cell::Cell::new(false);
+        let rejected = controller.with_current_clipboard_history_copy(
+            &identity.content_label, identity.session_epoch, |_| { called.set(true); Ok(()) });
+        assert_eq!(rejected, Err(ClipboardHistoryPasteError::ExpiredPanelSession));
+        assert!(!called.get());
+        assert!(content_ready(&controller, &identity.content_label, identity.session_epoch));
+        let result = controller.with_current_clipboard_history_copy(
+            &identity.content_label, identity.session_epoch, |current| {
+                assert_eq!(current, &identity);
+                // Session replacement/teardown uses this same gate. It cannot
+                // interleave between validation and the clipboard effect.
+                assert!(controller.core.try_lock().is_err());
+                called.set(true);
+                Ok("copied")
+            });
+        assert_eq!(result, Ok("copied"));
+        assert!(called.get());
+        called.set(false);
+        controller.teardown_session(Some(identity.session_epoch));
+        let rejected = controller.with_current_clipboard_history_copy(
+            &identity.content_label, identity.session_epoch, |_| { called.set(true); Ok(()) });
+        assert_eq!(rejected, Err(ClipboardHistoryPasteError::ExpiredPanelSession));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn clipboard_history_copy_rejects_forged_caller_and_replaced_epoch() {
+        use crate::clipboard_history::ClipboardHistoryPasteError;
+        let controller = PluginPanelController::default();
+        let identity = controller.open_session(owner("a")).unwrap();
+        assert!(content_ready(&controller, &identity.content_label, identity.session_epoch));
+        for (label, epoch) in [("forged", identity.session_epoch),
+            (identity.content_label.as_str(), identity.session_epoch + 1)] {
+            assert_eq!(controller.with_current_clipboard_history_copy(label, epoch,
+                |_| -> Result<(), ClipboardHistoryPasteError> { panic!("unauthorized write") }),
+                Err(ClipboardHistoryPasteError::ExpiredPanelSession));
+        }
+    }
+
+    #[test]
     fn storage_calls_require_live_panel_session_and_epoch() {
         let controller = PluginPanelController::default();
         let identity = controller.open_session(owner("a")).unwrap();
@@ -5694,6 +5942,8 @@ mod tests {
         assert_eq!(
             public_members,
             vec![
+                "onActions(next) { return contextActions.register(next); },",
+                "get setStatus() {",
                 "onUpdate(next) {",
                 "onHostKey(next) {",
                 "async focusHostInput() {",

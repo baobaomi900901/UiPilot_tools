@@ -178,6 +178,7 @@ pub(crate) enum PluginScheduleOutcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginCompletionOutcome {
+    pub(crate) credential_publication: Option<(u64, super::result_action::ResultActionLease)>,
     pub(crate) accepted: bool,
     pub(crate) next: Option<ScheduledPluginRequest>,
 }
@@ -723,7 +724,11 @@ impl PluginRequestScheduler {
         } else {
             None
         };
-        Ok(PluginCompletionOutcome { accepted, next })
+        Ok(PluginCompletionOutcome {
+            credential_publication: None,
+            accepted,
+            next,
+        })
     }
 
     pub(crate) fn context_status(&self, context: &PluginRequestContext) -> PluginContextStatus {
@@ -984,6 +989,41 @@ impl PluginRequestScheduler {
         candidate
             .map(|candidate| dispatch(&mut state, candidate, now))
             .transpose()
+    }
+
+    // A host credential lease belongs only to the request that used the service.
+    // Keep its physical execution slot until completion, as with permission revocation.
+    pub(crate) fn retire_request_context(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), PluginScheduleError> {
+        let mut state = self.lock()?;
+        let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        if let Some(running) = queue
+            .running
+            .as_mut()
+            .filter(|r| r.request.context == *context)
+        {
+            running.current = false;
+            running.action_retirement = Some(super::content_action::ContentActionError::Expired);
+            changed = true;
+        }
+        if let Some((_, reason)) = queue
+            .action_completion
+            .as_mut()
+            .filter(|(current, _)| current == context)
+        {
+            *reason = Some(super::content_action::ContentActionError::Expired);
+            changed = true;
+        }
+        if changed {
+            queue.result_publication.revoke();
+            queue.result_publication = super::result_action::ResultActionLease::default();
+        }
+        Ok(())
     }
 
     // Retire logical ownership while the Runtime still owns its execution slot.

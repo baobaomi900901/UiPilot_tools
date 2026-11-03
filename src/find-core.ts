@@ -52,6 +52,7 @@ export interface FindCore {
   acceptForward(payload: unknown): void
   acceptTheme(payload: unknown): void
   setQuery(query: string): void
+  submitSearch(): void
   setCategory(category: FileCategory): void
   cycleCategory(direction: 'next' | 'previous'): void
   setPreviewEnabled(enabled: boolean): void
@@ -445,6 +446,11 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     if (query) beginSearch()
   }
 
+  function submitSearch(): void {
+    if (destroyed || !model.ready || !model.invocationId || model.executePending || model.searchPending) return
+    if (model.query) beginSearch()
+  }
+
   function setCategory(category: FileCategory): void {
     if (!model.ready || !model.invocationId || model.executePending || category === model.category) return
     model.category = category
@@ -630,6 +636,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     acceptForward,
     acceptTheme,
     setQuery,
+    submitSearch,
     setCategory,
     cycleCategory,
     setPreviewEnabled,

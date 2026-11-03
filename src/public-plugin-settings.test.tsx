@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { PublicPluginDetail } from './public-plugin-panel'
 import type { LauncherClient, PublicPluginInventoryItem } from './protocol'
 
-const base: PublicPluginInventoryItem = { pluginId: 'com.example.settings', name: 'Settings', version: '1.0.0', description: null, source: 'localPackage', commands: [], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [
+const base: PublicPluginInventoryItem = { pluginId: 'com.example.settings', name: 'Settings', version: '1.0.0', description: null, source: 'localPackage', installationDirectory: null, commands: [], enabled: true, fault: null, generation: 1, iconUrl: null, network: null, permissions: [], settings: [
   { definition: { type: 'text', key: 'constructor', label: '文本', default: '你好' } },
   { definition: { type: 'number', key: 'count', label: '数量', min: 1, max: 5, step: 1, default: 2 } },
   { definition: { type: 'boolean', key: 'flag', label: '开关' } },
@@ -24,6 +24,50 @@ function button(label: string) { return host.querySelector<HTMLButtonElement>(`b
 async function click(label: string) { await act(async () => button(label).click()) }
 beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true, ResizeObserver: class { observe() {} unobserve() {} disconnect() {} } }); window.matchMedia = vi.fn().mockImplementation(() => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} })); host = document.createElement('div'); document.body.append(host); root = createRoot(host) })
 afterEach(async () => { await act(async () => root.unmount()); host.remove() })
+it('shows global credential availability independently from plugin authorization', async () => {
+  const client = { ...clientFixture(), credentials: { list: vi.fn(async () => ({ revision: '1', items: [{ service: 'youdaoTranslation', name: '有道', configured: true, enabled: false }] })) }, setPublicPluginPermissionAccess: vi.fn(async () => {}) }
+  const plugin: PublicPluginInventoryItem = { ...base, settings: [], permissions: [{ permission: 'credentials.youdaoTranslation', supported: true, granted: true }, { permission: 'credentials.baiduOcr', supported: true, granted: false }, { permission: 'credentials.deepseek', supported: true, granted: false }] }
+  const reload = await render(client, undefined, plugin)
+  expect(host.textContent).toContain('主程序密钥')
+  expect(host.textContent).toContain('有道翻译密钥 · credentials.youdaoTranslation')
+  const rows = [...host.querySelectorAll('.host-credential-row')]
+  expect(rows[0].textContent).toContain('配置已关闭'); expect(rows[0].textContent).toContain('已授权')
+  expect(rows[1].textContent).toContain('尚未配置'); expect(rows[1].textContent).toContain('未授权')
+  await click('有道翻译密钥')
+  expect(client.setPublicPluginPermissionAccess).toHaveBeenCalledExactlyOnceWith({ pluginId: base.pluginId, permission: 'credentials.youdaoTranslation', granted: false, expectedInventoryRevision: '1' })
+  expect(reload).toHaveBeenCalledOnce()
+})
+it('requires current credential consent and does not replay an authorization after a revision change', async () => {
+  const client = { ...clientFixture(), setPublicPluginPermissionAccess: vi.fn(async () => {}) }
+  const plugin: PublicPluginInventoryItem = { ...base, settings: [], permissions: [{ permission: 'credentials.deepseek', supported: true, granted: false }] }
+  await render(client, undefined, plugin)
+  expect(host.textContent).toContain('配置状态加载失败')
+  await click('DeepSeek 密钥')
+  expect(document.querySelector('[role="dialog"]')?.textContent).toContain('可能消耗 API 额度')
+  await render(client, undefined, plugin, '2')
+  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="确认开启DeepSeek 密钥"]')!.click())
+  expect(client.setPublicPluginPermissionAccess).not.toHaveBeenCalled()
+  expect(host.textContent).toContain('插件清单已改变')
+})
+it('refreshes detail permissions from host changes and uses the current read owner', async () => {
+  let changed: (() => void) | undefined
+  const unsubscribe = vi.fn()
+  const client = { ...clientFixture(), listenPublicPluginPermissionsChanged: vi.fn(async (handler: () => void) => { changed = handler; return unsubscribe }) }
+  const firstRead = vi.fn(async () => {})
+  await render(client, firstRead)
+  expect(changed).toBeTypeOf('function')
+  await act(async () => changed!())
+  expect(firstRead).toHaveBeenCalledTimes(1)
+  const nextRead = vi.fn(async () => {})
+  await render(client, nextRead)
+  await act(async () => changed!())
+  expect(nextRead).toHaveBeenCalledTimes(1)
+  expect(firstRead).toHaveBeenCalledTimes(1)
+  await act(async () => root.render(null))
+  expect(unsubscribe).toHaveBeenCalledTimes(1)
+  await act(async () => changed!())
+  expect(nextRead).toHaveBeenCalledTimes(1)
+})
 it('submits only dirty ordinary keys safely, keeps unset values absent and excludes secrets', async () => {
   const client = clientFixture(); await render(client)
   expect(button('保存普通设置').disabled).toBe(true)
@@ -58,7 +102,7 @@ it('keeps uncertain drafts, only retries reads, and distinguishes a saved write 
 })
 it('admits one save and excludes recovery until reconciliation, then ignores a closed detail completion', async () => {
   const client = clientFixture(), save = deferred(); client.savePublicPluginSettings.mockReturnValueOnce(save.promise); const reload = await render(client)
-  await input('文本', 'draft'); await act(async () => { button('保存普通设置').click(); button('保存普通设置').click(); [...host.querySelectorAll<HTMLButtonElement>('button')].find(b => b.textContent === '重新载入开发目录')!.click() })
+  await input('文本', 'draft'); await act(async () => { button('保存普通设置').click(); button('保存普通设置').click(); [...host.querySelectorAll<HTMLButtonElement>('button')].find(b => b.textContent === '重新载入')!.click() })
   expect(client.savePublicPluginSettings).toHaveBeenCalledOnce(); expect(client.selectPublicPluginDirectory).not.toHaveBeenCalled()
   await render(client, undefined, { ...base, pluginId: 'com.example.other' }); await act(async () => save.resolve()); expect(reload).not.toHaveBeenCalled(); expect(host.textContent).not.toContain('已保存')
 })
@@ -91,7 +135,7 @@ it('marks an owned accepted refresh saved, but preserves failed drafts when dura
 it('blocks ordinary editing and saving during a pending recovery confirmation', async () => {
   const client = { ...clientFixture(), selectPublicPluginDirectory: vi.fn(async () => 'synthetic/package'), preparePublicPlugin: vi.fn(async () => ({ token: 'one-use', pluginId: base.pluginId, name: base.name, version: '1.0.0', permissions: [], isUpdate: true, operation: 'developmentRefresh', previousVersion: '1.0.0', sourceVerified: false, iconUrl: null, network: null })) }
   await render(client); await input('文本', 'draft')
-  await act(async () => [...host.querySelectorAll<HTMLButtonElement>('button')].find(b => b.textContent === '重新载入开发目录')!.click())
+  await act(async () => [...host.querySelectorAll<HTMLButtonElement>('button')].find(b => b.textContent === '重新载入')!.click())
   expect(host.textContent).toContain('确认重新载入'); expect(button('保存普通设置').disabled).toBe(true)
   await click('保存普通设置'); expect(client.savePublicPluginSettings).not.toHaveBeenCalled()
 })

@@ -99,7 +99,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.14.1'
+    tooNewHost.minimumHostVersion = '0.16.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
@@ -669,3 +669,53 @@ it('matches Rust file-open manifest parity fixtures',async()=>{
  const cases=JSON.parse(await readFile(resolve('../../docs/plugin-sdk/tests/file-open-manifest-fixtures.json'),'utf8'))
  for(const item of cases)expect(validate(item.manifest).ok,item.name).toBe(item.valid)
 })
+
+
+describe('host credential service permissions', () => {
+ it.each(['credentials.youdaoTranslation', 'credentials.baiduOcr', 'credentials.deepseek'])('accepts %s only on Windows Host 0.15+', (permission) => {
+  const value = timerManifest()
+  value.minimumHostVersion = '0.15.0'
+  value.permissions = ['ui.window', permission]
+  expect(validate(value).issues).toEqual([])
+  value.minimumHostVersion = '0.14.0'
+  expect(validate(value).issues.length).toBeGreaterThan(0)
+  value.minimumHostVersion = '0.15.0'
+  value.supportedPlatforms = ['windows', 'macos']
+  expect(validate(value, 'macos').issues.length).toBeGreaterThan(0)
+ })
+})
+
+it('selection.read requires Windows Host 0.16 and is independent of clipboard permissions', () => {
+ const value = timerManifest()
+ value.minimumHostVersion = '0.16.0'
+ value.permissions = ['ui.window', 'selection.read']
+ expect(validate(value).issues).toEqual([])
+ expect(validate({ ...value, minimumHostVersion: '0.15.0' }).ok).toBe(false)
+ expect(validate({ ...value, supportedPlatforms: ['windows', 'macos'] }).ok).toBe(false)
+ expect(validate({ ...value, supportedPlatforms: ['macos'] }, 'macos').ok).toBe(false)
+})
+
+it('requires Host 0.16.0 for Delete host keys', async () => {
+  const manifest = JSON.parse(await readFile(resolve('../../examples/public-plugins/com.uipilot.clipboard-history/package/plugin.json'), 'utf8'))
+  manifest.panel.hostKeys = ['Delete', 'Tab']
+  manifest.minimumHostVersion = '0.16.0'
+  const accepted = validate(manifest)
+  expect(accepted.ok).toBe(true)
+  if (accepted.ok) expect(accepted.manifest.panel?.hostKeys).toEqual(['Tab', 'Delete'])
+  manifest.minimumHostVersion = '0.15.0'
+  expect(validate(manifest).issues.some((issue) => issue.code === 'API_INCOMPATIBLE')).toBe(true)
+})
+
+ it('requires Host 0.17.0, read permission, and Windows submit Panel for history copy', () => {
+   const value = { schemaVersion: 1, pluginId: 'com.example.copy', version: '1.0.0', apiVersion: 1,
+     minimumHostVersion: '0.17.0', name: 'Copy', supportedPlatforms: ['windows'],
+     command: { defaultName: 'copy', activationMode: 'submit', outputMode: 'panel', inputRequired: false },
+     runtime: { entry: 'dist/runtime.js' }, panel: { entry: 'dist/panel.html' },
+     permissions: ['ui.panel', 'clipboard.history.read', 'clipboard.history.copy'], settings: [] }
+   expect(validate(value)).toMatchObject({ ok: true })
+   expect(validate({ ...value, minimumHostVersion: '0.16.0' })).toMatchObject({ ok: false, issues: [{ code: 'API_INCOMPATIBLE' }] })
+   expect(validate({ ...value, permissions: ['ui.panel', 'clipboard.history.copy'] })).toMatchObject({ ok: false, issues: [{ code: 'MANIFEST_SEMANTIC_INVALID' }] })
+   expect(validate({ ...value, supportedPlatforms: ['windows', 'macos'] })).toMatchObject({ ok: false })
+   expect(validate({ ...value, command: { ...value.command, activationMode: 'live' } })).toMatchObject({ ok: false })
+   expect(validate({ ...value, command: { ...value.command, outputMode: 'mainResult' }, panel: undefined })).toMatchObject({ ok: false })
+ })

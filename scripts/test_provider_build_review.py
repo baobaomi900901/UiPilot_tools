@@ -51,8 +51,10 @@ class BuildReviewTests(unittest.TestCase):
         import dev_uipilot as d
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source=root/'rust source'
+            (root/'src-tauri').mkdir()
+            (root/'src-tauri/tauri.conf.json').write_text('{}')
             with patch.object(d,'run_dev',return_value=0):
-                d.main(['--root',str(root),'--rust-uia',str(source)])
+                self.assertEqual(d.main(['--root',str(root),'--rust-uia',str(source),'--non-interactive']), 0)
             self.assertEqual(__import__('json').loads((root/'.uipilot-local.json').read_text())['rust_uia'],str(source.resolve()))
 
     @unittest.skipUnless(os.name=='nt','Windows job handles')

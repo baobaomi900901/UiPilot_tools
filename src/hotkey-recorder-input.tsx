@@ -92,7 +92,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
   }, [releaseRecording, ownerId, onCommit, allowDoubleTap, allowSameValue, value, updateRecorderState])
 
   const display =
-    recording ? '按下快捷键…' : value ? formatHotkeyDisplay(value) : '未设置'
+    recording ? '按下快捷键…' : value ? formatHotkeyDisplay(value) : ''
 
   useLayoutEffect(() => {
     if (recording) {
@@ -198,6 +198,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
         readOnly
         aria-label={label}
         value={display}
+        placeholder="未设置"
         id={id}
         name={name}
         disabled={disabled || !recording || blockedByOwner}
@@ -212,7 +213,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
         onKeyUp={handleKeyUp}
       />
       <Button ref={actionRef} aria-label={`录制${label}`} disabled={disabled || arming || blockedByOwner} onClick={() => void toggleRecording()}>
-        {recording ? '取消录制' : '重新录制'}
+        {recording ? '取消录制' : value ? '重新录制' : '录制'}
       </Button>
       {armingFailed && <span role="status">无法开始录制，请重试。</span>}
     </div>

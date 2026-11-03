@@ -13,7 +13,7 @@ import type {
 import { readDirectorySnapshot, type DirectoryReaderOptions } from './directory-reader.js'
 import { PackagePolicyError } from './package-policy.js'
 import { validateSnapshot } from './validate.js'
-import { assertNoReparsePoints, createWindowsAttributeProbe } from './windows-attributes.js'
+import { assertNoReparsePoints, withWindowsAttributeProbe, type WindowsAttributeProbe } from './windows-attributes.js'
 
 interface PublicationOperations {
   open: (path: string, flags: 'wx') => Promise<FileHandle>
@@ -50,6 +50,11 @@ class OutputError extends Error {
 }
 
 async function checkOutput(source: string, output: string, options: PackOptions): Promise<void> {
+  return withWindowsAttributeProbe(options.hostPlatform ?? process.platform, options.probe,
+    (probe) => checkOutputWithProbe(source, output, probe))
+}
+
+async function checkOutputWithProbe(source: string, output: string, probe: WindowsAttributeProbe | undefined): Promise<void> {
   if (!output.endsWith('.uipilot-plugin')) throw new OutputError('OUTPUT_INVALID')
   try {
     await lstat(output)
@@ -58,9 +63,6 @@ async function checkOutput(source: string, output: string, options: PackOptions)
     if (systemCode(error) !== 'ENOENT') throw error
   }
   const parent = dirname(output)
-  const probe = (options.hostPlatform ?? process.platform) === 'win32'
-    ? options.probe ?? createWindowsAttributeProbe()
-    : undefined
   let current = parent
   for (;;) {
     const metadata = await lstat(current)

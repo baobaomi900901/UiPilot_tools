@@ -1,6 +1,6 @@
 mod address_policy;
 mod authority_gate;
-mod broker;
+pub(crate) mod broker;
 mod registry;
 mod transport;
 

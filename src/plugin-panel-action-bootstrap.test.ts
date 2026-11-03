@@ -14,6 +14,7 @@ const panel = (actions = true, result: () => Promise<unknown> = async () => ({ o
   const invoke = vi.fn(async (command: string) => command === 'plugin_panel_request' ? result() : undefined)
   const window: any = { __TAURI_INTERNALS__: { invoke } }
   const source = template('src-tauri/src/plugin_panel.rs', 'PUBLIC_PANEL_BOOTSTRAP_TEMPLATE')
+    .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
     .replace('__PANEL_JSON__', jsonSource).replace('__RUNTIME_ACTIONS__', String(actions))
     .replaceAll('__SESSION_EPOCH__', '7').replace('__HOST_KEYS__', '[]')
   vm.runInNewContext(source, { ...env, window, document: { addEventListener() {}, querySelector() { return null } } })
@@ -25,7 +26,8 @@ async function runtime(module: any, optedIn = true, windowActions = false) {
   const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke, transformCallback(next: any) { callback = next; return 1 } } }
   const document = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } }
   const source = template('src-tauri/src/public_plugins/runtime.rs', 'PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE')
-    .replace('__RESULT_ACTIONS__', 'false').replace('__WINDOW_ACTIONS__', String(windowActions)).replace('__PANEL_JSON__', jsonSource).replace('__PANEL_ACTIONS__', String(optedIn)).replace('__NETWORK_HTTPS__', 'false')
+    .replace('__RESULT_ACTIONS__', 'false').replace('__WINDOW_ACTIONS__', String(windowActions)).replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
+    .replace('__PANEL_JSON__', jsonSource).replace('__PANEL_ACTIONS__', String(optedIn)).replace('__NETWORK_HTTPS__', 'false')
     .replace('const module = entry ? await import(entry) : null;', 'const module = window.testModule;')
   vm.runInNewContext(source, { ...env, window, document })
   await vi.waitFor(() => expect(document.title).not.toBe(''))

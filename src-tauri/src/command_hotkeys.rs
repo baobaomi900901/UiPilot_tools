@@ -229,10 +229,14 @@ pub(crate) fn saved_matches(settings: &Settings, entry: &CommandEntry) -> bool {
         == Some(&entry.hotkey)
 }
 pub(crate) fn launcher_conflicts(settings: &Settings, chord: &str) -> bool {
-    settings
-        .screenshot_hotkey
-        .as_deref()
-        .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
+    selection_conflicts(settings, chord)
+        || crate::settings::ManagedBuiltinFeature::ALL
+            .into_iter()
+            .any(|feature| {
+                settings
+                    .builtin_hotkey(feature)
+                    .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
+            })
         || settings
             .public_plugin_command_hotkeys
             .values()
@@ -243,11 +247,15 @@ pub(crate) fn launcher_conflicts(settings: &Settings, chord: &str) -> bool {
             })
 }
 pub(crate) fn conflicts(settings: &Settings, plugin: &str, command: &str, chord: &str) -> bool {
-    HotkeyKind::parse(&settings.hotkey).is_ok_and(|h| h.canonical() == chord)
-        || settings
-            .screenshot_hotkey
-            .as_deref()
-            .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
+    selection_conflicts(settings, chord)
+        || HotkeyKind::parse(&settings.hotkey).is_ok_and(|h| h.canonical() == chord)
+        || crate::settings::ManagedBuiltinFeature::ALL
+            .into_iter()
+            .any(|feature| {
+                settings
+                    .builtin_hotkey(feature)
+                    .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
+            })
         || settings
             .public_plugin_command_hotkeys
             .iter()
@@ -259,10 +267,34 @@ pub(crate) fn conflicts(settings: &Settings, plugin: &str, command: &str, chord:
             })
 }
 
+fn selection_conflicts(settings: &Settings, chord: &str) -> bool {
+    settings
+        .translation_selection_hotkey
+        .as_deref()
+        .is_some_and(|s| HotkeyKind::parse(s).is_ok_and(|h| h.canonical() == chord))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::BTreeSet};
+    #[test]
+    fn builtin_chords_conflict_with_launcher_and_public_commands() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "hotkey": "Alt+Space", "autostart": false,
+            "builtinHotkeys": {"quicklinks": "Ctrl+P", "webSearch": "Ctrl+W"}
+        }))
+        .unwrap();
+        let quicklinks = command_chord("Ctrl+P").unwrap().to_string();
+        let web_search = command_chord("Ctrl+W").unwrap().to_string();
+        assert!(launcher_conflicts(&settings, &quicklinks));
+        assert!(conflicts(
+            &settings,
+            "com.example.a",
+            "default",
+            &web_search
+        ));
+    }
     #[test]
     fn screenshot_saved_chord_conflicts_with_launcher_and_plugin() {
         let settings: Settings = serde_json::from_value(serde_json::json!({

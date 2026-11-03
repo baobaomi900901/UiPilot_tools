@@ -20,13 +20,16 @@ $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
 [Console]::InputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
-$request = [Console]::In.ReadToEnd() | ConvertFrom-Json
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+$request = $line | ConvertFrom-Json
 $entries = foreach ($relative in @($request.paths)) {
   $nativeRelative = [string]$relative -replace '/', '\'
   $candidate = if ($nativeRelative.Length -eq 0) { [string]$request.root } else { [IO.Path]::Combine([string]$request.root, $nativeRelative) }
   [ordered]@{ path = [string]$relative; attributes = [int64][IO.File]::GetAttributes($candidate) }
 }
-[Console]::Out.Write((ConvertTo-Json ([ordered]@{ entries = @($entries) }) -Compress -Depth 4))
+[Console]::Out.WriteLine((ConvertTo-Json ([ordered]@{ entries = @($entries) }) -Compress -Depth 4))
+[Console]::Out.Flush()
+}
 `
 
 function invalid(message: string): PackagePolicyError {
@@ -92,14 +95,9 @@ async function verifiedSystemPaths(environment: NodeJS.ProcessEnv): Promise<{
   return { systemRoot, system32, temp, executable }
 }
 
-async function runProbe(
+function startProbe(
   paths: Awaited<ReturnType<typeof verifiedSystemPaths>>,
-  root: string,
-  canonicalRelativePaths: readonly string[],
-): Promise<ReadonlyMap<string, number>> {
-  if (canonicalRelativePaths.length > MAX_PROTOCOL_PATHS) throw invalid('Windows attribute request is too large.')
-  const request = Buffer.from(JSON.stringify({ root, paths: canonicalRelativePaths }), 'utf8')
-  if (request.byteLength > MAX_PROTOCOL_BYTES) throw invalid('Windows attribute request is too large.')
+): { request: WindowsAttributeProbe; close: () => void } {
   const encodedScript = Buffer.from(SCRIPT, 'utf16le').toString('base64')
 
   const child = spawn(
@@ -117,39 +115,66 @@ async function runProbe(
       stdio: ['pipe', 'pipe', 'pipe'],
     },
   )
-  const stdout: Buffer[] = []
-  const stderr: Buffer[] = []
-  let outputBytes = 0
-  child.stdout.on('data', (chunk: Buffer) => {
-    outputBytes += chunk.byteLength
-    if (outputBytes <= MAX_PROTOCOL_BYTES) stdout.push(chunk)
-  })
-  child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
-  child.stdin.end(request)
-
-  const exitCode = await new Promise<number | null>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      child.kill()
-      reject(invalid('Windows attribute probe timed out.'))
-    }, 5_000)
-    child.once('error', (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
-    child.once('exit', (code) => {
-      clearTimeout(timeout)
-      resolve(code)
-    })
-  }).catch(() => {
-    throw invalid('Windows attribute probe failed.')
-  })
-  if (exitCode !== 0 || stderr.length > 0 || outputBytes > MAX_PROTOCOL_BYTES) {
-    throw invalid('Windows attribute probe failed.')
+  let stopped = false
+  let output = Buffer.alloc(0)
+  let pending: { paths: readonly string[]; resolve: (value: ReadonlyMap<string, number>) => void;
+    reject: (error: Error) => void; timeout: ReturnType<typeof setTimeout> } | undefined
+  function stop(message = 'Windows attribute probe closed.'): void {
+    if (stopped) return
+    stopped = true
+    const current = pending
+    pending = undefined
+    if (current) { clearTimeout(current.timeout); current.reject(invalid(message)) }
+    child.stdin.destroy()
+    child.kill()
   }
+  child.on('error', () => stop('Windows attribute probe failed.'))
+  child.on('exit', () => stop('Windows attribute probe exited unexpectedly.'))
+  child.stdin.on('error', () => stop('Windows attribute probe input failed.'))
+  child.stdout.on('error', () => stop('Windows attribute probe output failed.'))
+  child.stderr.on('error', () => stop('Windows attribute probe output failed.'))
+  child.stderr.on('data', () => stop('Windows attribute probe failed.'))
+  child.stdout.on('data', (chunk: Buffer) => {
+    if (stopped) return
+    if (!pending || output.byteLength + chunk.byteLength > MAX_PROTOCOL_BYTES) {
+      stop('Windows attribute response is invalid.')
+      return
+    }
+    output = Buffer.concat([output, chunk])
+    const newline = output.indexOf(10)
+    if (newline < 0) return
+    if (newline !== output.length - 1) { stop('Windows attribute response is invalid.'); return }
+    try {
+      const response = parseResponse(output.subarray(0, newline), pending.paths)
+      const current = pending
+      pending = undefined
+      output = Buffer.alloc(0)
+      clearTimeout(current.timeout)
+      current.resolve(response)
+    } catch { stop('Windows attribute response is invalid.') }
+  })
+  return {
+    close: stop,
+    request: (root, canonicalRelativePaths) => new Promise((resolve, reject) => {
+      if (stopped || pending) { reject(invalid('Windows attribute probe is unavailable.')); return }
+      if (canonicalRelativePaths.length > MAX_PROTOCOL_PATHS) {
+        reject(invalid('Windows attribute request is too large.')); return
+      }
+      const request = Buffer.from(JSON.stringify({ root, paths: canonicalRelativePaths }) + '\n', 'utf8')
+      if (request.byteLength > MAX_PROTOCOL_BYTES) {
+        reject(invalid('Windows attribute request is too large.')); return
+      }
+      pending = { paths: canonicalRelativePaths, resolve, reject,
+        timeout: setTimeout(() => stop('Windows attribute probe timed out.'), 5_000) }
+      child.stdin.write(request)
+    }),
+  }
+}
 
+function parseResponse(bytes: Buffer, canonicalRelativePaths: readonly string[]): ReadonlyMap<string, number> {
   let response: unknown
   try {
-    response = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(stdout)))
+    response = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
   } catch {
     throw invalid('Windows attribute response is invalid.')
   }
@@ -179,16 +204,34 @@ async function runProbe(
 
 export function createWindowsAttributeProbe(
   environment: NodeJS.ProcessEnv = process.env,
-): WindowsAttributeProbe {
+): WindowsAttributeProbe & { close: () => void } {
   const frozenEnvironment = {
     SystemRoot: environment.SystemRoot,
     WINDIR: environment.WINDIR,
   }
   let pathsPromise: ReturnType<typeof verifiedSystemPaths> | undefined
-  return async (root, canonicalRelativePaths) => {
+  let session: ReturnType<typeof startProbe> | undefined
+  let closed = false
+  const probe: WindowsAttributeProbe = async (root, canonicalRelativePaths) => {
+    if (closed) throw invalid('Windows attribute probe closed.')
     pathsPromise ??= verifiedSystemPaths(frozenEnvironment)
-    return runProbe(await pathsPromise, root, canonicalRelativePaths)
+    const paths = await pathsPromise
+    if (closed) throw invalid('Windows attribute probe closed.')
+    session ??= startProbe(paths)
+    return session.request(root, canonicalRelativePaths)
   }
+  return Object.assign(probe, { close: () => { closed = true; session?.close() } })
+}
+
+export async function withWindowsAttributeProbe<T>(
+  platform: NodeJS.Platform,
+  injected: WindowsAttributeProbe | undefined,
+  operation: (probe: WindowsAttributeProbe | undefined) => Promise<T>,
+): Promise<T> {
+  if (platform !== 'win32') return operation(undefined)
+  if (injected) return operation(injected)
+  const probe = createWindowsAttributeProbe()
+  try { return await operation(probe) } finally { probe.close() }
 }
 
 export function assertNoReparsePoints(

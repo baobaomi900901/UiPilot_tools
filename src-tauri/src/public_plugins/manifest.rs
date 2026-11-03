@@ -32,12 +32,22 @@ pub(crate) enum PublicPermission {
     UrlOpen,
     #[serde(rename = "clipboard.read")]
     ClipboardRead,
+    #[serde(rename = "selection.read")]
+    SelectionRead,
     #[serde(rename = "clipboard.history.read")]
     ClipboardHistoryRead,
     #[serde(rename = "clipboard.history.paste")]
     ClipboardHistoryPaste,
+    #[serde(rename = "clipboard.history.copy")]
+    ClipboardHistoryCopy,
     #[serde(rename = "network.https")]
     NetworkHttps,
+    #[serde(rename = "credentials.youdaoTranslation")]
+    CredentialsYoudaoTranslation,
+    #[serde(rename = "credentials.baiduOcr")]
+    CredentialsBaiduOcr,
+    #[serde(rename = "credentials.deepseek")]
+    CredentialsDeepseek,
     #[serde(rename = "files.userSelected")]
     FilesUserSelected,
     #[serde(rename = "files.index.readAll")]
@@ -51,16 +61,29 @@ pub(crate) enum PublicPermission {
 }
 
 impl PublicPermission {
+    pub(crate) fn is_host_service(self) -> bool {
+        matches!(
+            self,
+            Self::CredentialsYoudaoTranslation
+                | Self::CredentialsBaiduOcr
+                | Self::CredentialsDeepseek
+        )
+    }
     pub(super) fn is_available(self, platform: PublicPlatform) -> bool {
         matches!(self, Self::UiWindow | Self::UiPanel | Self::ClipboardWrite)
             || (matches!(
                 self,
-                Self::UrlOpen
+                Self::SelectionRead
+                    | Self::UrlOpen
                     | Self::ClipboardPaste
                     | Self::FilesOpenText
                     | Self::ClipboardHistoryRead
                     | Self::ClipboardHistoryPaste
+                    | Self::ClipboardHistoryCopy
                     | Self::NetworkHttps
+                    | Self::CredentialsYoudaoTranslation
+                    | Self::CredentialsBaiduOcr
+                    | Self::CredentialsDeepseek
                     | Self::NotificationsPublish
                     | Self::TimerControl
             ) && platform == PublicPlatform::Windows)
@@ -266,6 +289,7 @@ pub(crate) enum PanelHostKeyDeclaration {
     #[serde(rename = "Shift+Tab")]
     ShiftTab,
     Enter,
+    Delete,
 }
 
 fn panel_host_keys_schema(generator: &mut SchemaGenerator) -> Schema {
@@ -511,7 +535,7 @@ pub(crate) fn public_manifest_v1_schema() -> schemars::Schema {
         {"required": ["commands"], "not": {"anyOf": [
             {"required": ["command"], "properties": {"command": true}}, {"required": ["window"], "properties": {"window": true}}, {"required": ["panel"], "properties": {"panel": true}}
         ]}, "properties": {"commands": true, "permissions": {"type": "array", "not": {"contains": {"enum": [
-            "ui.window", "ui.panel", "timer.control", "clipboard.history.read", "clipboard.history.paste"
+            "ui.window", "ui.panel", "timer.control", "clipboard.history.read", "clipboard.history.paste", "clipboard.history.copy"
         ]}}}}}
     ]));
     schema.as_object_mut().unwrap().get_mut("$defs").unwrap()["PublicNamedCommandV1"]
@@ -590,6 +614,7 @@ fn validate_manifest(
                             | PublicPermission::TimerControl
                             | PublicPermission::ClipboardHistoryRead
                             | PublicPermission::ClipboardHistoryPaste
+                            | PublicPermission::ClipboardHistoryCopy
                     )
                 })
         })
@@ -656,6 +681,7 @@ fn validate_manifest(
     let has_clipboard_history_paste = manifest
         .permissions
         .contains(&PublicPermission::ClipboardHistoryPaste);
+    let has_clipboard_history_copy = manifest.permissions.contains(&PublicPermission::ClipboardHistoryCopy);
     if let Some(command) = manifest.legacy_command() {
         match command.output_mode {
             PublicOutputMode::Window
@@ -705,14 +731,14 @@ fn validate_manifest(
         {
             return Err(PublicPackageError::InvalidPackage);
         }
-        if (has_clipboard_history_read || has_clipboard_history_paste)
+        if (has_clipboard_history_read || has_clipboard_history_paste || has_clipboard_history_copy)
             && (command.activation_mode != PublicActivationMode::Submit
                 || command.output_mode != PublicOutputMode::Panel
                 || manifest.panel.is_none()
                 || manifest.window.is_some()
                 || !manifest.permissions.contains(&PublicPermission::UiPanel)
                 || manifest.permissions.contains(&PublicPermission::UiWindow)
-                || (has_clipboard_history_paste && !has_clipboard_history_read))
+                || ((has_clipboard_history_paste || has_clipboard_history_copy) && !has_clipboard_history_read))
         {
             return Err(PublicPackageError::InvalidPackage);
         }
@@ -723,6 +749,14 @@ fn validate_manifest(
     }
     let minimum_host = parse_canonical_version(&manifest.minimum_host_version)
         .ok_or(PublicPackageError::InvalidPackage)?;
+    if manifest.permissions.iter().any(|p| p.is_host_service())
+        && (minimum_host < [0, 15, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if has_clipboard_history_copy && (minimum_host < [0, 17, 0] || manifest.supported_platforms != [PublicPlatform::Windows]) {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.api_version != 1
         || manifest.api_version != host.api_version
         || minimum_host > host.version
@@ -781,6 +815,13 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
+    if manifest
+        .permissions
+        .contains(&PublicPermission::SelectionRead)
+        && (minimum_host < [0, 16, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.is_multi_command() && minimum_host < MULTI_COMMAND_MIN_HOST {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -799,6 +840,12 @@ fn validate_manifest(
         .legacy_command()
         .is_some_and(|command| command.output_mode == PublicOutputMode::Panel)
         && minimum_host < [0, 3, 0]
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest.panel.as_ref().is_some_and(|panel| {
+        panel.host_keys.contains(&PanelHostKeyDeclaration::Delete)
+    }) && minimum_host < [0, 16, 0]
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -831,7 +878,7 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
-    if (has_clipboard_history_read || has_clipboard_history_paste) && minimum_host < [0, 3, 3] {
+    if (has_clipboard_history_read || has_clipboard_history_paste || has_clipboard_history_copy) && minimum_host < [0, 3, 3] {
         return Err(PublicPackageError::IncompatibleApi);
     }
     if manifest
@@ -1018,6 +1065,39 @@ mod schema_tests {
             &serde_json::to_vec(value).unwrap(),
             &PublicPluginHost::current(PublicPlatform::Windows),
         )
+    }
+
+    #[test]
+    fn clipboard_history_copy_requires_read_windows_panel_and_host_0_17() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.17.0");
+        value["command"] = serde_json::json!({"defaultName":"copy", "activationMode":"submit", "outputMode":"panel", "inputRequired":false});
+        value["panel"] = serde_json::json!({"entry":"dist/panel.html"});
+        value["permissions"] = serde_json::json!(["ui.panel", "clipboard.history.read", "clipboard.history.copy"]);
+        assert!(parse(&value).is_ok());
+        let mut invalid = value.clone();
+        invalid["minimumHostVersion"] = serde_json::json!("0.16.0");
+        assert_eq!(parse(&invalid), Err(PublicPackageError::IncompatibleApi));
+        invalid = value.clone();
+        invalid["permissions"] = serde_json::json!(["ui.panel", "clipboard.history.copy"]);
+        assert_eq!(parse(&invalid), Err(PublicPackageError::InvalidPackage));
+        invalid = value.clone();
+        invalid["supportedPlatforms"] = serde_json::json!(["windows", "macos"]);
+        assert_eq!(parse(&invalid), Err(PublicPackageError::IncompatibleApi));
+        invalid = value;
+        invalid["command"]["outputMode"] = serde_json::json!("mainResult");
+        assert_eq!(parse(&invalid), Err(PublicPackageError::InvalidPackage));
+    }
+
+    #[test]
+    fn selection_read_requires_windows_and_version_0_16() {
+        let mut value = manifest(None);
+        value["permissions"] = serde_json::json!(["selection.read"]);
+        assert!(matches!(parse(&value), Err(PublicPackageError::IncompatibleApi)));
+        value["minimumHostVersion"] = serde_json::json!("0.16.0");
+        assert!(parse(&value).is_ok());
+        value["supportedPlatforms"] = serde_json::json!(["windows", "macos"]);
+        assert!(matches!(parse(&value), Err(PublicPackageError::IncompatibleApi)));
     }
 
     #[test]
@@ -1387,6 +1467,21 @@ mod schema_tests {
     }
 
     #[test]
+    fn delete_host_key_requires_host_0_16() {
+        let mut panel = manifest(None);
+        panel["minimumHostVersion"] = serde_json::json!("0.16.0");
+        panel["command"] = serde_json::json!({
+            "defaultName": "panel", "activationMode": "submit", "outputMode": "panel", "inputRequired": false
+        });
+        panel["panel"] = serde_json::json!({ "entry": "dist/panel.html", "hostKeys": ["Delete", "Tab"] });
+        panel["permissions"] = serde_json::json!(["ui.panel"]);
+        let parsed = parse(&panel).expect("Delete is supported on 0.16.0");
+        assert_eq!(serde_json::to_value(parsed).unwrap()["panel"]["hostKeys"], serde_json::json!(["Tab", "Delete"]));
+        panel["minimumHostVersion"] = serde_json::json!("0.15.0");
+        assert_eq!(parse(&panel), Err(PublicPackageError::IncompatibleApi));
+    }
+
+    #[test]
     fn panel_host_keys_are_strict_and_require_host_0_3_3_for_extended_keys() {
         let mut panel = manifest(None);
         panel["minimumHostVersion"] = serde_json::json!("0.3.3");
@@ -1615,7 +1710,7 @@ mod schema_tests {
         );
         assert_eq!(
             PublicPluginHost::current(PublicPlatform::Windows).version,
-            [0, 14, 0]
+            [0, 16, 0]
         );
     }
 

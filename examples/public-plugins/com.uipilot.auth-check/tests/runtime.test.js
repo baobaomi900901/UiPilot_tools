@@ -74,7 +74,9 @@ test('every SDK network error uses only its fixed name and static guidance witho
     let calls = 0
     const error = { name, get message() { assert.fail('must not read error message') }, get stack() { assert.fail('must not read error stack') } }
     const result = await onCommand(invocation('request'), { network: { async request() { calls++; throw error } } })
-    assert.deepEqual(result, expectedResult(name, guidance))
+    assert.deepEqual(result, expectedResult(name, name === 'PermissionDeniedError'
+      ? '网络访问已关闭，可在「设置 → 权限」中开启后重新运行 request。'
+      : guidance))
     assert.equal(calls, 1)
   }
 })
@@ -99,7 +101,7 @@ test('local status failures use a fixed result and never contact the provider', 
 
 test('missing network capability is a static local failure', async () => {
   const { onCommand } = await runtime()
-  assert.deepEqual(await onCommand(invocation('request'), {}), expectedResult('网络能力不可用', '需要 Windows Host 0.4.0 或更高版本及网络授权。'))
+  assert.deepEqual(await onCommand(invocation('request'), {}), expectedResult('网络能力不可用', '请检查 Host 版本是否支持网络能力，以及插件是否申报网络访问权限。'))
 })
 
 test('manifest declares only the fixed Windows bearer binding and public test secret', async () => {

@@ -1,0 +1,1 @@
+Valid UiPilot public plugin com.example.diagnostics@1.0.0.

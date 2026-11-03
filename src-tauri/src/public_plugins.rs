@@ -1,11 +1,12 @@
+pub(crate) mod host_services;
 mod activation;
-pub(crate) mod file_open;
 mod activation_bundle;
 mod alarm_asset;
 pub(crate) mod content_action;
 mod data_call_gate;
 mod delayed_messages;
 pub(crate) mod diagnostics;
+pub(crate) mod file_open;
 mod icon;
 mod manifest;
 pub(crate) mod window_action;
@@ -96,6 +97,11 @@ const PUBLIC_PLUGIN_CSP: &str = "default-src 'self'; script-src 'self'; style-sr
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicPluginResponse {
     MainResults(Vec<PublicMainResult>),
+    ServiceMainResults {
+        results: Vec<PublicMainResult>,
+        credential_revision: u64,
+        publication: result_action::ResultActionLease,
+    },
     MainActionResults {
         route: PublicPluginRoute,
         results: Vec<result_action::PublicActionResult>,
@@ -394,6 +400,24 @@ impl PublicPluginService {
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
         self.set_network_access_outcome(plugin_id, granted, expected_inventory_revision)
             .result
+    }
+
+    pub(crate) fn set_permission_access_outcome(
+        &self,
+        plugin_id: &str,
+        permission: PublicPermission,
+        granted: bool,
+        expected_inventory_revision: &str,
+    ) -> ManagementOutcome {
+        self.manage_with_effects(|manager, effects| {
+            manager.set_permission_access_with_effects(
+                plugin_id,
+                permission,
+                granted,
+                expected_inventory_revision,
+                effects,
+            )
+        })
     }
 
     pub(crate) fn set_network_access_outcome(
@@ -1533,6 +1557,14 @@ impl PublicPluginService {
                         pending.route.activation_id,
                     )
                 });
+                let result = result.map(|result| {
+                    result.map(|response| match (response, outcome.credential_publication) {
+                        (PublicPluginResponse::MainResults(results), Some((credential_revision, publication))) => {
+                            PublicPluginResponse::ServiceMainResults { results, credential_revision, publication }
+                        }
+                        (response, _) => response,
+                    })
+                });
                 let _ = pending.sender.send(result);
             }
         }
@@ -2165,7 +2197,7 @@ impl PublicPluginHost {
     pub(crate) const fn current(platform: PublicPlatform) -> Self {
         Self {
             platform,
-            version: [0, 14, 0],
+            version: [0, 17, 0],
             api_version: 1,
         }
     }

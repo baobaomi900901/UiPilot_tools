@@ -180,11 +180,11 @@ test('edits and new updates ignore late import; confirmation never authorizes la
 
 test('file errors are sanitized and recovery blocks import without bypassing original save protection',async t=>{
  const p=page(t);p.session(loaded('saved',2));p.ui.output.value='formatted'
- for(const [name,copy] of [['FileOpenEncodingError',/UTF-8/],['FileOpenUnsupportedError',/本地/],['FileOpenFailedError',/未完成/]]) {
+ for(const [name,copy] of [['FileOpenEncodingError',/UTF-8/],['FileOpenUnsupportedError',/本地/],['FileOpenFailedError',/未完成/],['FileOpenPermissionError',/读取文本文件权限不可用.*设置 → 权限.*草稿已保留/]]) {
   p.ui.import.click();p.imports.at(-1).reject({name,message:'private detail'});await tick()
   assert.equal(p.ui.input.value,'saved');assert.equal(p.ui.output.value,'formatted');assert.match(p.ui.status.textContent,copy);assert.doesNotMatch(p.ui.status.textContent,/private detail/);assert.equal(p.calls.length,0)
  }
- p.session({ok:false,code:'storage-unavailable'},'recovery');assert.equal(p.ui.import.disabled,true);p.ui.import.click();assert.equal(p.imports.length,3)
+ p.session({ok:false,code:'storage-unavailable'},'recovery');assert.equal(p.ui.import.disabled,true);p.ui.import.click();assert.equal(p.imports.length,4)
 })
 test('new update ignores late cancellation and failure from old picker',async t=>{
  for(const outcome of ['cancel','error']) {

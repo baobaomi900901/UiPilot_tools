@@ -65,10 +65,9 @@ button {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
   width: 100%;
-  height: 100dvh;
-  min-height: 280px;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
-  border-top: 1px solid var(--uipilot-color-border, #d9d9dc);
   background: var(--panel-canvas);
 }
 
@@ -216,34 +215,6 @@ h1 {
   height: 16px;
 }
 
-.status {
-  position: absolute;
-  top: 56px;
-  left: 50%;
-  z-index: 3;
-  max-width: calc(100% - 32px);
-  margin: 0;
-  padding: 6px 10px;
-  overflow: hidden;
-  color: var(--uipilot-color-text-muted, #6f6f74);
-  font-size: 12px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  border: 1px solid var(--uipilot-color-border, #d9d9dc);
-  border-radius: 6px;
-  background: var(--panel-surface);
-  transform: translateX(-50%);
-}
-
-.status:empty {
-  display: none;
-}
-
-.status[data-tone='error'] {
-  color: var(--uipilot-color-danger, #dc4343);
-}
-
 .history-list-shell {
   position: relative;
   min-width: 0;
@@ -333,6 +304,11 @@ h1 {
   background: transparent;
   cursor: pointer;
   text-align: left;
+}
+
+.entry-select:focus,
+.entry-select:focus-visible {
+  outline: none;
 }
 
 .entry-image,

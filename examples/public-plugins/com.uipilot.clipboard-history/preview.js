@@ -1,3 +1,6 @@
+import { createContextActionsMenu } from '../../../src/context-actions-ui.js'
+import { installPanelContextActions } from '../../../src/panel-context-actions.js'
+
 function minutesAgo(minutes) {
   return new Date(Date.now() - minutes * 60_000).toISOString()
 }
@@ -39,6 +42,23 @@ function installTheme(theme) {
 }
 
 function installBridge(theme) {
+  const actions = installPanelContextActions({ document, window, getEpoch: () => '1', createMenu: createContextActionsMenu,
+    invoke: async (command, payload) => {
+      if (window.parent === window && command === 'plugin_panel_actions_submit') {
+        submitPreviewQuery()
+      } else window.parent.postMessage({ type: 'notes-preview-actions-submit', ...payload }, window.location.origin)
+    },
+  })
+  window.addEventListener('message', event => {
+    if (event.origin !== window.location.origin || event.source !== window.parent) return
+    if (event.data?.type === 'notes-preview-actions-open') window.__UIPILOT_PLUGIN_PANEL_ACTIONS__(event.data)
+  })
+  function openPreviewActions() {
+    const source = document.activeElement?.id === 'preview-query' ? 'hostInput' : 'content'
+    window.__UIPILOT_PLUGIN_PANEL_ACTIONS__({ sessionEpoch: '1', source, ticket: source === 'hostInput' ? 'preview-submit' : '' })
+  }
+  document.querySelector('#preview-operations')?.addEventListener('click', openPreviewActions)
+  let updateHandler = null
   let hostKeyHandler = null
   let changedHandler = null
   let routeSequence = 0
@@ -95,8 +115,10 @@ function installBridge(theme) {
   }
 
   const clipboardHistory = Object.freeze({
-    async list() {
-      return snapshot()
+    async list({ query = '' } = {}) {
+      const value = query.trim().toLocaleLowerCase()
+      const full = snapshot()
+      return { ...full, entries: full.entries.filter(entry => !value || (entry.textPreview ?? entry.firstFileName ?? '').toLocaleLowerCase().includes(value)) }
     },
     onChanged(handler) {
       changedHandler = handler
@@ -104,13 +126,13 @@ function installBridge(theme) {
         if (changedHandler === handler) changedHandler = null
       }
     },
-    async paste({ id }) {
+    async copy({ id }) {
       if (!entries.some((entry) => entry.id === id)) {
         const error = new Error('redacted')
         error.name = 'RecordNotFound'
         throw error
       }
-      return Object.freeze({ outcome: 'admitted' })
+      return Object.freeze({ outcome: 'copied' })
     },
     async remove({ id }) {
       entries = entries.filter((entry) => entry.id !== id)
@@ -123,6 +145,15 @@ function installBridge(theme) {
   })
 
   const api = Object.freeze({
+    onActions: actions.register,
+    async setStatus(status) {
+      if (window.parent !== window) window.parent.postMessage({ type: 'notes-preview-status', status }, window.location.origin)
+      else {
+        const footer = document.querySelector('#preview-status')
+        footer.textContent = status.message
+        footer.dataset.tone = status.tone || 'info'
+      }
+    },
     onHostKey(handler) {
       hostKeyHandler = handler
       return () => {
@@ -130,6 +161,7 @@ function installBridge(theme) {
       }
     },
     onUpdate(handler) {
+      updateHandler = handler
       queueMicrotask(() => void handler(Object.freeze({
         requestId: 'clipboard-preview-request',
         input: '',
@@ -141,7 +173,10 @@ function installBridge(theme) {
       })))
       return () => {}
     },
-    async focusHostInput() {},
+    async focusHostInput() {
+      if (window.parent === window) document.querySelector('#preview-query')?.focus()
+      else window.parent.postMessage({ type: 'notes-preview-focus-input' }, window.location.origin)
+    },
     async requestHide() {},
     storage: Object.freeze({
       async get() { return null },
@@ -151,14 +186,37 @@ function installBridge(theme) {
     clipboardHistory,
   })
   Object.defineProperty(window, 'uipilotPluginPanel', { value: api })
+  const input = document.querySelector('#preview-query')
+  function submitPreviewQuery() {
+    if (input) updateHandler?.({ input: input.value, theme, sessionEpoch: '1' })
+  }
+  input?.addEventListener('keydown', event => {
+    if (event.isComposing || event.repeat) return
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      submitPreviewQuery()
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      hostKeyHandler?.({ key: 'ArrowDown', sessionEpoch: '1' })
+    }
+  })
 
   window.addEventListener('keydown', (event) => {
+    if (event.target === input && event.key.toLowerCase() === 'k' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.isComposing && !event.repeat) {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      openPreviewActions()
+      return
+    }
+    if (actions.handleKey(event)) return
+    if (event.defaultPrevented || event.target.closest?.('input, textarea, [contenteditable]')) return
+    if (event.target.closest?.('.entry-select')) return
     if (!hostKeyHandler || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return
     let routed = null
     if (event.key === 'Tab') routed = { key: 'Tab', shiftKey: event.shiftKey }
     else if (!event.shiftKey && event.key === 'ArrowDown') routed = { key: 'ArrowDown', shiftKey: false }
     else if (!event.shiftKey && event.key === 'ArrowUp') routed = { key: 'ArrowUp', shiftKey: false }
-    else if (!event.shiftKey && event.key === 'Enter') routed = { key: 'Enter', shiftKey: false }
+    else if (!event.shiftKey && !event.repeat && event.key === 'Delete') routed = { key: 'Delete', shiftKey: false }
     if (!routed) return
 
     event.preventDefault()
@@ -186,6 +244,36 @@ async function loadPanel() {
   stylesheet.href = './package/dist/panel.css'
   document.head.append(stylesheet)
   document.body.replaceChildren(...Array.from(source.body.childNodes, (node) => document.importNode(node, true)))
+
+  if (window.parent === window) {
+    const input = document.createElement('input')
+    input.id = 'preview-query'
+    input.placeholder = '搜索文字或文件名'
+    input.setAttribute('aria-label', '搜索剪贴板历史')
+    document.body.prepend(input)
+    const footer = document.createElement('footer')
+    footer.id = 'preview-footer'
+    const status = document.createElement('span')
+    status.id = 'preview-status'
+    status.setAttribute('role', 'status')
+    status.setAttribute('aria-live', 'polite')
+    const operations = document.createElement('button')
+    operations.id = 'preview-operations'
+    operations.textContent = '操作 Ctrl+K'
+    operations.addEventListener('pointerdown', event => event.preventDefault())
+    footer.append(status, operations)
+    document.body.append(footer)
+    const style = document.createElement('style')
+    style.textContent = `body { display: flex; flex-direction: column; }
+      .clipboard-app { flex: 1; min-height: 0; height: auto; }
+      #preview-query { flex: none; height: 44px; margin: 8px; padding: 0 12px; border: 1px solid var(--uipilot-color-border); border-radius: 8px; background: var(--uipilot-color-surface); color: var(--uipilot-color-text); }
+      #preview-footer { display: flex; align-items: center; gap: 12px; flex: none; min-height: 36px; padding: 6px 10px; border-top: 1px solid var(--uipilot-color-border); font-size: 12px; color: var(--uipilot-color-text-muted); }
+      #preview-status { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+      #preview-operations { flex: none; white-space: nowrap; text-align: right; }
+      #preview-status[data-tone=success] { color: #22a06b; }
+      #preview-status[data-tone=error] { color: var(--uipilot-color-danger); }`
+    document.head.append(style)
+  }
 
   installTheme(theme)
   installBridge(theme)

@@ -30,7 +30,7 @@ test('preview covers text, image, available files, unavailable files, and both t
     'available: false',
     "get('theme') === 'light'",
     'clipboardHistory',
-    "key: 'Enter'",
+    "async copy({ id })",
   ]) {
     assert.match(source, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   }
@@ -43,7 +43,7 @@ test('README documents permissions, privacy boundary, preview, verification, and
     '最近 50 条',
     '500 MiB',
     'clipboard.history.read',
-    'clipboard.history.paste',
+    'clipboard.history.copy',
     '不会获得完整文本、原图或完整文件路径',
     'preview.html',
     'node --test --experimental-test-isolation=none',

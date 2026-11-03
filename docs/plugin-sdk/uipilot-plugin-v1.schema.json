@@ -7,7 +7,8 @@
         "Primary+N",
         "Tab",
         "Shift+Tab",
-        "Enter"
+        "Enter",
+        "Delete"
       ],
       "type": "string"
     },
@@ -211,9 +212,14 @@
         "files.openText",
         "url.open",
         "clipboard.read",
+        "selection.read",
         "clipboard.history.read",
         "clipboard.history.paste",
+        "clipboard.history.copy",
         "network.https",
+        "credentials.youdaoTranslation",
+        "credentials.baiduOcr",
+        "credentials.deepseek",
         "files.userSelected",
         "files.index.readAll",
         "notifications.publish",
@@ -504,7 +510,8 @@
                 "ui.panel",
                 "timer.control",
                 "clipboard.history.read",
-                "clipboard.history.paste"
+                "clipboard.history.paste",
+                "clipboard.history.copy"
               ]
             }
           },

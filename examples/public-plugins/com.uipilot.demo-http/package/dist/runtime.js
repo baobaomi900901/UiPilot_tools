@@ -123,7 +123,9 @@ export async function onCommand(invocation, api) {
     return oneResult(invocation.requestId, {
       id: 'demo-http-error',
       title: errorName(error),
-      subtitle: 'Host HTTPS request rejected',
+      subtitle: errorName(error) === 'PermissionDeniedError'
+        ? 'Network access is off. Check Settings → Permissions.'
+        : 'Host HTTPS request rejected',
       detail: `Command: ${command.name}`,
     })
   }

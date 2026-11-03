@@ -59,7 +59,6 @@ button {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  border-top: 1px solid var(--uipilot-color-border);
 }
 
 .sidebar {
@@ -484,28 +483,6 @@ html[data-theme='dark'] {
   white-space: nowrap;
 }
 
-.editor-save-state {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 5px;
-  color: var(--note-success);
-  font-size: 12px;
-}
-
-.editor-save-state.is-dirty {
-  color: var(--uipilot-color-text-muted);
-}
-
-.editor-save-state.is-dirty svg {
-  display: none;
-}
-
-.editor-save-state svg {
-  width: 14px;
-  height: 14px;
-}
-
 .editor-surface {
   position: relative;
   flex: 1 1 auto;
@@ -640,54 +617,6 @@ html[data-theme='dark'] {
 .editor-copy-button:focus-visible {
   outline: 1px solid var(--note-border-strong);
   outline-offset: 2px;
-}
-
-.editor-status {
-  position: absolute;
-  top: 28px;
-  left: 50%;
-  z-index: 2;
-  max-width: calc(100% - 64px);
-  padding: 0;
-  overflow: hidden;
-  color: var(--uipilot-color-text);
-  font-size: 12px;
-  line-height: 1.4;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  pointer-events: none;
-  visibility: hidden;
-  opacity: 0;
-  transform: translate(-50%, 0);
-  transition:
-    opacity var(--note-transition),
-    visibility var(--note-transition);
-}
-
-.editor-status:not(:empty) {
-  padding: 6px 10px;
-  visibility: visible;
-  opacity: 1;
-  transform: translate(-50%, 0);
-  border: 1px solid var(--uipilot-color-border);
-  border-radius: 6px;
-  background: var(--note-surface);
-  box-shadow: none;
-}
-
-.editor-status[data-tone='success'] {
-  color: var(--note-success);
-  border-color: var(--uipilot-color-border);
-  border-color: color-mix(in srgb, var(--note-success) 35%, var(--uipilot-color-border));
-  background: var(--note-success-surface);
-}
-
-.editor-status[data-tone='error'] {
-  color: var(--uipilot-color-danger);
-  border-color: var(--uipilot-color-border);
-  border-color: color-mix(in srgb, var(--uipilot-color-danger) 35%, var(--uipilot-color-border));
-  background: var(--uipilot-color-surface);
-  background: color-mix(in srgb, var(--uipilot-color-danger) 10%, var(--uipilot-color-surface));
 }
 
 .dialog {

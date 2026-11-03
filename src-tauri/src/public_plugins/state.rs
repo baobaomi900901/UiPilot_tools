@@ -363,7 +363,9 @@ impl PluginStateStore {
         let mut non_network_grants = permission_grants.clone();
         let network_granted = non_network_grants.remove(&PublicPermission::NetworkHttps);
         declared.remove(&PublicPermission::NetworkHttps);
-        if declared != non_network_grants || (network_granted && manifest.network.is_none()) {
+        if !non_network_grants.is_subset(&declared)
+            || (network_granted && manifest.network.is_none())
+        {
             return Err(PluginStateError::InvalidPermissions);
         }
         let network_https_hosts_grant = if network_granted {
@@ -677,6 +679,35 @@ impl PluginStateStore {
         self.publish_prepared(prepared)
     }
 
+    pub(crate) fn prepare_set_permission_access(
+        &self,
+        manifest: &PublicManifestV1,
+        permission: PublicPermission,
+        granted: bool,
+    ) -> Result<PreparedStateCommit, PluginStateError> {
+        if permission == PublicPermission::NetworkHttps
+            || !manifest.permissions.contains(&permission)
+        {
+            return Err(PluginStateError::InvalidPermissions);
+        }
+        let state = self.lock()?;
+        let previous = state
+            .by_plugin
+            .get(&manifest.plugin_id)
+            .ok_or(PluginStateError::InvalidPlugin)?;
+        if !previous.document.installed {
+            return Err(PluginStateError::InvalidPlugin);
+        }
+        let mut document = previous.document.clone();
+        if granted {
+            document.permission_grants.insert(permission);
+        } else {
+            document.permission_grants.remove(&permission);
+        }
+        document.inventory_revision = next_revision(state.revision)?;
+        self.prepare_document(&state, &manifest.plugin_id, document, false)
+    }
+
     pub(crate) fn prepare_set_network_access(
         &self,
         plugin_id: &str,
@@ -963,13 +994,7 @@ impl PluginStateStore {
         {
             return Err(PluginStateError::InvalidPlugin);
         }
-        let mut names = BTreeSet::new();
         for command in commands.values() {
-            if !names.insert(command.effective_name().to_ascii_lowercase()) {
-                return Err(PluginStateError::NameConflict {
-                    owner: Some(plugin_id.into()),
-                });
-            }
             self.ensure_name_available(state, plugin_id, command.effective_name())?;
         }
         Ok(())
@@ -977,8 +1002,8 @@ impl PluginStateStore {
 
     fn ensure_name_available(
         &self,
-        state: &StateData,
-        plugin_id: &str,
+        _state: &StateData,
+        _plugin_id: &str,
         name: &str,
     ) -> Result<(), PluginStateError> {
         let folded = name.to_ascii_lowercase();
@@ -990,18 +1015,6 @@ impl PluginStateStore {
                 .contains(&folded)
         {
             return Err(PluginStateError::NameConflict { owner: None });
-        }
-        if let Some(owner) = state.by_plugin.values().find_map(|stored| {
-            let document = &stored.document;
-            (document.installed
-                && document.plugin_id != plugin_id
-                && document
-                    .commands
-                    .values()
-                    .any(|command| command.effective_name().to_ascii_lowercase() == folded))
-            .then(|| document.plugin_id.clone())
-        }) {
-            return Err(PluginStateError::NameConflict { owner: Some(owner) });
         }
         Ok(())
     }
@@ -1195,9 +1208,9 @@ fn load_owner_with_recovery(
             // also become durable before the normalized configuration can be published.
             let original = codec::decode_document(&bytes).ok_or(PluginStateError::Storage)?;
             if index != 0 {
-                document
-                    .permission_grants
-                    .remove(&PublicPermission::NetworkHttps);
+                // A backup predates the latest user revocations. Recover data
+                // and preferences, but never recover stale capability authority.
+                document.permission_grants.clear();
                 document.network_https_hosts_grant.clear();
                 document.network_credentials_grant.clear();
             }

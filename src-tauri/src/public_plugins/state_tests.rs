@@ -113,6 +113,59 @@ fn network_permission_grants() -> BTreeSet<PublicPermission> {
     BTreeSet::from([PublicPermission::NetworkHttps])
 }
 
+#[test]
+fn permission_access_partial_grants_survive_activation_and_restart() {
+    let dir = TestDir::new("partial-permissions");
+    let manifest = timer_manifest("1.0.0");
+    let grants = BTreeSet::from([PublicPermission::UiWindow]);
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    let config = store.install_or_upgrade(&manifest, grants.clone()).unwrap();
+    assert_eq!(config.permission_grants, grants);
+    drop(store);
+    let reloaded = PluginStateStore::load(dir.path(), []).unwrap();
+    assert_eq!(
+        reloaded
+            .config(&manifest.plugin_id)
+            .unwrap()
+            .unwrap()
+            .permission_grants,
+        grants
+    );
+    assert_eq!(
+        reloaded
+            .prepare_activation(
+                &manifest,
+                BTreeSet::from([PublicPermission::ClipboardWrite]),
+                2,
+                None
+            )
+            .err(),
+        Some(PluginStateError::InvalidPermissions)
+    );
+}
+
+#[test]
+fn permission_access_backup_recovery_does_not_restore_old_grants() {
+    let dir = TestDir::new("permission-backup");
+    let manifest = timer_manifest("1.0.0");
+    let store = PluginStateStore::load(dir.path(), []).unwrap();
+    store
+        .install_or_upgrade(&manifest, manifest.permissions.iter().copied().collect())
+        .unwrap();
+    let owner = dir.path().join(&manifest.plugin_id);
+    let previous = fs::read(owner.join("state.json")).unwrap();
+    fs::write(owner.join("state.json.backup"), previous).unwrap();
+    fs::write(owner.join("state.json"), b"corrupt").unwrap();
+    drop(store);
+    let recovered = PluginStateStore::load(dir.path(), []).unwrap();
+    assert!(recovered
+        .config(&manifest.plugin_id)
+        .unwrap()
+        .unwrap()
+        .permission_grants
+        .is_empty());
+}
+
 fn definitions() -> Value {
     json!([
         {
@@ -334,63 +387,43 @@ fn plugin_network_grant_invalid_hosts_without_permission_loads_fail_closed() {
 }
 
 #[test]
-fn effective_names_are_global_and_failed_rename_is_atomic() {
-    let dir = TestDir::new("names");
-    let store = PluginStateStore::load(
-        dir.path(),
-        ["find".into(), "math".into(), "web-search".into()],
-    )
-    .unwrap();
-    let alpha = manifest("com.example.alpha", "alpha", json!([]));
-    let beta = manifest("com.example.beta", "beta", json!([]));
-    install(&store, &alpha);
-    let before = install(&store, &beta);
-
-    assert_eq!(
-        store.rename("com.example.beta", Some("alpha")),
-        Err(PluginStateError::NameConflict {
-            owner: Some("com.example.alpha".into())
-        })
-    );
-    assert_eq!(store.config("com.example.beta").unwrap(), Some(before));
-
-    store.set_enabled("com.example.alpha", false).unwrap();
-    assert!(matches!(
-        store.rename("com.example.beta", Some("alpha")),
-        Err(PluginStateError::NameConflict { .. })
-    ));
-    assert_eq!(
-        store.rename("com.example.beta", Some("find")),
-        Err(PluginStateError::NameConflict { owner: None })
-    );
-    assert_eq!(
-        store.rename("com.example.beta", Some("web-search")),
-        Err(PluginStateError::NameConflict { owner: None })
-    );
-    assert!(matches!(
-        store.install_or_upgrade(
-            &manifest("com.example.web", "web-search", json!([])),
-            BTreeSet::new(),
-        ),
-        Err(PluginStateError::NameConflict { owner: None })
-    ));
-
+fn duplicate_effective_names_persist_across_plugins() {
+    let dir = TestDir::new("duplicate-names");
+    let store = PluginStateStore::load(dir.path(), ["find".into()]).unwrap();
+    install(&store, &manifest("com.example.alpha", "alpha", json!([])));
+    install(&store, &manifest("com.example.beta", "beta", json!([])));
+    store.rename("com.example.beta", Some("alpha")).unwrap();
     drop(store);
-    let reloaded = PluginStateStore::load(
-        dir.path(),
-        ["find".into(), "math".into(), "web-search".into()],
-    )
-    .unwrap();
+    let restored = PluginStateStore::load(dir.path(), ["find".into()]).unwrap();
     assert_eq!(
-        reloaded
+        restored
             .config("com.example.beta")
             .unwrap()
             .unwrap()
             .command("default")
             .unwrap()
             .effective_name,
-        "beta"
+        "alpha"
     );
+    assert!(matches!(
+        restored.rename("com.example.beta", Some("find")),
+        Err(PluginStateError::NameConflict { owner: None })
+    ));
+}
+
+#[test]
+fn reserved_names_remain_rejected_after_duplicate_renames() {
+    let dir = TestDir::new("reserved-names");
+    let store = PluginStateStore::load(dir.path(), ["find".into(), "math".into()]).unwrap();
+    install(&store, &manifest("com.example.alpha", "alpha", json!([])));
+    install(&store, &manifest("com.example.beta", "beta", json!([])));
+    store.rename("com.example.beta", Some("alpha")).unwrap();
+    let before = store.config("com.example.beta").unwrap();
+    assert_eq!(
+        store.rename("com.example.beta", Some("find")),
+        Err(PluginStateError::NameConflict { owner: None })
+    );
+    assert_eq!(store.config("com.example.beta").unwrap(), before);
 }
 
 #[test]
@@ -430,7 +463,7 @@ fn dynamic_reserved_names_block_public_plugin_activation_and_rename() {
 }
 
 #[test]
-fn timer_upgrade_requires_every_declared_grant_and_preserves_current_generation() {
+fn timer_upgrade_accepts_partial_grants_and_rejects_undeclared_grants() {
     let dir = TestDir::new("timer-grants");
     let store = PluginStateStore::load(dir.path(), Vec::<String>::new()).unwrap();
     let installed_manifest = timer_manifest("1.0.0");
@@ -440,12 +473,22 @@ fn timer_upgrade_requires_every_declared_grant_and_preserves_current_generation(
         .unwrap();
 
     let upgrade = timer_manifest("1.1.0");
-    let missing_timer_grant = upgrade.permissions.iter().copied().take(2).collect();
+    let missing_timer_grant = upgrade
+        .permissions
+        .iter()
+        .copied()
+        .take(2)
+        .collect::<BTreeSet<_>>();
+    let updated = store
+        .install_or_upgrade(&upgrade, missing_timer_grant.clone())
+        .unwrap();
+    assert_eq!(updated.permission_grants, missing_timer_grant);
+    assert_eq!(updated.active_generation, installed.active_generation + 1);
     assert_eq!(
-        store.install_or_upgrade(&upgrade, missing_timer_grant),
+        store.install_or_upgrade(&upgrade, BTreeSet::from([PublicPermission::ClipboardWrite])),
         Err(PluginStateError::InvalidPermissions)
     );
-    assert_eq!(store.config(&upgrade.plugin_id).unwrap(), Some(installed));
+    assert_eq!(store.config(&upgrade.plugin_id).unwrap(), Some(updated));
 }
 
 #[test]
@@ -1360,18 +1403,12 @@ fn command_reconciliation_is_by_surviving_id_with_atomic_conflicts_and_fresh_rea
             .is_err());
         assert!(before.command(id).is_none());
     }
-    for name in ["bee", "reserved"] {
+    for name in ["reserved"] {
         assert!(matches!(
             store.prepare_rename(&first.plugin_id, "constructor", Some(name)),
             Err(PluginStateError::NameConflict { .. })
         ));
     }
-    let conflicting = multi_manifest(&[("constructor", "new"), ("b", "custom")]);
-    assert!(matches!(
-        store.install_or_upgrade(&conflicting, BTreeSet::new()),
-        Err(PluginStateError::NameConflict { .. })
-    ));
-    assert_eq!(store.config(&first.plugin_id).unwrap().unwrap(), before);
     let updated = install(
         &store,
         &multi_manifest(&[("b", "beetwo"), ("constructor", "custom"), ("c", "cee")]),
@@ -1615,7 +1652,7 @@ fn valid_schema_one_credential_order_normalization_keeps_raw_and_does_not_repair
 
 #[test]
 fn per_command_favorite_restart_noop_and_restore_conflicts_preserve_exact_state() {
-    for conflict in ["sibling", "other-package", "builtin", "quicklink"] {
+    for conflict in ["builtin", "quicklink"] {
         let dir = TestDir::new(&format!("pair-favorite-restore-{conflict}"));
         let plugin = multi_manifest(&[("constructor", "old"), ("b", "bee")]);
         let store = PluginStateStore::load(dir.path(), []).unwrap();

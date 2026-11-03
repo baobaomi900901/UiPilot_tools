@@ -9,6 +9,10 @@ export interface PluginInvocation {
    * Dispatch within one onCommand by ID, never by startup name or array order.
    */
   commandId?: string
+  /** Windows Host 0.16.0 selection-translation entry supplies selected text here
+   * after an explicit shortcut and selection.read grant. No clipboard/selection
+   * getter is exposed to plugins; ordinary command input uses the same contract.
+   */
   input: string
   context: {
     platform: 'windows' | 'macos'
@@ -65,7 +69,31 @@ export type PluginNetworkErrorName =
   | 'NetworkLimitExceededError'
   | 'ExpiredRequestError'
 
+export interface PluginYoudaoTranslationInput {
+ readonly text: string
+ readonly from: 'en' | 'zh-CHS'
+ readonly to: 'en' | 'zh-CHS'
+}
+export interface PluginServicesApi {
+ readonly youdao: {
+  /** Host 0.15.0 currently permits only legacy `command` mainResult packages with
+   * runtime.resultActions absent or false. Other output/command shapes reject
+   * InvalidServiceRequestError even if this facade exists and grants are enabled.
+   */
+  translate(input: Readonly<PluginYoudaoTranslationInput>): Promise<Readonly<{ translations: readonly string[] }>>
+ }
+}
+export type PluginServiceErrorName = PluginNetworkErrorName
+ | 'InvalidServiceRequestError' | 'ServicePermissionDeniedError'
+ | 'CredentialNotConfiguredError' | 'CredentialDisabledError'
+ | 'ProviderAuthenticationError' | 'ProviderQuotaError' | 'ProviderFailureError'
+
 export interface UiPilotPluginApiV1 {
+ /** Windows Host 0.15.0+, request-bound and deeply frozen.
+  * Presence follows the Runtime network capability; it proves neither service
+  * authorization nor compatibility with the package command/output shape.
+  */
+ readonly services?: Readonly<PluginServicesApi>
   readonly network?: Readonly<PluginNetworkApi>
   readonly storage: {
     get(key: string): Promise<JsonValue | null>
@@ -289,11 +317,18 @@ export type ClipboardHistoryPasteErrorName =
   | 'PasteTargetUnavailable'
   | 'ClipboardWriteFailed'
 
+export type ClipboardHistoryCopyErrorName = Exclude<ClipboardHistoryPasteErrorName, 'PasteTargetUnavailable'>
+
 export interface UiPilotPluginPanelClipboardHistoryApiV1 {
-  list(): Promise<Readonly<ClipboardHistorySnapshot>>
+  /** Query: Windows Host 0.17.0+, max 512 Unicode characters before trimming.
+   * Matches full text or any file name case-insensitively. Filtered results retain revision. */
+  list(input?: Readonly<{ query?: string }>): Promise<Readonly<ClipboardHistorySnapshot>>
   onChanged(
     handler: (snapshot: Readonly<ClipboardHistorySnapshot>) => void | Promise<void>,
   ): () => void
+  /** Windows Host 0.17.0+, requires clipboard.history.read and clipboard.history.copy.
+   * Resolves after the full record is written, preserving the Panel and focus. */
+  copy(input: Readonly<{ id: string }>): Promise<Readonly<{ outcome: 'copied' }>>
   paste(input: Readonly<{
     id: string
     routeSequence: U64Decimal
@@ -302,7 +337,7 @@ export interface UiPilotPluginPanelClipboardHistoryApiV1 {
   clear(): Promise<void>
 }
 
-export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter'
+export type PluginPanelHostKey = 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter' | 'Delete'
 
 export interface PluginPanelHostKeyEvent {
   key: PluginPanelHostKey
@@ -314,7 +349,27 @@ export interface PluginPanelHostKeyEvent {
   routeSequence: U64Decimal
 }
 
+export interface PluginPanelContextAction {
+  /** Unique within both groups; [a-z][a-z0-9-]{0,63}; host- is reserved. */
+  id: string
+  title: string
+  shortcut?: string
+  icon?: 'search' | 'edit' | 'copy' | 'save' | 'plus' | 'trash' | 'arrow' | 'settings' | 'close' | 'pin' | 'eye' | 'arrow-right-to-line' | 'arrow-left-to-line'
+  disabledReason?: string
+  run(): void | Promise<void>
+}
+
 export interface UiPilotPluginPanelApiV1 {
+  /** Host 0.16.0+. One synchronous provider, evaluated before the menu takes focus.
+   * Up to 12 actions per group. Return null while a plugin modal owns focus.
+   * Session/input updates invalidate open actions. Callbacks must also guard object identity.
+   */
+  onActions(provider: (context: Readonly<{ source: 'hostInput' | 'content' }>) => {
+    context?: readonly PluginPanelContextAction[]
+    global?: readonly PluginPanelContextAction[]
+  } | null): () => void
+  /** Host 0.16.0+. Session-bound, plain text, max 512 Unicode characters. Empty message clears. */
+  readonly setStatus: (input: Readonly<{ message: string; tone?: 'info' | 'success' | 'error' }>) => Promise<void>
   /** Present only with panel.runtimeActions. Fresh frozen JSON; one idle-only call, no retry.
    * Do not await inside onUpdate/onHostKey. Cancellation may follow a committed write: reload.
    */

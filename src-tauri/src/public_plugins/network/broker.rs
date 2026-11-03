@@ -126,6 +126,7 @@ pub(crate) struct PluginHttpsBroker {
 }
 
 struct ValidatedRequest {
+    deny_redirects: bool,
     url: Url,
     hostname: String,
     method: PluginNetworkRequestMethod,
@@ -141,6 +142,12 @@ struct ValidatedRequest {
 pub(crate) struct PreparedPluginNetworkCall {
     request: ValidatedRequest,
     call: RegisteredPluginNetworkCall,
+}
+
+impl PreparedPluginNetworkCall {
+    pub(crate) fn deny_redirects(&mut self) {
+        self.request.deny_redirects = true;
+    }
 }
 
 #[cfg(test)]
@@ -305,7 +312,7 @@ impl PluginHttpsBroker {
         Ok(PreparedPluginNetworkCall { request, call })
     }
 
-    pub(super) async fn execute(
+    pub(crate) async fn execute(
         &self,
         prepared: PreparedPluginNetworkCall,
         redirect_authority: RedirectAuthority,
@@ -383,7 +390,7 @@ impl PluginHttpsBroker {
                 .map_err(map_transport_error)?;
             let normalized_headers = validate_response_metadata(&response)?;
             if is_redirect(response.status) {
-                if redirects >= MAX_REDIRECTS {
+                if request.deny_redirects || redirects >= MAX_REDIRECTS {
                     return Err(PluginNetworkErrorCode::NetworkTargetDenied);
                 }
                 let location = single_location(&normalized_headers)?;
@@ -496,6 +503,7 @@ fn validate_request(
     let plugin_headers = validate_request_headers(request.headers)?;
     let (body, content_type) = encode_body(request.method, request.body)?;
     Ok(ValidatedRequest {
+        deny_redirects: false,
         url,
         hostname,
         method: request.method,
@@ -1645,5 +1653,23 @@ mod tests {
                     && value == b"Bearer plugin-owned-legacy")
         );
         assert!(sent[0].sensitive_headers.is_empty());
+    }
+    #[tokio::test]
+    async fn host_service_request_refuses_even_same_host_redirect() {
+        let (broker, transport) =
+            broker(vec![Ok(response(302, vec![("location", b"/next")], b""))]);
+        let mut prepared = broker
+            .admit(
+                &context("host-service-redirect"),
+                &hosts(),
+                request(PluginNetworkRequestMethod::Post),
+            )
+            .unwrap();
+        prepared.deny_redirects();
+        assert_eq!(
+            broker.execute(prepared, Arc::new(|_, _| true)).await.err(),
+            Some(PluginNetworkErrorCode::NetworkTargetDenied)
+        );
+        assert_eq!(transport.take_requests().len(), 1);
     }
 }

@@ -1,11 +1,14 @@
+import { TranslationSelectionHotkey } from './translation-selection-hotkey'
 import { BuiltinFeatureRow, useBuiltinFeatures } from './builtin-feature-panel'
-import { HotkeyRecorderInput } from './hotkey-recorder-input'
+import { StartupCommandEditor } from './plugin-startup-editor'
 import type { HotkeyRecordingPhase } from './launcher-core'
-import { Button, Input, Modal, Popconfirm, Spin, Switch, Tooltip } from 'antd'
-import { FolderOpen, RefreshCw, Star, Undo2, Upload } from 'lucide-react'
+import { Button, Checkbox, Input, Modal, Spin, Switch, Tooltip } from 'antd'
+import { FolderOpen, RefreshCw, Upload } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { formatPublicPluginDiagnostics, parsePublicPluginDiagnostics, parseU64Decimal } from './protocol'
+import { HOST_CREDENTIALS, isHostCredentialPermission, installationPermissionGrants } from './host-credential-permissions'
+import { HostCredentialAccess } from './host-credential-access'
 import { PluginIcon } from './plugin-icon'
 import { PublicPluginSettings } from './public-plugin-settings'
 import type {
@@ -20,19 +23,32 @@ import type {
   PublicPluginDiagnosticReport,
 } from './protocol'
 
+export interface PublicPluginRemovalOutcome {
+  pluginId: string
+  pluginName: string
+  dataCleanupPending: boolean
+}
+
+function removalMessage(outcome: PublicPluginRemovalOutcome): string {
+  return `${outcome.pluginName}：${outcome.dataCleanupPending ? '插件已删除，但部分插件数据尚未清理。请核对残留数据，不会自动重试删除。' : '插件已删除。'}`
+}
+
 interface PublicPluginPanelProps {
   client: LauncherClient
+  removalOutcome?: PublicPluginRemovalOutcome | null
   onOpenBuiltinDetails?: (feature: BuiltinFeatureView) => void
   onOpenDetails?: (plugin: PublicPluginInventoryItem, revision: string, hotkeyRevision: string) => void
 }
 
-const CLEANUP_PENDING_MESSAGE = '插件已卸载，数据清理将在下次启动时重试'
 const CREDENTIAL_NOTICE = '此凭据会发送给该服务；服务响应可能包含其回显。'
 const PLUGIN_FILTER_DEBOUNCE_MS = 150
 const CLIPBOARD_HISTORY_NOTICE = '授权后，UiPilot 运行、插件启用且权限有效期间，会在本机记录该插件可用的剪贴板历史摘要；不会自动识别密码或敏感来源。'
 
 function permissionLabel(permission: PublicPermission): string {
+  if (isHostCredentialPermission(permission)) return HOST_CREDENTIALS[permission].label
   switch (permission) {
+    case 'selection.read':
+      return '读取选中文字（仅在主动触发划词翻译时）'
     case 'files.openText':
       return '选择并读取本地 UTF-8 文本文件（最多 8 KiB）'
     case 'url.open':
@@ -45,6 +61,8 @@ function permissionLabel(permission: PublicPermission): string {
       return '读取剪贴板（保留，暂不支持）'
     case 'clipboard.history.read':
       return '剪贴板历史读取'
+    case 'clipboard.history.copy':
+      return '剪贴板历史复制'
     case 'clipboard.history.paste':
       return '剪贴板历史粘贴'
     case 'network.https':
@@ -63,31 +81,23 @@ function permissionLabel(permission: PublicPermission): string {
 }
 
 function permissionSummary(permission: PublicPermission): string {
-  return `${permissionLabel(permission)} · ${permission}`
+  const label = permissionLabel(permission)
+  return label === permission ? permission : `${label} · ${permission}`
 }
 
 function hasClipboardHistoryRead(permissions: readonly PublicPermission[]) {
   return permissions.includes('clipboard.history.read')
 }
 
-function isCleanupPending(error: unknown): boolean {
-  return typeof error === 'object'
-    && error !== null
-    && 'code' in error
-    && error.code === 'dataCleanupPending'
-}
-
 function PublicPluginRow({
   client,
   plugin,
   reload,
-  onCleanupPending,
   onDetails,
 }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
   reload: () => Promise<void>
-  onCleanupPending: () => Promise<void>
   onDetails: () => void
 }) {
   const [busy, setBusy] = useState(false)
@@ -100,9 +110,8 @@ function PublicPluginRow({
     try {
       await operation()
       await reload()
-    } catch (caught) {
-      if (isCleanupPending(caught)) await onCleanupPending()
-      else setError('操作不可用，请重试。')
+    } catch {
+      setError('操作不可用，请重试。')
     } finally {
       setBusy(false)
     }
@@ -111,63 +120,20 @@ function PublicPluginRow({
   return (
     <article className="plugin-item public-plugin-item">
       <div className="public-plugin-icon-cell">
-        <PluginIcon iconUrl={plugin.iconUrl} size={36} />
+        <PluginIcon iconUrl={plugin.iconUrl} size={28} />
       </div>
-      <div className="plugin-item-main public-plugin-main">
-        <div className="public-plugin-summary-copy">
-          <div className="plugin-title-line">
-            <h3>{plugin.name}</h3>
-            <span>·</span>
-            <span>v{plugin.version}</span>
-            <span className="public-plugin-command" title={plugin.commands.map((command) => `${command.commandId}: /${command.effectiveName}`).join(' · ')}>
-              {plugin.commands.slice(0, 1).map((command) => <code key={command.commandId}>/{command.effectiveName}</code>)}
-              {plugin.commands.length > 1 ? <span className="public-plugin-command-count">共 {plugin.commands.length} 条命令</span> : null}
-            </span>
-            {plugin.fault ? <span className="plugin-fault-label">运行故障</span> : null}
-          </div>
-          {plugin.description ? <p className="plugin-description">{plugin.description}</p> : null}
-        </div>
-        <div className="public-plugin-row-links">
-          <Button type="link" size="small" aria-label="查看插件详情" onClick={onDetails}>
-            详情
-          </Button>
-          <Popconfirm
-            title="卸载插件"
-            description={(
-              <div className="public-uninstall-options">
-                <Button
-                  danger
-                  disabled={busy}
-                  onClick={() => void mutate(() => client.uninstallPublicPlugin({
-                    pluginId: plugin.pluginId,
-                    retainData: false,
-                  }))}
-                >
-                  全部卸载
-                </Button>
-                <Button
-                  disabled={busy}
-                  onClick={() => void mutate(() => client.uninstallPublicPlugin({
-                    pluginId: plugin.pluginId,
-                    retainData: true,
-                  }))}
-                >
-                  保留数据卸载
-                </Button>
-              </div>
-            )}
-            okButtonProps={{ style: { display: 'none' } }}
-            cancelText="取消"
-          >
-            <Button type="link" size="small" danger aria-label="卸载插件" disabled={busy}>
-              删除
-            </Button>
-          </Popconfirm>
-        </div>
-        {error ? <div className="plugin-row-error" role="alert">{error}</div> : null}
+      <div className="plugin-title-line public-plugin-name">
+        <h3 title={plugin.name}>{plugin.name}</h3>
+        {plugin.fault ? <span className="plugin-fault-label">运行故障</span> : null}
+      </div>
+      <div className="public-plugin-command" title={plugin.commands.map((command) => `${command.commandId}: /${command.effectiveName}`).join(' · ')}>
+        {plugin.commands.slice(0, 1).map((command) => <code key={command.commandId}>/{command.effectiveName}</code>)}
+        {plugin.commands.length > 1 ? <span className="public-plugin-command-count">+{plugin.commands.length - 1}</span> : null}
       </div>
       <div className="plugin-actions public-plugin-actions">
         <Switch
+          size="small"
+          aria-label={`启用 ${plugin.name}`}
           checked={plugin.enabled}
           disabled={busy}
           onChange={(enabled) => void mutate(() => client.setPublicPluginEnabled({
@@ -176,12 +142,14 @@ function PublicPluginRow({
           }))}
         />
       </div>
+      <Button className="public-plugin-detail-link" type="link" size="small" aria-label="查看插件详情" onClick={onDetails}>详情</Button>
+      {error ? <div className="plugin-row-error public-plugin-row-error" role="alert">{error}</div> : null}
     </article>
   )
 }
 
 function permissionText({ permission, supported, granted }: PublicPluginInventoryItem['permissions'][number]) {
-  return `${permissionSummary(permission)} · ${supported ? (granted ? '已授权' : '未授权') : '不支持'}`
+  return `${permissionSummary(permission)} · ${supported ? (granted ? '已开启' : '已关闭') : '暂不支持'}`
 }
 
 function CredentialBindings({ credentials, settings = [], addedIds = [] }: {
@@ -209,185 +177,13 @@ function CredentialBindings({ credentials, settings = [], addedIds = [] }: {
   )
 }
 
-// Each command owns its drafts and continuations; package settings remain singular.
-function PublicPluginCommandRow({ client, pluginId, command, revision, reload, single, onRecordingPhase }: {
-  client: LauncherClient
-  pluginId: string
-  command: PublicPluginInventoryItem['commands'][number]
-  revision: string
-  reload: (beforePublish?: (revision: string) => void) => Promise<void>
-  single: boolean
-  onRecordingPhase?: (phase: HotkeyRecordingPhase) => void
-}) {
-  const [draft, setDraft] = useState(command.effectiveName)
-  const [busy, setBusy] = useState(false)
-  const [unreconciled, setUnreconciled] = useState(false)
-  const acceptedRevision = useRef<string | null>(null)
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
-  const touched = useRef(false)
-  const row = useRef<HTMLDivElement>(null)
-  const alive = useRef(true)
-  const currentRevision = useRef(revision)
-  currentRevision.current = revision
-  const sequence = useRef(0)
-  const pending = useRef(false)
-  const focusReturn = useRef<{ origin: HTMLElement; moved: boolean } | null>(null)
-  const previousCommand = useRef(command)
-  useEffect(() => {
-    alive.current = true
-    const onFocus = (event: FocusEvent) => {
-      if (focusReturn.current && event.target !== document.body && event.target !== focusReturn.current.origin) focusReturn.current.moved = true
-    }
-    document.addEventListener('focusin', onFocus)
-    return () => { alive.current = false; sequence.current++; document.removeEventListener('focusin', onFocus) }
-  }, [])
-  useLayoutEffect(() => {
-    // Revision ownership governs UI publication, not the outstanding mutation gate.
-    // The reload owner marks this row's accepted refresh before publishing inventory.
-    if (acceptedRevision.current !== revision) {
-      if (pending.current) focusReturn.current = null
-      sequence.current++
-      setError('')
-      setNotice('')
-    }
-    acceptedRevision.current = null
-    setUnreconciled(false)
-    const previous = previousCommand.current
-    if (previous.effectiveName !== command.effectiveName || previous.nameOverride !== command.nameOverride) {
-      setDraft(command.effectiveName)
-      touched.current = false
-    }
-    previousCommand.current = command
-  }, [revision, command.effectiveName, command.nameOverride])
-  useLayoutEffect(() => {
-    // Release admission only after the accepted props/disabled state reach the DOM.
-    if (!busy) pending.current = false
-  })
-  useLayoutEffect(() => {
-    const focus = focusReturn.current
-    if (busy || !focus) return
-    focusReturn.current = null
-    if (focus.moved) return
-    const active = document.activeElement
-    if (active !== document.body && active !== focus.origin) return
-    const recovery = unreconciled ? row.current?.querySelector<HTMLButtonElement>('button[data-command-refresh]') : null
-    const target = focus.origin.isConnected && !focus.origin.matches(':disabled') ? focus.origin
-      : recovery ?? row.current?.querySelector<HTMLButtonElement>('.settings-hotkey-recorder button') ?? row.current?.querySelector<HTMLInputElement>('input')
-    if (target?.isConnected && !target.matches(':disabled')) target.focus()
-  }, [busy, unreconciled])
-  const reconcile = async (owns: () => boolean) => {
-    try {
-      await reload((nextRevision) => {
-        if (owns()) acceptedRevision.current = nextRevision
-      })
-      if (alive.current) setUnreconciled(false)
-    } catch {
-      if (alive.current) {
-        // The write may already be durable. Retry only the read, never the mutation.
-        setUnreconciled(true)
-        setError('无法刷新当前状态，请刷新命令状态后继续。')
-        setNotice('')
-      }
-    } finally {
-      if (alive.current) setBusy(false)
-    }
-  }
-  const mutate = async (operation: () => Promise<void>, success: () => void, failure: string, origin?: HTMLElement) => {
-    if (pending.current || unreconciled) return
-    pending.current = true
-    const token = ++sequence.current
-    const ownerRevision = revision
-    const owns = () => alive.current && sequence.current === token && currentRevision.current === ownerRevision
-    if (origin) focusReturn.current = { origin, moved: false }
-    setBusy(true); setError(''); setNotice('')
-    try {
-      await operation()
-      if (owns()) success()
-    } catch {
-      if (owns()) setError(failure)
-    }
-    // A sibling revision can retire captured feedback, but cannot erase reconciliation.
-    if (alive.current) await reconcile(owns)
-  }
-  const retryRefresh = (origin: HTMLElement) => {
-    if (pending.current) return
-    pending.current = true
-    const token = ++sequence.current
-    const ownerRevision = revision
-    focusReturn.current = { origin, moved: false }
-    setBusy(true); setError('')
-    void reconcile(() => alive.current && sequence.current === token && currentRevision.current === ownerRevision)
-  }
-  const save = (nameOverride: string | null, origin?: HTMLElement) => {
-    if (pending.current || unreconciled) return
-    if (nameOverride === command.nameOverride) {
-      setDraft(command.effectiveName); touched.current = false; setError('')
-      return
-    }
-    void mutate(
-      () => client.setPublicPluginEffectiveName({ pluginId, commandId: command.commandId, nameOverride }),
-      () => { setDraft(nameOverride ?? command.defaultName); touched.current = false; setNotice('已保存') },
-      '无法保存启动键，请检查名称冲突后重试。', origin,
-    )
-  }
-  const saveHotkey = (hotkey: string | null, origin?: HTMLElement) => mutate(
-    () => client.setPublicPluginCommandHotkey({ pluginId, commandId: command.commandId, hotkey }),
-    () => setNotice(hotkey === null ? '已清除快捷键' : '已保存快捷键'),
-    '无法保存快捷键，请检查快捷键冲突或系统占用后重试。', origin,
-  )
-  const suffix = single ? '' : ` ${command.commandId}`
-  return (
-    <div className="public-command-row" data-command-id={command.commandId} aria-busy={busy} ref={row}>
-      {!single ? <code className="public-command-id" title={command.commandId}>{command.commandId}</code> : null}
-      <form className="public-detail-name-control" onSubmit={(event) => { event.preventDefault(); save(draft, document.activeElement instanceof HTMLElement ? document.activeElement : undefined) }}>
-        <Input aria-label={`启动键${suffix}`} placeholder="输入启动键" value={draft} readOnly={busy || unreconciled}
-          onChange={(event) => { touched.current = true; setDraft(event.target.value) }}
-          onBlur={(event) => {
-            // Tab/click into a row action gives that action sole ownership (especially restore).
-            if (!touched.current || row.current?.contains(event.relatedTarget as Node | null)) return
-            save(event.currentTarget.value)
-          }}
-          onKeyDown={(event) => {
-            if (event.nativeEvent.isComposing) return
-            if (event.key === 'Enter') { event.preventDefault(); save(draft, event.currentTarget) }
-            if (event.key === 'Escape' && (touched.current || error)) {
-              event.preventDefault(); event.stopPropagation(); setDraft(command.effectiveName); touched.current = false; setError('')
-            }
-          }} />
-        <Button htmlType="submit" aria-label={`保存启动键${suffix}`} disabled={busy || unreconciled}>保存</Button>
-        <Tooltip title="恢复默认"><Button aria-label={`恢复默认启动键${suffix}`} icon={<Undo2 aria-hidden size={16} strokeWidth={1.8} />} disabled={busy || unreconciled}
-          onClick={(event) => save(null, event.currentTarget)} /></Tooltip>
-        <Tooltip title={command.favorite ? '取消常用' : '设为常用'}><Button
-          aria-label={`${command.favorite ? '取消常用' : '设为常用'}${suffix}`} aria-pressed={command.favorite} disabled={busy || unreconciled}
-          icon={<Star aria-hidden size={16} strokeWidth={1.8} fill={command.favorite ? 'currentColor' : 'none'} />}
-          onClick={(event) => void mutate(
-            () => client.setPublicPluginFavorite({ pluginId, commandId: command.commandId, favorite: !command.favorite }),
-            () => setNotice(command.favorite ? '已取消常用' : '已设为常用'), '无法更改常用状态，请重试。', event.currentTarget,
-          )} /></Tooltip>
-      </form>
-      <div className="public-command-hotkey">
-        <HotkeyRecorderInput key={revision} value={command.hotkey ?? ''} label={`命令快捷键${suffix}`} allowDoubleTap={false}
-          disabled={busy || unreconciled} onRecordingPhase={onRecordingPhase}
-          onCommit={(chord) => saveHotkey(chord, row.current?.querySelector<HTMLButtonElement>('.settings-hotkey-recorder button') ?? undefined)} />
-        <Button aria-label={`清除命令快捷键${suffix}`} disabled={busy || unreconciled || !command.hotkey} onClick={(event) => void saveHotkey(null, event.currentTarget)}>清除</Button>
-        <span className="public-command-hotkey-status" role="status">{({ unset: '未设置', active: '已启用', suspended: '已暂停', unavailable: '不可用' })[command.hotkeyStatus ?? 'unset']}</span>
-      </div>
-      <div className="public-command-feedback" aria-live="polite">
-        {error ? <span role="alert" className="plugin-row-error">{error}</span> : busy ? '保存中…' : notice}
-        {unreconciled ? <Button size="small" data-command-refresh aria-label={`刷新命令状态${suffix}`} disabled={busy}
-          onClick={(event) => retryRefresh(event.currentTarget)}>刷新状态</Button> : null}
-      </div>
-    </div>
-  )
-}
-
 export function PublicPluginConfirmation({ prepared, busy, onCommit, onCancel }: { prepared: PublicPluginPrepareSummary; busy: boolean; onCommit: () => void; onCancel: () => void }) {
   return (
         <div className="public-prepare" role="status">
           <PluginIcon iconUrl={prepared.iconUrl} size={32} />
           <strong>{prepared.name}</strong><span>{prepared.previousVersion ? `${prepared.previousVersion} → ${prepared.version}` : prepared.version}</span>
           <span>{prepared.operation === 'developmentRefresh' ? '同版本开发目录快照' : prepared.isUpdate ? '替换插件包' : '安装插件'}</span>
+          {prepared.permissions.some((permission) => permission.startsWith('credentials.')) ? <p>主程序密钥授权默认关闭；已有授权保持原状态。安装后请在插件详情逐项确认开启，可能消耗 API 额度。</p> : null}
           {prepared.isUpdate ? <p>插件包版本与保存的数据版本独立；替换或降级不会自动转换、恢复数据，请核对兼容性。</p> : null}
           <span>{prepared.permissions.filter((permission) => permission !== 'network.https').map(permissionSummary).join('、') || (prepared.network ? permissionSummary('network.https') : '无额外权限')}</span>
           {hasClipboardHistoryRead(prepared.permissions) ? (
@@ -429,8 +225,8 @@ export function publicPluginRecoveryError(error: unknown): string {
   }
 }
 
-export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload, detailBusy = false, onBusy = () => {}, acquire = () => true }: {
-  client: LauncherClient; plugin: PublicPluginInventoryItem; inventoryRevision: string; reload: () => Promise<void>; detailBusy?: boolean; onBusy?: (busy: boolean) => void; acquire?: () => boolean
+export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload, detailBusy = false, onBusy = () => {}, acquire = () => true, onRemoved }: {
+  client: LauncherClient; plugin: PublicPluginInventoryItem; inventoryRevision: string; reload: () => Promise<void>; detailBusy?: boolean; onBusy?: (busy: boolean) => void; acquire?: () => boolean; onRemoved?: (outcome: PublicPluginRemovalOutcome) => void
 }) {
   const live = useRef(true)
   const request = useRef(0)
@@ -440,6 +236,9 @@ export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload
   const [busy, setBusy] = useState(false)
   const [prepared, setPrepared] = useState<PublicPluginPrepareSummary | null>(null)
   const [report, setReport] = useState<PublicPluginDiagnosticReport | null>(null)
+  const [removeOpen, setRemoveOpen] = useState(false)
+  const [retainData, setRetainData] = useState(true)
+  const removeOrigin = useRef<HTMLElement | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   useEffect(() => { live.current = true; return () => { live.current = false; request.current += 1 } }, [])
@@ -448,8 +247,8 @@ export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload
     restore.current = false
     if (origin.current?.isConnected && (!document.activeElement || document.activeElement === document.body || document.activeElement === origin.current)) origin.current.focus()
   }, [busy, prepared])
-  const begin = () => {
-    if (pending.current || detailBusy || !acquire()) return false
+  const begin = (ownDialog = false) => {
+    if (pending.current || (detailBusy && !ownDialog) || !acquire()) return false
     pending.current = true; setBusy(true); onBusy(true); setError(''); setNotice(''); return true
   }
   const end = (confirming = false) => { pending.current = false; if (live.current) { setBusy(false); onBusy(confirming) } }
@@ -487,7 +286,7 @@ export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload
   const commit = () => {
     if (!prepared) return
     const confirmation = prepared
-    void mutate(() => client.commitPublicPlugin({ input: { token: confirmation.token, permissionGrants: [...confirmation.permissions] } }), '开发目录快照已重新载入；请重新运行命令查看新代码。')
+    void mutate(() => client.commitPublicPlugin({ input: { token: confirmation.token, permissionGrants: installationPermissionGrants(confirmation.permissions) } }), '开发目录快照已重新载入；请重新运行命令查看新代码。')
   }
   const diagnose = async () => {
     if (!begin()) return
@@ -506,34 +305,83 @@ export function PublicPluginRecovery({ client, plugin, inventoryRevision, reload
     catch { if (live.current) setError('无法复制诊断，请重试。') }
     finally { end() }
   }
+  const closeRemove = () => { if (pending.current) return; setRemoveOpen(false); restore.current = true; onBusy(false) }
+  const remove = async () => {
+    if (!removeOpen || !begin(true)) return
+    let outcome: PublicPluginRemovalOutcome | null = null
+    try {
+      await client.uninstallPublicPlugin({ pluginId: plugin.pluginId, retainData })
+      outcome = { pluginId: plugin.pluginId, pluginName: plugin.name, dataCleanupPending: false }
+    } catch (failure) {
+      const code = typeof failure === 'object' && failure !== null && 'code' in failure ? failure.code : null
+      if (code === 'dataCleanupPending') outcome = { pluginId: plugin.pluginId, pluginName: plugin.name, dataCleanupPending: true }
+      else if (live.current) setError('无法删除插件，请刷新状态后核对。')
+    }
+    if (!live.current) return
+    if (outcome) {
+      setRemoveOpen(false); setNotice(removalMessage(outcome))
+      // Publish durable outcomes before a read removes this detail from the tree.
+      onRemoved?.(outcome)
+    }
+    try { await reload() } catch { if (live.current) setError('无法刷新当前状态，请返回列表后核对。') }
+    restore.current = true; end()
+  }
   return <div className="public-plugin-recovery" aria-busy={busy} onKeyDown={(event) => {
     if (event.key === 'Escape' && prepared) { event.preventDefault(); event.stopPropagation(); void cancel() }
   }}>
     <div className="public-recovery-actions">
-      <Button type="text" disabled={busy || detailBusy || !!prepared} onClick={(event) => void refresh(event.currentTarget)}>重新载入开发目录</Button>
+      <Button disabled={busy || detailBusy || !!prepared} onClick={(event) => void refresh(event.currentTarget)}>重新载入</Button>
       {!plugin.enabled ? <Button disabled={busy || detailBusy || !!prepared} onClick={(event) => { origin.current = event.currentTarget; void mutate(() => client.setPublicPluginEnabled({ pluginId: plugin.pluginId, enabled: true }), '插件已启用；请重新运行命令。') }}>{plugin.fault ? '重新启用' : '启用'}</Button> : null}
-      <Button disabled={busy || detailBusy || !!prepared} onClick={() => void diagnose()}>查看诊断</Button>
+      <Button danger aria-label="删除插件" disabled={busy || detailBusy || !!prepared || removeOpen} onClick={(event) => {
+        if (!acquire()) return
+        removeOrigin.current = event.currentTarget; origin.current = event.currentTarget; setRetainData(true); setRemoveOpen(true); onBusy(true)
+      }}>删除</Button>
+      <Button disabled={busy || detailBusy || !!prepared || removeOpen} onClick={() => void diagnose()}>查看诊断</Button>
     </div>
     <p className="public-recovery-help">重新选择 package 目录；保存的数据不会被主动清除。替换后需重新运行命令；已停用的插件仍保持停用。</p>
     {prepared ? <PublicPluginConfirmation prepared={prepared} busy={busy} onCommit={commit} onCancel={() => void cancel()} /> : null}
     {report ? <div className="public-diagnostic-preview">
       <p>{report.state === null ? '状态未确认，请重启宿主后核对' : report.state.status === 'notInstalled' ? '当前未安装' : report.state.enabled ? '配置已启用；不代表 Runtime 健康' : '配置已停用'}。诊断包含插件标识和版本，请核对预览后复制。</p>
-      <pre aria-label="诊断 JSON 预览" tabIndex={0}>{formatPublicPluginDiagnostics(report)}</pre>
+      <Input.TextArea aria-label="诊断 JSON 预览" readOnly value={formatPublicPluginDiagnostics(report)} rows={10} />
       <Button disabled={busy || detailBusy || !!prepared} onClick={() => void copy()}>复制此诊断</Button>
     </div> : null}
+    <Modal className="public-plugin-confirmation" title="删除插件" open={removeOpen} onCancel={closeRemove} focusable={{ focusTriggerAfterClose: false }}
+      okText="删除" cancelText="取消" confirmLoading={busy} onOk={() => void remove()}
+      okButtonProps={{ danger: true, 'aria-label': '确认删除插件' }} cancelButtonProps={{ disabled: busy }}
+      afterClose={() => {
+        const target = removeOrigin.current
+        if (!busy && target?.isConnected && (document.activeElement === document.body || document.activeElement === target)) target.focus()
+      }}>
+      <p>删除 {plugin.name}？</p>
+      {error ? <p role="alert" className="plugin-row-error">{error}</p> : null}
+      <Checkbox checked={retainData} disabled={busy} onChange={(event) => setRetainData(event.target.checked)}>保留插件数据</Checkbox>
+    </Modal>
     <div className="public-detail-feedback" aria-live="polite">{busy ? <span role="status">正在处理…</span> : null}{notice ? <span role="status">{notice}</span> : null}{error ? <span role="alert" className="plugin-row-error">{error}</span> : null}</div>
   </div>
 }
 
-export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRevision = '0', onRecordingPhase, reload }: {
+export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRevision = '0', onRecordingPhase, reload, headerActionsTarget, onRemoved }: {
   client: LauncherClient
   plugin: PublicPluginInventoryItem
   inventoryRevision: string
   hotkeyRevision?: string
+  headerActionsTarget?: HTMLElement | null
+  onRemoved?: (outcome: PublicPluginRemovalOutcome) => void
   onRecordingPhase?: (phase: HotkeyRecordingPhase) => void
   reload: (beforePublish?: (revision: string) => void) => Promise<void>
 }) {
   const [busy, setBusy] = useState(false)
+  const [selectedCommandId, setSelectedCommandId] = useState(plugin.commands[0]?.commandId ?? '')
+  const selectedCommand = plugin.commands.find((command) => command.commandId === selectedCommandId) ?? plugin.commands[0]
+  const submitCommand = useRef<(() => Promise<boolean>) | null>(null)
+  const switching = useRef(false)
+  const [commandBlocked, setCommandBlocked] = useState(false)
+  const changeCommand = async (commandId: string) => {
+    if (switching.current || commandBlocked || commandId === selectedCommand?.commandId) return
+    switching.current = true
+    try { if (!submitCommand.current || await submitCommand.current()) setSelectedCommandId(commandId) }
+    finally { switching.current = false }
+  }
   const [recoveryBusy, setRecoveryBusy] = useState(false)
   const [ordinaryBusy, setOrdinaryBusy] = useState(false)
   const managementOwner = useRef<'ordinary' | 'detail' | 'recovery' | null>(null)
@@ -559,6 +407,22 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
     moved: boolean
   } | null>(null)
   const [closedDialog, setClosedDialog] = useState(0)
+  const permissionReload = useRef(reload)
+  useEffect(() => { permissionReload.current = reload }, [reload])
+  useEffect(() => {
+    if (!client.listenPublicPluginPermissionsChanged) return
+    let live = true
+    let unsubscribe: (() => void) | undefined
+    void client.listenPublicPluginPermissionsChanged(() => {
+      if (!live) return
+      void permissionReload.current().catch(() => {
+        if (live) setError('无法刷新权限状态，请重新打开详情。')
+      })
+    }).then((stop) => { if (live) unsubscribe = stop; else stop() }).catch(() => {
+      if (live) setError('无法监听权限变化，请重新打开详情。')
+    })
+    return () => { live = false; unsubscribe?.() }
+  }, [client, plugin.pluginId])
 
   const rememberFocus = (origin: HTMLElement, fallback: HTMLElement | null, dialog: 'network' | 'clear' | null) => {
     focusReturn.current = {
@@ -683,16 +547,27 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
     <section className="public-plugin-detail" aria-labelledby="public-plugin-detail-title" aria-busy={busy}>
       <fieldset className="public-detail-fields" disabled={busy || recoveryBusy || ordinaryBusy || networkConsent !== null || clearKey !== null}>
       <dl className="public-plugin-detail-list">
-        <dt className="public-detail-name-term">启动键</dt>
+        <dt className="public-detail-name-term">启动</dt>
         <dd className="public-detail-name-value">
-          {plugin.commands.map((command) => <PublicPluginCommandRow key={command.commandId}
-            client={client} pluginId={plugin.pluginId} command={command} revision={`${inventoryRevision}:${hotkeyRevision}`} onRecordingPhase={onRecordingPhase}
-            reload={reload} single={plugin.commands.length === 1} />)}
+          {plugin.commands.length > 1 ? <select className="public-command-selector" data-command-selector aria-label="选择启动命令"
+            value={selectedCommand?.commandId ?? ''} disabled={commandBlocked} onChange={(event) => void changeCommand(event.target.value)}>
+            {plugin.commands.map((command) => <option key={command.commandId} value={command.commandId}>{command.commandId} · /{command.effectiveName}</option>)}
+          </select> : null}
+          {selectedCommand ? <StartupCommandEditor key={selectedCommand.commandId} command={selectedCommand}
+            revision={`${inventoryRevision}:${hotkeyRevision}`} onRecordingPhase={onRecordingPhase}
+            reload={reload} single={plugin.commands.length === 1} headerActionsTarget={headerActionsTarget}
+            submitRef={submitCommand} onBlockedChange={setCommandBlocked} disabled={busy || recoveryBusy || ordinaryBusy || networkConsent !== null || clearKey !== null}
+            operations={{
+              name: (nameOverride) => client.setPublicPluginEffectiveName({ pluginId: plugin.pluginId, commandId: selectedCommand.commandId, nameOverride }),
+              hotkey: (hotkey) => client.setPublicPluginCommandHotkey({ pluginId: plugin.pluginId, commandId: selectedCommand.commandId, hotkey }),
+              favorite: (favorite) => client.setPublicPluginFavorite({ pluginId: plugin.pluginId, commandId: selectedCommand.commandId, favorite }),
+            }} /> : <span>无启动命令</span>}
         </dd>
+        {plugin.pluginId === 'com.uipilot.translate' ? <><dt>划词翻译快捷键</dt><dd><TranslationSelectionHotkey key={inventoryRevision} client={client} disabled={busy || recoveryBusy || ordinaryBusy || networkConsent !== null || clearKey !== null} onRecordingPhase={onRecordingPhase} /></dd></> : null}
         <dt>版本号</dt>
         <dd>{plugin.version}</dd>
         <dt>插件说明</dt>
-        <dd>{plugin.description || '暂无插件说明'}</dd>
+        <dd className="public-detail-description">{plugin.description || '暂无插件说明'}</dd>
         <dt>权限列表</dt>
         <dd>
           {plugin.permissions.length ? (
@@ -708,22 +583,22 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
             </>
           ) : '无额外权限'}
         </dd>
-        <dt>网络 Host</dt>
+        {plugin.network ? <><dt>网络 Host</dt>
         <dd>
           {plugin.network?.httpsHosts.length ? (
             <ul className="public-plugin-detail-items">
               {plugin.network.httpsHosts.map((host) => <li key={host}><code>{host}</code></li>)}
             </ul>
           ) : '无'}
-        </dd>
+        </dd></> : null}
         {networkPermission && plugin.network ? (
           <>
-            <dt>网络访问</dt>
+            <dt>网络访问权限</dt>
             <dd>
               <div className="public-network-access-header">
-                <Switch aria-label="网络访问" checked={networkPermission.granted} disabled={busy || !networkPermission.supported}
+                <Switch aria-label="网络访问" checked={networkPermission.granted} disabled={busy || commandBlocked || !networkPermission.supported}
                   onChange={(granted, event) => { if (!acquire('detail')) return; if (granted) setNetworkConsent({ plugin, revision: inventoryRevision, origin: event.currentTarget }); else setNetworkAccess(false, event.currentTarget) }} />
-                <span>{networkPermission.supported ? (networkPermission.granted ? '已授权' : '未授权') : '不支持'}</span>
+                <span>{networkPermission.supported ? (networkPermission.granted ? '已开启' : '已关闭') : '暂不支持'}</span>
               </div>
               <CredentialBindings credentials={plugin.network.credentials} settings={plugin.settings} />
             </dd>
@@ -743,12 +618,12 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
                       <label htmlFor={`public-secret-${definition.key}`}>{definition.label} <code>{definition.key}</code></label>
                       <span id={statusId} className="public-secret-status">{secretConfigured ? '已配置' : '未配置'}</span>
                       <Input id={`public-secret-${definition.key}`} type="password" aria-label={definition.label} aria-describedby={statusId}
-                        placeholder="输入新凭据" autoComplete="new-password" readOnly={busy}
+                        placeholder="输入新凭据" autoComplete="new-password" readOnly={busy || commandBlocked}
                         value={draft}
                         onChange={(event) => setSecretDrafts((drafts) => ({ ...drafts, [definition.key]: event.target.value }))} />
                       <div className="public-secret-actions">
-                        <Button htmlType="submit" type="primary" aria-label={`保存 ${definition.label}`} disabled={!draft.trim()} aria-disabled={busy}>保存</Button>
-                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy} onClick={(event) => { if (!acquire('detail')) return; clearOrigin.current = event.currentTarget; setClearKey(definition.key) }}>清除</Button>
+                        <Button htmlType="submit" type="primary" aria-label={`保存 ${definition.label}`} disabled={!draft.trim() || commandBlocked} aria-disabled={busy}>保存</Button>
+                        <Button danger aria-label={`清除 ${definition.label}`} disabled={busy || commandBlocked} onClick={(event) => { if (!acquire('detail')) return; clearOrigin.current = event.currentTarget; setClearKey(definition.key) }}>清除</Button>
                       </div>
                     </form>
                   )
@@ -757,15 +632,17 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
             </dd>
           </>
         ) : null}
+        {plugin.permissions.some(({ permission }) => permission === 'selection.read') ? <><dt>读取选中文字</dt><dd><HostCredentialAccess selectedText key={plugin.pluginId} client={client} plugin={plugin} revision={inventoryRevision} reload={reload} disabled={busy || recoveryBusy || ordinaryBusy || commandBlocked || networkConsent !== null || clearKey !== null} acquire={() => { if (!acquire('ordinary')) return false; setOrdinaryBusy(true); return true }} release={() => { release('ordinary'); setOrdinaryBusy(false) }} /></dd></> : null}
+        {plugin.permissions.some(({ permission }) => permission.startsWith('credentials.')) ? <><dt>主程序密钥</dt><dd><HostCredentialAccess key={plugin.pluginId} client={client} plugin={plugin} revision={inventoryRevision} reload={reload} disabled={busy || recoveryBusy || ordinaryBusy || commandBlocked || networkConsent !== null || clearKey !== null} acquire={() => { if (!acquire('ordinary')) return false; setOrdinaryBusy(true); return true }} release={() => { release('ordinary'); setOrdinaryBusy(false) }} /></dd></> : null}
         <dt>插件所在目录</dt>
-        <dd>暂未提供插件目录</dd>
+        <dd className="public-detail-directory">{plugin.installationDirectory ?? '暂未提供插件目录'}</dd>
       </dl>
       </fieldset>
       <PublicPluginSettings key={`settings:${plugin.pluginId}`} client={client} plugin={plugin} revision={inventoryRevision} reload={reload}
-        detailBusy={busy || recoveryBusy || networkConsent !== null || clearKey !== null}
+        detailBusy={busy || recoveryBusy || networkConsent !== null || clearKey !== null || commandBlocked}
         acquire={() => { if (!acquire('ordinary')) return false; setOrdinaryBusy(true); return true }}
         release={() => { release('ordinary'); setOrdinaryBusy(false) }} />
-      <PublicPluginRecovery key={plugin.pluginId} client={client} plugin={plugin} inventoryRevision={inventoryRevision} reload={reload} detailBusy={busy || ordinaryBusy || networkConsent !== null || clearKey !== null} acquire={() => acquire('recovery')} onBusy={(next) => { setRecoveryBusy(next); if (!next) release('recovery') }} />
+      <PublicPluginRecovery key={plugin.pluginId} onRemoved={onRemoved} client={client} plugin={plugin} inventoryRevision={inventoryRevision} reload={reload} detailBusy={busy || ordinaryBusy || networkConsent !== null || clearKey !== null || commandBlocked} acquire={() => acquire('recovery')} onBusy={(next) => { setRecoveryBusy(next); if (!next) release('recovery') }} />
       <div className="public-detail-feedback" aria-live="polite">
         {busy ? <span role="status">正在保存…</span> : null}
         {notice ? <span role="status">{notice}</span> : null}
@@ -789,7 +666,7 @@ export function PublicPluginDetail({ client, plugin, inventoryRevision, hotkeyRe
   )
 }
 
-export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails }: PublicPluginPanelProps) {
+export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails, removalOutcome }: PublicPluginPanelProps) {
   const builtins = useBuiltinFeatures(client)
   const epoch = useRef(0)
   const [inventory, setInventory] = useState<PublicPluginInventory | null>(null)
@@ -827,11 +704,6 @@ export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails 
       if (owner === epoch.current) setLoading(false)
     }
   }, [client])
-
-  const handleCleanupPending = useCallback(async () => {
-    setNotice(CLEANUP_PENDING_MESSAGE)
-    await reload()
-  }, [reload])
 
   useEffect(() => {
     void reload().catch(() => {})
@@ -891,7 +763,7 @@ export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails 
     let committed = false
     let operationError = ''
     try {
-      await client.commitPublicPlugin({ input: { token: confirmation.token, permissionGrants: [...confirmation.permissions] } })
+      await client.commitPublicPlugin({ input: { token: confirmation.token, permissionGrants: installationPermissionGrants(confirmation.permissions) } })
       committed = true; setNotice('插件包已安装。')
     } catch (failure) { operationError = publicPluginRecoveryError(failure) }
     finally { restorePreparedOrigin.current = true; setPrepared(null) }
@@ -902,18 +774,18 @@ export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails 
     mutationPending.current = false; setBusy(false)
   }
   const filteredPlugins = pluginFilter && inventory
-    ? inventory.items.filter((plugin) => [plugin.name, plugin.description, ...plugin.commands.map((command) => `/${command.effectiveName}`)].join(' ').toLocaleLowerCase().includes(pluginFilter))
+    ? inventory.items.filter((plugin) => [plugin.name, ...plugin.commands.map((command) => `/${command.effectiveName}`)].join(' ').toLocaleLowerCase().includes(pluginFilter))
     : inventory?.items ?? []
 
-  const filteredBuiltins = builtins.items.filter((item) => !pluginFilter || [item.name, item.command, item.description].join(' ').toLocaleLowerCase().includes(pluginFilter))
+  const filteredBuiltins = builtins.items.filter((item) => !pluginFilter || [item.name, item.command].join(' ').toLocaleLowerCase().includes(pluginFilter))
 
   return (
     <section className="public-plugin-inventory" aria-labelledby="public-plugin-title">
       <div className="plugin-inventory-header">
         <h2 id="public-plugin-title">插件</h2>
         <div className="public-install-actions">
-          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)}>选择插件包</Button></Tooltip>
-          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)}>选择开发目录</Button></Tooltip>
+          <Tooltip title="选择插件包"><Button aria-label="选择插件包" icon={<Upload aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('archive', event.currentTarget)}><span className="public-install-label">选择插件包</span></Button></Tooltip>
+          <Tooltip title="选择开发目录"><Button aria-label="选择开发目录" icon={<FolderOpen aria-hidden size={16} strokeWidth={1.8} />} disabled={busy} onClick={(event) => void prepare('developmentDirectory', event.currentTarget)}><span className="public-install-label">选择开发目录</span></Button></Tooltip>
           <Tooltip title="刷新">
             <Button
               aria-label="刷新"
@@ -926,8 +798,8 @@ export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails 
       </div>
       <div className="public-plugin-filter">
         <Input
-          aria-label="筛选插件名称"
-          placeholder="筛选插件名称"
+          aria-label="搜索插件名称或启动命令"
+          placeholder="搜索插件名称或启动命令"
           allowClear
           value={pluginFilterDraft}
           disabled={loading && !inventory}
@@ -938,22 +810,26 @@ export function PublicPluginPanel({ client, onOpenDetails, onOpenBuiltinDetails 
         <PublicPluginConfirmation prepared={prepared} busy={busy} onCommit={() => void commitPrepared()} onCancel={() => void cancelPrepared()} />
       ) : null}
       {error ? <div className="plugin-list-state plugin-list-error" role="alert">{error}</div> : null}
+      {removalOutcome ? <div className="plugin-list-state" role="status">{removalMessage(removalOutcome)}</div> : null}
       {notice ? <div className="plugin-list-state" role="status">{notice}</div> : null}
       {loading && !inventory ? <div className="plugin-list-state"><Spin size="small" /></div> : null}
       {inventory?.items.length === 0 ? <div className="plugin-list-state">未安装公开插件</div> : null}
       {inventory && (inventory.items.length > 0 || builtins.items.length > 0) && filteredBuiltins.length === 0 && filteredPlugins.length === 0 ? <div className="plugin-list-state">未找到匹配插件</div> : null}
       {builtins.error ? <div className="plugin-list-state plugin-list-error" role="alert">{builtins.error}</div> : null}
-      {filteredBuiltins.map((item) => <BuiltinFeatureRow key={item.feature} item={item} busy={builtins.busy} onToggle={(enabled) => void builtins.toggle(item.feature, enabled)} onDetails={() => onOpenBuiltinDetails?.(item)} />)}
-      {filteredPlugins.map((plugin) => (
-        <PublicPluginRow
-          key={`${plugin.pluginId}:${plugin.generation}`}
-          client={client}
-          plugin={plugin}
-          reload={reload}
-          onCleanupPending={handleCleanupPending}
-          onDetails={() => onOpenDetails?.(plugin, inventory!.revision, inventory!.hotkeyRevision)}
-        />
-      ))}
+      {filteredBuiltins.length > 0 || filteredPlugins.length > 0 ? (
+        <div className="public-plugin-list">
+          {filteredBuiltins.map((item) => <BuiltinFeatureRow key={item.feature} item={item} busy={builtins.busy} onToggle={(enabled) => void builtins.toggle(item.feature, enabled)} onDetails={() => onOpenBuiltinDetails?.(item)} />)}
+          {filteredPlugins.map((plugin) => (
+            <PublicPluginRow
+              key={`${plugin.pluginId}:${plugin.generation}`}
+              client={client}
+              plugin={plugin}
+              reload={reload}
+              onDetails={() => onOpenDetails?.(plugin, inventory!.revision, inventory!.hotkeyRevision)}
+            />
+          ))}
+        </div>
+      ) : null}
     </section>
   )
 }

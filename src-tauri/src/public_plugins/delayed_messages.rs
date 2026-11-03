@@ -45,6 +45,7 @@ struct SchedulerState {
     next_schedule_id: u64,
     pending_by_due: BTreeMap<(Instant, u64), ScheduledPluginMessage>,
     pending_by_plugin: HashMap<String, usize>,
+    cancelled_through: HashMap<String, u64>,
     terminal: bool,
 }
 
@@ -54,6 +55,7 @@ impl Default for SchedulerState {
             next_schedule_id: 1,
             pending_by_due: BTreeMap::new(),
             pending_by_plugin: HashMap::new(),
+            cancelled_through: HashMap::new(),
             terminal: false,
         }
     }
@@ -139,6 +141,12 @@ impl DelayedMessageScheduler {
         if state.terminal {
             return Err(DelayedMessageScheduleError::Unavailable);
         }
+        // A worker may already have popped a due message. Retire its ticket as
+        // well as queued work so a later regrant cannot resurrect it.
+        let through = state.next_schedule_id - 1;
+        state
+            .cancelled_through
+            .insert(plugin_id.to_owned(), through);
         let removed = state
             .pending_by_plugin
             .remove(plugin_id)
@@ -151,6 +159,18 @@ impl DelayedMessageScheduler {
         drop(state);
         self.wake.notify_one();
         Ok(removed)
+    }
+
+    pub(crate) fn is_current(&self, message: &ScheduledPluginMessage) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            !state.terminal
+                && message.schedule_id
+                    > state
+                        .cancelled_through
+                        .get(&message.plugin_id)
+                        .copied()
+                        .unwrap_or(0)
+        })
     }
 
     #[cfg(test)]

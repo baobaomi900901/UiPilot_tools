@@ -9,6 +9,7 @@ interface BootstrapNetworkApi {
 
 interface BootstrapRuntimeApi {
   readonly network?: Readonly<BootstrapNetworkApi>
+  readonly services?: { readonly youdao: { translate(input: unknown): Promise<unknown> } }
 }
 
 const context = Object.freeze({
@@ -49,7 +50,7 @@ async function executeRuntimeBootstrap(
   let eventCallback: ((message: { payload: unknown }) => Promise<void>) | null = null
   const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
     if (command === 'plugin:event|listen') return undefined
-    if (command === 'plugin_network_request') return requestResult(args)
+    if (command === 'plugin_network_request' || command === 'plugin_youdao_translate') return requestResult(args)
     return undefined
   })
   const hostWindow: Record<string, unknown> = {
@@ -452,4 +453,53 @@ describe('credential reference snapshot', () => {
     expect(getter).not.toHaveBeenCalled()
     expect(runtime.invoke.mock.calls.filter(([command]) => command === 'plugin_network_request')).toEqual([])
   })
+})
+
+
+describe('host Youdao service facade', () => {
+ it('snapshots input, freezes output and expires retained APIs', async () => {
+  let retained: BootstrapRuntimeApi | undefined
+  let output: unknown
+  const input = { text: 'hello', from: 'en', to: 'zh-CHS' }
+  const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
+   retained = api
+   const pending = api.services!.youdao.translate(input)
+   input.text = 'changed'
+   output = await pending
+   return { results: [] }
+  }, async () => ({ translations: ['你好'] }))
+  await runtime.dispatch()
+  expect(Object.isFrozen(retained!.services!.youdao)).toBe(true)
+  expect(Object.isFrozen(output)).toBe(true)
+  expect(Object.isFrozen((output as {translations: string[]}).translations)).toBe(true)
+  expect(runtime.invoke).toHaveBeenCalledWith('plugin_youdao_translate', {input: {context, input: {text: 'hello', from: 'en', to: 'zh-CHS'}}})
+  await expect(retained!.services!.youdao.translate(input)).rejects.toMatchObject({name: 'ExpiredRequestError'})
+ })
+ it('rejects getters and invalid UTF-8 length, language and fields before IPC', async () => {
+  let getterCalls = 0
+  const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
+   for (const input of [
+    { get text() { getterCalls++; return 'hello' }, from: 'en', to: 'zh-CHS' },
+    { text: '', from: 'en', to: 'zh-CHS' },
+    { text: '中'.repeat(2731), from: 'en', to: 'zh-CHS' },
+    { text: 'hello', from: 'en', to: 'en' },
+    { text: 'hello', from: 'en', to: 'zh-CHS', url: 'https://example.com' },
+   ]) await expect(api.services!.youdao.translate(input)).rejects.toMatchObject({name: 'InvalidServiceRequestError'})
+   return { results: [] }
+  })
+  await runtime.dispatch()
+  expect(getterCalls).toBe(0)
+  expect(runtime.invoke.mock.calls.some(([command]) => command === 'plugin_youdao_translate')).toBe(false)
+ })
+ it.each([
+  ['servicePermissionDenied', 'ServicePermissionDeniedError'], ['credentialNotConfigured', 'CredentialNotConfiguredError'],
+  ['credentialDisabled', 'CredentialDisabledError'], ['credentialUnavailable', 'CredentialUnavailableError'],
+  ['providerAuthentication', 'ProviderAuthenticationError'], ['providerQuota', 'ProviderQuotaError'], ['providerFailure', 'ProviderFailureError'],
+ ])('maps %s to fixed %s', async (code, name) => {
+  const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
+   await expect(api.services!.youdao.translate({text:'hello',from:'en',to:'zh-CHS'})).rejects.toMatchObject({name, message: name})
+   return {results:[]}
+  }, async () => {throw {code}})
+  await runtime.dispatch()
+ })
 })

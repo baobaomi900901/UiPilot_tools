@@ -29,14 +29,16 @@ import {
 } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { AppVersion } from './app-version'
+import { createContextActionsMenu, type ContextActionsMenu, type ContextAction } from './context-actions-ui.js'
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 
 import { sameFavoriteTarget, type HotkeyRecordingPhase, type LauncherCore } from './launcher-core'
-import { CredentialSettings, createCredentialDraft } from './credential-settings'
+import { CredentialSettings, type CredentialSettingsHandle, type CredentialSettingsStatus } from './credential-settings'
 import { MessageCenterPanel } from './message-center-panel'
 import { bindNativeTextInput } from './native-input'
 import { PluginIcon } from './plugin-icon'
-import { PublicPluginDetail, PublicPluginPanel } from './public-plugin-panel'
+import { PublicPluginDetail, PublicPluginPanel, type PublicPluginRemovalOutcome } from './public-plugin-panel'
+import { PluginPermissionsPanel } from './plugin-permissions-panel'
 import type {
   ControlKey,
   FileCategory,
@@ -263,6 +265,7 @@ function settingsTabKey(target: EventTarget): SettingsTabKey | null {
   if (controlledPanel?.endsWith('-panel-general')) return 'general'
   if (controlledPanel?.endsWith('-panel-messages')) return 'messages'
   if (controlledPanel?.endsWith('-panel-plugins')) return 'plugins'
+  if (controlledPanel?.endsWith('-panel-permissions')) return 'permissions'
   if (controlledPanel?.endsWith('-panel-credentials')) return 'credentials'
   return null
 }
@@ -304,6 +307,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
+  const [publicPluginRemovalOutcome, setPublicPluginRemovalOutcome] = useState<PublicPluginRemovalOutcome | null>(null)
+  const [detailHeaderActions, setDetailHeaderActions] = useState<HTMLDivElement | null>(null)
   const [builtinFeatureDetail, setBuiltinFeatureDetail] = useState<BuiltinFeatureView | null>(null)
   const [publicPluginDetail, setPublicPluginDetail] = useState<{ plugin: PublicPluginInventoryItem; revision: string; hotkeyRevision: string; session: number } | null>(null)
   const detailSession = useRef(0)
@@ -322,6 +327,32 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const queryRef = useRef<HTMLInputElement | null>(null)
   const mainResultInputRef = useRef<HTMLInputElement | null>(null)
   const panelInputRef = useRef<HTMLInputElement | null>(null)
+  const operationsMenu = useRef<ContextActionsMenu | null>(null)
+  const [operationsOpen, setOperationsOpen] = useState(false)
+  const [operationsError, setOperationsError] = useState('')
+  const panelActionSource = useRef<'hostInput' | 'content'>('hostInput')
+  const panelMenuTicket = useRef<{ ticket: string; sessionEpoch: string; suffix: string } | null>(null)
+  useEffect(() => {
+    const blur = () => { panelActionSource.current = 'content'; operationsMenu.current?.close(false) }
+    window.addEventListener('blur', blur)
+    let alive = true
+    let unlisten: (() => void) | undefined
+    if (snapshot.panel) void core.client.listenPluginPanelActionsSubmit?.((payload) => {
+      const record = payload as { sessionEpoch?: unknown; ticket?: unknown } | null
+      const pending = panelMenuTicket.current
+      const current = core.getSnapshot()
+      if (!alive || !pending || !record || record.sessionEpoch !== pending.sessionEpoch || record.ticket !== pending.ticket ||
+          current.view !== 'launcher' || current.panel?.sessionEpoch !== pending.sessionEpoch || current.panel.suffix !== pending.suffix || current.panel.closePending) return
+      panelMenuTicket.current = null
+      core.keyDown('Enter', false)
+    }).then((dispose) => { if (alive) unlisten = dispose; else dispose() }).catch(() => { if (alive) setOperationsError('操作面板暂不可用') })
+    return () => { alive = false; unlisten?.(); window.removeEventListener('blur', blur); operationsMenu.current?.close(false) }
+  }, [core, snapshot.panel?.sessionEpoch])
+  useEffect(() => {
+    operationsMenu.current?.close(false)
+    panelMenuTicket.current = null
+    setOperationsError('')
+  }, [snapshot.invocationId, snapshot.viewEpoch, snapshot.querySequence, snapshot.results[snapshot.selectedIndex]?.key, snapshot.panel?.sessionEpoch, snapshot.panel?.suffix])
   const quicklinksInputRef = useRef<HTMLInputElement | null>(null)
   const quicklinkItemRefs = useRef(new Map<string, HTMLButtonElement>())
   const quicklinksEditorRef = useRef<HTMLElement | null>(null)
@@ -331,7 +362,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const panelHostRef = useRef<HTMLDivElement | null>(null)
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
-  const [credentialDraft, setCredentialDraft] = useState(createCredentialDraft)
+  const credentialSettingsRef = useRef<CredentialSettingsHandle | null>(null)
+  const [credentialStatus, setCredentialStatus] = useState<CredentialSettingsStatus>({ message: '', tone: 'default', detail: false })
   const [settingsPinned, setSettingsPin] = useState(false)
   const [appliedPin, setAppliedPin] = useState(false)
   const [pinAttempt, setPinAttempt] = useState(0)
@@ -347,7 +379,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   useEffect(() => {
     if (snapshot.view !== 'settings') return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (hotkeyRecordingActive.current || !isWindowPinShortcut(event)) return
+      if (operationsMenu.current?.isOpen || hotkeyRecordingActive.current || !isWindowPinShortcut(event)) return
       event.preventDefault()
       event.stopPropagation()
       if (!event.repeat && !snapshot.hidePending && !pinPending) {
@@ -786,22 +818,27 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }, [activeFileIndex, file, snapshot.view])
 
   const statusResult = snapshot.results[snapshot.selectedIndex]
+  const launcherResultsActive = snapshot.view === 'launcher' && !file && !panelActive
+  const resultOperation = launcherResultsActive && statusResult && !snapshot.resultActionRerun
+    ? statusResult.actions
+      ? statusResult.defaultActionTitle ?? (statusResult.actions.length ? '选择动作' : '')
+      : statusResult.hasDefaultAction === false ? '' : snapshot.mainResultCommand ? '复制' : '执行'
+    : ''
   const status =
+    operationsError ||
+    (snapshot.view === 'settings' && activeSettingsTab === 'credentials'
+      ? credentialStatus.message : '') ||
     snapshot.shownNotice ||
     snapshot.status ||
-    (snapshot.results.length
-      ? snapshot.mainResultCommand
-        ? `${snapshot.results.length} 个结果${statusResult?.subtitle ? ` · ${statusResult.subtitle}` : ''}`
-        : `${snapshot.results.length} 个结果。${statusResult?.title ?? ''}${
-            statusResult?.subtitle ? `，${statusResult.subtitle}` : ''
-          }`
+    (panel ? panel.feedback?.status.message : '') ||
+    (snapshot.view === 'launcher' && !panelActive && snapshot.results.length
+      ? `${snapshot.results.length} 个结果`
       : '')
   const messageBadgeCount = snapshot.messageCenter.status === 'unavailable'
     ? '!'
     : snapshot.messageCenter.status === 'ready'
       ? snapshot.messageCenter.unreadCount ?? 0
       : 0
-  const launcherResultsActive = snapshot.view === 'launcher' && !file && !panelActive
   const captureActionFocus = (index = snapshot.selectedIndex) => {
     const row = snapshot.results[index]
     if (!row) return
@@ -812,6 +849,43 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     }
   }
   const openActions = () => { captureActionFocus(); core.openResultActionMenu() }
+  const openOperations = () => {
+    if (panel) {
+      const ticket = window.crypto.randomUUID()
+      panelMenuTicket.current = { ticket, sessionEpoch: panel.sessionEpoch, suffix: panel.suffix }
+      if (!core.client.openPluginPanelActions) { setOperationsError('操作面板暂不可用'); return }
+      void core.client.openPluginPanelActions({ sessionEpoch: panel.sessionEpoch, source: panelActionSource.current, ticket })
+        .catch(() => setOperationsError('操作面板暂不可用'))
+      return
+    }
+    const menu = operationsMenu.current ??= createContextActionsMenu(document, () => setOperationsError('操作未完成，请重试'))
+    if (menu.isOpen) { menu.close(); return }
+    core.closeResultActionMenu()
+    const context: ContextAction[] = []
+    const global: ContextAction[] = []
+    const owner = { invocationId: snapshot.invocationId, viewEpoch: snapshot.viewEpoch, querySequence: snapshot.querySequence, resultKey: statusResult?.key }
+    const owned = (run: () => void | Promise<void>) => () => {
+      const now = core.getSnapshot()
+      if (now.invocationId === owner.invocationId && now.viewEpoch === owner.viewEpoch && now.querySequence === owner.querySequence && now.results[now.selectedIndex]?.key === owner.resultKey) return run()
+    }
+    if (launcherResultsActive && statusResult) {
+      if (statusResult.actions) statusResult.actions.forEach((action, index) => context.push({ id: `result-${index}`, title: action.title,
+        shortcut: action.actionId === statusResult.defaultActionId ? 'Enter' : undefined,
+        icon: /复制/.test(action.title) ? 'copy' : 'arrow', disabledReason: snapshot.resultActionsDisabled ? '结果暂不可用，请重新运行' : undefined,
+        run: owned(() => core.executeResultAction(snapshot.selectedIndex, action.actionId)) }))
+      else if (statusResult.hasDefaultAction !== false) context.push({ id: 'result-default', title: resultOperation || '执行', shortcut: 'Enter', icon: snapshot.mainResultCommand ? 'copy' : 'arrow', run: owned(() => core.activateResult(snapshot.selectedIndex)) })
+      if (snapshot.resultActionRerun) context.push({ id: 'rerun', title: '重新运行', icon: 'arrow', run: owned(core.rerunResultCommand) })
+    }
+    if (quicklinks) {
+      global.push({ id: 'new-link', title: '新建快捷链接', shortcut: 'Ctrl+N', icon: 'plus', run: core.newQuicklink })
+      if (quicklinksDraftActive) context.push({ id: 'save-link', title: '保存快捷链接', icon: 'save', run: () => core.saveQuicklink() })
+    }
+    if (file) context.push({ id: 'open-file', title: '打开选中项', shortcut: 'Enter', icon: 'arrow', disabledReason: file.selected ? undefined : '没有选中项', run: () => core.keyDown('Enter', false) })
+    global.push({ id: 'settings', title: snapshot.view === 'settings' ? '返回启动器' : '打开设置', icon: 'settings', run: () => core.navigate(snapshot.view === 'settings' ? 'launcher' : 'settings') },
+      { id: 'hide', title: '隐藏窗口', shortcut: 'Esc', icon: 'close', run: core.requestHide })
+    setOperationsOpen(true)
+    menu.open({ context, global }, { bottom: 44, onClose: () => setOperationsOpen(false) })
+  }
   const settingsControl = (
     <Tooltip title="设置">
       <span className="launcher-settings-control">
@@ -878,14 +952,14 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
   }
   const launcherTabKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
-    if (!launcherResultsActive) return
+    if (hotkeyRecordingActive.current || event.target instanceof Element && event.target.closest('dialog, [role="dialog"]')) return
     if (event.key.toLowerCase() === 'k' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !composing(event)) {
-      if (!statusResult?.actions?.length) return
       event.preventDefault()
       event.stopPropagation()
-      openActions()
+      if (!event.repeat) openOperations()
       return
     }
+    if (!launcherResultsActive) return
     if (
       event.key !== 'Tab' ||
       event.ctrlKey ||
@@ -920,6 +994,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     queryKeyDown(event)
   }
   const panelKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.defaultPrevented) return
     const isComposing = composing(event)
     if (event.key === 'Backspace' && !isComposing) {
       const input = event.currentTarget
@@ -930,6 +1005,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       return
     }
     if (core.routePanelHostKey({
+      repeat: event.repeat,
       key: event.key,
       ctrlKey: event.ctrlKey,
       metaKey: event.metaKey,
@@ -1112,7 +1188,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       event.key.toLowerCase() === 'f'
     ) {
       const input = settingsTabsRef.current
-        ?.querySelector<HTMLInputElement>('input[aria-label="筛选插件名称"]')
+        ?.querySelector<HTMLInputElement>('input[aria-label="搜索插件名称或启动命令"]')
       if (!input?.isConnected || input.disabled) return
       event.preventDefault()
       event.stopPropagation()
@@ -1123,6 +1199,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     }
     if (event.key === 'Escape') {
       if (!isComposing) event.preventDefault()
+      if (!isComposing && activeSettingsTab === 'credentials' && credentialSettingsRef.current?.back()) return
       core.keyDown('Escape', isComposing)
       return
     }
@@ -1582,6 +1659,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           </label>
           <BoundInput
             className="panel-suffix-input"
+            onFocus={() => { panelActionSource.current = 'hostInput' }}
             core={core}
             control={panel.suffixControl}
             value={panel.suffix}
@@ -1599,6 +1677,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           />
         </div>
       </div>
+      <div className="panel-content-divider" aria-hidden="true" />
       <div ref={panelHostRef} className="panel-host-region" aria-label="插件面板内容" />
     </section>
   ) : null
@@ -2048,6 +2127,13 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     </OverlayScrollbarsComponent>
   )
   const selectSettingsTab = (key: SettingsTabKey) => {
+    if (activeSettingsTab === 'credentials' && key !== 'credentials' && credentialSettingsRef.current) {
+      credentialSettingsRef.current.requestLeave(() => applySettingsTab(key))
+      return
+    }
+    applySettingsTab(key)
+  }
+  const applySettingsTab = (key: SettingsTabKey) => {
     core.selectSettingsTab(key)
     if (key === 'plugins') {
       if (activatedPluginEpoch.current === snapshot.viewEpoch) return
@@ -2071,7 +2157,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current })} />
+        <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2223,16 +2309,19 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 type="text"
               />
             </Tooltip>
-            <h1 id="public-plugin-detail-title" className="public-plugin-detail-title">{selectedPublicPlugin?.name ?? builtinFeatureDetail!.name}</h1>
+            <h1 id="public-plugin-detail-title" className="public-plugin-detail-title" title={selectedPublicPlugin?.name ?? builtinFeatureDetail!.name}>{selectedPublicPlugin?.name ?? builtinFeatureDetail!.name}</h1>
           </div>
+          <div className="public-detail-header-actions" ref={setDetailHeaderActions} />
         </header>
       </div>
       <OverlayScrollbarsComponent className="settings-detail-panel" options={settingsScrollbarOptions}>
         <div className="settings-scroll-content">
-          {builtinFeatureDetail ? <BuiltinFeatureDetail key={builtinFeatureDetail.feature} client={core.client} feature={builtinFeatureDetail} /> : selectedPublicPlugin ? <PublicPluginDetail
+          {builtinFeatureDetail ? <BuiltinFeatureDetail key={builtinFeatureDetail.feature} client={core.client} feature={builtinFeatureDetail} headerActionsTarget={detailHeaderActions} onRecordingPhase={handleHotkeyRecordingPhase} /> : selectedPublicPlugin ? <PublicPluginDetail
             client={core.client}
             key={`${selectedPublicPlugin.pluginId}:${publicPluginDetail!.session}`}
             plugin={selectedPublicPlugin}
+            headerActionsTarget={detailHeaderActions}
+            onRemoved={(outcome) => { setPublicPluginRemovalOutcome(outcome); closePublicPluginDetail() }}
             inventoryRevision={publicPluginDetail!.revision}
             hotkeyRevision={publicPluginDetail!.hotkeyRevision} onRecordingPhase={handleHotkeyRecordingPhase}
             reload={async (beforePublish) => {
@@ -2285,14 +2374,16 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 aria-label="返回主界面"
                 disabled={snapshot.hidePending}
                 icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
-                onClick={() => core.navigate('launcher')}
+                onClick={() => {
+                  if (activeSettingsTab === 'credentials' && credentialSettingsRef.current) credentialSettingsRef.current.requestLeave(() => core.navigate('launcher'))
+                  else core.navigate('launcher')
+                }}
                 size="small"
                 type="text"
               />
             </Tooltip>
             <h1>设置</h1>
           </div>
-          <AppVersion />
           <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
             <Button
               aria-label={pinError ? '重试置顶设置' : appliedPin ? '取消置顶' : '置顶设置窗口'}
@@ -2338,12 +2429,21 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             },
             { key: 'plugins', label: '插件', children: pluginSettingsPanel },
             {
+              key: 'permissions', label: '权限', children: (
+                <OverlayScrollbarsComponent className="settings-tab-panel" options={settingsScrollbarOptions}>
+                  <div className="settings-scroll-content">
+                    <PluginPermissionsPanel client={core.client} active={snapshot.view === 'settings' && activeSettingsTab === 'permissions' && !publicPluginDetail && !builtinFeatureDetail} />
+                  </div>
+                </OverlayScrollbarsComponent>
+              ),
+            },
+            {
               key: 'credentials',
               label: '密钥配置',
               children: (
                 <OverlayScrollbarsComponent className="settings-tab-panel" options={settingsScrollbarOptions}>
                   <div className="settings-scroll-content">
-                    <CredentialSettings draft={credentialDraft} setDraft={setCredentialDraft} validateYoudao={core.client.validateYoudaoTranslation} />
+                    <CredentialSettings ref={credentialSettingsRef} client={core.client.credentials} onStatusChange={setCredentialStatus} />
                   </div>
                 </OverlayScrollbarsComponent>
               ),
@@ -2351,7 +2451,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           ]}
           tabPlacement="start"
           onChange={(key) => {
-            if (key !== 'general' && key !== 'messages' && key !== 'plugins' && key !== 'credentials') return
+            if (key !== 'general' && key !== 'messages' && key !== 'plugins' && key !== 'permissions' && key !== 'credentials') return
             selectSettingsTab(key)
           }}
         />
@@ -2370,27 +2470,25 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           <div className="launcher-region launcher-section-region">
             {snapshot.view === 'launcher' ? (quicklinksPanel ?? panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
           </div>
-          {snapshot.view === 'launcher' || status.length > 0 ? (
-            <div className="launcher-region launcher-status-region">
-              <div className={`status-region${launcherResultsActive && snapshot.resultActionRerun
+            <div className={`launcher-region launcher-status-region${snapshot.view === 'settings' ? ' settings-status-region' : ''}`}>
+              <div className={`status-region${snapshot.view === 'settings' && activeSettingsTab === 'credentials' && credentialStatus.message
+                ? credentialStatus.tone === 'error' ? ' is-action-error' : credentialStatus.tone === 'success' ? ' is-action-success' : ''
+                : snapshot.view === 'launcher' && !snapshot.shownNotice && !snapshot.status && panel?.feedback?.status.message
+                ? panel.feedback.status.tone === 'error' ? ' is-action-error' : panel.feedback.status.tone === 'success' ? ' is-action-success' : ''
+                : launcherResultsActive && snapshot.resultActionRerun
                 ? snapshot.status === '已复制' ? ' is-action-success' : ' is-action-error'
                 : launcherResultsActive && snapshot.executePending && statusResult?.actions ? ' is-action-pending' : ''}`}
-                role="status" aria-live="polite" aria-atomic="true">
+                role="status" aria-live="polite" aria-atomic="true" title={status || undefined}>
                 {status}
               </div>
-              {launcherResultsActive && (statusResult?.actions?.length || snapshot.resultActionRerun) ? (
-                <div className="launcher-footer-actions">
-                  {statusResult?.actions?.length ? (
-                    <button ref={actionsButtonRef} type="button" aria-label="动作 Ctrl+K" aria-haspopup="menu"
-                      aria-expanded={snapshot.resultActionMenu !== undefined} disabled={snapshot.resultActionsDisabled}
-                      onClick={openActions}>动作 <kbd>Ctrl+K</kbd></button>
-                  ) : null}
-                  {snapshot.resultActionRerun ? <button ref={rerunButtonRef} type="button"
-                    disabled={snapshot.executePending || snapshot.searchPending} onClick={core.rerunResultCommand}>重新运行</button> : null}
-                </div>
-              ) : null}
+              <div className="launcher-status-actions">
+              {snapshot.view === 'settings' ? <AppVersion /> : null}
+              <button ref={actionsButtonRef} className="launcher-operations-trigger" type="button" aria-label="操作 Ctrl+K"
+                aria-haspopup="dialog" aria-expanded={panel ? undefined : operationsOpen} onPointerDown={(event) => event.preventDefault()} onClick={openOperations}>
+                操作 <kbd>Ctrl+K</kbd>
+              </button>
+              </div>
             </div>
-          ) : null}
         </main>
       </App>
     </ConfigProvider>

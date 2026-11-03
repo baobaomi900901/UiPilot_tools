@@ -41,7 +41,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin generate_public_plugin_sche
 - `activationMode` is `live` or `submit`; `window` and `panel` output require `submit`.
 - `outputMode` is static. `window` requires a window entry and `ui.window`; `panel` requires a panel entry and `ui.panel`; `mainResult` forbids window/panel entries and both UI permissions. Panel packages require `minimumHostVersion >= 0.3.0`; a non-empty `panel.hostKeys` declaration requires `minimumHostVersion >= 0.3.1`, the extended `Tab`, `Shift+Tab`, or `Enter` declarations require `minimumHostVersion >= 0.3.3`, and an explicit `panel.hostKeyFocus` requires `minimumHostVersion >= 0.3.4`.
 - Windows Runtime HTTPS requires `minimumHostVersion >= 0.3.2`, exact permission `network.https`, and a non-null `network` object containing `httpsHosts`. The permission and object must either both be present or both be absent.
-- Windows Panel clipboard history requires `minimumHostVersion >= 0.3.3`, exact permissions `clipboard.history.read` and optionally `clipboard.history.paste`, plus `submit + panel + ui.panel`. `clipboard.read` remains reserved and unsupported; it is not an alias for clipboard history.
+- Windows Panel clipboard history requires `minimumHostVersion >= 0.3.3`, permissions `clipboard.history.read` and optionally `clipboard.history.paste` (or `clipboard.history.copy` on Host 0.17.0+), plus `submit + panel + ui.panel`. `clipboard.read` remains reserved and unsupported; it is not an alias for clipboard history.
 
 `network.https` declares exact destination hosts, not URLs, origins, wildcard suffixes, or redirect groups:
 
@@ -197,7 +197,7 @@ Runtime and content WebViews have no plaintext getter. Runtime can ask only `set
 
 ### Panel Host Keys And Return
 
-`panel.hostKeys` is optional, contains at most eight unique declarations, and accepts only `ArrowDown`, `ArrowUp`, `Primary+N`, `Tab`, `Shift+Tab`, and `Enter`. Validators reject unknown values, duplicates, non-arrays, wrong element types, and extra panel properties. Canonical order is `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter`. `Tab`, `Shift+Tab`, and `Enter` require `minimumHostVersion >= 0.3.3`.
+`panel.hostKeys` is optional, contains at most eight unique declarations, and accepts only `ArrowDown`, `ArrowUp`, `Primary+N`, `Tab`, `Shift+Tab`, and `Enter`. Validators reject unknown values, duplicates, non-arrays, wrong element types, and extra panel properties. Canonical order is `ArrowDown < ArrowUp < Primary+N < Tab < Shift+Tab < Enter < Delete`. `Tab`, `Shift+Tab`, and `Enter` require `minimumHostVersion >= 0.3.3`.
 
 `panel.hostKeyFocus` is optional and accepts only `content` or `host`. Omitted is equivalent to `content`, preserving the original behavior: before each Host Key delivery, the Host gives native focus to the Panel content WebView. `host` keeps native focus on the tagged launcher input while delivering the same frozen event and is intended for panels that use Host Keys only as list/category commands. An explicit value requires `minimumHostVersion >= 0.3.4`. Wrong types, `null`, unknown values, and extra properties fail closed. The setting does not change queue ordering, acknowledgement, timeout, teardown, or routed Enter paste authority.
 
@@ -218,9 +218,13 @@ When `hostKeys` is non-empty, content must register exactly one `onHostKey(handl
 
 Escape in panel content uses capture-phase arbitration. A synchronous `preventDefault()`, active `dialog[open]`, or composition suppresses hide; `preventDefault()` after an `await` is too late. Explicit-return hides best-effort restore the external HWND+PID captured when UiPilot was shown. Blur and launch-handoff hides never restore, and foreground restore failure does not turn a successful hide into an error.
 
+### Panel status bar (Host 0.16.0+)
+
+Panel mode retains the Host footer. `window.uipilotPluginPanel.setStatus({ message, tone? })` returns a Promise and sends plain-text feedback to that footer. `tone` is `info` (default), `success`, or `error`; `message` is at most 512 Unicode characters, may not contain NUL, and an empty string clears it. It needs no permission beyond the active `ui.panel` session. No HTML, notification, focus change or persistent message is created. The method is bound to the session when obtained; old sessions and out-of-order messages cannot replace the current panel's feedback. Capture the method before asynchronous work when retaining callbacks across updates. Panel replacement/closure clears the status. Plugins own success-clear timing and must avoid a stale timer clearing newer feedback.
+
 ### Panel Clipboard History
 
-`window.uipilotPluginPanel.clipboardHistory` is Windows-only and available only to `submit + panel + ui.panel` plugins declaring `clipboard.history.read`; paste also requires `clipboard.history.paste`. The Host records text, image, and file-list clipboard changes while UiPilot is running, the plugin is enabled, and permission is granted. Panel code receives only summaries through `list()` and `onChanged(handler)`: text previews, image thumbnails, file names/counts, availability, `id`, `capturedAt`, and `revision`. Image summaries use displayable `data:image/png;base64,...` thumbnail URLs; the public-plugin CSP still rejects network, file, and `blob:` images. It never receives raw text, original PNG bytes, complete file paths, HWND, PID, arbitrary key names, or paste counts.
+`window.uipilotPluginPanel.clipboardHistory` is Windows-only and available only to `submit + panel + ui.panel` plugins declaring `clipboard.history.read`; paste also requires `clipboard.history.paste`, and copy requires `clipboard.history.copy` (Host 0.17.0+). The Host records text, image, and file-list clipboard changes while UiPilot is running, the plugin is enabled, and permission is granted. Panel code receives only summaries through `list()` and `onChanged(handler)`: text previews, image thumbnails, file names/counts, availability, `id`, `capturedAt`, and `revision`. Image summaries use displayable `data:image/png;base64,...` thumbnail URLs; the public-plugin CSP still rejects network, file, and `blob:` images. It never receives raw text, original PNG bytes, complete file paths, HWND, PID, arbitrary key names, or paste counts.
 
 `clipboardHistory.paste({ id, routeSequence })` is accepted only from the current Panel session after a routed Enter event. It returns `{ outcome: 'admitted' }` before teardown, then the Host writes the selected record to the system clipboard, hides UiPilot, restores the previously captured external window when safe, and sends one platform paste chord. Failures expose stable `Error.name` values: `PermissionDenied`, `ExpiredPanelSession`, `RecordNotFound`, `RecordUnavailable`, `PasteTargetUnavailable`, and `ClipboardWriteFailed`. Error messages are redacted.
 
@@ -262,12 +266,17 @@ API v1 implements only:
 - `clipboard.write`: expose host-owned `copyText` actions.
 - `url.open`: Windows Host `0.12.0+` explicit HTTP(S) browser result actions, with declared `runtime.resultActions` and current consent.
 - `clipboard.history.read`: on Windows Host `0.3.3+`, allow the Host to collect this plugin's local clipboard history and expose redacted summaries to its Panel.
+- `clipboard.history.copy`: on Windows Host `0.17.0+`, restore a full record to the clipboard while preserving the current Panel and focus; requires `clipboard.history.read`, explicit grant, and `submit + panel + ui.panel`.
 - `clipboard.history.paste`: on Windows Host `0.3.3+`, allow a current Panel session to restore one selected clipboard history record and paste it once after a routed Enter event; requires `clipboard.history.read`.
 - `network.https`: on Windows Host `0.3.2+`, expose bounded request-scoped Host-managed HTTPS to the exact authorized `network.httpsHosts` set.
 - `notifications.publish`: on Windows only, submit one immediate or host-owned delayed plain-text message and ask the host to show its own notification and tray reminder.
 - `timer.control`: on Windows only, control one host-owned plugin-window timer that can continue after the window hides; requires `ui.window`, `notifications.publish`, and `submit + window`.
 
 Other parsed permission names are reserved and installation fails until the host implements them. Permission changes during reload require normal confirmation; no development-package bypass exists.
+
+The host's **Settings → Permissions** page groups installed public plugins by capability and lets the user change each declared, supported grant. Grants are independent of the plugin's enable switch; granting one capability does not grant its dependencies. Plugins must handle permission denial after installation. Network regrant still requires confirmation of the complete current host and credential scope.
+
+Revocation retires stale command work and denies subsequent capability admission. UI revocation retires and closes the affected surface; notification/timer revocation cancels the associated delayed work or timer. Regrant does not revive canceled work. Revoking clipboard-history read stops that plugin's recording while retaining its prior history. Permission changes do not erase plugin data. Restart, development refresh and replacement preserve revoked permissions that remain declared; newly declared permissions still require the normal confirmation. Recovery from a backup cannot restore stale capability grants. Already completed system effects cannot be undone.
 
 ## Unsupported In v1
 
@@ -398,3 +407,47 @@ Clipboard writes use the main HWND with RAII allocation ownership. After success
 Success is `{kind:"pasteSent"}` and displays **已请求粘贴**: Windows accepted one input batch, without proving that an application inserted text or saved a document. Stable errors are `pasteTargetUnavailable` (no current original target), `pasteInputBusy` (keys not released), `pasteFailed` (hide/restore/final guard/partial input failure), plus `clipboardWriteFailed`. Preclaim failures report `sourceConsumed:false`; every postclaim success or failure consumes all siblings. Never retry automatically. Users must check the target and explicitly rerun for a fresh source. Ordinary hidden events retire the UI owner; a late outcome cannot reopen or restore old results.
 
 The final foreground/sequence checks reduce races but do not establish an OS-wide atomic target lock. Target closure, elevated applications, secure desktop or a noneditable focus may prevent insertion. Native clipboard, window and keyboard acceptance remains user-operated; automated tests inject drivers and do not produce those effects.
+
+
+## Host 0.15.0：主程序密钥业务服务
+
+当前有道业务调用仅支持旧 `command` 形态的 `mainResult` 包，且 `runtime.resultActions` 必须省略或为 `false`。`commands` 多命令包、Panel、子窗口及启用结果动作的包均不能调用有道业务方法；即使权限已授予，也会拒绝 `InvalidServiceRequestError`。其他插件形态仍可声明和管理三项服务授权，以供未来能力使用。`api.services` 当前随 Runtime 网络能力提供，其存在不代表服务已授权，也不代表插件命令/输出形态兼容。百度 OCR 与 DeepSeek 仍无公开业务方法。
+
+
+Windows Runtime 的 `api.services?.youdao.translate({text, from, to})` 使用宿主配置的有道翻译密钥；插件不接收密钥、签名、URL 或认证参数。声明 `credentials.youdaoTranslation`、`network.https`，最低版本 `0.15.0`，并声明 `network.httpsHosts: ["openapi.youdao.com"]`。用户在设置 → 权限单独授权，在设置 → 密钥配置中配置并启用服务；两者独立，关闭配置不会清除授权。
+
+仅允许 `en` → `zh-CHS` 或反向。text 不 trim，须为 1..8192 UTF-8 字节且不含 NUL。只接受三个自有可枚举数据属性，不执行 getter、不接受额外字段。返回深冻结的 `{translations: string[]}`；facade 与原请求绑定，处理结束后保留的方法拒绝 `ExpiredRequestError`，不能借用后续调用。
+
+固定错误名：`InvalidServiceRequestError`、`ServicePermissionDeniedError`、`CredentialNotConfiguredError`、`CredentialDisabledError`、`CredentialUnavailableError`、`PermissionDeniedError`、`NetworkTargetDeniedError`、`NetworkTimeoutError`、`NetworkFailureError`、`NetworkResponseTooLargeError`、`NetworkResponseInvalidError`、`NetworkLimitExceededError`、`ExpiredRequestError`、`ProviderAuthenticationError`、`ProviderQuotaError`、`ProviderFailureError`。错误不包含真实凭据或供应商原始响应。
+
+`credentials.baiduOcr` 和 `credentials.deepseek` 是独立的默认关闭授权，目前没有公开业务 API，也不能替代有道授权。声明服务权限仅支持 Windows，最低 Host 为 0.15.0。翻译示例申报三项服务权限，但仅调用有道服务。
+## Host 0.16.0：划词翻译入口
+
+`selection.read` 是 Windows Host 0.16.0+ 的独立权限，表示用户主动按取词快捷键时允许宿主将本次选中文字作为插件输入。它不开放任意剪贴板读取、后台选区监控或输入模拟 API；`clipboard.read` 仍保留且未支持。安装、升级不默认授予该权限，已有明确授权/撤销保持不变。
+
+首版宿主入口仅用于 `com.uipilot.translate` 的旧式单命令 `submit + mainResult`。快捷键与普通启动快捷键分开管理，初始 Alt+A，可在插件详情录制或清除。插件禁用、删除、未授权时不得捕获选区；快捷键冲突显示不可用，不覆盖其他绑定。
+
+宿主先绑定外部前台窗口并捕获选区，再显示主界面，以稳定插件与命令身份填入并自动提交一次；插件仍只接收 `PluginInvocation.input`，沿用有道、网络授权及配置检查。无选区、失败、NUL 或超过 8192 UTF-8 字节时不发出服务请求，不将旧剪贴板内容当作选区。重复事件不重放，过期捕获不能覆盖更新的界面操作。
+
+宿主优先读取 Windows 可访问性选区；没有 TextPattern 的控件可进入临时 Ctrl+C 兼容路径。宿主先在内存缓存原剪贴板格式，再读取本次新增复制的文本，仅在确认剪贴板仍属于本次操作时恢复旧内容；新的复制或输入会使旧操作失效。无法安全备份时在复制前终止。原剪贴板内容不交给插件，不把旧内容当作选区。临时复制/恢复被排除在 UiPilot 历史之外，Win+V 仅定向清理能够识别的新增记录，不删除旧记录或清空历史。系统历史访问失败或清理失败会显示相应提示；第三方历史管理器不在该合同内。主程序不在日志中记录选中文字或缓存内容，真实跨应用兼容性由用户主动验收。
+
+
+### Panel contextual operations (Host 0.16.0+)
+
+`onActions(provider)` registers one synchronous provider (returns unsubscribe). Called before menu focus with `{ source: 'hostInput' | 'content' }`; return null to retain modal ownership, otherwise `{ context?, global? }` with at most 12 actions each. Actions require unique ASCII id (`[a-z][a-z0-9-]{0,63}`, reserved `host-` prefix), title (80 Unicode scalars), and run callback; shortcut (32), disabledReason (160), and SDK icon enum are optional. Text rejects control characters and renders as text, never HTML. Disabled actions cannot execute. Callbacks stay inside that Panel document, grant no extra permissions, execute once after local focus restoration, and are invalidated on session/input update. Plugin callbacks must additionally check captured object identity. Exceptions produce a fixed Host status without exception details.
+
+The Host owns the Ctrl+K footer entry and shared menu renderer in the appropriate WebView. Context actions precede global actions. Esc/Ctrl+K dismiss and restore focus/selection; menu keys do not reach plugin handlers. No instructional footer is shown inside the menu. Main-input Search uses a session-bound single-use ticket, accepted only while the input remains unchanged. Main-only menu-open and content-only submit commands retain caller-label checks; no raw invoke API is exposed.
+
+### Panel Delete Host Key（Host 0.16.0+）
+
+`panel.hostKeys` 新增 `Delete`，规范排序位于 `Enter` 之后；声明它需要 `minimumHostVersion >= 0.16.0`。SDK 的 `PluginPanelHostKeyEvent.key` 相应增加 `Delete`。
+
+仅对声明此键的当前 Panel，在主输入框为空、无 Ctrl/Meta/Shift/Alt、非 IME composing 且非重复 keydown 时转发。主输入框含文字时保留原生 Delete 编辑行为。Ctrl+K 菜单拥有输入时不投递给背后列表。既有串行投递、会话/序号、ack、超时和焦点策略保持不变，Delete 不授予 Enter 粘贴票据。
+
+`onActions` 的 `shortcut` 仍只负责展示，不注册快捷键；插件需要声明 hostKeys 并通过 onHostKey 执行相同动作。内容区直接处理 Delete 时同样保护可编辑控件、IME、修饰键、长按及已消费事件。删除回调必须捕获并复核选中对象/会话，进行中禁用重复操作。不可用时用 disabledReason 解释，反馈用 setStatus。
+
+### Clipboard history search and copy (Windows Host 0.17.0+)
+
+`clipboardHistory.list(input?: { query?: string })` accepts only the optional `query` field. No argument and empty/whitespace queries return all summaries. Queries are limited to 512 Unicode characters before trimming; invalid input rejects with `TypeError`. The Host matches a case-insensitive contiguous substring against the complete text or any file name (including extension, excluding parent directories). Nonempty queries exclude images. Results preserve recent-first ordering and the history revision. A filtered result never replaces the unfiltered `onChanged` snapshot cache; when history changes, query again and discard stale requests using the Panel session and a request generation.
+
+`clipboardHistory.copy({ id })` requires declared and granted `clipboard.history.read` plus `clipboard.history.copy`, exact Windows support, `submit + panel + ui.panel`, and `minimumHostVersion >= 0.17.0`. New copy permission is never implicitly granted by an upgrade. It uses the current active Panel session and resolves to `{ outcome: 'copied' }` only after the Host writes the complete text, original image, or file list to the system clipboard. It preserves the Panel and focus and does not simulate paste. Unknown fields are rejected. Stable errors are `PermissionDenied`, `ExpiredPanelSession`, `RecordNotFound`, `RecordUnavailable`, and `ClipboardWriteFailed`; error messages are redacted. There is no retry and no routed Enter ticket requirement. The existing `paste` API and permission retain their behavior.

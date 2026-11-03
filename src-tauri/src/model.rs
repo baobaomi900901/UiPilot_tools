@@ -69,6 +69,8 @@ pub(crate) enum LauncherResultActivation {
         completion_text: String,
     },
     WindowActivation {
+        #[serde(rename = "commandId")]
+        command_id: String,
         #[serde(rename = "pluginId")]
         plugin_id: String,
         #[serde(rename = "commandLabel")]
@@ -89,11 +91,18 @@ pub(crate) enum LauncherResultActivation {
         favorite: bool,
     },
     PanelActivation {
+        #[serde(rename = "commandId")]
+        command_id: String,
         #[serde(rename = "pluginId")]
         plugin_id: String,
         #[serde(rename = "initialArgument")]
         initial_argument: String,
         favorite: bool,
+    },
+    BuiltinActivation {
+        feature: crate::settings::ManagedBuiltinFeature,
+        #[serde(rename = "initialArgument")]
+        initial_argument: String,
     },
     OpenQuicklinks,
     OpenScreenshot,
@@ -111,14 +120,17 @@ impl LauncherResultActivation {
 
     pub(crate) fn window_activation(
         plugin_id: String,
+        command_id: String,
         command_label: String,
         initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
         (crate::public_plugins::valid_plugin_id(&plugin_id)
+            && valid_launcher_command(&command_id)
             && valid_launcher_command(&command_label)
             && valid_panel_initial_argument(&initial_argument))
         .then_some(Self::WindowActivation {
+            command_id,
             plugin_id,
             command_label,
             initial_argument,
@@ -148,12 +160,15 @@ impl LauncherResultActivation {
 
     pub(crate) fn panel_activation(
         plugin_id: String,
+        command_id: String,
         initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
         (crate::public_plugins::valid_plugin_id(&plugin_id)
+            && valid_launcher_command(&command_id)
             && valid_panel_initial_argument(&initial_argument))
         .then_some(Self::PanelActivation {
+            command_id,
             plugin_id,
             initial_argument,
             favorite,
@@ -362,6 +377,7 @@ mod tests {
     fn window_activation_serializes_command_and_rejects_invalid_values() {
         let activation = LauncherResultActivation::window_activation(
             "com.uipilot.pomodoro".into(),
+            "default".into(),
             "pomodoro".into(),
             "focus".into(),
             true,
@@ -371,6 +387,7 @@ mod tests {
             serde_json::to_value(activation).unwrap(),
             serde_json::json!({
                 "kind": "windowActivation",
+                "commandId": "default",
                 "pluginId": "com.uipilot.pomodoro",
                 "commandLabel": "pomodoro",
                 "initialArgument": "focus",
@@ -379,6 +396,7 @@ mod tests {
         );
         assert!(LauncherResultActivation::window_activation(
             "Invalid Plugin".into(),
+            "default".into(),
             "pomodoro".into(),
             "".into(),
             false,
@@ -386,6 +404,7 @@ mod tests {
         .is_none());
         assert!(LauncherResultActivation::window_activation(
             "com.uipilot.pomodoro".into(),
+            "default".into(),
             "Pomodoro".into(),
             "".into(),
             false,
@@ -393,6 +412,7 @@ mod tests {
         .is_none());
         assert!(LauncherResultActivation::window_activation(
             "com.uipilot.pomodoro".into(),
+            "default".into(),
             "pomodoro".into(),
             "bad\narg".into(),
             false,
@@ -404,6 +424,7 @@ mod tests {
     fn panel_activation_serializes_initial_argument_and_rejects_invalid_identity() {
         let activation = LauncherResultActivation::panel_activation(
             "com.uipilot.demo-panel".into(),
+            "default".into(),
             "hello".into(),
             true,
         )
@@ -412,6 +433,7 @@ mod tests {
             serde_json::to_value(activation).unwrap(),
             serde_json::json!({
                 "kind": "panelActivation",
+                "commandId": "default",
                 "pluginId": "com.uipilot.demo-panel",
                 "initialArgument": "hello",
                 "favorite": true
@@ -419,12 +441,14 @@ mod tests {
         );
         assert!(LauncherResultActivation::panel_activation(
             "Invalid Plugin".into(),
+            "default".into(),
             "".into(),
             false,
         )
         .is_none());
         assert!(LauncherResultActivation::panel_activation(
             "com.uipilot.demo-panel".into(),
+            "default".into(),
             "bad\narg".into(),
             false,
         )

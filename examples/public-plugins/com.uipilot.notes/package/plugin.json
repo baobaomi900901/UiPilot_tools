@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "pluginId": "com.uipilot.notes",
-  "version": "1.2.5",
+  "version": "1.2.10",
   "apiVersion": 1,
-  "minimumHostVersion": "0.3.1",
+  "minimumHostVersion": "0.16.0",
   "name": "Notes",
   "description": "在启动器面板中记录、搜索和管理笔记。",
   "supportedPlatforms": ["windows"],

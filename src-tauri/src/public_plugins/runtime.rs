@@ -36,6 +36,10 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   const networkEnabled = __NETWORK_HTTPS__;
   const uncurryThis = (method) => Function.prototype.call.bind(method);
   const arrayIsArray = Array.isArray;
+  const arraySome = uncurryThis(Array.prototype.some);
+  const stringIncludes = uncurryThis(String.prototype.includes);
+  const encoder = new TextEncoder();
+  const encodeText = TextEncoder.prototype.encode.bind(encoder);
   const arrayPush = uncurryThis(Array.prototype.push);
   const ErrorConstructor = Error;
   const NumberConstructor = Number;
@@ -180,6 +184,13 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   };
   const networkErrorNames = deepFreeze(nullRecord({
     invalidNetworkRequest: 'InvalidNetworkRequestError',
+    invalidServiceRequest: 'InvalidServiceRequestError',
+    servicePermissionDenied: 'ServicePermissionDeniedError',
+    credentialNotConfigured: 'CredentialNotConfiguredError',
+    credentialDisabled: 'CredentialDisabledError',
+    providerAuthentication: 'ProviderAuthenticationError',
+    providerQuota: 'ProviderQuotaError',
+    providerFailure: 'ProviderFailureError',
     permissionDenied: 'PermissionDeniedError',
     networkTargetDenied: 'NetworkTargetDeniedError',
     networkTimeout: 'NetworkTimeoutError',
@@ -267,6 +278,36 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
             }
           },
         });
+      }
+      if (networkEnabled) {
+        apiShape.services = nullRecord({ youdao: nullRecord({
+          translate: async function(input) {
+            let snapshot;
+            try {
+              if (arguments.length !== 1) throw 0;
+              snapshot = ownData(input, new SetConstructor(['text', 'from', 'to']));
+              if (reflectOwnKeys(snapshot).length !== 3 || typeof snapshot.text !== 'string'
+                  || !snapshot.text.length || stringIncludes(snapshot.text, '\0')
+                  || encodeText(snapshot.text).length > 8192
+                  || !((snapshot.from === 'en' && snapshot.to === 'zh-CHS')
+                    || (snapshot.from === 'zh-CHS' && snapshot.to === 'en'))) throw 0;
+              deepFreeze(snapshot);
+            } catch (_) { throw fail('InvalidServiceRequestError'); }
+            const requestContext = context();
+            let response;
+            try {
+              response = await invoke('plugin_youdao_translate', { input: { context: requestContext, input: snapshot } });
+            } catch (error) { throw mapNetworkError(error); }
+            context();
+            try {
+              const source = ownData(response, new SetConstructor(['translations']));
+              const translations = copyJson(source.translations);
+              if (reflectOwnKeys(source).length !== 1 || !arrayIsArray(translations)
+                  || !translations.length || arraySome(translations, (text) => typeof text !== 'string' || !text.length)) throw 0;
+              return deepFreeze(nullRecord({ translations }));
+            } catch (_) { throw fail('NetworkResponseInvalidError'); }
+          },
+        }) });
       }
       const api = deepFreeze(apiShape);
       let completion;

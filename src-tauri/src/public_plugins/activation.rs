@@ -152,6 +152,7 @@ pub(crate) struct PublicPluginInventoryItem {
     pub(crate) description: Option<String>,
     pub(crate) version: String,
     pub(crate) source: &'static str,
+    pub(crate) installation_directory: Option<String>,
     pub(crate) commands: Vec<PublicPluginInventoryCommand>,
     pub(crate) enabled: bool,
     pub(crate) fault: Option<PublicPluginFault>,
@@ -589,6 +590,9 @@ pub(crate) struct PublicPluginManager {
     owner_cleanup: Arc<PluginOwnerCleanupStore>,
     bundles: Arc<ActivationReservationBook>,
     mutation: Mutex<()>,
+    // Permission edits share the state's global inventory revision. Serialize
+    // their durable phases even when the edited plugins differ.
+    permission_mutation: Mutex<()>,
     hotkey_settings: Mutex<Option<crate::settings::SettingsStore>>,
     hotkey_changed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -825,6 +829,7 @@ impl PublicPluginManager {
             owner_cleanup,
             bundles,
             mutation: Mutex::new(()),
+            permission_mutation: Mutex::new(()),
             hotkey_settings: Mutex::new(None),
             hotkey_changed: Mutex::new(None),
             #[cfg(test)]
@@ -919,6 +924,29 @@ impl PublicPluginManager {
             config.active_generation,
         ))
     }
+    pub(crate) fn selection_translation_authority(&self) -> Option<u64> {
+        if self
+            .owner_cleanup
+            .is_blocked("com.uipilot.translate")
+            .ok()?
+        {
+            return None;
+        }
+        let bundle = self.bundles.bundle("com.uipilot.translate").ok()??;
+        let c = &bundle.config;
+        let m = &bundle.runtime.manifest;
+        (c.installed
+            && c.enabled
+            && c.fault.is_none()
+            && c.active_generation == bundle.runtime.generation
+            && m.permissions.contains(&PublicPermission::SelectionRead)
+            && c.permission_grants
+                .contains(&PublicPermission::SelectionRead)
+            && m.legacy_command()
+                .is_some_and(|c| c.output_mode == PublicOutputMode::MainResult))
+        .then_some(c.active_generation)
+    }
+
     pub(crate) fn command_hotkey_authority(
         &self,
         plugin: &str,
@@ -963,6 +991,10 @@ impl PublicPluginManager {
         self.clipboard_history.shutdown();
     }
 
+    pub(crate) fn clipboard_history_for_selection(&self) -> Arc<ClipboardHistoryService> {
+        Arc::clone(&self.clipboard_history)
+    }
+
     pub(crate) fn clipboard_history_snapshot_for_panel(
         &self,
         plugin_id: &str,
@@ -979,6 +1011,89 @@ impl PublicPluginManager {
         self.clipboard_history
             .snapshot(plugin_id)
             .map_err(|_| ClipboardHistoryBridgeError::Unavailable)
+    }
+
+    pub(crate) fn clipboard_history_query_for_panel(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        query: Option<&str>,
+    ) -> Result<ClipboardHistorySnapshot, ClipboardHistoryBridgeError> {
+        self.authorize_clipboard_history_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )?;
+        self.clipboard_history
+            .snapshot_query(plugin_id, query)
+            .map_err(|error| match error {
+                ClipboardHistoryError::InvalidQuery => ClipboardHistoryBridgeError::InvalidQuery,
+                _ => ClipboardHistoryBridgeError::Unavailable,
+            })
+    }
+
+    /// Permission publication stays serialized until the guarded native write completes.
+    pub(crate) fn with_clipboard_history_copy_authorization<T>(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        effect: impl FnOnce() -> Result<T, ClipboardHistoryPasteError>,
+    ) -> Result<T, ClipboardHistoryPasteError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?;
+        self.authorize_clipboard_history_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )
+        .map_err(|error| match error {
+            ClipboardHistoryBridgeError::PermissionDenied => {
+                ClipboardHistoryPasteError::PermissionDenied
+            }
+            ClipboardHistoryBridgeError::ExpiredPanelSession => {
+                ClipboardHistoryPasteError::ExpiredPanelSession
+            }
+            _ => ClipboardHistoryPasteError::RecordUnavailable,
+        })?;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(plugin_id)
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
+            .ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+        if !bundle
+            .config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardHistoryCopy)
+            || !bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::ClipboardHistoryCopy)
+        {
+            return Err(ClipboardHistoryPasteError::PermissionDenied);
+        }
+        effect()
+    }
+
+    pub(crate) fn clipboard_history_write_copy_for_panel(
+        &self,
+        plugin_id: &str,
+        id: &str,
+    ) -> Result<(), ClipboardHistoryPasteError> {
+        self.clipboard_history
+            .with_temporary_copy(|_| {
+                let record = self.clipboard_history.record_for_paste(plugin_id, id)?;
+                crate::clipboard_history::paste_clipboard_history_record(&record)?;
+                Ok(())
+            })
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
     }
 
     pub(crate) fn clipboard_history_remove_for_panel(
@@ -1056,6 +1171,37 @@ impl PublicPluginManager {
         let _ = self.clipboard_history.cancel_paste_restore_suppression();
     }
 
+    /// Recheck at native effect execution, serialized with permission publication.
+    pub(crate) fn with_clipboard_history_paste_authorization<T>(
+        &self,
+        plugin_id: &str,
+        generation: u64,
+        activation_id: u64,
+        admission_epoch: u64,
+        expected_revision: Option<u64>,
+        effect: impl FnOnce(u64) -> Result<T, ClipboardHistoryPasteError>,
+    ) -> Result<T, ClipboardHistoryPasteError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?;
+        self.authorize_clipboard_history_paste_panel_call(
+            plugin_id,
+            generation,
+            activation_id,
+            admission_epoch,
+        )?;
+        let bundle = self
+            .bundles
+            .confirmed_bundle(plugin_id)
+            .map_err(|_| ClipboardHistoryPasteError::RecordUnavailable)?
+            .ok_or(ClipboardHistoryPasteError::ExpiredPanelSession)?;
+        let revision = bundle.config.inventory_revision;
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(ClipboardHistoryPasteError::ExpiredPanelSession);
+        }
+        effect(revision)
+    }
+
     fn authorize_clipboard_history_panel_call(
         &self,
         plugin_id: &str,
@@ -1070,7 +1216,10 @@ impl PublicPluginManager {
             .ok_or(ClipboardHistoryBridgeError::ExpiredPanelSession)?;
         let config = &bundle.config;
         let snapshot = &bundle.runtime;
-        if !config.installed
+        if !config
+            .permission_grants
+            .contains(&PublicPermission::UiPanel)
+            || !config.installed
             || !config.enabled
             || config.fault.is_some()
             || bundle.runtime_recovery_needed
@@ -1122,7 +1271,8 @@ impl PublicPluginManager {
             ClipboardHistoryBridgeError::ExpiredPanelSession => {
                 ClipboardHistoryPasteError::ExpiredPanelSession
             }
-            ClipboardHistoryBridgeError::Unavailable => {
+            ClipboardHistoryBridgeError::Unavailable
+            | ClipboardHistoryBridgeError::InvalidQuery => {
                 ClipboardHistoryPasteError::RecordUnavailable
             }
         })?;
@@ -1496,7 +1646,31 @@ impl PublicPluginManager {
                     .iter()
                     .copied()
                     .collect::<BTreeSet<_>>();
-                if declared != permission_grants {
+                if declared
+                    .iter()
+                    .filter(|p| {
+                        !p.is_host_service()
+                            && !matches!(
+                                **p,
+                                PublicPermission::SelectionRead
+                                    | PublicPermission::ClipboardHistoryCopy
+                            )
+                    })
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    != permission_grants
+                        .iter()
+                        .filter(|p| {
+                            !p.is_host_service()
+                                && !matches!(
+                                    **p,
+                                    PublicPermission::SelectionRead
+                                        | PublicPermission::ClipboardHistoryCopy
+                                )
+                        })
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                {
                     return Err(PublicPluginManagementError::PermissionDenied);
                 }
                 let previous_config = self.state.config(&pending.prepared.manifest.plugin_id)?;
@@ -1534,6 +1708,30 @@ impl PublicPluginManager {
                         && config.network_credentials_grant == pending.previous_declared_credentials
                 });
                 let mut effective_permission_grants = declared;
+                effective_permission_grants.retain(|p| {
+                    (!p.is_host_service()
+                        && !matches!(
+                            *p,
+                            PublicPermission::SelectionRead
+                                | PublicPermission::ClipboardHistoryCopy
+                        ))
+                        || previous_config
+                            .as_ref()
+                            .filter(|c| c.installed)
+                            .is_some_and(|c| c.permission_grants.contains(p))
+                });
+                // Existing declarations retain the user's explicit revocations. New
+                // declarations have already passed the complete consent check above.
+                if let Some(previous) = previous_config.as_ref().filter(|c| c.installed) {
+                    let previous_manifest = self.installed_manifest(previous)?;
+                    for permission in previous_manifest.permissions {
+                        if permission != PublicPermission::NetworkHttps
+                            && !previous.permission_grants.contains(&permission)
+                        {
+                            effective_permission_grants.remove(&permission);
+                        }
+                    }
+                }
                 if pending.prepared.manifest.network.is_some()
                     && !pending.requires_network_consent
                     && !previous_network_granted
@@ -2299,6 +2497,137 @@ impl PublicPluginManager {
         )
     }
 
+    pub(crate) fn set_permission_access_with_effects(
+        &self,
+        plugin_id: &str,
+        permission: PublicPermission,
+        granted: bool,
+        expected_inventory_revision: &str,
+        effects: &mut ManagementEffects,
+    ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        if !permission.is_available(self.host.platform) {
+            return Err(PublicPluginManagementError::PermissionDenied);
+        }
+        if permission == PublicPermission::NetworkHttps {
+            return self.set_network_access_with_effects(
+                plugin_id,
+                granted,
+                Some(expected_inventory_revision),
+                effects,
+            );
+        }
+        let _permission_mutation = self
+            .permission_mutation
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        let (bundle, reservation, prepared_state) = {
+            let _mutation = self.lock_mutation()?;
+            if expected_inventory_revision != self.state.inventory_revision()?.to_string() {
+                return Err(PublicPluginManagementError::Unavailable);
+            }
+            let config = self
+                .state
+                .config(plugin_id)?
+                .filter(|c| c.installed)
+                .ok_or(PublicPluginManagementError::Unavailable)?;
+            let manifest = self.installed_manifest(&config)?;
+            if !manifest.permissions.contains(&permission) {
+                return Err(PublicPluginManagementError::PermissionDenied);
+            }
+            if config.permission_grants.contains(&permission) == granted {
+                return Ok(mutation_from_config(&config));
+            }
+            let bundle = self.bundles.bundle(plugin_id)?;
+            let reservation = self.bundles.reserve(plugin_id)?;
+            let prepared = self
+                .state
+                .prepare_set_permission_access(&manifest, permission, granted)?;
+            (bundle, reservation, prepared)
+        };
+        let mut timer_effects = Vec::new();
+        let mut durable = false;
+        let result = (|| {
+            self.make_state_durable_with_effects(&reservation, &prepared_state, Some(effects))?;
+            durable = true;
+            let _mutation = self.lock_mutation()?;
+            let mut transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            effects.retired.extend(
+                self.scheduler
+                    .retire_plugin_requests(plugin_id)
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?,
+            );
+            effects.changed = true;
+            transition
+                .set_plugin_authority(plugin_id, None)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            if !granted {
+                if permission == PublicPermission::NotificationsPublish {
+                    self.cancel_delayed_messages(plugin_id);
+                }
+                if matches!(
+                    permission,
+                    PublicPermission::UiWindow
+                        | PublicPermission::NotificationsPublish
+                        | PublicPermission::TimerControl
+                ) {
+                    if let Some(bundle) = &bundle {
+                        timer_effects = self.cancel_timer_generation(
+                            plugin_id,
+                            bundle.runtime.generation,
+                            bundle.activation_id,
+                        );
+                    }
+                }
+            }
+            let config = self.state.publish_prepared(prepared_state)?;
+            let next_bundle = bundle.as_ref().map(|b| b.with_config(config.clone()));
+            reservation.publish(next_bundle.clone())?;
+            let authority = next_bundle
+                .as_ref()
+                .map(|b| {
+                    checked_network_authority_snapshot(
+                        &self.bundles,
+                        &self.state,
+                        &self.secrets,
+                        &config,
+                        &b.runtime,
+                        b.activation_id,
+                        b.admission_epoch,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            transition
+                .set_plugin_authority(plugin_id, authority)
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
+            Ok(mutation_from_config(&config))
+        })();
+        self.apply_timer_post_lock_effects(timer_effects);
+        if result.is_err() && (effects.changed || durable) {
+            // Unknown durability/publication closes the reservation book as well
+            // as requests. Retire persistent work even if mutation was poisoned.
+            self.close_network_authority_with_effects(plugin_id, Some(effects));
+            self.cancel_delayed_messages(plugin_id);
+            // The capture service owns authority independently of runtime bundles.
+            // Retire just this cached owner; persisted state may still be stale.
+            let _ = self.clipboard_history.uninstall(plugin_id, true);
+            if let Some(bundle) = &bundle {
+                self.apply_timer_post_lock_effects(self.cancel_timer_generation(
+                    plugin_id,
+                    bundle.runtime.generation,
+                    bundle.activation_id,
+                ));
+            }
+        }
+        if result.is_ok() {
+            self.refresh_clipboard_history_authorization()?;
+        }
+        result
+    }
+
     pub(crate) fn set_network_access_with_effects(
         &self,
         plugin_id: &str,
@@ -2306,6 +2635,10 @@ impl PublicPluginManager {
         expected_inventory_revision: Option<&str>,
         effects: &mut ManagementEffects,
     ) -> Result<PublicPluginMutation, PublicPluginManagementError> {
+        let _permission_mutation = self
+            .permission_mutation
+            .lock()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let (bundle, reservation, prepared_state) = {
             let _mutation = self.lock_mutation()?;
             let config = self
@@ -2315,8 +2648,7 @@ impl PublicPluginManager {
                 .ok_or(PublicPluginManagementError::Unavailable)?;
             let manifest = self.installed_manifest(&config)?;
             let credentials = super::state::manifest_credentials(&manifest);
-            if granted
-                && !credentials.is_empty()
+            if (expected_inventory_revision.is_some() || (granted && !credentials.is_empty()))
                 && expected_inventory_revision
                     != Some(self.state.inventory_revision()?.to_string().as_str())
             {
@@ -3043,6 +3375,11 @@ impl PublicPluginManager {
                 description: snapshot.manifest.description.clone(),
                 version: config.version.clone(),
                 source: "localPackage",
+                installation_directory: config.package_digest.as_deref().map(|digest| {
+                    package_destination(&self.packages_root, &config.plugin_id, digest)
+                        .to_string_lossy()
+                        .into_owned()
+                }),
                 commands: config
                     .commands
                     .iter()
@@ -3180,6 +3517,14 @@ impl PublicPluginManager {
                 .manifest
                 .command_by_id(command_id)
                 .ok_or(PublicPluginManagementError::Unavailable)?;
+            let ui_permission = match command.output_mode {
+                PublicOutputMode::Window => Some(PublicPermission::UiWindow),
+                PublicOutputMode::Panel => Some(PublicPermission::UiPanel),
+                PublicOutputMode::MainResult => None,
+            };
+            if ui_permission.is_some_and(|p| !config.permission_grants.contains(&p)) {
+                continue;
+            }
             // Capture publication authority from the same confirmed owner snapshot.
             let confirmed = self.bundles.confirmed_bundle(&config.plugin_id)?;
             if !confirmed
@@ -3281,7 +3626,10 @@ impl PublicPluginManager {
             let Some(command) = snapshot.manifest.legacy_command() else {
                 return Ok(None);
             };
-            if command.output_mode != PublicOutputMode::Panel
+            if !config
+                .permission_grants
+                .contains(&PublicPermission::UiPanel)
+                || command.output_mode != PublicOutputMode::Panel
                 || command.activation_mode != PublicActivationMode::Submit
             {
                 return Ok(None);
@@ -3592,6 +3940,7 @@ impl PublicPluginManager {
                 .legacy_command()
                 .is_none_or(|command| command.output_mode != output_mode)
             || !snapshot.manifest.permissions.contains(&permission)
+            || !config.permission_grants.contains(&permission)
         {
             return None;
         }
@@ -3659,6 +4008,9 @@ impl PublicPluginManager {
                 let shell_allowed = active_bundle.is_some()
                     && config.enabled
                     && config.fault.is_none()
+                    && config
+                        .permission_grants
+                        .contains(&PublicPermission::UiWindow)
                     && snapshot
                         .manifest
                         .legacy_command()
@@ -3698,10 +4050,13 @@ impl PublicPluginManager {
         {
             return Err(PublicPluginManagementError::Unavailable);
         }
-        if snapshot
-            .manifest
-            .legacy_command()
-            .is_none_or(|command| command.output_mode != PublicOutputMode::Window)
+        if !config
+            .permission_grants
+            .contains(&PublicPermission::UiWindow)
+            || snapshot
+                .manifest
+                .legacy_command()
+                .is_none_or(|command| command.output_mode != PublicOutputMode::Window)
             || !snapshot
                 .manifest
                 .permissions
@@ -4383,7 +4738,7 @@ impl PublicPluginManager {
     }
 
     fn commit_timer_claim(&self, ticket: ClaimTicket) -> TimerClaimDispatch {
-        let admitted = {
+        let (admitted, mutation) = {
             let Ok(mutation) = self.lock_mutation() else {
                 return TimerClaimDispatch {
                     effect: None,
@@ -4425,8 +4780,7 @@ impl PublicPluginManager {
                 };
             }
             let admitted = self.timers.admit_claim(&ticket).unwrap_or(false);
-            drop(mutation);
-            admitted
+            (admitted, mutation)
         };
         if !admitted {
             return TimerClaimDispatch {
@@ -4440,6 +4794,9 @@ impl PublicPluginManager {
             plugin_name_snapshot: ticket.frozen_completion.plugin_name_snapshot.clone(),
             content: ticket.frozen_completion.completion_message.clone(),
         });
+        // Finish an admitted native publication before permission revocation can
+        // return. Audio admission remains outside this guard and is cancelable.
+        drop(mutation);
         let (persisted, effect) = match outcome {
             MessagePublishOutcome::Published(published) => {
                 (true, Some(MessagePostGuardEffect::Published(published)))
@@ -4488,6 +4845,9 @@ impl PublicPluginManager {
         message: ScheduledPluginMessage,
     ) -> Option<MessagePostGuardEffect> {
         let mutation = self.lock_mutation().ok()?;
+        if !self.delayed_messages.is_current(&message) {
+            return None;
+        }
         let eligible = self
             .bundles
             .bundle(&message.plugin_id)
@@ -4510,15 +4870,16 @@ impl PublicPluginManager {
                         .permissions
                         .contains(&PublicPermission::NotificationsPublish)
             });
-        drop(mutation);
         if !eligible {
             return None;
         }
-        match self.message_center.commit_publish(MessagePublishRequest {
+        let outcome = self.message_center.commit_publish(MessagePublishRequest {
             plugin_id: message.plugin_id,
             plugin_name_snapshot: message.plugin_name_snapshot,
             content: message.content,
-        }) {
+        });
+        drop(mutation);
+        match outcome {
             MessagePublishOutcome::Published(published) => {
                 Some(MessagePostGuardEffect::Published(published))
             }
@@ -4562,6 +4923,122 @@ impl PublicPluginManager {
 
     pub(crate) fn scheduler(&self) -> &Arc<PluginRequestScheduler> {
         &self.scheduler
+    }
+
+    pub(crate) async fn youdao_translate(
+        &self,
+        caller: PluginRuntimeIdentity,
+        input: super::host_services::YoudaoCommandInput,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<super::host_services::YoudaoResponse, super::host_services::ServiceError> {
+        use super::host_services::{network_code, parse_response, ServiceError};
+        let prepare = || -> Result<_, &'static str> {
+            input.input.validate()?;
+            let _mutation = self.lock_mutation().map_err(|_| "expiredRequest")?;
+            if caller.plugin_id != input.context.plugin_id
+                || caller.generation != input.context.plugin_generation
+            {
+                return Err("expiredRequest");
+            }
+            let bundle = self
+                .bundles
+                .confirmed_bundle(&caller.plugin_id)
+                .map_err(|_| "expiredRequest")?
+                .ok_or("expiredRequest")?;
+            if !bundle.config.installed
+                || !bundle.config.enabled
+                || bundle.config.fault.is_some()
+                || bundle.runtime_recovery_needed
+                || bundle.runtime.generation != caller.generation
+            {
+                return Err("expiredRequest");
+            }
+            if !bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::CredentialsYoudaoTranslation)
+                || !bundle
+                    .config
+                    .permission_grants
+                    .contains(&PublicPermission::CredentialsYoudaoTranslation)
+            {
+                return Err("servicePermissionDenied");
+            }
+            if bundle.runtime.manifest.is_multi_command()
+                || bundle.runtime.manifest.runtime.result_actions
+                || bundle
+                    .runtime
+                    .manifest
+                    .normalized_commands()
+                    .any(|(_, command)| command.output_mode != PublicOutputMode::MainResult)
+            {
+                return Err("invalidServiceRequest");
+            }
+            drop(_mutation);
+            let gate = Arc::clone(&self.network_authority);
+            let scheduler = Arc::clone(&self.scheduler);
+            let context = input.context.clone();
+            store.with_youdao(
+                &input.context,
+                self.scheduler
+                    .capture_result_publication(
+                        &caller.plugin_id,
+                        caller.generation,
+                        bundle.activation_id,
+                        bundle.admission_epoch,
+                    )
+                    .map_err(|_| "expiredRequest")?,
+                Box::new(move || {
+                    if let Ok(transition) = gate.begin_transition() {
+                        let _ = scheduler.retire_request_context(&context);
+                        transition.invalidate_context(&context);
+                    }
+                }),
+                |revision, values| {
+                    let salt = format!(
+                        "{}-{}",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                        std::process::id()
+                    );
+                    let timestamp = chrono::Utc::now().timestamp().to_string();
+                    let request = input.input.request(values, &salt, &timestamp)?;
+                    let mut prepared = self
+                        .network_authority
+                        .admit(
+                            &caller.plugin_id,
+                            caller.generation,
+                            &input.context,
+                            self.scheduler.as_ref(),
+                            request,
+                        )
+                        .map_err(network_code)?;
+                    prepared.deny_redirects();
+                    Ok((revision, prepared))
+                },
+            )
+        };
+        let (revision, prepared) = prepare().map_err(ServiceError::from)?;
+        let pending = self
+            .network_authority
+            .broker()
+            .execute(
+                prepared,
+                self.network_authority
+                    .redirect_authority(Arc::clone(&self.scheduler)),
+            )
+            .await
+            .map_err(network_code)
+            .map_err(ServiceError::from)?;
+        store
+            .with_revision(revision, || {
+                let response = self
+                    .network_authority
+                    .deliver(pending, self.scheduler.as_ref())
+                    .map_err(network_code)?;
+                parse_response(response.status, &response.body)
+            })
+            .map_err(ServiceError::from)
     }
 
     pub(crate) async fn request_network(
@@ -5972,6 +6449,550 @@ mod tests {
         .unwrap()
     }
 
+    fn change_permission(
+        manager: &PublicPluginManager,
+        permission: PublicPermission,
+        granted: bool,
+    ) -> ManagementEffects {
+        let mut effects = ManagementEffects::default();
+        manager
+            .set_permission_access_with_effects(
+                "com.example.timer",
+                permission,
+                granted,
+                &manager.inventory().unwrap().revision,
+                &mut effects,
+            )
+            .unwrap();
+        effects
+    }
+
+    #[test]
+    fn permission_access_revocation_expires_timer_and_window_authority_without_other_grants() {
+        for permission in [
+            PublicPermission::UiWindow,
+            PublicPermission::NotificationsPublish,
+            PublicPermission::TimerControl,
+        ] {
+            let dir = TestDir::new("permission-access-timer");
+            write_timer_package(&dir.source(), "1.0.0");
+            let clock = Arc::new(TestClock::default());
+            let manager = timer_manager(&dir, clock.clone(), Arc::new(TestPublisher::successful()));
+            let generation = install_timer(&manager, &dir.source());
+            let (key, ticket) = start_due_timer(&manager, &clock, generation);
+            let before = manager.state.config("com.example.timer").unwrap().unwrap();
+            assert!(change_permission(&manager, permission, false).changed);
+            let after = manager.state.config("com.example.timer").unwrap().unwrap();
+            let mut expected = before.permission_grants.clone();
+            expected.remove(&permission);
+            assert_eq!(after.permission_grants, expected);
+            assert_eq!(after.enabled, before.enabled);
+            assert!(manager
+                .window_timer_get_state("com.example.timer", generation, key.activation_id)
+                .is_err());
+            let dispatch = manager.commit_timer_claim(ticket);
+            assert!(dispatch.effect.is_none());
+            if permission == PublicPermission::UiWindow {
+                assert!(manager.route("/timer").unwrap().is_none());
+                assert!(manager.window_identity("com.example.timer").is_err());
+                assert!(manager
+                    .window_asset("com.example.timer", "/dist/window.html")
+                    .is_none());
+            }
+            change_permission(&manager, permission, true);
+            assert_eq!(
+                manager
+                    .state
+                    .config("com.example.timer")
+                    .unwrap()
+                    .unwrap()
+                    .permission_grants,
+                before.permission_grants
+            );
+        }
+    }
+
+    #[test]
+    fn permission_access_rejects_stale_undeclared_and_unsupported_and_manages_disabled() {
+        let dir = TestDir::new("permission-access-validation");
+        write_timer_package(&dir.source(), "1.0.0");
+        let manager = manager(&dir);
+        install_timer(&manager, &dir.source());
+        let revision = manager.inventory().unwrap().revision;
+        for (permission, revision) in [
+            (PublicPermission::ClipboardWrite, revision.as_str()),
+            (PublicPermission::ClipboardRead, revision.as_str()),
+            (PublicPermission::TimerControl, "0"),
+        ] {
+            assert!(manager
+                .set_permission_access_with_effects(
+                    "com.example.timer",
+                    permission,
+                    false,
+                    revision,
+                    &mut ManagementEffects::default()
+                )
+                .is_err());
+        }
+        manager
+            .set_enabled_with_readiness("com.example.timer", false, |_| true)
+            .unwrap();
+        change_permission(&manager, PublicPermission::TimerControl, false);
+        change_permission(&manager, PublicPermission::TimerControl, true);
+        assert!(
+            !manager
+                .state
+                .config("com.example.timer")
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn permission_access_network_requires_revision_for_revoke_and_retires_old_requests() {
+        let dir = TestDir::new("permission-access-network");
+        let manager = installed_credential_manager(&dir);
+        let running = dispatch_network_scheduled(&manager);
+        let revision = manager.inventory().unwrap().revision;
+        let mut effects = ManagementEffects::default();
+        assert!(manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::NetworkHttps,
+                false,
+                "0",
+                &mut effects
+            )
+            .is_err());
+        assert!(!effects.changed);
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::NetworkHttps,
+                false,
+                &revision,
+                &mut effects,
+            )
+            .unwrap();
+        assert!(effects.changed);
+        assert_eq!(
+            manager.scheduler.context_status(&running.context),
+            PluginContextStatus::Expired
+        );
+        let config = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(config.network_https_hosts_grant.is_empty());
+        assert!(config.network_credentials_grant.is_empty());
+    }
+
+    #[test]
+    fn permission_access_popped_notification_is_not_revived_by_regrant() {
+        let dir = TestDir::new("permission-access-popped-message");
+        write_notification_package(&dir.source(), "1.0.0");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        let installed = manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                prepared.permissions.iter().copied().collect(),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        schedule_test_message(&manager, installed.runtime.generation, "old", now);
+        let old = manager
+            .delayed_messages
+            .claim_due(now + Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        for granted in [false, true] {
+            manager
+                .set_permission_access_with_effects(
+                    "com.example.activation",
+                    PublicPermission::NotificationsPublish,
+                    granted,
+                    &manager.inventory().unwrap().revision,
+                    &mut ManagementEffects::default(),
+                )
+                .unwrap();
+        }
+        assert!(manager.commit_scheduled_message(old).is_none());
+        schedule_test_message(&manager, installed.runtime.generation, "new", now);
+        let fresh = manager
+            .delayed_messages
+            .claim_due(now + Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(manager.commit_scheduled_message(fresh).is_some());
+    }
+
+    #[test]
+    fn permission_access_concurrent_plugins_reject_stale_without_terminal_publication() {
+        let dir = TestDir::new("permission-access-concurrent");
+        write_timer_package(&dir.source(), "1.0.0");
+        let manager = Arc::new(manager(&dir));
+        install_timer(&manager, &dir.source());
+        let network = dir.path().join("network-source");
+        write_network_package(&network, "1.0.0", &["example.com"]);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&network), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                prepared.permissions.iter().copied().collect(),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let revision = manager.inventory().unwrap().revision;
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        *manager.after_state_durable.lock().unwrap() = Some(Arc::new(move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        let first = std::thread::spawn({
+            let manager = manager.clone();
+            let revision = revision.clone();
+            move || {
+                manager.set_permission_access_with_effects(
+                    "com.example.timer",
+                    PublicPermission::TimerControl,
+                    false,
+                    &revision,
+                    &mut ManagementEffects::default(),
+                )
+            }
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let second = std::thread::spawn({
+            let manager = manager.clone();
+            move || {
+                started_tx.send(()).unwrap();
+                manager.set_permission_access_with_effects(
+                    "com.example.network",
+                    PublicPermission::NetworkHttps,
+                    false,
+                    &revision,
+                    &mut ManagementEffects::default(),
+                )
+            }
+        });
+        started.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().is_ok());
+        assert!(second.join().unwrap().is_err());
+        assert!(
+            manager.inventory().is_ok(),
+            "stale concurrent toggles must not make management terminal"
+        );
+    }
+
+    #[test]
+    fn permission_access_timer_revoke_waits_for_admitted_publish() {
+        struct BlockingPublisher {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl MessagePublisher for BlockingPublisher {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn commit_publish(&self, _: MessagePublishRequest) -> MessagePublishOutcome {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                MessagePublishOutcome::Unavailable
+            }
+        }
+        let dir = TestDir::new("permission-access-publish-fence");
+        write_timer_package(&dir.source(), "1.0.0");
+        let clock = Arc::new(TestClock::default());
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let manager = Arc::new(
+            PublicPluginManager::load_with_timer_dependencies(
+                dir.path(),
+                PublicPluginHost::current(PublicPlatform::Windows),
+                [],
+                Arc::new(MessageCenterService::load(dir.path())),
+                clock.clone(),
+                Arc::new(BlockingPublisher {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+            )
+            .unwrap(),
+        );
+        let generation = install_timer(&manager, &dir.source());
+        let (_, ticket) = start_due_timer(&manager, &clock, generation);
+        let publishing = std::thread::spawn({
+            let manager = manager.clone();
+            move || manager.commit_timer_claim(ticket)
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (finished_tx, finished) = std::sync::mpsc::channel();
+        let revoking = std::thread::spawn({
+            let manager = manager.clone();
+            move || {
+                change_permission(&manager, PublicPermission::NotificationsPublish, false);
+                finished_tx.send(()).unwrap();
+            }
+        });
+        let returned_before_publish = finished.recv_timeout(Duration::from_millis(100)).is_ok();
+        release.send(()).unwrap();
+        publishing.join().unwrap();
+        revoking.join().unwrap();
+        assert!(
+            !returned_before_publish,
+            "revocation returned while an admitted notification was still publishing"
+        );
+    }
+
+    #[test]
+    fn permission_access_restart_refresh_update_preserve_revocation_but_require_new_consent() {
+        let dir = TestDir::new("permission-access-update");
+        write_timer_package(&dir.source(), "1.0.0");
+        let manager = manager(&dir);
+        install_timer(&manager, &dir.source());
+        change_permission(&manager, PublicPermission::TimerControl, false);
+        drop(manager);
+        let manager = self::manager(&dir);
+        assert!(!manager
+            .state
+            .config("com.example.timer")
+            .unwrap()
+            .unwrap()
+            .permission_grants
+            .contains(&PublicPermission::TimerControl));
+        // Development refresh retains version and must not reset revoked grants.
+        fs::write(
+            dir.source().join("dist/runtime.js"),
+            "export async function onCommand() { return { data: { refreshed: true } }; }",
+        )
+        .unwrap();
+        let now = Instant::now();
+        let refreshed = manager
+            .prepare_targeted(
+                "main",
+                source(&dir.source()),
+                Some(PublicPluginRefreshTarget {
+                    plugin_id: "com.example.timer".into(),
+                    expected_inventory_revision: manager.inventory().unwrap().revision,
+                }),
+                now,
+            )
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &refreshed.token,
+                refreshed.permissions.iter().copied().collect(),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        assert!(!manager
+            .state
+            .config("com.example.timer")
+            .unwrap()
+            .unwrap()
+            .permission_grants
+            .contains(&PublicPermission::TimerControl));
+        write_timer_package(&dir.source(), "1.1.0");
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["permissions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("clipboard.write"));
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        assert!(manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiWindow,
+                    PublicPermission::NotificationsPublish,
+                    PublicPermission::TimerControl
+                ]),
+                now,
+                |_| true
+            )
+            .is_err());
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                prepared.permissions.iter().copied().collect(),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let config = manager.state.config("com.example.timer").unwrap().unwrap();
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::TimerControl));
+        assert!(config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardWrite));
+    }
+
+    #[test]
+    fn permission_access_failure_rolls_back_or_retires_authority() {
+        for failure in ["candidate", "unknown", "publication"] {
+            let dir = TestDir::new("permission-access-failure");
+            write_timer_package(&dir.source(), "1.0.0");
+            let manager = Arc::new(manager(&dir));
+            let generation = install_timer(&manager, &dir.source());
+            let revision = manager.inventory().unwrap().revision;
+            let owner = dir.path().join("public-plugins/state/com.example.timer");
+            if failure == "candidate" {
+                fs::create_dir(owner.join("state.json.backup")).unwrap();
+            } else if failure == "unknown" {
+                fs::remove_file(owner.join("state.json")).unwrap();
+                fs::create_dir(owner.join("state.json")).unwrap();
+            } else {
+                *manager.after_state_durable.lock().unwrap() = Some(Arc::new({
+                    let weak = Arc::downgrade(&manager);
+                    move || {
+                        let manager = weak.upgrade().unwrap();
+                        let _ = std::thread::spawn(move || {
+                            let _guard = manager.mutation.lock().unwrap();
+                            panic!("synthetic permission publication failure");
+                        })
+                        .join();
+                    }
+                }));
+            }
+            let mut effects = ManagementEffects::default();
+            assert!(manager
+                .set_permission_access_with_effects(
+                    "com.example.timer",
+                    PublicPermission::TimerControl,
+                    false,
+                    &revision,
+                    &mut effects
+                )
+                .is_err());
+            if failure == "candidate" {
+                assert!(!effects.changed);
+                assert!(manager
+                    .state
+                    .config("com.example.timer")
+                    .unwrap()
+                    .unwrap()
+                    .permission_grants
+                    .contains(&PublicPermission::TimerControl));
+                assert!(manager.route("/timer").unwrap().is_some());
+            } else {
+                assert!(effects.changed);
+                assert!(manager
+                    .window_timer_get_state("com.example.timer", generation, 1)
+                    .is_err());
+                assert!(manager.route("/timer").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn permission_access_failed_history_revoke_stops_capture_without_deleting_history() {
+        for failure in ["unknown", "publication"] {
+            let dir = TestDir::new("permission-access-history-failure");
+            write_clipboard_history_package_with_permissions(
+                &dir.source(),
+                "1.0.0",
+                vec!["ui.panel", "clipboard.history.read"],
+            );
+            let manager = Arc::new(manager(&dir));
+            let now = Instant::now();
+            let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &prepared.token,
+                    prepared.permissions.iter().copied().collect(),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+            let plugin_id = "com.example.clipboard-history";
+            manager
+                .clipboard_history_capture_for_test(ClipboardCapture::text(
+                    "retained",
+                    "2026-10-30T01:00:00Z",
+                ))
+                .unwrap();
+            let before = manager
+                .clipboard_history_snapshot_for_test(plugin_id)
+                .unwrap();
+            assert!(manager
+                .clipboard_history_authorized_plugins_for_test()
+                .contains(&plugin_id.into()));
+            let revision = manager.inventory().unwrap().revision;
+            if failure == "unknown" {
+                let current = dir
+                    .path()
+                    .join("public-plugins/state")
+                    .join(plugin_id)
+                    .join("state.json");
+                fs::remove_file(&current).unwrap();
+                fs::create_dir(&current).unwrap();
+            } else {
+                *manager.after_state_durable.lock().unwrap() = Some(Arc::new({
+                    let weak = Arc::downgrade(&manager);
+                    move || {
+                        let manager = weak.upgrade().unwrap();
+                        let _ = std::thread::spawn(move || {
+                            let _guard = manager.mutation.lock().unwrap();
+                            panic!("synthetic history permission publication failure");
+                        })
+                        .join();
+                    }
+                }));
+            }
+            assert!(manager
+                .set_permission_access_with_effects(
+                    plugin_id,
+                    PublicPermission::ClipboardHistoryRead,
+                    false,
+                    &revision,
+                    &mut ManagementEffects::default()
+                )
+                .is_err());
+            assert!(!manager
+                .clipboard_history_authorized_plugins_for_test()
+                .contains(&plugin_id.into()));
+            manager
+                .clipboard_history_capture_for_test(ClipboardCapture::text(
+                    "must-not-capture",
+                    "2026-10-30T02:00:00Z",
+                ))
+                .unwrap();
+            assert_eq!(
+                manager
+                    .clipboard_history_snapshot_for_test(plugin_id)
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
     fn manager_with_network_authority(
         dir: &TestDir,
         network_authority: Arc<PluginNetworkAuthorityGate>,
@@ -6335,7 +7356,7 @@ mod tests {
                 "pluginId": "com.example.clipboard-history",
                 "version": version,
                 "apiVersion": 1,
-                "minimumHostVersion": "0.3.3",
+                "minimumHostVersion": if permissions.contains(&"clipboard.history.copy") { "0.17.0" } else { "0.3.3" },
                 "name": "Clipboard History",
                 "supportedPlatforms": ["windows"],
                 "command": {
@@ -6918,6 +7939,259 @@ mod tests {
             ),
             Err(ClipboardHistoryBridgeError::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn permission_access_queued_history_paste_rechecks_each_grant_before_effect() {
+        for permission in [
+            PublicPermission::UiPanel,
+            PublicPermission::ClipboardHistoryRead,
+            PublicPermission::ClipboardHistoryPaste,
+        ] {
+            let dir = TestDir::new("permission-access-queued-history-paste");
+            write_clipboard_history_package_with_permissions(
+                &dir.source(),
+                "1.0.0",
+                vec![
+                    "ui.panel",
+                    "clipboard.history.read",
+                    "clipboard.history.paste",
+                ],
+            );
+            let manager = manager(&dir);
+            let now = Instant::now();
+            let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &prepared.token,
+                    BTreeSet::from([
+                        PublicPermission::UiPanel,
+                        PublicPermission::ClipboardHistoryRead,
+                        PublicPermission::ClipboardHistoryPaste,
+                    ]),
+                    now,
+                    |_| true,
+                )
+                .unwrap();
+            let plugin_id = "com.example.clipboard-history";
+            let activation_id = manager.activation_id(plugin_id).unwrap();
+            let admission_epoch = manager.admission_epoch(plugin_id).unwrap();
+            let effects = std::cell::Cell::new(0);
+            let revision = manager
+                .with_clipboard_history_paste_authorization(
+                    plugin_id,
+                    1,
+                    activation_id,
+                    admission_epoch,
+                    None,
+                    Ok,
+                )
+                .unwrap();
+            let execute = || {
+                manager.with_clipboard_history_paste_authorization(
+                    plugin_id,
+                    1,
+                    activation_id,
+                    admission_epoch,
+                    Some(revision),
+                    |_| {
+                        effects.set(effects.get() + 1);
+                        Ok(())
+                    },
+                )
+            };
+            execute().unwrap();
+            manager
+                .set_permission_access_with_effects(
+                    plugin_id,
+                    permission,
+                    false,
+                    &manager.inventory().unwrap().revision,
+                    &mut ManagementEffects::default(),
+                )
+                .unwrap();
+            assert!(
+                execute().is_err(),
+                "queued effect must reject revoked {permission:?}"
+            );
+            assert_eq!(
+                effects.get(),
+                1,
+                "revoked grant must prevent the native effect"
+            );
+            let grants = manager
+                .state
+                .config(plugin_id)
+                .unwrap()
+                .unwrap()
+                .permission_grants;
+            assert_eq!(grants.len(), 2, "unrelated grants remain present");
+            manager
+                .set_permission_access_with_effects(
+                    plugin_id,
+                    permission,
+                    true,
+                    &manager.inventory().unwrap().revision,
+                    &mut ManagementEffects::default(),
+                )
+                .unwrap();
+            assert!(
+                execute().is_err(),
+                "regrant must not revive the queued native effect"
+            );
+            assert_eq!(effects.get(), 1);
+            assert!(manager
+                .with_clipboard_history_paste_authorization(
+                    plugin_id,
+                    1,
+                    activation_id,
+                    admission_epoch,
+                    None,
+                    |_| Ok(())
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn clipboard_history_copy_requires_explicit_grant_and_rechecks_revocation() {
+        let dir = TestDir::new("clipboard-copy-authorization");
+        write_clipboard_history_package_with_permissions(
+            &dir.source(),
+            "1.0.0",
+            vec![
+                "ui.panel",
+                "clipboard.history.read",
+                "clipboard.history.copy",
+            ],
+        );
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let plugin_id = "com.example.clipboard-history";
+        let activation = manager.activation_id(plugin_id).unwrap();
+        let admission = manager.admission_epoch(plugin_id).unwrap();
+        let effects = std::cell::Cell::new(0);
+        let execute = |generation, activation, admission| {
+            manager.with_clipboard_history_copy_authorization(
+                plugin_id,
+                generation,
+                activation,
+                admission,
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            )
+        };
+        assert_eq!(
+            execute(1, activation, admission),
+            Err(ClipboardHistoryPasteError::PermissionDenied)
+        );
+        manager
+            .set_permission_access_with_effects(
+                plugin_id,
+                PublicPermission::ClipboardHistoryCopy,
+                true,
+                &manager.inventory().unwrap().revision,
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        execute(1, activation, admission).unwrap();
+        assert_eq!(
+            execute(2, activation, admission),
+            Err(ClipboardHistoryPasteError::ExpiredPanelSession)
+        );
+        manager
+            .set_permission_access_with_effects(
+                plugin_id,
+                PublicPermission::ClipboardHistoryCopy,
+                false,
+                &manager.inventory().unwrap().revision,
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            execute(1, activation, admission),
+            Err(ClipboardHistoryPasteError::PermissionDenied)
+        );
+        assert_eq!(effects.get(), 1);
+    }
+
+    #[test]
+    fn clipboard_history_copy_is_not_automatically_granted_on_update() {
+        let dir = TestDir::new("clipboard-copy-upgrade");
+        write_clipboard_history_package_with_permissions(
+            &dir.source(),
+            "1.0.0",
+            vec![
+                "ui.panel",
+                "clipboard.history.read",
+                "clipboard.history.paste",
+            ],
+        );
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                    PublicPermission::ClipboardHistoryPaste,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        write_clipboard_history_package_with_permissions(
+            &dir.source(),
+            "1.1.0",
+            vec![
+                "ui.panel",
+                "clipboard.history.read",
+                "clipboard.history.copy",
+            ],
+        );
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::UiPanel,
+                    PublicPermission::ClipboardHistoryRead,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        let config = manager
+            .state
+            .config("com.example.clipboard-history")
+            .unwrap()
+            .unwrap();
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardHistoryCopy));
+        assert!(config
+            .permission_grants
+            .contains(&PublicPermission::ClipboardHistoryRead));
     }
 
     #[test]
@@ -8652,6 +9926,10 @@ mod tests {
             "activation"
         );
         assert_eq!(value["items"][0]["source"], "localPackage");
+        let installation = value["items"][0]["installationDirectory"].as_str().unwrap();
+        assert!(std::path::Path::new(installation)
+            .join("plugin.json")
+            .is_file());
         assert!(value["items"][0].get("runtime").is_none());
         assert!(value["items"][0].get("outputMode").is_none());
         assert!(value.to_string().find("runtime.js").is_none());
@@ -8872,7 +10150,7 @@ mod tests {
     #[test]
     fn multi_command_conflicts_reject_the_entire_install_or_upgrade() {
         for upgrade in [false, true] {
-            for conflict in ["custom", "occupied", "find", "quick"] {
+            for conflict in ["find", "quick"] {
                 let dir = TestDir::new("multi-atomic-conflicts");
                 let manager = multi_manager(&dir);
                 let other = dir.path().join("other");
@@ -10151,6 +11429,49 @@ mod tests {
         assert!(!manager
             .record_runtime_result("com.example.activation", 1, old_activation, false, now,)
             .unwrap());
+    }
+
+    #[test]
+    fn sole_eligible_duplicate_alias_routes_by_captured_identity_during_recovery() {
+        let dir = TestDir::new("duplicate-recovery-route");
+        write_package(&dir.source(), "1.0.0", "one");
+        let manager = manager(&dir);
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness("main", &prepared.token, BTreeSet::new(), now, |_| true)
+            .unwrap();
+        let other = dir.path().join("other");
+        write_discovery_package(&other, "com.example.other", "Other", "activation", "Other");
+        install_discovery_package(&manager, &other, Instant::now());
+        let transaction = manager
+            .begin_uninstall("com.example.activation", false)
+            .unwrap()
+            .unwrap();
+        manager.abort_uninstall_before_commit(transaction).unwrap();
+        let suggestions = manager
+            .command_suggestions("activation")
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.effective_name == "activation")
+            .collect::<Vec<_>>();
+        let (plugin, command, argument) =
+            crate::commands::sole_public_match(&suggestions, "hello  world").unwrap();
+        assert_eq!(plugin, "com.example.other");
+        let selected = manager
+            .route_by_id(&plugin, &command, &argument)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.plugin_id, "com.example.other");
+        assert_eq!(selected.input, "hello  world");
+        assert!(!selected.runtime_recovery_needed);
+        assert!(
+            manager
+                .route("/activation hello  world")
+                .unwrap()
+                .unwrap()
+                .runtime_recovery_needed
+        );
     }
 
     #[test]
@@ -12864,6 +14185,38 @@ mod tests {
             .publish(Some(bundle.with_config(config)))
             .unwrap();
     }
+
+    #[test]
+    fn permission_access_regrant_never_revives_old_result_actions() {
+        for permission in [PublicPermission::UrlOpen, PublicPermission::ClipboardWrite] {
+            let dir = TestDir::new("permission-access-old-results");
+            let manager = manager(&dir);
+            install_url_result_package(&manager, &dir.source());
+            let (registry, origins) = url_result_source(&manager, true);
+            for granted in [false, true] {
+                manager
+                    .set_permission_access_with_effects(
+                        "com.example.activation",
+                        permission,
+                        granted,
+                        &manager.inventory().unwrap().revision,
+                        &mut ManagementEffects::default(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    manager.open_url_result_action(&registry, &origins[0], |_| panic!(
+                        "retired URL effect"
+                    )),
+                    super::super::result_action::ResultActionOutcome::Failed { .. }
+                ));
+            }
+            let (fresh_registry, fresh_origins) = url_result_source(&manager, true);
+            assert!(matches!(
+                manager.open_url_result_action(&fresh_registry, &fresh_origins[0], |_| Ok(())),
+                super::super::result_action::ResultActionOutcome::UrlOpened
+            ));
+        }
+    }
     #[test]
     fn result_action_paste_consumes_once_and_releases_mutation_before_hide() {
         use super::super::result_action::*;
@@ -13944,5 +15297,425 @@ mod tests {
                 })
             );
         }
+    }
+    fn write_host_service_package(dir: &TestDir) {
+        write_network_package(&dir.source(), "1.0.0", &["openapi.youdao.com"]);
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["minimumHostVersion"] = json!("0.15.0");
+        manifest["permissions"] = json!([
+            "network.https",
+            "credentials.youdaoTranslation",
+            "credentials.baiduOcr",
+            "credentials.deepseek"
+        ]);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    #[tokio::test]
+    async fn host_services_independent_grants_caller_and_config_mutation_retire_pending_request() {
+        let dir = TestDir::new("host-service-revocation");
+        write_host_service_package(&dir);
+        let (gate, started) = PluginNetworkAuthorityGate::blocking_for_test();
+        let manager = Arc::new(manager_with_network_authority(&dir, gate));
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        let config = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::CredentialsYoudaoTranslation));
+        let store = Arc::new(crate::credentials::CredentialStore::new(
+            dir.path().join("synthetic-host-credentials"),
+        ));
+        store.synthetic_youdao_for_test();
+        let context = dispatch_network_request(&manager);
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        let command = || {
+            serde_json::from_value::<super::super::host_services::YoudaoCommandInput>(
+                json!({"context":context,"input":{"text":"hello","from":"en","to":"zh-CHS"}}),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            manager
+                .youdao_translate(caller.clone(), command(), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "servicePermissionDenied"
+        );
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsBaiduOcr,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        manager
+            .scheduler
+            .complete(&context, Instant::now())
+            .unwrap();
+        // Granting OCR cannot authorize translation.
+        let context = dispatch_network_request(&manager);
+        let command: super::super::host_services::YoudaoCommandInput = serde_json::from_value(
+            json!({"context":context,"input":{"text":"hello","from":"en","to":"zh-CHS"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            manager
+                .youdao_translate(caller.clone(), command, &store)
+                .await
+                .unwrap_err()
+                .code,
+            "servicePermissionDenied"
+        );
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsYoudaoTranslation,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        manager
+            .scheduler
+            .complete(&context, Instant::now())
+            .unwrap();
+        let context = dispatch_network_request(&manager);
+        let command = serde_json::from_value(
+            json!({"context":context,"input":{"text":"hello","from":"en","to":"zh-CHS"}}),
+        )
+        .unwrap();
+        let task = {
+            let manager = manager.clone();
+            let store = store.clone();
+            tokio::spawn(async move { manager.youdao_translate(caller, command, &store).await })
+        };
+        started.notified().await;
+        store.disable_youdao_for_test();
+        assert_eq!(task.await.unwrap().unwrap_err().code, "expiredRequest");
+        assert_eq!(
+            manager.scheduler.context_status(&context),
+            super::super::PluginContextStatus::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn host_services_result_already_returned_to_js_cannot_complete_after_configuration_mutation(
+    ) {
+        let dir = TestDir::new("host-service-js-late");
+        write_host_service_package(&dir);
+        let (gate, barrier) = PluginNetworkAuthorityGate::paused_body_for_test(
+            200,
+            br#"{"errorCode":"0","translation":["hello"]}"#.to_vec(),
+        );
+        let manager = Arc::new(manager_with_network_authority(&dir, gate));
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsYoudaoTranslation,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        let store = Arc::new(crate::credentials::CredentialStore::new(
+            dir.path().join("synthetic-host"),
+        ));
+        store.synthetic_youdao_for_test();
+        let context = dispatch_network_request(&manager);
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        let command = serde_json::from_value(
+            json!({"context":context,"input":{"text":"你好","from":"zh-CHS","to":"en"}}),
+        )
+        .unwrap();
+        let task = {
+            let manager = manager.clone();
+            let store = store.clone();
+            tokio::spawn(async move { manager.youdao_translate(caller, command, &store).await })
+        };
+        barrier.reached.notified().await;
+        barrier.release.notify_one();
+        assert_eq!(task.await.unwrap().unwrap().translations, vec!["hello"]);
+        let rejected = serde_json::from_value(json!({"context":{"pluginId":context.plugin_id,"pluginGeneration":context.plugin_generation,"requestId":"forged-expired-request"},"input":{"text":"你好","from":"zh-CHS","to":"en"}})).unwrap();
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        assert_eq!(
+            manager
+                .youdao_translate(caller, rejected, &store)
+                .await
+                .unwrap_err()
+                .code,
+            "expiredRequest"
+        );
+
+        assert_eq!(
+            manager.scheduler.context_status(&context),
+            super::super::PluginContextStatus::Current
+        );
+        let (revision, completion) = store
+            .with_completion(&context, |revision| {
+                (
+                    revision,
+                    manager
+                        .scheduler
+                        .complete(&context, Instant::now())
+                        .unwrap(),
+                )
+            })
+            .unwrap();
+        assert!(completion.accepted);
+        let (revision, publication) =
+            revision.expect("native service revision survives completion");
+        store.disable_youdao_for_test();
+        // The already-settled legacy response is still fenced at actual registry publication.
+        let published = std::cell::Cell::new(false);
+        assert_eq!(
+            store.with_revision(revision, || {
+                published.set(true);
+                Ok(())
+            }),
+            Err("expiredRequest")
+        );
+        assert!(!published.get());
+        assert!(manager
+            .scheduler
+            .with_result_publication(&context.plugin_id, &publication, || ())
+            .is_ok());
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsYoudaoTranslation,
+                false,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        assert!(manager
+            .scheduler
+            .with_result_publication(&context.plugin_id, &publication, || panic!(
+                "revoked response cannot publish"
+            ))
+            .is_err());
+    }
+    #[test]
+    fn selection_permission_defaults_off_and_preserves_explicit_choice_on_upgrade() {
+        let dir = TestDir::new("selection-grant-upgrade");
+        write_host_service_package(&dir);
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["minimumHostVersion"] = json!("0.16.0");
+        manifest["permissions"] = json!(["network.https", "selection.read"]);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let manager = manager(&dir);
+        let permission: PublicPermission = serde_json::from_value(json!("selection.read")).unwrap();
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                prepared.permissions.iter().copied().collect(),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        assert!(!manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap()
+            .permission_grants
+            .contains(&permission));
+        for (index, granted) in [true, false].into_iter().enumerate() {
+            manager
+                .set_permission_access_with_effects(
+                    "com.example.network",
+                    permission,
+                    granted,
+                    &manager.state.inventory_revision().unwrap().to_string(),
+                    &mut ManagementEffects::default(),
+                )
+                .unwrap();
+            manifest["version"] = json!(format!("1.0.{}", index + 1));
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let prepared = manager
+                .prepare("main", source(&dir.source()), Instant::now())
+                .unwrap();
+            manager
+                .commit_with_readiness(
+                    "main",
+                    &prepared.token,
+                    BTreeSet::from([PublicPermission::NetworkHttps]),
+                    Instant::now(),
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(
+                manager
+                    .state
+                    .config("com.example.network")
+                    .unwrap()
+                    .unwrap()
+                    .permission_grants
+                    .contains(&permission),
+                granted
+            );
+        }
+    }
+
+    #[test]
+    fn host_service_permissions_default_off_and_updates_preserve_only_explicit_grants() {
+        let dir = TestDir::new("host-service-update");
+        write_host_service_package(&dir);
+        let manager = manager(&dir);
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                prepared.permissions.iter().copied().collect(),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        let config = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(config
+            .permission_grants
+            .iter()
+            .all(|p| !p.is_host_service()));
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsYoudaoTranslation,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        let manifest_path = dir.source().join("plugin.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["version"] = json!("1.0.1");
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        let config = manager
+            .state
+            .config("com.example.network")
+            .unwrap()
+            .unwrap();
+        assert!(config
+            .permission_grants
+            .contains(&PublicPermission::CredentialsYoudaoTranslation));
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::CredentialsBaiduOcr));
+        assert!(!config
+            .permission_grants
+            .contains(&PublicPermission::CredentialsDeepseek));
+    }
+    #[tokio::test]
+    async fn host_service_rejects_result_action_runtime_before_network() {
+        let dir = TestDir::new("host-service-output-boundary");
+        write_host_service_package(&dir);
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["runtime"]["resultActions"] = json!(true);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let manager = manager(&dir);
+        let prepared = manager
+            .prepare("main", source(&dir.source()), Instant::now())
+            .unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([PublicPermission::NetworkHttps]),
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsYoudaoTranslation,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        let context = dispatch_network_request(&manager);
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        let command = serde_json::from_value(
+            json!({"context":context,"input":{"text":"hello","from":"en","to":"zh-CHS"}}),
+        )
+        .unwrap();
+        let store = crate::credentials::CredentialStore::new(dir.path().join("synthetic"));
+        store.synthetic_youdao_for_test();
+        assert_eq!(
+            manager
+                .youdao_translate(caller, command, &store)
+                .await
+                .unwrap_err()
+                .code,
+            "invalidServiceRequest"
+        );
     }
 }

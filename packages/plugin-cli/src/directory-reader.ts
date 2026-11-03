@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { PackagePolicyError, SnapshotBuilder, type PackageSnapshot } from './package-policy.js'
 import {
   assertNoReparsePoints,
-  createWindowsAttributeProbe,
+  withWindowsAttributeProbe,
   type WindowsAttributeProbe,
 } from './windows-attributes.js'
 
@@ -46,7 +46,10 @@ export async function readDirectorySnapshot(
   options: DirectoryReaderOptions = {},
 ): Promise<PackageSnapshot> {
   const platform = options.hostPlatform ?? process.platform
-  const probe = platform === 'win32' ? options.probe ?? createWindowsAttributeProbe() : undefined
+  return withWindowsAttributeProbe(platform, options.probe, (probe) => readDirectory(root, probe))
+}
+
+async function readDirectory(root: string, probe: WindowsAttributeProbe | undefined): Promise<PackageSnapshot> {
   const rootBefore = await lstat(root).catch(() => {
     throw invalid()
   })

@@ -114,6 +114,17 @@ test('runtime supplies only the invocation-derived completion message', async ()
   })
 })
 
+test('denied timer capability explains required permissions without exposing the raw error', async () => {
+  const { createPomodoroModel } = await import(new URL('../package/dist/window.js', import.meta.url))
+  const timer = fakeTimer()
+  timer.getState = async () => { throw { code: 'PermissionDenied', message: 'private failure' } }
+  const model = createPomodoroModel({ timer, storage: { async get() { return null }, async set() {} }, completionMessage: '完成' })
+  await model.initialize()
+  assert.match(model.getSnapshot().error, /设置 → 权限.*计时器控制、发送通知和独立窗口/)
+  assert.doesNotMatch(model.getSnapshot().error, /PermissionDenied|private failure/)
+  model.dispose()
+})
+
 test('window renders the exact duration selector and default ten minutes', async () => {
   const html = await readFile(new URL('../package/dist/window.html', import.meta.url), 'utf8')
   const options = [...html.matchAll(/<option value="(\d+)">([^<]+)<\/option>/g)]

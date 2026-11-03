@@ -1,6 +1,6 @@
 {
   "name": "uipilot",
-  "version": "0.14.0",
+  "version": "0.17.0",
   "private": true,
   "workspaces": [
     "packages/*"
@@ -9,6 +9,7 @@
     "test": "vitest run",
     "dev": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-with-everything.ps1",
     "dev:vite": "vite",
+    "preview:settings": "vite --host 127.0.0.1 --port 14339 --strictPort",
     "build": "tsc --noEmit && vite build",
     "build:managed-everything": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release",
     "stage:managed-everything:production": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode ProductionBundleInput",

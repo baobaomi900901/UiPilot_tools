@@ -34,6 +34,10 @@ pub(crate) struct ClipboardImageSnapshot {
 
 pub(crate) trait ClipboardReader: Send + Sync {
     fn read_capture(&self) -> Result<Option<ClipboardCapture>, ClipboardReadError>;
+
+    fn sequence(&self) -> u32 {
+        0
+    }
 }
 
 pub(crate) trait ClipboardObserver: Send + Sync {
@@ -122,6 +126,10 @@ struct SystemClipboardReader;
 impl ClipboardReader for SystemClipboardReader {
     fn read_capture(&self) -> Result<Option<ClipboardCapture>, ClipboardReadError> {
         platform::read_system_clipboard()
+    }
+
+    fn sequence(&self) -> u32 {
+        current_clipboard_sequence()
     }
 }
 

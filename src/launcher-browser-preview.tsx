@@ -1,4 +1,5 @@
 import { createRoot } from 'react-dom/client'
+import { createPreviewCredentialClient } from './credential-preview'
 
 import { createLauncherCore } from './launcher-core'
 import { LauncherView } from './launcher-view'
@@ -55,7 +56,7 @@ let previewPublicPlugins: PublicPluginInventory = { hotkeyRevision: '0',
       name: 'Notes',
       description: '项目笔记、代码片段和常用链接管理。',
       version: '0.1.0',
-      source: 'localPackage',
+      source: 'localPackage', installationDirectory: 'C:/Users/demo/AppData/Roaming/UiPilot/plugins/example/0.1.0',
       commands: [{ commandId: 'default', defaultName: 'notes', effectiveName: 'notes', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
       enabled: true,
       fault: null,
@@ -75,7 +76,7 @@ let previewPublicPlugins: PublicPluginInventory = { hotkeyRevision: '0',
       name: 'Translate',
       description: '选中文本翻译、方向切换和复制结果。',
       version: '0.3.0',
-      source: 'localPackage',
+      source: 'localPackage', installationDirectory: 'C:/Users/demo/AppData/Roaming/UiPilot/plugins/example/0.1.0',
       commands: [{ commandId: 'default', defaultName: 'translate', effectiveName: 'translate', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }],
       enabled: false,
       fault: null,
@@ -109,7 +110,7 @@ let previewPublicPlugins: PublicPluginInventory = { hotkeyRevision: '0',
 // Synthetic metadata only: preview saves retain configuration flags, never entered values.
 const credentialPreviewPlugin: PublicPluginInventoryItem = {
   pluginId: 'com.uipilot.credential-demo', name: 'Credential Demo',
-  description: '合成凭据设置与网络授权预览，不连接真实服务。', version: '0.1.0', source: 'localPackage',
+  description: '合成凭据设置与网络授权预览，不连接真实服务。', version: '0.1.0', source: 'localPackage', installationDirectory: 'C:/Users/demo/AppData/Roaming/UiPilot/plugins/example/0.1.0',
   commands: [{ commandId: 'default', defaultName: 'credential-demo', effectiveName: 'credential-demo', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' as const }], enabled: true,
   fault: null, generation: 1, iconUrl: null,
   network: { httpsHosts: ['api.example.com'], credentials: [
@@ -122,20 +123,65 @@ const credentialPreviewPlugin: PublicPluginInventoryItem = {
   ],
 }
 previewPublicPlugins = { ...previewPublicPlugins, items: [...previewPublicPlugins.items, credentialPreviewPlugin] }
+if (previewParameters.has('permissions')) {
+  previewPublicPlugins = { ...previewPublicPlugins, items: previewPublicPlugins.items.map((plugin) => ({
+    ...plugin,
+    permissions: plugin.permissions.map((entry) =>
+      entry.permission === 'clipboard.read' || entry.permission === 'files.userSelected'
+        ? { ...entry, supported: false, granted: false }
+        : entry),
+  })) }
+  previewPublicPlugins.items = [...previewPublicPlugins.items, {
+    ...credentialPreviewPlugin,
+    pluginId: 'com.uipilot.permission-preview', name: '工作助手',
+    description: '仅用于权限界面预览的合成插件。', network: null, settings: [],
+    commands: [{ commandId: 'default', defaultName: 'work', effectiveName: 'work', nameOverride: null, favorite: false, hotkey: null, hotkeyStatus: 'unset' }],
+    permissions: [
+      { permission: 'clipboard.write', supported: true, granted: true },
+      { permission: 'clipboard.history.read', supported: true, granted: false },
+      { permission: 'clipboard.history.paste', supported: true, granted: false },
+      { permission: 'files.openText', supported: true, granted: true },
+      { permission: 'ui.window', supported: true, granted: true },
+      { permission: 'notifications.publish', supported: true, granted: true },
+      { permission: 'timer.control', supported: true, granted: true },
+    ],
+  }]
+}
+if (previewParameters.has('hostCredentials')) {
+  previewPublicPlugins = { ...previewPublicPlugins, items: previewPublicPlugins.items
+    .filter((plugin) => plugin.pluginId === 'com.uipilot.translate')
+    .map((plugin) => ({
+      ...plugin, name: '翻译', version: '1.2.0', enabled: true,
+      description: '使用主程序保存的有道配置完成中英互译。',
+      network: { httpsHosts: ['openapi.youdao.com'], credentials: [] }, settings: [],
+      permissions: [
+        { permission: 'clipboard.write' as const, supported: true, granted: true },
+        { permission: 'network.https' as const, supported: true, granted: true },
+        { permission: 'selection.read' as const, supported: true, granted: false },
+        { permission: 'credentials.youdaoTranslation' as const, supported: true, granted: false },
+        { permission: 'credentials.baiduOcr' as const, supported: true, granted: false },
+        { permission: 'credentials.deepseek' as const, supported: true, granted: false },
+      ],
+    })),
+  }
+}
+let previewSelectionHotkey: string | null = 'Alt+A'
 let previewScenarioPending = true
+const permissionChangeListeners = new Set<() => void>()
 function updatePreviewPlugin(pluginId: string, update: (plugin: PublicPluginInventoryItem) => PublicPluginInventoryItem) {
   previewPublicPlugins = {
     hotkeyRevision: previewPublicPlugins.hotkeyRevision,
     revision: String(BigInt(previewPublicPlugins.revision) + 1n),
     items: previewPublicPlugins.items.map((plugin) => plugin.pluginId === pluginId ? update(plugin) : plugin),
   }
+  queueMicrotask(() => permissionChangeListeners.forEach((handler) => handler()))
 }
 
 const commandPreview = previewParameters.has('commands')
 const commandPreviewCount = previewParameters.get('commands') === '16' ? 16 : 2
 const commandPreviewPlugin: PublicPluginInventoryItem = {
   pluginId: 'com.uipilot.multi-preview', name: 'Command Demo', description: '同包命令独立管理预览。',
-  version: '0.1.0', source: 'localPackage', enabled: true, fault: null, generation: 1, iconUrl: null,
+  version: '0.1.0', source: 'localPackage', installationDirectory: 'C:/Users/demo/AppData/Roaming/UiPilot/plugins/example/0.1.0', enabled: true, fault: null, generation: 1, iconUrl: null,
   commands: Array.from({ length: commandPreviewCount }, (_, index) => ({
     commandId: index === 1 ? 'constructor' : index === 0 ? 'upper' : `command-${index + 1}`,
     defaultName: commandPreviewCount === 16 ? `long-command-name-number-${String(index + 1).padStart(2, '0')}` : index === 0 ? 'upper' : 'lower',
@@ -224,7 +270,10 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
     return {
       requestId: `preview-main-result-${querySequence}`,
       mainResultCommand: { pluginId: 'com.uipilot.translate', commandId: 'default', commandLabel: 'translate', argument },
-      items: scenario === 'empty' ? [] : [
+      items: scenario === 'empty' ? [] : scenario === 'legacy' ? [{
+        resultId: 'preview-legacy-translation', title: 'Method', subtitle: '中译英',
+        activation: { kind: 'executeResult' }, hasDefaultAction: true,
+      }] : [
         { title: '保持专注，完成眼前的工作。', subtitle: '中文 · 简体', detail: 'Stay focused and finish the task at hand.' },
         { title: 'Stay focused and finish the task at hand.', subtitle: 'English · 英语', detail: '保持专注，完成眼前的工作。' },
         { title: '专注于当下，让每一项工作都有清晰的结果与下一步。', subtitle: '另一种表达 · 长文本预览', detail: 'Focus on the present and make every task lead to a clear result and a practical next step.' },
@@ -243,7 +292,7 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
         title: `/${panelPreviewCommand}`,
         subtitle: 'Panel 外壳样式预览',
         activation: {
-          kind: 'panelActivation',
+          kind: 'panelActivation', commandId: 'default',
           pluginId: panelPreviewPluginId,
           initialArgument: '',
           favorite: false,
@@ -318,16 +367,27 @@ async function searchResponse(query: string, querySequence: number): Promise<Sea
 const noMessages = { revision: '0', unreadCount: 0, messages: [] }
 
 let previewBuiltinFeatures: readonly BuiltinFeatureView[] = [
-  { feature: 'screenshot', name: '截图', command: '/screenshot', description: '截取屏幕区域，编辑、复制、保存或贴图。', examples: ['/screenshot'], version: '0.14.0', enabled: true },
-  { feature: 'quicklinks', name: '快捷链接', command: '/quicklinks', description: '管理快捷链接，使用自定义命令打开链接。', examples: ['/quicklinks'], version: '0.14.0', enabled: true },
-  { feature: 'webSearch', name: '网页搜索', command: '/web-search', description: '使用默认搜索引擎搜索网页。', examples: ['/web-search UiPilot'], version: '0.14.0', enabled: true },
+  { feature: 'screenshot', name: '截图', command: '/screenshot', defaultCommand: '/screenshot', favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: 'C:/Program Files/UiPilot', description: '截取屏幕区域，编辑、复制、保存或贴图。', examples: ['/screenshot'], version: '0.14.0', enabled: true },
+  { feature: 'quicklinks', name: '快捷链接', command: '/quicklinks', defaultCommand: '/quicklinks', favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: 'C:/Program Files/UiPilot', description: '管理快捷链接，使用自定义命令打开链接。', examples: ['/quicklinks'], version: '0.14.0', enabled: true },
+  { feature: 'webSearch', name: '网页搜索', command: '/web-search', defaultCommand: '/web-search', favorite: false, hotkey: null, hotkeyStatus: 'unset', directory: 'C:/Program Files/UiPilot', description: '使用默认搜索引擎搜索网页。', examples: ['/web-search UiPilot'], version: '0.14.0', enabled: true },
 ]
 
 const client: LauncherClient = {
+  credentials: createPreviewCredentialClient(),
   listBuiltinFeatures: async () => previewBuiltinFeatures,
   setBuiltinFeatureEnabled: async ({ feature, enabled }) => {
-    previewBuiltinFeatures = previewBuiltinFeatures.map((item) => item.feature === feature ? { ...item, enabled } : item)
+    previewBuiltinFeatures = previewBuiltinFeatures.map((item) => item.feature === feature ? { ...item, enabled, hotkeyStatus: item.hotkey ? (enabled ? 'active' : 'suspended') : 'unset' } : item)
     return previewBuiltinFeatures
+  },
+  setBuiltinFeatureName: async ({ feature, nameOverride }) => {
+    const name = nameOverride?.trim().replace(/^\//u, '') ?? null
+    if (name !== null && (!/^[a-z][a-z0-9-]{0,31}$/u.test(name) || name === 'find')) throw new Error('Invalid command')
+    previewBuiltinFeatures = previewBuiltinFeatures.map((item) => item.feature === feature ? { ...item, command: name === null ? item.defaultCommand : `/${name}` } : item)
+  },
+  setBuiltinFeatureHotkey: async ({ feature, hotkey }) => {
+    if (hotkey && (hotkey === settings.hotkey || previewBuiltinFeatures.some((item) => item.feature !== feature && item.hotkey === hotkey) || previewPublicPlugins.items.some((plugin) => plugin.commands.some((command) => command.hotkey === hotkey)))) throw new Error('Shortcut conflict')
+    previewBuiltinFeatures = previewBuiltinFeatures.map((item) => item.feature === feature ? { ...item, hotkey, hotkeyStatus: hotkey === null ? 'unset' : item.enabled ? 'active' : 'suspended' } : item)
+    if (feature === 'screenshot') { settings.screenshotHotkey = hotkey; settings.screenshotHotkeyStatus = hotkey ? 'active' : 'unset' }
   },
   validateYoudaoTranslation: async () => ({ valid: false, message: 'Preview mode' }),
   listenShown: async (handler) => {
@@ -339,8 +399,22 @@ const client: LauncherClient = {
     return () => undefined
   },
   listenHidden: async () => () => undefined,
+  listenPublicPluginPermissionsChanged: async (handler) => {
+    permissionChangeListeners.add(handler)
+    return () => { permissionChangeListeners.delete(handler) }
+  },
   listenMessageStateChanged: async () => () => undefined,
   listenPluginPanelError: async () => () => undefined,
+  listenPluginPanelStatus: async (handler) => {
+    let sequence = 0
+    const receive = (event: MessageEvent) => {
+      const frame = document.querySelector<HTMLIFrameElement>('.browser-preview-panel-frame')
+      if (event.origin !== window.location.origin || event.source !== frame?.contentWindow || event.data?.type !== 'notes-preview-status') return
+      handler({ sessionEpoch: revisionOne, sequence: String(++sequence), status: event.data.status })
+    }
+    window.addEventListener('message', receive)
+    return () => window.removeEventListener('message', receive)
+  },
   listenPluginPanelReset: async () => () => undefined,
   listenPluginPanelFocusHostInput: async () => () => undefined,
   getMessageSummary: async () => ({ revision: '0', unreadCount: 0 }),
@@ -384,11 +458,28 @@ const client: LauncherClient = {
     ...(panelPreviewInputPlaceholder === undefined ? {} : { inputPlaceholder: panelPreviewInputPlaceholder }),
     hostKeys: [],
   }),
+  openPluginPanelActions: async (input) => {
+    const frame = document.querySelector<HTMLIFrameElement>('.browser-preview-panel-frame')
+    frame?.contentWindow?.postMessage({ type: 'notes-preview-actions-open', ...input }, window.location.origin)
+    frame?.contentWindow?.focus()
+  },
+  listenPluginPanelActionsSubmit: async (handler) => {
+    const receive = (event: MessageEvent) => {
+      const frame = document.querySelector<HTMLIFrameElement>('.browser-preview-panel-frame')
+      if (event.origin !== window.location.origin || event.source !== frame?.contentWindow) return
+      if (event.data?.type === 'notes-preview-actions-submit') handler(event.data)
+      if (event.data?.type === 'notes-preview-focus-input') document.querySelector<HTMLInputElement>('.panel-suffix-input')?.focus()
+    }
+    window.addEventListener('message', receive)
+    return () => window.removeEventListener('message', receive)
+  },
   enqueuePluginPanelHostKey: async () => ({ outcome: 'enqueued', routeSequence: revisionOne }),
   closePluginPanel: async () => undefined,
   setPluginPanelBounds: async () => undefined,
   acknowledgePluginPanelFocusHostInput: async () => undefined,
   commitPluginWindowTransfer: async () => undefined,
+  getTranslationSelectionSettings: async () => ({ hotkey: previewSelectionHotkey, status: !previewSelectionHotkey ? 'unset' : previewPublicPlugins.items.find((plugin) => plugin.pluginId === 'com.uipilot.translate')?.permissions.some((permission) => permission.permission === 'selection.read' && permission.granted) ? 'active' : 'suspended' }),
+  setTranslationSelectionHotkey: async ({ hotkey }) => { previewSelectionHotkey = hotkey; return { hotkey, status: hotkey ? 'suspended' : 'unset' } },
   setPublicPluginCommandHotkey: async () => undefined,
   resolvePublicPluginCommandEntry: async () => { throw new Error('native command hotkeys are unavailable in preview') },
   listPublicPlugins: async () => {
@@ -434,6 +525,15 @@ const client: LauncherClient = {
       permissions: plugin.permissions.map((permission) => permission.permission === 'network.https' ? { ...permission, granted } : permission),
     }))
   },
+  setPublicPluginPermissionAccess: async ({ pluginId, permission, granted, expectedInventoryRevision }) => {
+    if (expectedInventoryRevision !== previewPublicPlugins.revision) throw { code: 'staleInventory' }
+    const plugin = previewPublicPlugins.items.find((item) => item.pluginId === pluginId)
+    const declared = plugin?.permissions.find((item) => item.permission === permission)
+    if (!declared?.supported) throw { code: 'permissionDenied' }
+    updatePreviewPlugin(pluginId, (item) => ({ ...item,
+      permissions: item.permissions.map((entry) => entry.permission === permission ? { ...entry, granted } : entry),
+    }))
+  },
   setPublicPluginFavorite: async ({ pluginId, commandId, favorite }) => {
     await beforeCommandMutation(commandId)
     if (previewParameters.get('commandScenario') === 'remove') {
@@ -441,12 +541,15 @@ const client: LauncherClient = {
       return
     }
     updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, favorite } : command) })) },
-  setBuiltinFeatureFavorite: async () => undefined,
+  setBuiltinFeatureFavorite: async ({ feature, favorite }) => {
+    previewBuiltinFeatures = previewBuiltinFeatures.map((item) => item.feature === feature ? { ...item, favorite } : item)
+  },
   setPublicPluginEffectiveName: async ({ pluginId, commandId, nameOverride }) => {
     await beforeCommandMutation(commandId)
-    const name = nameOverride ?? previewPublicPlugins.items.find((plugin) => plugin.pluginId === pluginId)?.commands.find((command) => command.commandId === commandId)?.defaultName
-    if (!name || !/^[a-z][a-z0-9-]{0,31}$/u.test(name) || name === 'conflict' || previewPublicPlugins.items.some((plugin) => plugin.commands.some((command) => (plugin.pluginId !== pluginId || command.commandId !== commandId) && command.effectiveName === name))) throw new Error('Synthetic command conflict')
-    updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, nameOverride, effectiveName: nameOverride ?? command.defaultName } : command) })) },
+    const normalized = nameOverride?.trim().replace(/^\//u, '') ?? null
+    const name = normalized ?? previewPublicPlugins.items.find((plugin) => plugin.pluginId === pluginId)?.commands.find((command) => command.commandId === commandId)?.defaultName
+    if (!name || !/^[a-z][a-z0-9-]{0,31}$/u.test(name) || name === 'conflict') throw new Error('Synthetic command conflict')
+    updatePreviewPlugin(pluginId, (plugin) => ({ ...plugin, commands: plugin.commands.map((command) => command.commandId === commandId ? { ...command, nameOverride: normalized, effectiveName: name } : command) })) },
   savePublicPluginSettings: async ({ input }) => {
     await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
     updatePreviewPlugin(input.pluginId, (plugin) => ({ ...plugin, settings: plugin.settings.map((setting) =>
@@ -496,11 +599,7 @@ function mountPanelContentPreview(hostElement: HTMLElement): () => void {
   const frame = document.createElement('iframe')
   frame.title = contentPreview.title
   frame.src = `/examples/public-plugins/${contentPreview.path}/preview.html?theme=${previewTheme}`
-  frame.style.display = 'block'
-  frame.style.width = '100%'
-  frame.style.height = '100%'
-  frame.style.border = '0'
-  frame.style.background = previewTheme === 'dark' ? '#07080a' : '#f7f7f8'
+  frame.className = 'browser-preview-frame browser-preview-panel-frame'
   frame.allow = 'clipboard-write'
 
   const attach = () => {

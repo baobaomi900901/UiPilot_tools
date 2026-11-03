@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-panel-actions-submit"
+description = "Enables the plugin_panel_actions_submit command without any pre-configured scope."
+commands.allow = ["plugin_panel_actions_submit"]
+
+[[permission]]
+identifier = "deny-plugin-panel-actions-submit"
+description = "Denies the plugin_panel_actions_submit command without any pre-configured scope."
+commands.deny = ["plugin_panel_actions_submit"]

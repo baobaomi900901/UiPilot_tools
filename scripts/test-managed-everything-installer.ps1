@@ -650,7 +650,7 @@ Assert-SourceContains $build @(
 Assert-SourceContains $package @('stage:managed-everything:production', 'stage:managed-everything:vm')
 Assert-SourceContains $tauri @(
     '"installMode": "perMachine"', '"installerHooks"', '"template"',
-    '"beforeBundleCommand": "npm run stage:managed-everything:production"'
+    '"beforeBundleCommand": "python scripts/provider_build.py validate && npm run stage:managed-everything:production"'
 )
 Assert-SourceContains $vmTauri @(
     'VM Instrumented Setup', 'vm-instrumented',
@@ -721,11 +721,15 @@ if ($joined.Contains('#[cfg(feature = "fault-injection")]') -and
 
 $baseline = Join-Path $root 'src-tauri\windows\installer.tauri-cli-2.11.4.nsi'
 $expectedBaselineHash = '20f4ecc730defb71f1342eaeaec4021df13be3d843abba0effe88ea5835fa079'
-if ((Get-LowerSha256 $baseline) -cne $expectedBaselineHash) {
+# Git may check these text snapshots out with CRLF on Windows.
+$baselineText = (Get-Content -LiteralPath $baseline -Raw -Encoding utf8).Replace("`r`n", "`n")
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $baselineHash = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($baselineText)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+finally { $sha.Dispose() }
+if ($baselineHash -cne $expectedBaselineHash) {
     throw 'Frozen Tauri CLI 2.11.4 installer template snapshot changed'
 }
-$baselineText = Get-Content -LiteralPath $baseline -Raw -Encoding utf8
-$customText = Get-Content -LiteralPath $template -Raw -Encoding utf8
+$customText = (Get-Content -LiteralPath $template -Raw -Encoding utf8).Replace("`r`n", "`n")
 $pageLeaveReinstall = [regex]::Match($customText, '(?ms)^Function PageLeaveReinstall\r?\n.*?^FunctionEnd\r?\n')
 Assert-Condition $pageLeaveReinstall.Success 'Could not locate the custom reinstall leave function'
 $reinstallDecision = $pageLeaveReinstall.Value.Substring(0, $pageLeaveReinstall.Value.IndexOf('reinst_uninstall:', [StringComparison]::Ordinal))

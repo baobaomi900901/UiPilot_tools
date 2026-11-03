@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-youdao-translate"
+description = "Enables the plugin_youdao_translate command without any pre-configured scope."
+commands.allow = ["plugin_youdao_translate"]
+
+[[permission]]
+identifier = "deny-plugin-youdao-translate"
+description = "Denies the plugin_youdao_translate command without any pre-configured scope."
+commands.deny = ["plugin_youdao_translate"]

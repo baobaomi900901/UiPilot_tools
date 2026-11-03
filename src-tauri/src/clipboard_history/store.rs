@@ -136,6 +136,17 @@ impl ClipboardHistoryStore {
     }
 
     pub(crate) fn snapshot(&self) -> Result<ClipboardHistorySnapshot, ClipboardHistoryError> {
+        self.snapshot_query(None)
+    }
+
+    pub(crate) fn snapshot_query(
+        &self,
+        query: Option<&str>,
+    ) -> Result<ClipboardHistorySnapshot, ClipboardHistoryError> {
+        if query.is_some_and(|query| query.chars().count() > 512) {
+            return Err(ClipboardHistoryError::InvalidQuery);
+        }
+        let query = query.unwrap_or("").trim().to_lowercase();
         let state = self
             .state
             .lock()
@@ -146,6 +157,20 @@ impl ClipboardHistoryStore {
                 .document
                 .entries
                 .iter()
+                .filter(|entry| {
+                    query.is_empty()
+                        || match &entry.payload {
+                            HistoryEntryPayload::Text { text, .. } => {
+                                text.to_lowercase().contains(&query)
+                            }
+                            HistoryEntryPayload::Files { paths } => paths.iter().any(|path| {
+                                path.file_name().is_some_and(|name| {
+                                    name.to_string_lossy().to_lowercase().contains(&query)
+                                })
+                            }),
+                            HistoryEntryPayload::Image { .. } => false,
+                        }
+                })
                 .map(|entry| summary(entry))
                 .collect(),
         })

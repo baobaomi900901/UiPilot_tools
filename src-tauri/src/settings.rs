@@ -58,6 +58,13 @@ pub(crate) enum ManagedBuiltinFeature {
 
 impl ManagedBuiltinFeature {
     pub(crate) const ALL: [Self; 3] = [Self::Screenshot, Self::Quicklinks, Self::WebSearch];
+    pub(crate) fn default_name(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::Quicklinks => "quicklinks",
+            Self::WebSearch => "web-search",
+        }
+    }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
@@ -83,6 +90,12 @@ pub(crate) struct Settings {
     pub(crate) hotkey: String,
     #[serde(default)]
     pub(crate) screenshot_hotkey: Option<String>,
+    #[serde(default = "default_translation_selection_hotkey")]
+    pub(crate) translation_selection_hotkey: Option<String>,
+    #[serde(default)]
+    pub(crate) builtin_hotkeys: BTreeMap<ManagedBuiltinFeature, String>,
+    #[serde(default)]
+    pub(crate) builtin_names: BTreeMap<ManagedBuiltinFeature, String>,
     #[serde(default)]
     pub(crate) screenshot_save_directory: Option<PathBuf>,
     pub(crate) autostart: bool,
@@ -150,6 +163,9 @@ impl Default for Settings {
         Self {
             hotkey: "Shift+Space".into(),
             screenshot_hotkey: None,
+            translation_selection_hotkey: default_translation_selection_hotkey(),
+            builtin_hotkeys: BTreeMap::new(),
+            builtin_names: BTreeMap::new(),
             screenshot_save_directory: None,
             autostart: false,
             theme: ThemePreference::System,
@@ -167,9 +183,29 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub(crate) fn builtin_hotkey(&self, feature: ManagedBuiltinFeature) -> Option<&str> {
+        if feature == ManagedBuiltinFeature::Screenshot {
+            self.screenshot_hotkey.as_deref()
+        } else {
+            self.builtin_hotkeys.get(&feature).map(String::as_str)
+        }
+    }
+    pub(crate) fn builtin_command(&self, feature: ManagedBuiltinFeature) -> String {
+        format!(
+            "/{}",
+            self.builtin_names
+                .get(&feature)
+                .map(String::as_str)
+                .unwrap_or(feature.default_name())
+        )
+    }
     pub(crate) fn builtin_feature_enabled(&self, feature: ManagedBuiltinFeature) -> bool {
         !self.disabled_builtin_features.contains(&feature)
     }
+}
+
+fn default_translation_selection_hotkey() -> Option<String> {
+    Some("Alt+A".into())
 }
 
 fn default_file_preview_enabled() -> bool {
@@ -280,6 +316,18 @@ impl SettingsStore {
         Ok(action())
     }
 
+    pub(crate) fn with_enabled_builtin_settings<T>(
+        &self,
+        feature: ManagedBuiltinFeature,
+        action: impl FnOnce(&Settings) -> T,
+    ) -> Result<T, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        if !state.value.builtin_feature_enabled(feature) {
+            return Err(());
+        }
+        Ok(action(&state.value))
+    }
+
     pub(crate) fn set_builtin_feature_enabled(
         &self,
         feature: ManagedBuiltinFeature,
@@ -298,6 +346,62 @@ impl SettingsStore {
         self.persist(&mut state, candidate)
     }
 
+    pub(crate) fn set_builtin_feature_name(
+        &self,
+        feature: ManagedBuiltinFeature,
+        name: Option<String>,
+    ) -> Result<(), SettingsError> {
+        self.set_builtin_feature_name_checked(feature, name, |_| true)
+    }
+
+    pub(crate) fn set_builtin_feature_name_checked(
+        &self,
+        feature: ManagedBuiltinFeature,
+        name: Option<String>,
+        allowed: impl FnOnce(&str) -> bool,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        if name.as_deref().is_some_and(|value| !allowed(value)) {
+            return Err(SettingsError::Storage);
+        }
+        let mut candidate = state.value.clone();
+        match name {
+            Some(name) => {
+                candidate.builtin_names.insert(feature, name);
+            }
+            None => {
+                candidate.builtin_names.remove(&feature);
+            }
+        }
+        if candidate == state.value {
+            return Ok(());
+        }
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_builtin_hotkey(
+        &self,
+        feature: ManagedBuiltinFeature,
+        hotkey: Option<String>,
+    ) -> Result<(), SettingsError> {
+        if feature == ManagedBuiltinFeature::Screenshot {
+            return self.set_screenshot_hotkey(hotkey);
+        }
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        match hotkey {
+            Some(hotkey) => {
+                candidate.builtin_hotkeys.insert(feature, hotkey);
+            }
+            None => {
+                candidate.builtin_hotkeys.remove(&feature);
+            }
+        }
+        if candidate == state.value {
+            return Ok(());
+        }
+        self.persist(&mut state, candidate)
+    }
     pub(crate) fn set_screenshot_hotkey(
         &self,
         hotkey: Option<String>,
@@ -305,6 +409,16 @@ impl SettingsStore {
         let mut state = self.state.lock().expect("settings lock poisoned");
         let mut candidate = state.value.clone();
         candidate.screenshot_hotkey = hotkey;
+        self.persist(&mut state, candidate)
+    }
+
+    pub(crate) fn set_translation_selection_hotkey(
+        &self,
+        hotkey: Option<String>,
+    ) -> Result<(), SettingsError> {
+        let mut state = self.state.lock().expect("settings lock poisoned");
+        let mut candidate = state.value.clone();
+        candidate.translation_selection_hotkey = hotkey;
         self.persist(&mut state, candidate)
     }
 
@@ -602,6 +716,52 @@ fn valid_app_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builtin_names_default_persist_and_reset_independently() {
+        let dir = TestDir::new("builtin-aliases");
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .snapshot()
+                .builtin_command(ManagedBuiltinFeature::Screenshot),
+            "/screenshot"
+        );
+        store
+            .set_builtin_feature_name(ManagedBuiltinFeature::Screenshot, Some("shared".into()))
+            .unwrap();
+        store
+            .set_builtin_feature_name(ManagedBuiltinFeature::Quicklinks, Some("shared".into()))
+            .unwrap();
+        drop(store);
+        let restored = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(
+            restored
+                .snapshot()
+                .builtin_command(ManagedBuiltinFeature::Screenshot),
+            "/shared"
+        );
+        assert_eq!(
+            restored
+                .snapshot()
+                .builtin_command(ManagedBuiltinFeature::Quicklinks),
+            "/shared"
+        );
+        restored
+            .set_builtin_feature_name(ManagedBuiltinFeature::Screenshot, None)
+            .unwrap();
+        assert_eq!(
+            restored
+                .snapshot()
+                .builtin_command(ManagedBuiltinFeature::Screenshot),
+            "/screenshot"
+        );
+        assert_eq!(
+            restored
+                .snapshot()
+                .builtin_command(ManagedBuiltinFeature::Quicklinks),
+            "/shared"
+        );
+    }
     #[test]
     fn screenshot_admission_and_disable_have_one_order_and_keep_existing_session() {
         use crate::screenshot::{
@@ -1602,6 +1762,9 @@ mod tests {
         let dir = TestDir::new("file-preview-only-field");
         let persisted = Settings {
             screenshot_hotkey: None,
+            translation_selection_hotkey: default_translation_selection_hotkey(),
+            builtin_hotkeys: BTreeMap::new(),
+            builtin_names: BTreeMap::new(),
             screenshot_save_directory: None,
             hotkey: "Ctrl+Space".into(),
             autostart: true,

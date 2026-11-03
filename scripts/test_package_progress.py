@@ -45,5 +45,36 @@ class ProgressTests(unittest.TestCase):
         self.assertIn('总耗时', '\n'.join(messages))
 
 
+    def test_long_rust_build_reports_last_target_and_output_silence(self):
+        messages = []
+        now = [0.0]
+        progress = Progress('setup', emit=messages.append, clock=lambda: now[0])
+        progress.feed('> uipilot@0.16.0 build:managed-everything\n')
+        now[0] = 3.0
+        progress.feed('   Compiling windows v0.61.3\n')
+        now[0] = 20.0
+        progress.tick()
+        text = '\n'.join(messages)
+        self.assertIn('Compiling windows v0.61.3', text)
+        self.assertIn('17 秒无新输出', text)
+        progress.feed('MANAGED_EVERYTHING_HELPER_BUILD_PASS path\n')
+        now[0] = 40.0
+        progress.tick()
+        self.assertNotIn('Compiling windows', messages[-1])
+
+    def test_plugin_cli_build_is_not_reported_as_frontend_build(self):
+        messages = []
+        progress = Progress('plugin', emit=messages.append)
+        progress.feed('[15:21:43] 构建插件 CLI\n> @uipilot/plugin-cli@0.1.0 build\n')
+        self.assertEqual(progress.stage, '构建插件 CLI')
+        self.assertNotIn('构建前端', '\n'.join(messages))
+
+    def test_cargo_lock_wait_is_visible_without_verbose_output(self):
+        messages = []
+        progress = Progress('setup', emit=messages.append)
+        progress.feed('    Blocking waiting for file lock on build directory\n')
+        self.assertIn('等待 Cargo 构建目录锁', '\n'.join(messages))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -265,7 +265,7 @@ describe('FindView', () => {
     expect(stylesSource).toMatch(/\.find-footer\s*\{[^}]*height:\s*22px;/s)
   })
 
-  it('collapses the preview as a right-side drawer when its switch is off', async () => {
+  it('collapses the preview from its menu action without a footer switch', async () => {
     const fake = fakeClient()
     const core = createFindCore(fake.client)
     const host = await mount(core)
@@ -276,7 +276,9 @@ describe('FindView', () => {
     expect(surface.classList.contains('is-preview-collapsed')).toBe(false)
     expect(preview.getAttribute('aria-hidden')).toBe('false')
 
-    await act(async () => host.querySelector<HTMLElement>('[role="switch"][aria-label="文件预览"]')!.click())
+    expect(host.querySelector('[role="switch"]')).toBeNull()
+    await pressFind(host.querySelector('[role="combobox"]')!, 'k', { ctrlKey: true })
+    await act(async () => menuAction('关闭预览').click())
     await vi.waitFor(() => expect(core.getSnapshot().previewEnabled).toBe(false))
 
     expect(surface.classList.contains('is-preview-collapsed')).toBe(true)
@@ -515,13 +517,11 @@ describe('FindView', () => {
     const input = host.querySelector<HTMLInputElement>('[role="combobox"]')!
     const pin = host.querySelector<HTMLButtonElement>('button[aria-label="固定窗口"]')!
     const close = host.querySelector<HTMLButtonElement>('button[aria-label="关闭"]')!
-    const previewSwitch = host.querySelector<HTMLElement>('[role="switch"][aria-label="文件预览"]')!
     const categories = [...host.querySelectorAll<HTMLButtonElement>('.find-category')]
 
     expect(input.tabIndex).toBe(-1)
     expect(pin.tabIndex).toBe(-1)
     expect(close.tabIndex).toBe(-1)
-    expect(previewSwitch.tabIndex).toBe(-1)
     expect(categories.every((button) => button.tabIndex === 0)).toBe(true)
     expect(
       [...host.querySelectorAll<HTMLElement>('*')]
@@ -531,8 +531,9 @@ describe('FindView', () => {
     input.focus()
     const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
     await act(async () => input.dispatchEvent(tab))
-    expect(tab.defaultPrevented).toBe(false)
-    expect(core.getSnapshot().category).toBe('all')
+    expect(tab.defaultPrevented).toBe(true)
+    expect(core.getSnapshot().category).toBe('folder')
+    expect(document.activeElement).toBe(categories[1])
   })
 
   it('activates the next file category on forward Tab', async () => {
@@ -776,4 +777,152 @@ describe('FindView', () => {
     expect(thumbnail.getAttribute('src')).toBe('data:image/png;base64,UE5H')
     expect(thumbnail.alt).toBe('Quarterly.png 缩略图')
   })
+})
+
+async function readyFind() {
+  const fake = fakeClient()
+  const core = createFindCore(fake.client)
+  const host = await mount(core)
+  await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+  await act(async () => fake.emitForward())
+  await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+  return { fake, core, host, input: host.querySelector<HTMLInputElement>('[role="combobox"]')! }
+}
+async function pressFind(target: Element, key: string, extra: KeyboardEventInit = {}) {
+  await act(async () => target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...extra })))
+}
+function menuAction(title: string) {
+  return [...document.querySelectorAll<HTMLButtonElement>('.uipilot-context-action')].find(button => button.querySelector('.uipilot-context-action-label')?.textContent === title)!
+}
+
+it('Find actions distinguish input search from file reveal and restore row focus', async () => {
+  const { fake, core, host, input } = await readyFind()
+  const before = vi.mocked(fake.client.searchFiles).mock.calls.length
+  await pressFind(input, 'Enter')
+  await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(before + 1))
+  expect(fake.client.executeResult).not.toHaveBeenCalled()
+  await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+  input.focus()
+  await pressFind(input, 'k', { ctrlKey: true })
+  expect(menuAction('搜索')).toBeDefined()
+  expect(menuAction('固定窗口')).toBeDefined()
+  expect(menuAction('关闭预览')).toBeDefined()
+  expect(menuAction('返回搜索框')).toBeDefined()
+  await act(async () => menuAction('搜索').click())
+  await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(before + 2))
+  expect(fake.client.executeResult).not.toHaveBeenCalled()
+  await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+  await pressFind(input, 'ArrowDown')
+  const row = host.querySelector<HTMLElement>('[role="option"]')!
+  expect(document.activeElement).toBe(row)
+  await pressFind(row, 'k', { ctrlKey: true })
+  expect(menuAction('搜索')).toBeUndefined()
+  expect(menuAction('打开所在的文件夹')).toBeDefined()
+  await pressFind(document.activeElement!, 'Escape')
+  expect(document.activeElement).toBe(row)
+  expect(fake.client.hide).not.toHaveBeenCalled()
+  await pressFind(row, 'Enter')
+  expect(fake.client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'request-1', resultId: 'secret-result-id' })
+})
+
+it('Find menu owns arrow keys, toggles globals and invalidates old file actions', async () => {
+  const { fake, core, host, input } = await readyFind()
+  const row = host.querySelector<HTMLElement>('[role="option"]')!
+  await act(async () => row.click())
+  await pressFind(row, 'k', { ctrlKey: true })
+  const old = menuAction('打开所在的文件夹')
+  const keyDown = vi.spyOn(core, 'keyDown')
+  await pressFind(document.activeElement!, 'ArrowDown')
+  expect(keyDown).not.toHaveBeenCalled()
+  await act(async () => core.setQuery('new search'))
+  expect(document.querySelector('.uipilot-context-actions')).toBeNull()
+  expect(document.activeElement).toBe(input)
+  await act(async () => old.click())
+  expect(fake.client.executeResult).not.toHaveBeenCalled()
+  await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+  input.focus()
+  await pressFind(input, 'k', { ctrlKey: true })
+  await act(async () => menuAction('固定窗口').click())
+  await vi.waitFor(() => expect(core.getSnapshot().pinPending).toBe(false))
+  expect(core.getSnapshot().pinned).toBe(true)
+  await pressFind(input, 'k', { ctrlKey: true })
+  expect(menuAction('取消固定窗口')).toBeDefined()
+  await act(async () => menuAction('关闭预览').click())
+  await vi.waitFor(() => expect(core.getSnapshot().previewPending).toBe(false))
+  expect(core.getSnapshot().previewEnabled).toBe(false)
+  await pressFind(input, 'k', { ctrlKey: true })
+  expect(menuAction('打开预览')).toBeDefined()
+  await act(async () => menuAction('返回搜索框').click())
+  expect(document.activeElement).toBe(input)
+})
+
+it('Find ignores composing and repeated Ctrl+K and disables empty-result reveal', async () => {
+  const { core, host, input } = await readyFind()
+  await pressFind(input, 'k', { ctrlKey: true, isComposing: true })
+  await pressFind(input, 'k', { ctrlKey: true, repeat: true })
+  expect(document.querySelector('.uipilot-context-actions')).toBeNull()
+  await pressFind(input, 'k', { ctrlKey: true })
+  await pressFind(document.activeElement!, 'k', { ctrlKey: true, repeat: true })
+  expect(document.querySelector('.uipilot-context-actions')).not.toBeNull()
+  await pressFind(document.activeElement!, 'Escape')
+  await act(async () => core.setQuery(''))
+  host.querySelector<HTMLElement>('.find-category')!.focus()
+  await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="操作 Ctrl+K"]')!.click())
+  const action = [...document.querySelectorAll<HTMLButtonElement>('.uipilot-context-action')].find(button => button.textContent?.includes('打开所在的文件夹'))!
+  expect(action.getAttribute('aria-disabled')).toBe('true')
+  await pressFind(document.activeElement!, 'Escape')
+})
+
+it('Find restores input after pending search invalidates its menu', async () => {
+  const { fake, core, input } = await readyFind()
+  let finish!: (value: FileSearchResponse) => void
+  vi.mocked(fake.client.searchFiles).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+  await act(async () => core.submitSearch())
+  input.focus()
+  await pressFind(input, 'k', { ctrlKey: true })
+  await act(async () => finish(response()))
+  expect(document.querySelector('.uipilot-context-actions')).toBeNull()
+  expect(document.activeElement).toBe(input)
+})
+
+it('Find cannot focus a different file while reveal is pending', async () => {
+  const { fake, core, host } = await readyFind()
+  const two = response()
+  two.items.push({ ...two.items[0]!, resultId: 'second', name: 'second.pdf', fullPath: 'C:\\second.pdf' })
+  vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(two)
+  await act(async () => core.submitSearch())
+  const rows = host.querySelectorAll<HTMLElement>('[role="option"]')
+  await act(async () => rows[0]!.click())
+  let finish!: (value: ExecuteOutcome) => void
+  vi.mocked(fake.client.executeResult).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+  await pressFind(rows[0]!, 'Enter')
+  await act(async () => rows[1]!.click())
+  expect(document.activeElement).toBe(rows[0])
+  expect(core.getSnapshot().selectedIndex).toBe(0)
+  await act(async () => finish({ status: 'fileRevealRequested' }))
+})
+
+it('Find category action and Tab share cycling without trapping result navigation', async () => {
+  const { core, host, input } = await readyFind()
+  input.focus()
+  await pressFind(input, 'k', { ctrlKey: true })
+  expect(menuAction('下一分类').querySelector('kbd')?.textContent).toBe('Tab')
+  expect(menuAction('上一分类').querySelector('kbd')?.textContent).toBe('Shift+Tab')
+  await pressFind(document.activeElement!, 'Tab')
+  expect(core.getSnapshot().category).toBe('all')
+  await act(async () => menuAction('下一分类').click())
+  expect(core.getSnapshot().category).toBe('folder')
+  expect(document.activeElement).toBe(host.querySelectorAll('.find-category')[1])
+  await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+  await pressFind(document.activeElement!, 'ArrowDown')
+  expect(document.activeElement?.getAttribute('role')).toBe('option')
+  await pressFind(document.activeElement!, 'Tab')
+  expect(core.getSnapshot().category).toBe('excel')
+  await pressFind(document.activeElement!, 'Tab', { shiftKey: true })
+  expect(core.getSnapshot().category).toBe('folder')
+  await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+  await pressFind(document.activeElement!, 'k', { ctrlKey: true })
+  await act(async () => menuAction('上一分类').click())
+  expect(core.getSnapshot().category).toBe('all')
+  expect(document.activeElement).toBe(host.querySelector('.find-category'))
 })

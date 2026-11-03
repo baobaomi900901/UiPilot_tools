@@ -9,7 +9,7 @@ import { PACKAGE_LIMITS, PackagePolicyError } from './package-policy.js'
 import { validateSnapshot } from './validate.js'
 import {
   assertNoReparsePoints,
-  createWindowsAttributeProbe,
+  withWindowsAttributeProbe,
   type WindowsAttributeProbe,
 } from './windows-attributes.js'
 
@@ -58,11 +58,14 @@ async function readArchiveFile(
   platform: NodeJS.Platform,
   injectedProbe?: WindowsAttributeProbe,
 ): Promise<Buffer> {
+  return withWindowsAttributeProbe(platform, injectedProbe, (probe) => readCheckedArchive(source, probe))
+}
+
+async function readCheckedArchive(source: string, probe: WindowsAttributeProbe | undefined): Promise<Buffer> {
   const before = await lstat(source)
   if (!before.isFile() || before.isSymbolicLink() || before.size > PACKAGE_LIMITS.maxArchiveBytes) {
     throw new PackagePolicyError('SOURCE_INVALID', 'Archive source is unsafe.')
   }
-  const probe = platform === 'win32' ? injectedProbe ?? createWindowsAttributeProbe() : undefined
   if (probe) assertNoReparsePoints([''], await probe(source, ['']))
   const handle = await open(source, 'r')
   try {
