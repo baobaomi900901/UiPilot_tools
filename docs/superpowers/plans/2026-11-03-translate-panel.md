@@ -171,6 +171,6 @@ onUpdate/onHostKey 内不等待 request；回调返回、当前会话就绪后�
 
 - 宿主与 SDK 已升级至 Host 0.18.0；翻译插件为 1.3.0，最低 Host 0.18.0。H1–H4 与插件各阶段已完成专项规范/质量审查。
 - 首次自动翻译使用正式 `panel.onReady`：启动时先于 `onUpdate` 注册，在当前更新 ACK 完成且宿主恢复可请求状态后触发；不以定时器猜测就绪。
-- 插件离线测试 100/100、SDK 类型检查、源目录及安装包 CLI 校验通过；宿主专项测试与前端生产构建通过。深浅主题、语言弹层、长文本、复制/朗读交互已用实际页面加假 Host 在浏览器检查。
+- 插件离线测试 101/101、SDK 类型检查、源目录及安装包 CLI 校验通过；宿主专项测试与前端生产构建通过。深浅主题、语言弹层、长文本、复制/朗读交互已用实际页面加假 Host 在浏览器检查。
 - 交付包：`examples/public-plugins/com.uipilot.translate/artifacts/com.uipilot.translate-1.3.0-windows-reviewed.uipilot-plugin`。
 - 安装、真实供应商、系统剪贴板/SAPI、跨应用划词、升级取消和原生强制颜色环境仍待用户主动验收；离线结果不代表这些检查已通过。
