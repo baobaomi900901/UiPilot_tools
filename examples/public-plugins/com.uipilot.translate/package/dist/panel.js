@@ -217,7 +217,12 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
     closeChoices()
   }
 
-  listen(source, 'input', () => { session?.capabilities.invalidate(); model.editText(source.value) })
+  listen(source, 'input', () => {
+    // Install the live value before effects can render; reassigning the old value
+    // would discard this edit and reset the browser's selection/IME state.
+    model.editText(source.value)
+    session?.capabilities.invalidate()
+  })
   listen(source, 'compositionstart', () => model.setComposition(true))
   listen(source, 'compositionend', () => model.setComposition(false))
   for (const [id, kind] of [['source-language', 'source'], ['detected-language', 'source'], ['target-language', 'target'], ['provider', 'provider']]) listen(node(id), 'click', () => openChoices(kind, node(id)))

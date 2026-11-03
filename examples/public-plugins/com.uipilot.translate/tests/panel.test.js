@@ -205,3 +205,44 @@ test('injected effects receive captured facades, invalidation and disposal; stal
   handler({playbackId:'1',status:'completed'});assert.equal(a.node('translation-speak').getAttribute('aria-label'),'停止朗读译文')
   a.input('source-text','changed');await flush();assert.deepEqual(stops,[{playbackId:'1'},{playbackId:'2'}]);assert.equal(a.node('translation-copy').disabled,true)
 })
+
+test('real adapter editing preserves current value and selection, clears output and stops speech through IME', async t => {
+  const stops = []
+  const effects = {
+    speech: {
+      async voices() { return [{ language: 'en' }, { language: 'zh-CHS' }] },
+      onState() { return () => {} },
+      async play() { return { playbackId: 'editing', status: 'playing' } },
+      async stop(input) { stops.push(input); return { playbackId: input.playbackId, status: 'stopped' } },
+    },
+  }
+  const a = await setup(t, { effects })
+  a.update(); a.ready(); await flush()
+  a.node('source-speak').click(); await flush()
+  const source = a.node('source-text')
+  source.focus()
+  source.dispatchEvent(new a.dom.window.CompositionEvent('compositionstart', { bubbles: true }))
+  source.value = 'hello again after你好'
+  source.setSelectionRange(6, 11, 'backward')
+  source.dispatchEvent(new a.dom.window.InputEvent('input', { bubbles: true, isComposing: true }))
+  assert.equal(source.value, 'hello again after你好')
+  assert.equal(source.selectionStart, 6)
+  assert.equal(source.selectionEnd, 11)
+  assert.equal(source.selectionDirection, 'backward')
+  assert.equal(a.node('translation').textContent, '')
+  assert.equal(a.node('translation-speak').disabled, true)
+  await flush()
+  assert.deepEqual(stops, [{ playbackId: 'editing' }])
+  a.key('source-text', 'Enter', { ctrlKey: true, isComposing: true })
+  await flush()
+  assert.equal(a.calls.length, 1, 'composition does not submit')
+  source.dispatchEvent(new a.dom.window.CompositionEvent('compositionend', { bubbles: true }))
+  a.key('source-text', 'Enter', { ctrlKey: true })
+  await flush()
+  assert.equal(a.calls.length, 2)
+  assert.equal(a.calls[1].payload.text, 'hello again after你好')
+  assert.equal(source.value, 'hello again after你好')
+  assert.equal(source.selectionStart, 6)
+  assert.equal(source.selectionEnd, 11)
+  assert.equal(a.document.activeElement, source)
+})
