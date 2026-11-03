@@ -23,6 +23,7 @@ async function setup(t, options = {}) {
     get storage() { const owner = current; return { set: (key, value) => { saves.push({ owner, key, value }); return options.save?.(owner, value) ?? Promise.resolve() } } },
     get setStatus() { const owner = current; return value => { statuses.push({ owner, ...value }); return Promise.resolve() } },
   }
+  Object.assign(host, options.effects ?? {})
   const app = mountPanel(document, host, options.adapter ? { createCapabilities: options.adapter } : {})
   t.after(() => { app.dispose(); dom.window.close() })
   const node = id => document.getElementById(id)
@@ -191,4 +192,16 @@ test('injected effects receive captured facades, invalidation and disposal; stal
   sessions[0].notify('stale failure')
   assert.equal(a.statuses.length, 0)
   assert.notEqual(sessions[0].facades.request, sessions[1].facades.request)
+})
+
+ test('real effect adapter uses captured facades, accessible stop labels and shared Host actions', async t => {
+  const copies=[], plays=[], stops=[]; let handler
+  const effects={clipboard:{async writeText(input){copies.push(input)}},speech:{async voices(){return [{language:'en'},{language:'zh-CHS'}]},onState(fn){handler=fn;return()=>{}},async play(input){plays.push(input);return {playbackId:String(plays.length),status:'playing'}},async stop(input){stops.push(input);return {playbackId:input.playbackId,status:'stopped'}}}}
+  const a=await setup(t,{effects});a.update();assert.equal(plays.length,0);a.ready();await flush()
+  a.node('source-copy').focus();a.node('source-copy').click();await flush();assert.deepEqual(copies,[{text:'hello'}]);assert.equal(a.document.activeElement,a.node('source-copy'));assert.equal(a.statuses.at(-1).message,'已复制')
+  a.node('source-speak').click();await flush();assert.equal(a.node('source-speak').getAttribute('aria-label'),'停止朗读原文');assert.equal(a.node('source-speak').getAttribute('aria-pressed'),'true')
+  assert.equal(a.actions().context.find(x=>x.id==='source-speak').title,'停止朗读原文')
+  a.actions().context.find(x=>x.id==='translation-speak').run();await flush();assert.equal(plays.length,2);assert.deepEqual(stops,[{playbackId:'1'}])
+  handler({playbackId:'1',status:'completed'});assert.equal(a.node('translation-speak').getAttribute('aria-label'),'停止朗读译文')
+  a.input('source-text','changed');await flush();assert.deepEqual(stops,[{playbackId:'1'},{playbackId:'2'}]);assert.equal(a.node('translation-copy').disabled,true)
 })

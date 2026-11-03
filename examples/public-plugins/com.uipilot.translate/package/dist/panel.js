@@ -1,3 +1,4 @@
+import { createPanelCapabilities } from './panel-capabilities.js'
 import { createPanelModel } from './panel-model.js'
 import { filterLanguages, LANGUAGES, PROVIDERS, PREFERENCES_STORAGE_KEY, sanitizePreferences } from './languages.js'
 
@@ -55,15 +56,7 @@ const ICONS = {
   close: [['path', { d: 'M18 6 6 18' }], ['path', { d: 'm6 6 12 12' }]],
 }
 
-/** Task5 replaces this factory with an SDK adapter; no browser/native fallback. */
-export function unavailableCapabilities() {
-  return {
-    availability: kind => kind === 'copy' ? '复制能力尚未接入' : '朗读能力尚未接入',
-    run() {}, invalidate() {}, dispose() {},
-  }
-}
-
-export function mountPanel(document, host, { createCapabilities = unavailableCapabilities } = {}) {
+export function mountPanel(document, host, { createCapabilities = createPanelCapabilities } = {}) {
   const view = document.defaultView
   const node = id => document.getElementById(id)
   const source = node('source-text'), output = node('translation'), dialog = node('choice-dialog')
@@ -118,9 +111,11 @@ export function mountPanel(document, host, { createCapabilities = unavailableCap
     for (const side of ['source', 'translation']) {
       for (const kind of ['copy', 'speak']) {
         const button = node(`${side}-${kind}`)
-        const title = `${kind === 'copy' ? '复制' : '朗读'}${side === 'source' ? '原文' : '译文'}`
+        const playing = kind === 'speak' && session?.capabilities.isPlaying?.(side)
+        const title = `${playing ? '停止' : ''}${kind === 'copy' ? '复制' : '朗读'}${side === 'source' ? '原文' : '译文'}`
         const reason = !session?.ready ? '面板尚未就绪' : side === 'translation' && state.status !== 'success' ? '需要本次有效译文' : !(side === 'source' ? state.text : state.translation) ? '没有可用文本' : session.capabilities.availability(kind, side, state)
         button.disabled = Boolean(reason)
+        if (kind === 'speak') button.setAttribute('aria-pressed', String(Boolean(playing)))
         button.title = reason ? `${title}：${reason}` : title
         button.setAttribute('aria-label', button.title)
       }
@@ -272,6 +267,7 @@ export function mountPanel(document, host, { createCapabilities = unavailableCap
   if (typeof host.onReady === 'function') cleanup.push(host.onReady(event => {
     if (!session || event.sessionEpoch !== session.sessionEpoch || event.requestId !== session.requestId) return
     session.ready = true
+    session.capabilities.start?.()
     model.markReady(event)
     pumpSave()
     render()
@@ -308,7 +304,7 @@ export function mountPanel(document, host, { createCapabilities = unavailableCap
     const context = [{ id: 'translate', title: '翻译原文', icon: 'arrow', shortcut: 'Ctrl+Enter', ...(state.text.trim() ? {} : { disabledReason: '请输入原文' }), run: guarded(() => { owner.capabilities.invalidate(); model.submit() }) }]
     for (const side of ['source', 'translation']) for (const kind of ['copy', 'speak']) {
       const button = node(`${side}-${kind}`)
-      context.push({ id: `${side}-${kind}`, title: `${kind === 'copy' ? '复制' : '朗读'}${side === 'source' ? '原文' : '译文'}`, ...(kind === 'copy' ? { icon: 'copy' } : {}), ...(button.disabled ? { disabledReason: button.title } : {}), run: guarded(() => { if (!button.disabled) owner.capabilities.run(kind, side, model.getState()) }) })
+      context.push({ id: `${side}-${kind}`, title: button.getAttribute('aria-label'), ...(kind === 'copy' ? { icon: 'copy' } : {}), ...(button.disabled ? { disabledReason: button.title } : {}), run: guarded(() => { if (!button.disabled) owner.capabilities.run(kind, side, model.getState()) }) })
     }
     return { context }
   }))

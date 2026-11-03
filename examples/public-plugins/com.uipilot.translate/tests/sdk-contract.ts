@@ -13,3 +13,16 @@ const translate: PluginPanelActionHandler = async (invocation, api) => {
 }
 void initialize
 void translate
+
+const panel = window.uipilotPluginPanel
+async function textEffects() {
+  await panel.clipboard?.writeText({ text: 'hello\n你好' })
+  const voices = await panel.speech?.voices()
+  const state = await panel.speech?.play({text:'hello',language:'en'})
+  if (state?.playbackId) await panel.speech?.stop({playbackId:state.playbackId})
+  const unsubscribe = panel.speech?.onState(state => { const id: string | null = state.playbackId; void id })
+  await panel.speech?.state()
+  unsubscribe?.()
+  void voices
+}
+void textEffects

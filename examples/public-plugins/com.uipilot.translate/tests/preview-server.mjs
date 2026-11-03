@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 
 const dist = new URL('../package/dist/', import.meta.url)
 const types = { html: 'text/html; charset=utf-8', css: 'text/css; charset=utf-8', js: 'text/javascript; charset=utf-8' }
-const allowed = new Set(['panel.html', 'panel.css', 'panel.js', 'panel-model.js', 'languages.js'])
+const allowed = new Set(['panel.html', 'panel.css', 'panel.js', 'panel-model.js', 'panel-capabilities.js', 'languages.js'])
 const port = Number(process.env.TRANSLATE_PREVIEW_PORT || 14348)
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1')
