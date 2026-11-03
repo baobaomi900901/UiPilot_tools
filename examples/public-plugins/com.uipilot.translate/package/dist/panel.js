@@ -313,11 +313,6 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
     }
     return { context }
   }))
-  if (typeof host.onHostKey === 'function') cleanup.push(host.onHostKey(event => {
-    if (!session || event.sessionEpoch !== session.sessionEpoch) return
-    // Host keys never await a Runtime request. Current manifest determines routing.
-    handleKey({ ...event, target: document.activeElement, preventDefault() {}, stopPropagation() {} })
-  }))
   function dispose() {
     if (disposed) return
     disposed = true
