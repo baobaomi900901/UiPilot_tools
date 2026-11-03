@@ -35,6 +35,6 @@ node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipil
 
 `package.test.js` 检查发布合同、包内入口/资产/模块依赖、缺失入口拒绝及语言/服务一致性。`panel-host-contract.test.js` 使用实际 Runtime、controller、model、provider 和 capability 模块，从 onCommand → onUpdate/onReady → request → onPanelAction → DOM 完成闭环；边界采用假有道、假剪贴板和假语音，还覆盖撤权、空划词输入、旧请求和音频事件隔离。这是离线自动化，不是实际供应商或原生 Host 验收。双主题、键盘与长文本的离线浏览器证据见工作记录；强制颜色仅有 CSS/测试覆盖，未模拟原生强制颜色环境。这些检查不能代替原生 WebView 验收。
 
-交付归档位于本目录 `artifacts/`，通过本地 CLI 0.18.0 从源包严格校验、打包并再次校验；不自动安装，不覆盖旧包。
+交付归档位于本目录 `artifacts/`，通过本地 CLI（目标 Host 0.18.0）从源包严格校验、打包并再次校验；不自动安装，不覆盖旧包。
 
 待用户在真实 Host 主动验收：安装/升级取消保留旧版与旧 Host 拒绝、命令改名/收藏/绑定保留、真实有道请求与撤权、外部选区捕获及失败恢复、系统复制和 SAPI 朗读/声音缺失、隐藏再进入、新划词取代正在翻译/朗读的内容、原生 WebView 双主题/强制颜色/键盘/长文本。当前测试没有运行真实网络、剪贴板、音频、选区或权限变更。
