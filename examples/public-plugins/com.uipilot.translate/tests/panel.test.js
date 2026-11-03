@@ -57,7 +57,7 @@ test('source and detection use same searchable selector; keyboard selection rest
   a.node('source-language').click()
   assert.equal(a.node('choice-dialog').open, true)
   assert.equal(a.actions(), null)
-  assert.equal(a.node('choice-options').children.length, 3)
+  assert.equal(a.node('choice-options').children.length, 113)
   a.input('choice-search', '英语')
   a.key('choice-search', 'ArrowDown'); a.key('choice-search', 'Enter')
   assert.equal(a.node('choice-dialog').open, false)
@@ -245,4 +245,31 @@ test('real adapter editing preserves current value and selection, clears output 
   assert.equal(source.selectionStart, 6)
   assert.equal(source.selectionEnd, 11)
   assert.equal(a.document.activeElement, source)
+})
+
+
+test('multilingual selector exposes manual-detection guidance and both text regions support RTL', async t => {
+  const a = await setup(t); a.update(); a.ready(); await flush()
+  assert.equal(a.node('source-text').getAttribute('dir'), 'auto')
+  assert.equal(a.node('translation').getAttribute('dir'), 'auto')
+  a.node('source-language').click()
+  a.input('choice-search', 'Cantonese')
+  assert.match(a.node('choice-options').textContent, /粤语.*手动/)
+  a.key('choice-search', 'Enter')
+  assert.match(a.node('source-language').textContent, /粤语/)
+  a.node('target-language').click()
+  a.input('choice-search', 'Japanese')
+  a.key('choice-search', 'Enter')
+  assert.match(a.node('target-language').textContent, /日语/)
+})
+
+
+test('keyboard navigation keeps the active language visible in a long list', async t => {
+  const a=await setup(t); a.update(); a.ready(); await flush()
+  const scrolled=[]
+  a.dom.window.HTMLElement.prototype.scrollIntoView=function(options){scrolled.push({text:this.textContent,options})}
+  a.node('source-language').click()
+  a.key('choice-search','ArrowUp')
+  assert.match(scrolled.at(-1)?.text ?? '', /祖鲁/)
+  assert.equal(scrolled.at(-1).options.block,'nearest')
 })

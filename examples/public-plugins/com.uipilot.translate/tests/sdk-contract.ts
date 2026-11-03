@@ -26,3 +26,12 @@ async function textEffects() {
   void voices
 }
 void textEffects
+
+const japanese: PluginYoudaoTranslationLanguage = 'ja'
+const traditional: PluginYoudaoTranslationLanguage = 'zh-CHT'
+const serbian: PluginYoudaoTranslationLanguage = 'sr-Latn'
+// @ts-expect-error automatic detection is not a concrete language
+const automatic: PluginYoudaoTranslationLanguage = 'auto'
+// @ts-expect-error unknown language codes remain rejected
+const unknownLanguage: PluginYoudaoTranslationLanguage = 'not-real'
+void [japanese, traditional, serbian, automatic, unknownLanguage]

@@ -2,7 +2,7 @@ import { isLanguage, PREFERENCES_STORAGE_KEY, sanitizePreferences } from './lang
 import { getProvider } from './providers.js'
 
 const errors = Object.freeze({
-  ServiceUnavailableError: ['SERVICE_UNAVAILABLE', '翻译服务不可用，需要 UiPilot 0.18.0 或更高版本'],
+  ServiceUnavailableError: ['SERVICE_UNAVAILABLE', '翻译服务不可用，需要 UiPilot 0.19.0 或更高版本'],
   NetworkFailureError: ['NETWORK_FAILURE', '翻译网络请求失败，请检查网络后重试'],
   NetworkTargetDeniedError: ['NETWORK_TARGET_DENIED', '翻译网络目标不可用，请检查插件网络配置'],
   NetworkResponseTooLargeError: ['RESPONSE_TOO_LARGE', '翻译响应过大，请缩短输入后重试'],
@@ -15,10 +15,11 @@ const errors = Object.freeze({
   CredentialDisabledError: ['CREDENTIAL_DISABLED', '有道翻译配置已关闭，请在设置 → 密钥配置中启用有道翻译'],
   CredentialUnavailableError: ['CREDENTIAL_UNAVAILABLE', '有道翻译密钥不可用，请在设置 → 密钥配置中检查有道翻译配置'],
   ProviderAuthenticationError: ['PROVIDER_AUTHENTICATION', '有道翻译认证失败，请在设置 → 密钥配置中检查有道翻译配置'],
+  ProviderLanguageUnsupportedError: ['LANGUAGE_UNSUPPORTED', '有道暂不支持当前语言方向，请手动选择其他源语言或目标语言'],
   ProviderQuotaError: ['PROVIDER_QUOTA', '有道翻译额度不足或调用受限，请检查有道翻译服务额度'],
   NetworkTimeoutError: ['NETWORK_TIMEOUT', '翻译请求超时，请稍后重试'],
   ExpiredRequestError: ['REQUEST_EXPIRED', '翻译请求已失效，请重新运行翻译'],
-  InvalidServiceRequestError: ['INVALID_REQUEST', '翻译输入无效，请输入不超过 8192 UTF-8 字节的中文或英文'],
+  InvalidServiceRequestError: ['INVALID_REQUEST', '翻译输入无效，请输入不超过 8192 UTF-8 字节的文本并选择支持的语言'],
 })
 const encoder = new TextEncoder()
 const payloadKeys = ['providerId', 'text', 'sourceLanguage', 'targetLanguage']

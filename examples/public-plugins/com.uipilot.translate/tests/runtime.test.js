@@ -34,7 +34,7 @@ test('unknown detection remains null', async () => {
   assert.equal((await invoke(payload, service(async () => ({ ...success, sourceLanguage: null })))).data.detectedSourceLanguage, null)
 })
 
-const invalidPayloads = [null, [], {}, { ...payload, providerId: 'constructor' }, { ...payload, providerId: '__proto__' }, { ...payload, providerId: 'other' }, { ...payload, sourceLanguage: 'fr' }, { ...payload, targetLanguage: 'auto' }, { ...payload, text: '' }, { ...payload, text: '\0' }, { ...payload, text: '中'.repeat(2731) }, { ...payload, url: 'private' }]
+const invalidPayloads = [null, [], {}, { ...payload, providerId: 'constructor' }, { ...payload, providerId: '__proto__' }, { ...payload, providerId: 'other' }, { ...payload, sourceLanguage: 'not-real' }, { ...payload, targetLanguage: 'auto' }, { ...payload, text: '' }, { ...payload, text: '\0' }, { ...payload, text: '中'.repeat(2731) }, { ...payload, url: 'private' }]
 for (const [index, input] of invalidPayloads.entries()) test(`invalid input ${index} never invokes API`, async () => {
   const result = await invoke(input, service(() => assert.fail('invalid payload called service')))
   assert.equal(result.data.ok, false)
@@ -52,7 +52,7 @@ test('unknown action is rejected before dispatch', async () => {
 })
 
 test('missing service capability has a fixed failure', async () => {
-  assert.deepEqual((await invoke()).data, { ok: false, code: 'SERVICE_UNAVAILABLE', message: '翻译服务不可用，需要 UiPilot 0.18.0 或更高版本' })
+  assert.deepEqual((await invoke()).data, { ok: false, code: 'SERVICE_UNAVAILABLE', message: '翻译服务不可用，需要 UiPilot 0.19.0 或更高版本' })
 })
 
 const errorMessages = {
@@ -76,7 +76,7 @@ for (const name of ['constructor', '__proto__', 'toString', 'UnknownError']) tes
   assert.deepEqual((await invoke(payload, service(async () => { throw { name, message: 'PRIVATE' } }))).data, { ok: false, code: 'TRANSLATION_FAILED', message: '翻译失败，请稍后重试' })
 })
 
-for (const response of [null, {}, { ...success, translations: [] }, { ...success, translations: [42] }, { ...success, translations: [''] }, { ...success, sourceLanguage: 'fr' }, { ...success, sourceLanguage: undefined }, { ...success, targetLanguage: 'en' }, { ...success, unchanged: undefined }]) test(`malformed service response ${JSON.stringify(response)}`, async () => {
+for (const response of [null, {}, { ...success, translations: [] }, { ...success, translations: [42] }, { ...success, translations: [''] }, { ...success, sourceLanguage: 'not-real' }, { ...success, sourceLanguage: undefined }, { ...success, targetLanguage: 'en' }, { ...success, unchanged: undefined }]) test(`malformed service response ${JSON.stringify(response)}`, async () => {
   assert.deepEqual((await invoke(payload, service(async () => response))).data, { ok: false, code: 'INVALID_RESPONSE', message: '翻译服务响应异常，请稍后重试' })
 })
 
@@ -110,4 +110,21 @@ test('whitespace-only explicit action never invokes the service', async () => {
   const result = await invoke({ ...payload, text: ' \t\r\n ' }, service(() => assert.fail('blank text called service')))
   assert.equal(result.data.ok, false)
   assert.equal(result.data.code, 'INVALID_REQUEST')
+})
+
+
+test('all published directions reach the Host and retain detected source metadata', async () => {
+  const { LANGUAGES } = await import('../package/dist/languages.js')
+  for (const language of LANGUAGES) {
+    let seen
+    const response = await runtime.onPanelAction({requestId:'multi',action:'translate',payload:{providerId:'youdao',text:'sample',sourceLanguage:'auto',targetLanguage:language.id}}, {services:{youdao:{async translate(input){seen=input;return {translations:['sample translated'],sourceLanguage:language.id,targetLanguage:language.id,unchanged:false}}}}})
+    assert.equal(seen.to,language.id)
+    assert.equal(response.data.detectedSourceLanguage,language.id)
+  }
+})
+
+
+test('unsupported provider language direction is a safe actionable error', async () => {
+  const result=await invoke(payload,service(async()=>{throw {name:'ProviderLanguageUnsupportedError',message:'PRIVATE PROVIDER RESPONSE'}}))
+  assert.deepEqual(result.data,{ok:false,code:'LANGUAGE_UNSUPPORTED',message:'有道暂不支持当前语言方向，请手动选择其他源语言或目标语言'})
 })

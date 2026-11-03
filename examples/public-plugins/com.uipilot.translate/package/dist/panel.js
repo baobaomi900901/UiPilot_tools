@@ -170,7 +170,7 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
       button.setAttribute('role', 'option')
       button.setAttribute('aria-selected', String(choice.id === selected))
       button.dataset.active = String(index === activeIndex)
-      button.textContent = choice.label
+      button.textContent = choice.label + (modal.kind === 'source' && choice.autoDetect === false ? ' · 需手动选择' : '')
       if (choice.id === selected) {
         const marker = document.createElement('span')
         marker.setAttribute('aria-hidden', 'true')
@@ -189,12 +189,13 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
     if (choices.length) search.setAttribute('aria-activedescendant', `choice-${activeIndex}`)
     else search.removeAttribute('aria-activedescendant')
     node('choice-empty').hidden = choices.length > 0
+    options.children[activeIndex]?.scrollIntoView?.({ block: 'nearest' })
   }
   function openChoices(kind, opener) {
     closeChoices(false)
     modal = { kind, opener }
     node('choice-title').textContent = kind === 'provider' ? '翻译服务' : kind === 'source' ? '源语言' : '目标语言'
-    search.placeholder = kind === 'provider' ? '搜索翻译服务' : '搜索语言'
+    search.placeholder = kind === 'provider' ? '搜索翻译服务' : '搜索语言名称或代码'
     search.setAttribute('aria-label', search.placeholder)
     options.setAttribute('aria-label', node('choice-title').textContent)
     search.value = ''
@@ -300,7 +301,7 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
     pendingSave = queued ? { owner, preferences: queued } : null
     document.documentElement.dataset.theme = update.theme === 'light' ? 'light' : 'dark'
     model.installUpdate({ sessionEpoch: update.sessionEpoch, requestId: update.requestId, text: typeof update.data?.text === 'string' ? update.data.text : update.input, preferences })
-    if (typeof host.onReady !== 'function') notify(owner, '翻译面板需要 UiPilot 0.18.0 或更高版本')
+    if (typeof host.onReady !== 'function') notify(owner, '翻译面板需要 UiPilot 0.19.0 或更高版本')
   }))
   if (typeof host.onActions === 'function') cleanup.push(host.onActions(() => {
     if (disposed || modal || !session?.ready) return null

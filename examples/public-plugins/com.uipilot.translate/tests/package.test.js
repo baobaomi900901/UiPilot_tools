@@ -6,10 +6,10 @@ import { getProvider } from '../package/dist/providers.js'
 const root = new URL('../package/', import.meta.url)
 const manifest = JSON.parse(await readFile(new URL('plugin.json', root), 'utf8'))
 
-test('1.3.0 keeps legacy identity and explicitly requires the released Panel capability floor', () => {
+test('1.4.0 keeps legacy identity and explicitly requires the released Panel capability floor', () => {
   assert.equal(manifest.pluginId, 'com.uipilot.translate')
-  assert.equal(manifest.version, '1.3.0')
-  assert.equal(manifest.minimumHostVersion, '0.18.0')
+  assert.equal(manifest.version, '1.4.0')
+  assert.equal(manifest.minimumHostVersion, '0.19.0')
   assert.equal(manifest.command.defaultName, 'translate')
   assert.equal(manifest.commands, undefined)
   assert.equal(manifest.command.activationMode, 'submit')
@@ -44,7 +44,8 @@ test('package contains all declared entries and local import/assets, with only a
 })
 
 test('language menu and service registry expose only implemented Host languages and provider', () => {
-  assert.deepEqual(LANGUAGES.map(item => item.id), ['en', 'zh-CHS'])
+  assert.equal(LANGUAGES.length, 112)
+  assert.ok(LANGUAGES.some(item => item.id === 'ja'))
   assert.deepEqual(PROVIDERS.map(item => item.id), ['youdao'])
   for (const provider of PROVIDERS) assert.equal(typeof getProvider(provider.id), 'function')
   assert.equal(getProvider('deepseek'), undefined)

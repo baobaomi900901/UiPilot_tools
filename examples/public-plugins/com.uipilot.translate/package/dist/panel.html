@@ -10,7 +10,7 @@
   <main class="translator" aria-label="翻译">
     <section class="text-block source-block" aria-label="原文">
       <label class="sr-only" for="source-text">原文</label>
-      <textarea id="source-text" placeholder="输入要翻译的文本" spellcheck="false"></textarea>
+      <textarea id="source-text" dir="auto" placeholder="输入要翻译的文本" spellcheck="false"></textarea>
       <div class="text-tools">
         <button id="source-speak" class="icon-button" type="button" aria-label="朗读原文" title="朗读原文" data-icon="volume"></button>
         <button id="source-copy" class="icon-button" type="button" aria-label="复制原文" title="复制原文" data-icon="copy"></button>
@@ -25,7 +25,7 @@
     <section class="text-block translation-block" aria-label="译文">
       <button id="provider" class="provider-button" type="button" aria-haspopup="dialog"><span>有道翻译</span><span data-icon="chevron"></span></button>
       <div class="output-body" aria-busy="false">
-        <div id="translation" role="region" aria-label="译文" tabindex="0"></div>
+        <div id="translation" dir="auto" role="region" aria-label="译文" tabindex="0"></div>
         <p id="translation-status" role="status">译文将显示在这里</p>
       </div>
       <div class="text-tools">

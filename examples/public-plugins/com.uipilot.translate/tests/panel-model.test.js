@@ -275,3 +275,16 @@ test('default scheduler calls receiver-sensitive global timers with their owning
   globalThis.clearTimeout = originalClear
  }
 })
+
+
+test('detected Japanese can reverse a translation into Arabic without losing direction', async () => {
+  const h=harness(); h.ready('こんにちは'); h.model.setLanguages('auto','ar'); await h.tick(500)
+  const call=h.calls.at(-1)
+  assert.equal(call.input.payload.targetLanguage, 'ar')
+  call.resolve({ok:true,text:'مرحبا',detectedSourceLanguage:'ja',targetLanguage:'ar'})
+  await h.tick()
+  assert.equal(h.model.getState().detectedSourceLanguage, 'ja')
+  assert.equal(h.model.swap(), true)
+  await h.tick()
+  assert.deepEqual(h.calls.at(-1).input.payload, {providerId:'youdao',text:'مرحبا',sourceLanguage:'ar',targetLanguage:'ja'})
+})
