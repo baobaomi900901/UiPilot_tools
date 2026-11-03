@@ -1,13 +1,40 @@
-# 翻译 1.2.1
+# 翻译 1.3.0
 
-Windows UiPilot 0.16.0+ 主结果插件，使用 `/translate hello` 中英互译，Enter 复制译文。输入含汉字时中译英，否则英译中。
+Windows UiPilot **0.18.0+** 启动器 Panel 插件。保留插件 ID `com.uipilot.translate` 和默认启动命令 `translate`，使用宿主管理的有道翻译服务；只支持英语 `en` 与简体中文 `zh-CHS`，源语言另有自动检测。服务选择器目前只有有道翻译。
 
-底栏遵循宿主统一规范：左侧显示结果数量或状态反馈，翻译方向保留在结果行，右侧独立显示 `Enter 复制`。副标题只包含翻译方向，失败结果不提供复制提示。更新到 1.2.1 时，在设置里重新选择 `package/` 开发目录更新插件，保留原数据与授权。
+## 操作
 
-划词翻译：在设置 → 权限中为“翻译”开启“读取选中文字”，并开启有道和网络授权；在其他应用中选择文字后按 Alt+A。主程序读取选区、打开翻译并自动提交一次。插件详情中的“划词翻译快捷键”可录制或清除，原启动快捷键不变。权限关闭时不会捕获选区；没有选区或捕获失败时不使用旧剪贴板内容。优先读取 Windows 可访问性选区；控件未提供该接口时，宿主可临时模拟 Ctrl+C、缓存并有条件恢复原剪贴板，同时排除 UiPilot 临时历史并定向处理 Win+V 新增记录。期间新的复制会保留；不能安全备份或完成清理时显示具体提示，允许手动输入。缓存只留在宿主内存，不传给插件。
+- `/translate` 打开空面板；`/translate hello` 填入并翻译。宿主顶部输入回车会替换原文并提交，不会增加第二条搜索栏。
+- 上方多行原文编辑后防抖 500 ms 翻译，输入法组词期间不请求。普通 Enter 换行，原文框内 Ctrl+Enter 立即翻译。源语言、目标语言和服务入口可搜索，方向键选择、Enter 确认、Escape 关闭并恢复焦点。
+- 自动检测显示本次识别语言；未知显示“未识别”。交换需要有效译文和明确源语言，以本次译文作为新原文反向翻译。
+- 两个文本区均提供复制和朗读。复制保留面板与焦点，通过宿主状态栏反馈；朗读再次点击停止，两侧互斥。没有系统对应语言声音时按钮说明原因。
+- 编辑、换方向、重新提交或新划词会立即清除旧译文/识别并停止旧音频；旧响应不覆盖新正文。关闭后重新进入不恢复正文。
 
-安装 `package/` 或 CLI 打包产物。在设置 → 密钥配置配置并启用有道翻译，在设置 → 权限授权有道翻译和网络。插件申报有道翻译、百度 OCR、DeepSeek 三项独立权限，默认不授予；本版本仅使用有道，其余两项没有业务 API。密钥由宿主保管和签名，插件不读取密钥、签名或供应商原始响应。
+仅保存源语言、目标语言和服务偏好，不保存原文、译文或历史。译文只读、可选中，保留换行。
 
-离线验证：`node --test examples/public-plugins/com.uipilot.translate/tests/runtime.test.js`。测试使用假宿主服务，无真实密钥或网络。真实供应商行为须用户在 Host 中手动验收。升级保持插件 ID、命令和复制动作，旧权限记录不自动扩大授权。
+## 配置与升级
 
-本插件使用旧 `command` + `mainResult` 且未启用 `runtime.resultActions`，符合 Host 0.15.0 当前有道业务调用边界。多命令、Panel、子窗口和结果动作插件即使已获授权也不能调用该方法；facade 存在不表示已授权或形态兼容。
+有道密钥在宿主设置 → 密钥配置中配置和启用。插件不读取密钥、不直连供应商、不调用浏览器语音或剪贴板历史。需要网络、有道翻译服务授权；复制、朗读和面板分别申报 `clipboard.write`、`speech.speak`、`ui.panel`。旧有百度 OCR 和 DeepSeek 权限声明保持不变，它们不是已实现的翻译服务。申报不代表授予，本次不会自动改变用户授权。
+
+划词使用宿主管理的 `selection.read`：用户主动开启后，在外部应用选中文字并使用既有划词快捷键（默认 Alt+A）。宿主捕获选区并填入 Panel；捕获失败不沿用旧正文或剪贴板。具体原生捕获与权限行为须在 Host 中验收。
+
+从 1.2.1 更新时在设置中选择此插件 `package/` 开发目录或版本化 `.uipilot-plugin` 归档。保留插件 ID、默认命令与既有用户命令改名、收藏和快捷键绑定的身份；新增权限仍需用户自行授权。**低于 0.18.0 的 Host 不兼容 1.3.0，应保留旧版并先升级宿主。** 1.2.1 为旧 command/mainResult 版本，不能把它的旧调用边界当作本版 Panel 能力。安装、旧 Host 拒绝和升级取消保留旧插件尚待原生验收，未由本次离线测试证明。
+
+失败显示安全错误提示，无任意供应商异常文本。网络或服务撤权后不会显示成功或保留旧译文；检查网络、授权、密钥或额度后，手动提交或修改输入重试，不自动反复调用。输入最多 8192 UTF-8 字节。
+
+## 离线验证与交付
+
+从仓库根目录运行：
+
+```powershell
+node --test examples/public-plugins/com.uipilot.translate/tests/*.test.js
+node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict --target ES2021 --module ESNext --moduleResolution Bundler examples/public-plugins/com.uipilot.translate/tests/sdk-contract.ts
+npm.cmd run build --workspace @uipilot/plugin-cli
+node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.translate/package --platform windows
+```
+
+`package.test.js` 检查发布合同、包内入口/资产/模块依赖、缺失入口拒绝及语言/服务一致性。`panel-host-contract.test.js` 使用实际 Runtime、controller、model、provider 和 capability 模块，从 onCommand → onUpdate/onReady → request → onPanelAction → DOM 完成闭环；边界采用假有道、假剪贴板和假语音，还覆盖撤权、空划词输入、旧请求和音频事件隔离。这是离线自动化，不是实际供应商或原生 Host 验收。双主题、键盘与长文本的离线浏览器证据见工作记录；强制颜色仅有 CSS/测试覆盖，未模拟原生强制颜色环境。这些检查不能代替原生 WebView 验收。
+
+交付归档位于本目录 `artifacts/`，通过本地 CLI 0.18.0 从源包严格校验、打包并再次校验；不自动安装，不覆盖旧包。
+
+待用户在真实 Host 主动验收：安装/升级取消保留旧版与旧 Host 拒绝、命令改名/收藏/绑定保留、真实有道请求与撤权、外部选区捕获及失败恢复、系统复制和 SAPI 朗读/声音缺失、隐藏再进入、新划词取代正在翻译/朗读的内容、原生 WebView 双主题/强制颜色/键盘/长文本。当前测试没有运行真实网络、剪贴板、音频、选区或权限变更。
