@@ -1,7 +1,15 @@
-import type { PluginHandler } from '../../../../docs/plugin-sdk/uipilot-plugin-api-v1'
-const handler: PluginHandler = async (invocation, api) => {
- const response = await api.services?.youdao.translate({text: invocation.input, from: 'en', to: 'zh-CHS'})
- const text = response?.translations.join('\n') ?? ''
- return {requestId: invocation.requestId, results: [{id: 'translation', title: text, defaultAction: {type: 'copyText', text}}]}
+import type { PluginHandler, PluginPanelActionHandler, PluginYoudaoTranslationLanguage } from '../../../../docs/plugin-sdk/uipilot-plugin-api-v1'
+
+const initialize: PluginHandler = async (invocation, api) => {
+  const stored = await api.storage.get('translate.preferences.v1')
+  return { requestId: invocation.requestId, data: { text: invocation.input, preferences: stored } }
 }
-void handler
+const translate: PluginPanelActionHandler = async (invocation, api) => {
+  const response = await api.services?.youdao.translate({ text: ' hello\n ', from: 'auto', to: 'zh-CHS' })
+  const detected: PluginYoudaoTranslationLanguage | null = response?.sourceLanguage ?? null
+  const unchanged: boolean = response?.unchanged ?? false
+  void unchanged
+  return { requestId: invocation.requestId, data: { ok: true, text: response?.translations.join('\n') ?? '', detectedSourceLanguage: detected, targetLanguage: response?.targetLanguage ?? 'zh-CHS' } }
+}
+void initialize
+void translate
