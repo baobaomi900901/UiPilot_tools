@@ -69,8 +69,121 @@ export type PluginNetworkErrorName =
   | 'NetworkLimitExceededError'
   | 'ExpiredRequestError'
 
-export type PluginYoudaoTranslationLanguage = 'en' | 'zh-CHS'
-/** Fixed supported language list: English and Simplified Chinese. */
+/** Host 0.19.0+: official Youdao text-translation language codes. */
+export type PluginYoudaoTranslationLanguage =
+  | 'en'
+  | 'zh-CHS'
+  | 'zh-CHT'
+  | 'ar'
+  | 'de'
+  | 'es'
+  | 'fr'
+  | 'hi'
+  | 'id'
+  | 'it'
+  | 'ja'
+  | 'ko'
+  | 'nl'
+  | 'pt'
+  | 'ru'
+  | 'th'
+  | 'vi'
+  | 'af'
+  | 'am'
+  | 'az'
+  | 'be'
+  | 'bg'
+  | 'bn'
+  | 'bs'
+  | 'ca'
+  | 'ceb'
+  | 'co'
+  | 'cs'
+  | 'cy'
+  | 'da'
+  | 'el'
+  | 'eo'
+  | 'et'
+  | 'eu'
+  | 'fa'
+  | 'fi'
+  | 'fj'
+  | 'fy'
+  | 'ga'
+  | 'gd'
+  | 'gl'
+  | 'gu'
+  | 'ha'
+  | 'haw'
+  | 'he'
+  | 'hr'
+  | 'ht'
+  | 'hu'
+  | 'hy'
+  | 'ig'
+  | 'is'
+  | 'jw'
+  | 'ka'
+  | 'kk'
+  | 'km'
+  | 'kn'
+  | 'ku'
+  | 'ky'
+  | 'la'
+  | 'lb'
+  | 'lo'
+  | 'lt'
+  | 'lv'
+  | 'mg'
+  | 'mi'
+  | 'mk'
+  | 'ml'
+  | 'mn'
+  | 'mr'
+  | 'ms'
+  | 'mt'
+  | 'mww'
+  | 'my'
+  | 'ne'
+  | 'no'
+  | 'ny'
+  | 'otq'
+  | 'pa'
+  | 'pl'
+  | 'ps'
+  | 'ro'
+  | 'sd'
+  | 'si'
+  | 'sk'
+  | 'sl'
+  | 'sm'
+  | 'sn'
+  | 'so'
+  | 'sq'
+  | 'sr-Cyrl'
+  | 'sr-Latn'
+  | 'st'
+  | 'su'
+  | 'sv'
+  | 'sw'
+  | 'ta'
+  | 'te'
+  | 'tg'
+  | 'tl'
+  | 'tlh'
+  | 'to'
+  | 'tr'
+  | 'ty'
+  | 'uk'
+  | 'ur'
+  | 'uz'
+  | 'xh'
+  | 'yi'
+  | 'yo'
+  | 'yua'
+  | 'yue'
+  | 'zu'
+/** Canonical language codes; automatic detection is permitted only for the source. */
 export interface PluginYoudaoTranslationInput {
  readonly text: string
  readonly from: 'auto' | PluginYoudaoTranslationLanguage
@@ -88,7 +201,8 @@ export interface PluginServicesApi {
   /** Legacy mainResult remains supported. Host 0.18.0+ also permits legacy
    * submit+panel Runtime actions with ui.panel granted and panel.runtimeActions.
    * Auto detection and explicit same-language inputs require minimumHostVersion
-   * >=0.18.0. Same-language calls still validate all authority and credentials.
+   * >=0.18.0. Added language codes require minimumHostVersion >=0.19.0.
+   * Same-language calls still validate all authority and credentials.
    * Facade presence does not imply authorization; text is bounded to 8192 UTF-8 bytes.
    */
   translate(input: Readonly<PluginYoudaoTranslationInput>): Promise<Readonly<PluginYoudaoTranslationResponse>>
@@ -97,7 +211,7 @@ export interface PluginServicesApi {
 export type PluginServiceErrorName = PluginNetworkErrorName
  | 'InvalidServiceRequestError' | 'ServicePermissionDeniedError'
  | 'CredentialNotConfiguredError' | 'CredentialDisabledError'
- | 'ProviderAuthenticationError' | 'ProviderQuotaError' | 'ProviderFailureError'
+ | 'ProviderAuthenticationError' | 'ProviderQuotaError' | 'ProviderFailureError' | 'ProviderLanguageUnsupportedError'
 
 export interface UiPilotPluginApiV1 {
  /** Windows Host 0.15.0+, request-bound and deeply frozen.
@@ -371,7 +485,8 @@ export interface PluginPanelContextAction {
 }
 
 /** Windows Host 0.18.0+. Exact local system languages; voice selection is Host-owned. */
-export type SpeechLanguage = 'en' | 'zh-CHS'
+/** Host 0.19.0+: availability depends on installed matching local SAPI voices. */
+export type SpeechLanguage = PluginYoudaoTranslationLanguage
 export interface SpeechVoice { readonly id: string; readonly name: string; readonly language: SpeechLanguage }
 export interface SpeechState {
   readonly playbackId: string | null

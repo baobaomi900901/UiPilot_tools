@@ -2,7 +2,7 @@
 
 Validate and pack UiPilot public plugins locally without installing UiPilot or Rust.
 
-The package version is `0.1.0`; its current validation target is UiPilot Host `0.13.0`, API v1. Windows bearer credential references require `minimumHostVersion >= 0.4.0` and exact declared secret/host bindings; the CLI validates metadata and never reads stored credentials. Historical feature minima remain unchanged. Browser result actions require Windows, `url.open`, `runtime.resultActions: true`, main-result commands and `minimumHostVersion >= 0.12.0`; validation never opens a URL.
+The package version is `0.1.0`; its current validation target is UiPilot Host `0.19.0`, API v1. Windows bearer credential references require `minimumHostVersion >= 0.4.0` and exact declared secret/host bindings; the CLI validates metadata and never reads stored credentials. Historical feature minima remain unchanged. Browser result actions require Windows, `url.open`, `runtime.resultActions: true`, main-result commands and `minimumHostVersion >= 0.12.0`; validation never opens a URL.
 
 The package requires Node.js 20 or newer. Install the supplied npm tarball:
 

@@ -5049,7 +5049,13 @@ impl PublicPluginManager {
                     .config
                     .permission_grants
                     .contains(&PublicPermission::UiPanel);
-            if !(legacy || panel) || (input.input.extended_input() && !extended_supported) {
+            let multilingual_supported =
+                super::manifest::parse_canonical_version(&manifest.minimum_host_version)
+                    .is_some_and(|v| v >= [0, 19, 0]);
+            if !(legacy || panel)
+                || (input.input.extended_input() && !extended_supported)
+                || (input.input.multilingual_input() && !multilingual_supported)
+            {
                 return Err("invalidServiceRequest");
             }
             if panel
@@ -15933,11 +15939,19 @@ mod tests {
         PublicPluginManager,
         crate::plugin_panel::PanelSessionIdentity,
     ) {
+        installed_translation_panel_version(dir, gate, plugin_id, "0.18.0")
+    }
+    fn installed_translation_panel_version(
+        dir: &TestDir,
+        gate: Arc<PluginNetworkAuthorityGate>,
+        plugin_id: &str,
+        minimum_host_version: &str,
+    ) -> (PublicPluginManager, crate::plugin_panel::PanelSessionIdentity) {
         write_host_service_package(dir);
         let path = dir.source().join("plugin.json");
         let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         manifest["pluginId"] = json!(plugin_id);
-        manifest["minimumHostVersion"] = json!("0.18.0");
+        manifest["minimumHostVersion"] = json!(minimum_host_version);
         manifest["command"]["activationMode"] = json!("submit");
         manifest["command"]["outputMode"] = json!("panel");
         manifest["panel"] = json!({"entry":"dist/panel.html","runtimeActions":true});
@@ -15950,7 +15964,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         fs::write(dir.source().join("dist/panel.html"), "<!doctype html>").unwrap();
         let mut manager = manager_with_network_authority(dir, gate);
-        manager.host.version = [0, 18, 0];
+        manager.host.version = [0, 19, 0];
         let prepared = manager
             .prepare("main", source(&dir.source()), Instant::now())
             .unwrap();
@@ -15989,6 +16003,54 @@ mod tests {
             host_key_focus: PanelHostKeyFocus::Content,
         };
         (manager, identity)
+    }
+    #[tokio::test]
+    async fn host_services_multilingual_requires_019_declaration_before_local_delivery() {
+        for minimum in ["0.18.0", "0.19.0"] {
+            let dir = TestDir::new(&format!("translation-languages-{minimum}"));
+            let (gate, _) = PluginNetworkAuthorityGate::blocking_for_test();
+            let (manager, identity) =
+                installed_translation_panel_version(&dir, gate, "com.example.network", minimum);
+            let action = manager
+                .admit_panel_action(
+                    &identity,
+                    super::super::panel_action::PanelActionRequest {
+                        action: "translate".into(),
+                        payload: Value::Null,
+                    },
+                    Instant::now(),
+                )
+                .unwrap();
+            let context = action.context;
+            let caller = PluginRuntimeIdentity {
+                plugin_id: context.plugin_id.clone(),
+                generation: context.plugin_generation,
+            };
+            let store =
+                crate::credentials::CredentialStore::new(dir.path().join("synthetic-multilingual"));
+            store.synthetic_youdao_for_test();
+            for code in ["ja", "ar", "zh-CHT", "sr-Cyrl"] {
+                let command = serde_json::from_value(
+                    json!({"context":context,"input":{"text":"hello","from":code,"to":code}}),
+                )
+                .unwrap();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    manager.youdao_translate(caller.clone(), command, &store),
+                )
+                .await
+                .expect("same language must stay local");
+                if minimum == "0.18.0" {
+                    assert_eq!(result.unwrap_err().code, "invalidServiceRequest");
+                } else {
+                    let response = result.unwrap();
+                    assert_eq!(response.source_language.as_deref(), Some(code));
+                    assert_eq!(response.target_language, code);
+                    assert!(response.unchanged);
+                }
+            }
+            assert_eq!(manager.network_authority.global_active_for_test(), 0);
+        }
     }
     #[tokio::test]
     async fn host_services_panel_local_response_keeps_credentials_and_completion_fenced() {

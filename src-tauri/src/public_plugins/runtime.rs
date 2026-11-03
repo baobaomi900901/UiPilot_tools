@@ -58,6 +58,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   const regexpTest = uncurryThis(RegExp.prototype.test);
   const SetConstructor = Set;
   const setHas = uncurryThis(Set.prototype.has);
+  // Kept in agreement with docs/plugin-sdk/youdao-languages.json by bridge tests.
+  const translationLanguages = new SetConstructor(["ar", "de", "en", "es", "fr", "hi", "id", "it", "ja", "ko", "nl", "pt", "ru", "th", "vi", "zh-CHS", "zh-CHT", "af", "am", "az", "be", "bg", "bn", "bs", "ca", "ceb", "co", "cs", "cy", "da", "el", "eo", "et", "eu", "fa", "fi", "fj", "fy", "ga", "gd", "gl", "gu", "ha", "haw", "he", "hr", "ht", "hu", "hy", "ig", "is", "jw", "ka", "kk", "km", "kn", "ku", "ky", "la", "lb", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "mww", "my", "ne", "no", "ny", "otq", "pa", "pl", "ps", "ro", "sd", "si", "sk", "sl", "sm", "sn", "so", "sq", "sr-Cyrl", "sr-Latn", "st", "su", "sv", "sw", "ta", "te", "tg", "tl", "tlh", "to", "tr", "ty", "uk", "ur", "uz", "xh", "yi", "yo", "yua", "yue", "zu"]);
   const StringConstructor = String;
   const WeakSetConstructor = WeakSet;
   const weakSetAdd = uncurryThis(WeakSet.prototype.add);
@@ -191,6 +193,7 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     providerAuthentication: 'ProviderAuthenticationError',
     providerQuota: 'ProviderQuotaError',
     providerFailure: 'ProviderFailureError',
+    providerLanguageUnsupported: 'ProviderLanguageUnsupportedError',
     permissionDenied: 'PermissionDeniedError',
     networkTargetDenied: 'NetworkTargetDeniedError',
     networkTimeout: 'NetworkTimeoutError',
@@ -289,8 +292,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
               if (reflectOwnKeys(snapshot).length !== 3 || typeof snapshot.text !== 'string'
                   || !snapshot.text.length || stringIncludes(snapshot.text, '\0')
                   || encodeText(snapshot.text).length > 8192
-                  || !(snapshot.from === 'auto' || snapshot.from === 'en' || snapshot.from === 'zh-CHS')
-                  || !(snapshot.to === 'en' || snapshot.to === 'zh-CHS')) throw 0;
+                  || !(snapshot.from === 'auto' || setHas(translationLanguages, snapshot.from))
+                  || !setHas(translationLanguages, snapshot.to)) throw 0;
               deepFreeze(snapshot);
             } catch (_) { throw fail('InvalidServiceRequestError'); }
             const requestContext = context();
@@ -302,7 +305,7 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
             try {
               const source = ownData(response, new SetConstructor(['translations', 'sourceLanguage', 'targetLanguage', 'unchanged']));
               const translations = copyJson(source.translations);
-              if (reflectOwnKeys(source).length !== 4 || !(source.sourceLanguage === null || source.sourceLanguage === 'en' || source.sourceLanguage === 'zh-CHS')
+              if (reflectOwnKeys(source).length !== 4 || !(source.sourceLanguage === null || setHas(translationLanguages, source.sourceLanguage))
                   || source.targetLanguage !== snapshot.to || typeof source.unchanged !== 'boolean' || !arrayIsArray(translations)
                   || !translations.length || arraySome(translations, (text) => typeof text !== 'string' || !text.length)) throw 0;
               return deepFreeze(nullRecord({ translations, sourceLanguage: source.sourceLanguage, targetLanguage: source.targetLanguage, unchanged: source.unchanged }));

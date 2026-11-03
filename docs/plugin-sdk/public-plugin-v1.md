@@ -462,8 +462,13 @@ and `minimumHostVersion >= 0.18.0`, only from its current `onPanelAction` Runtim
 request. Multi-command, Window and result-action packages remain unsupported.
 The content Panel uses its request bridge; it does not contact Youdao directly.
 
-The fixed supported languages are English (`en`) and Simplified Chinese
-(`zh-CHS`). Source additionally accepts `auto`; target never accepts `auto`.
+Host 0.18.x supports English (`en`) and Simplified Chinese (`zh-CHS`).
+Host 0.19.0 adds all 112 canonical codes in [the Youdao language catalog](./youdao-languages.json);
+requests using any added language require `minimumHostVersion >= 0.19.0`.
+Source additionally accepts `auto`; target never accepts `auto`. The catalog records
+which 83 languages the provider documents as auto-detectable; the remaining
+languages require explicit source selection. Advertised languages do not imply
+every language direction or account configuration is accepted by the provider.
 Auto and explicit same-language inputs require `minimumHostVersion >= 0.18.0`.
 The existing bounded input and independent `network.https`,
 `credentials.youdaoTranslation`, HTTPS host allowlist and enabled Host credential
@@ -472,14 +477,16 @@ without provider transport after all admission checks; it cannot bypass revoked
 permissions, a stale request or disabled credentials.
 
 The frozen response is `{translations, sourceLanguage, targetLanguage, unchanged}`.
-`sourceLanguage` is `en`, `zh-CHS` or `null`, based only on the provider `l` pair;
-unknown/unsupported detection is never guessed from text. Host requests
+`sourceLanguage` is a canonical catalog code or `null`, based only on the provider `l` pair;
+provider code casing is normalized, and unknown/unsupported detection is never
+guessed from text. Host requests
 `strict=true`, normalizes language spelling and rejects an actual target that
 mismatches the requested target with `NetworkResponseInvalidError`. A missing
 legacy provider language field yields `sourceLanguage: null`. The target is
 always the requested supported language. `unchanged` is true for explicit
 same-language calls or provider detection equal to target. Existing `translations`
-remains available, and fixed service error names stay unchanged.
+remains available. Host 0.19.0 adds `ProviderLanguageUnsupportedError` for provider
+error `102`; raw provider diagnostics and credentials are not exposed.
 
 `selection.read` also admits this authorized Panel shape on Host 0.18.0+. The
 Host still owns explicit selection capture and restoration, passes the captured
@@ -504,13 +511,15 @@ write succeeds, preserves focus and the Panel, and neither reads nor pastes.
 consent lists it, existing explicit grants remain, and new grants require the
 separate confirmation in Settings → Permissions. Speech has no network or
 credential dependency. Call it only from an explicit user button/menu action.
-`voices()` returns available local `{id,name,language}` entries for `en` and
-`zh-CHS`. `play({text,language})` uses the same text limits and exact language
-allowlist. The Host selects a matching local SAPI voice; there is no `voiceId`
+`voices()` returns available local `{id,name,language}` entries. Host 0.18.x
+exposes `en` and `zh-CHS`; Host 0.19.0 maps installed SAPI locales to the
+canonical language catalog, preserving Chinese and Serbian script distinctions.
+`play({text,language})` uses the same text limits and exact language allowlist.
+Translation support alone never implies an installed matching voice. The Host selects a matching local SAPI voice; there is no `voiceId`
 override, voice download, audio URL, file or XML/SSML input.
 
 `play`, `stop({playbackId})` and `state()` return
-`{playbackId:string|null,status:'idle'|'playing'|'completed'|'stopped'|'error',language:'en'|'zh-CHS'|null,errorCode?:string}`.
+`{playbackId:string|null,status:'idle'|'playing'|'completed'|'stopped'|'error',language:SpeechLanguage|null,errorCode?:string}`.
 `onState(handler)` returns an unsubscribe function. States and events belong to
 the captured session. Global playback has one owner; new playback stops old
 playback, while old IDs and late completion cannot affect the replacement.
@@ -544,3 +553,4 @@ update, PREPARE (even with the same epoch), teardown or unsubscribe invalidates
 queued callbacks. The Host does not await the receiver; thrown/rejected errors
 are contained without exposing exception details, retrying, or ACKing again.
 The hook grants no effect permission and does not authorize automatic speech.
+

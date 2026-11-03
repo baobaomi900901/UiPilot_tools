@@ -457,6 +457,29 @@ describe('credential reference snapshot', () => {
 
 
 describe('host Youdao service facade', () => {
+ it('accepts every canonical language in requests and detection metadata', async () => {
+  const catalog = JSON.parse(readFileSync('docs/plugin-sdk/youdao-languages.json', 'utf8')) as {languages: {id: string}[]}
+  const responses: unknown[] = []
+  const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
+   for (const {id} of catalog.languages) responses.push(await api.services!.youdao.translate({text:'hello',from:id,to:id}))
+   return {results:[]}
+  }, async (args) => {
+   const {input: {input}} = args as {input: {input: {to: string}}}
+   return {translations:['hello'],sourceLanguage:input.to,targetLanguage:input.to,unchanged:true}
+  })
+  await runtime.dispatch()
+  expect(responses).toHaveLength(catalog.languages.length)
+  expect(runtime.invoke.mock.calls.filter(([command]) => command === 'plugin_youdao_translate')).toHaveLength(112)
+ })
+ it.each(['unknown', 'FR', 'auto'])('rejects noncanonical detection %s', async (sourceLanguage) => {
+  let failure: unknown
+  const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
+   try { await api.services!.youdao.translate({text:'hello',from:'auto',to:'en'}) } catch (error) { failure = error }
+   return {results:[]}
+  }, async () => ({translations:['hello'],sourceLanguage,targetLanguage:'en',unchanged:false}))
+  await runtime.dispatch()
+  expect(failure).toMatchObject({name:'NetworkResponseInvalidError'})
+ })
  it('accepts auto and same-language inputs and returns frozen normalized metadata', async () => {
   const responses: unknown[] = []
   const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
@@ -488,29 +511,37 @@ describe('host Youdao service facade', () => {
  })
  it('rejects getters and invalid UTF-8 length, language and fields before IPC', async () => {
   let getterCalls = 0
+  const failures: string[] = []
   const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
    for (const input of [
     { get text() { getterCalls++; return 'hello' }, from: 'en', to: 'zh-CHS' },
     { text: '', from: 'en', to: 'zh-CHS' },
     { text: '中'.repeat(2731), from: 'en', to: 'zh-CHS' },
-    { text: 'hello', from: 'fr', to: 'en' },
+    { text: 'hello', from: 'invalid', to: 'en' },
+    { text: 'hello', from: 'FR', to: 'en' },
+    { text: 'hello', from: 'en', to: 'auto' },
     { text: 'hello', from: 'en', to: 'zh-CHS', url: 'https://example.com' },
-   ]) await expect(api.services!.youdao.translate(input)).rejects.toMatchObject({name: 'InvalidServiceRequestError'})
+   ]) {
+    try { await api.services!.youdao.translate(input) } catch (error) { failures.push((error as Error).name) }
+   }
    return { results: [] }
   })
   await runtime.dispatch()
   expect(getterCalls).toBe(0)
+  expect(failures).toEqual(Array(7).fill('InvalidServiceRequestError'))
   expect(runtime.invoke.mock.calls.some(([command]) => command === 'plugin_youdao_translate')).toBe(false)
  })
  it.each([
   ['servicePermissionDenied', 'ServicePermissionDeniedError'], ['credentialNotConfigured', 'CredentialNotConfiguredError'],
   ['credentialDisabled', 'CredentialDisabledError'], ['credentialUnavailable', 'CredentialUnavailableError'],
-  ['providerAuthentication', 'ProviderAuthenticationError'], ['providerQuota', 'ProviderQuotaError'], ['providerFailure', 'ProviderFailureError'],
+  ['providerAuthentication', 'ProviderAuthenticationError'], ['providerQuota', 'ProviderQuotaError'], ['providerFailure', 'ProviderFailureError'], ['providerLanguageUnsupported', 'ProviderLanguageUnsupportedError'],
  ])('maps %s to fixed %s', async (code, name) => {
+  let failure: unknown
   const runtime = await executeRuntimeBootstrap(true, async (_, api) => {
-   await expect(api.services!.youdao.translate({text:'hello',from:'en',to:'zh-CHS'})).rejects.toMatchObject({name, message: name})
+   try { await api.services!.youdao.translate({text:'hello',from:'en',to:'zh-CHS'}) } catch (error) { failure = error }
    return {results:[]}
   }, async () => {throw {code}})
   await runtime.dispatch()
+  expect(failure).toMatchObject({name, message: name})
  })
 })

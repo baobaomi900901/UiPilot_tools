@@ -3,6 +3,7 @@ use super::{
     network::{PluginNetworkErrorCode, PluginNetworkRequest},
     PluginRequestContext,
 };
+use crate::translation_languages::{normalize_code, TranslationLanguage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -56,13 +57,17 @@ impl YoudaoInput {
         if self.text.trim().is_empty()
             || self.text.contains('\0')
             || self.text.len() > 8192
-            || !matches!(self.from.as_str(), "auto" | "en" | "zh-CHS")
-            || !matches!(self.to.as_str(), "en" | "zh-CHS")
+            || (self.from != "auto" && TranslationLanguage::from_code(&self.from).is_none())
+            || TranslationLanguage::from_code(&self.to).is_none()
         {
             Err("invalidServiceRequest")
         } else {
             Ok(())
         }
+    }
+    pub(crate) fn multilingual_input(&self) -> bool {
+        !matches!(self.from.as_str(), "auto" | "en" | "zh-CHS")
+            || !matches!(self.to.as_str(), "en" | "zh-CHS")
     }
     pub(crate) fn extended_input(&self) -> bool {
         self.from == "auto" || self.from == self.to
@@ -141,6 +146,7 @@ pub(crate) fn parse_response(
         .ok_or("networkResponseInvalid")?
     {
         "0" => {}
+        "102" => return Err("providerLanguageUnsupported"),
         "108" | "110" | "111" | "112" | "202" | "203" => return Err("providerAuthentication"),
         "401" | "411" | "412" | "1411" | "2411" | "9411" => return Err("providerQuota"),
         _ => return Err("providerFailure"),
@@ -168,15 +174,6 @@ pub(crate) fn parse_response(
     {
         return Err("networkResponseTooLarge");
     }
-    let language = |value: &str| {
-        if value.eq_ignore_ascii_case("en") {
-            Some("en".to_string())
-        } else if value.eq_ignore_ascii_case("zh-CHS") {
-            Some("zh-CHS".to_string())
-        } else {
-            None
-        }
-    };
     let source_language = match value.get("l") {
         None => None,
         Some(pair) => {
@@ -184,10 +181,10 @@ pub(crate) fn parse_response(
                 .as_str()
                 .and_then(|pair| pair.split_once('2'))
                 .ok_or("networkResponseInvalid")?;
-            if language(to).as_deref() != Some(input.to.as_str()) {
+            if normalize_code(to) != Some(input.to.as_str()) {
                 return Err("networkResponseInvalid");
             }
-            language(from)
+            normalize_code(from).map(str::to_string)
         }
     };
     Ok(YoudaoResponse {
@@ -200,6 +197,43 @@ pub(crate) fn parse_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_official_language_is_valid_and_provider_case_is_normalized() {
+        let catalog: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/plugin-sdk/youdao-languages.json"
+        ))
+        .unwrap();
+        for language in catalog["languages"].as_array().unwrap() {
+            let code = language["id"].as_str().unwrap();
+            let input = YoudaoInput {
+                text: "hello".into(),
+                from: code.into(),
+                to: code.into(),
+            };
+            assert_eq!(input.validate(), Ok(()), "{code}");
+            let body = serde_json::json!({"errorCode":"0", "translation":["hello"], "l":format!("{}2{}",code.to_uppercase(),code.to_uppercase())});
+            let response = parse_response(200, &body.to_string(), &input).unwrap();
+            assert_eq!(response.source_language.as_deref(), Some(code));
+            assert_eq!(response.target_language, code);
+            assert!(response.unchanged);
+        }
+    }
+    #[test]
+    fn unsupported_provider_direction_has_a_sanitized_error() {
+        let input = YoudaoInput {
+            text: "hello".into(),
+            from: "en".into(),
+            to: "zh-CHS".into(),
+        };
+        assert_eq!(
+            parse_response(
+                200,
+                r#"{"errorCode":"102","detail":"private provider response"}"#,
+                &input
+            ),
+            Err("providerLanguageUnsupported")
+        );
+    }
     #[test]
     fn panel_languages_and_detection_are_normalized_without_guessing() {
         for from in ["auto", "en", "zh-CHS"] {
@@ -230,7 +264,7 @@ mod tests {
         );
         let unknown = parse_response(
             200,
-            r#"{"errorCode":"0","translation":["你好"],"l":"fr2zh-CHS"}"#,
+            r#"{"errorCode":"0","translation":["你好"],"l":"unknown2zh-CHS"}"#,
             &input,
         )
         .unwrap();
@@ -252,7 +286,8 @@ mod tests {
         for (text, from, to) in [
             ("".into(), "en", "zh-CHS"),
             ("x".repeat(8193), "en", "zh-CHS"),
-            ("hello".into(), "fr", "en"),
+            ("hello".into(), "unknown", "en"),
+            ("hello".into(), "FR", "en"),
             ("你好".into(), "auto", "auto"),
         ] {
             assert_eq!(

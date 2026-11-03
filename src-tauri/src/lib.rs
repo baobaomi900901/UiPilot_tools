@@ -3,6 +3,8 @@
 
 mod dev_startup;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
+mod translation_languages;
+#[cfg(any(test, not(feature = "test-instrumentation")))]
 mod command_hotkeys;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod selection_capture;

@@ -150,7 +150,7 @@ it('preserves new declared metadata across directory and archive sources on prod
   expect(directoryReport.valid).toBe(true)
   expect(archiveReport.valid).toBe(true)
   expect(directoryReport.issues).toEqual([])
-  expect(directoryReport.target.hostVersion).toBe('0.18.0')
+  expect(directoryReport.target.hostVersion).toBe('0.19.0')
   expect(archiveReport.plugin).toEqual(directoryReport.plugin)
   expect(directoryReport.plugin).toEqual({ pluginId: value.pluginId, version: '1.0.0', outputMode: 'mainResult',
     commands: [{ commandId: 'constructor', defaultName: 'result', activationMode: 'submit', outputMode: 'mainResult' }],

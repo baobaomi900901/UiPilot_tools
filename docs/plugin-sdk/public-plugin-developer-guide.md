@@ -1249,3 +1249,7 @@ update, PREPARE (even with the same epoch), teardown or unsubscribe invalidates
 queued callbacks. The Host does not await the receiver; thrown/rejected errors
 are contained without exposing exception details, retrying, or ACKing again.
 The hook grants no effect permission and does not authorize automatic speech.
+
+## Host 0.19.0 多语言翻译
+
+有道文本翻译和本地朗读使用 [112 种规范语言代码](./youdao-languages.json)。新增翻译语言要求 `minimumHostVersion >= 0.19.0`；源语言可用 `auto`，目标语言不能用 `auto`。目录同时记录服务支持自动识别的 83 种语言，其余请提供手动选择。`speech.voices()` 仅报告系统实际安装且能匹配的 SAPI 声音，翻译语种可用不代表朗读可用。参考 `examples/public-plugins/com.uipilot.translate/package/` 的多语言 Panel。
