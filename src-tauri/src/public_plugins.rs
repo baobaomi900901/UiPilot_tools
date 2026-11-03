@@ -2207,10 +2207,18 @@ pub(crate) struct PublicPluginHost {
 }
 
 impl PublicPluginHost {
-    pub(crate) const fn current(platform: PublicPlatform) -> Self {
+    pub(crate) fn current(platform: PublicPlatform) -> Self {
+        // Installation compatibility must use the same release as the running
+        // application, rather than a second manually maintained version.
+        let version = [
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+        ]
+        .map(|part| part.parse::<u32>().expect("Cargo release version must fit u32"));
         Self {
             platform,
-            version: [0, 18, 0],
+            version,
             api_version: 1,
         }
     }
