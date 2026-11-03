@@ -553,4 +553,3 @@ update, PREPARE (even with the same epoch), teardown or unsubscribe invalidates
 queued callbacks. The Host does not await the receiver; thrown/rejected errors
 are contained without exposing exception details, retrying, or ACKing again.
 The hook grants no effect permission and does not authorize automatic speech.
-
