@@ -166,4 +166,3 @@ onUpdate/onHostKey 内不等待 request；回调返回、当前会话就绪后�
 - 工作区：C:/Users/moby/.codex/worktrees/translate-panel/UiPilot_tools；分支 codex/translate-panel-implementation；基线 dc14697。
 - 现有翻译插件9项测试通过；环境的 node --test 派生子进程受限，直接 node tests/runtime.test.js 可运行相同 node:test 用例。
 - Task1按服务/划词 H1/H4、复制/朗读/版本 H2/H3 两个可评审提交组实施；正式接口见宿主扩展实施合同。
-

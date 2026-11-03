@@ -44,4 +44,3 @@
 - Microsoft SPEAKFLAGS：https://learn.microsoft.com/en-us/previous-versions/office/developer/speech-technologies/jj127460(v=msdn.10)
 
 实施顺序：H1/H4服务及划词→专项评审→H2/H3复制朗读和版本交付→专项评审→插件状态/Runtime/UI/能力接入→集成评审。实施代理可按此拆分能力请求Task1；插件包形态最后切换。
-
