@@ -1946,7 +1946,7 @@ impl PublicPluginService {
             .by_token
             .get_mut(token)
             .ok_or(PublicPluginManagementError::Unavailable)?;
-        if pending.route.result_publication.is_some() {
+        if self.manager()?.result_actions_enabled(&pending.route) {
             pending.route =
                 self.manager()?
                     .bind_result_command_route(&pending.route, context, token)?;

@@ -125,3 +125,5 @@
 - 最新开发版已由既有 dev 会话构建并启动；额外启动的验收 dev 会话遇到已有 Everything 资源占用后退出，未停止用户既有会话。
 - 原生工具窗口访问未获批准。用户明确选择自行测试并禁止使用 Computer Use，已停止 GUI 自动化。真实百度调用、截图粘贴、双主题和系统剪贴板七步闭环交由用户手动验收，不声明已通过。
 - 交付包：`artifacts/ocr-delivery/com.uipilot.baidu-ocr-1.0.0.uipilot-plugin`；使用主程序设置导入并确认权限，沿用已启用的百度 OCR 配置。
+- 用户手动验收：粘贴图片与列出百度 OCR 正常，回车识别出现“操作不可用”。定位到 `PublicPluginService::bind_request` 将 `result_publication` 的存在误作 `runtime.resultActions` 协议开关，导致 legacy OCR 在派发前被拒绝。补充按真实服务调用顺序执行、并核对全文复制结果的集成回归；原有 manager-only OCR 测试没有覆盖该分支。
+- 修复仅将绑定器分支改为按 `result_actions_enabled` 判断，保留图片请求的发布权限。新增集成回归先复现“没有 dispatch”再通过；相关插件服务 72 项测试通过，精确差异复审通过。既有开发会话已重新编译并启动修复版，通知用户重新粘贴图片测试；未使用 Computer Use。

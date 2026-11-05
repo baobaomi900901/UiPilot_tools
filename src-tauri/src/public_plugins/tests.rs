@@ -153,6 +153,115 @@ fn credential_completion_preserves_publication_guard_through_submission_receiver
 }
 
 #[test]
+fn image_legacy_service_submission_binds_before_dispatch_and_keeps_copy_result() {
+    let root = TestRoot::new("image-legacy-service-order");
+    let source = root.package();
+    let mut value = manifest("mainResult");
+    value["minimumHostVersion"] = json!("0.20.0");
+    value["command"]["activationMode"] = json!("submit");
+    value["command"]["inputCapabilities"] = json!(["image.ocr"]);
+    value["permissions"] = json!(["clipboard.write"]);
+    write_package(&source, &value);
+    let app_data = root.0.join("app-data");
+    let manager = Arc::new(
+        PublicPluginManager::load(
+            &app_data,
+            PublicPluginHost::current(PublicPlatform::Windows),
+            [],
+            Arc::new(MessageCenterService::load(&app_data)),
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    let installation = manager
+        .prepare(
+            "main",
+            PublicPluginInstallSource::DevelopmentDirectory { path: source },
+            now,
+        )
+        .unwrap();
+    manager
+        .commit_with_readiness(
+            "main",
+            &installation.token,
+            BTreeSet::from([PublicPermission::ClipboardWrite]),
+            now,
+            |_| true,
+        )
+        .unwrap();
+    let service = Arc::new(PublicPluginService::default());
+    assert!(service.manager.set(manager.clone()).is_ok());
+    manager.launcher_images.begin_import(1).unwrap();
+    let image = manager
+        .launcher_images
+        .finish_import(
+            1,
+            crate::launcher_image::normalize_rgba(1, 1, &[0, 0, 0, 255]).unwrap(),
+        )
+        .unwrap();
+    manager
+        .launcher_images
+        .admit_intent(
+            &image.id,
+            2,
+            true,
+            || Some(()),
+            |contexts| manager.retire_image_contexts(contexts),
+        )
+        .unwrap()
+        .unwrap();
+    let route = manager
+        .image_route("com.uipilot.demo", "default", "")
+        .unwrap();
+    let publication = route.result_publication.clone().unwrap();
+    assert!(!manager.result_actions_enabled(&route));
+    let prepared = service.prepare_command(route, 2, String::new()).unwrap();
+    let context = prepared.request_context().clone();
+    service
+        .bind_prepared_image(&prepared, &image.id, 2)
+        .unwrap();
+    let submission = service.admit_prepared_command(prepared, now).unwrap();
+    let dispatch = submission
+        .dispatch
+        .as_ref()
+        .expect("a legacy OCR image command must dispatch");
+    assert_eq!(dispatch.context, context);
+    assert_eq!(manager.invocation_command_id(dispatch).unwrap(), None);
+    assert!(manager.launcher_images.bound(&context, None).is_ok());
+    let completion = PluginCommandCompletion {
+        context: context.clone(),
+        failed: false,
+        response: Some(json!({
+            "requestId":context.request_id,
+            "results":[{"id":"ocr", "title":"first", "detail":"first\nsecond", "defaultAction":{"type":"copyText", "text":"first\nsecond"}}]
+        })),
+    };
+    let mut outcome = manager.scheduler().complete(&context, now).unwrap();
+    assert!(outcome.accepted);
+    outcome.credential_publication = Some((42, publication.clone()));
+    service
+        .complete_submission_with(&completion, outcome, now, || {
+            panic!("valid legacy OCR must not fault")
+        })
+        .unwrap();
+    let Some(Ok(PublicPluginResponse::ServiceMainResults {
+        results,
+        credential_revision,
+        publication: received,
+    })) = submission
+        .receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+    else {
+        panic!("legacy image result must reach its submission receiver");
+    };
+    assert_eq!(results[0].detail.as_deref(), Some("first\nsecond"));
+    assert_eq!(results[0].copy_text.as_deref(), Some("first\nsecond"));
+    assert_eq!(credential_revision, 42);
+    assert_eq!(received, publication);
+}
+
+#[test]
 fn save_plugin_settings_service_settles_exact_tokens_and_preserves_execution_slot() {
     use std::collections::BTreeMap;
     for case in [
