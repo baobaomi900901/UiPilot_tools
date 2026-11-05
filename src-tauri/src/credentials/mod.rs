@@ -6,7 +6,7 @@ mod tests;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 pub(crate) use store::CredentialStore;
-use tauri::{State, WebviewWindow};
+use tauri::{Emitter, State, WebviewWindow};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
@@ -207,9 +207,13 @@ pub(crate) async fn save_credential(
     input: serde_json::Value,
 ) -> Result<Inventory, Error> {
     require_main_label(window.label())?;
-    store
+    let result = store
         .save_with(parse_input(input)?, providers::verify)
-        .await
+        .await;
+    if result.is_ok() {
+        let _ = window.emit_to("main", "public-plugin-permissions-changed", ());
+    }
+    result
 }
 #[tauri::command]
 pub(crate) fn set_credential_enabled(
@@ -218,7 +222,11 @@ pub(crate) fn set_credential_enabled(
     input: serde_json::Value,
 ) -> Result<Inventory, Error> {
     require_main_label(window.label())?;
-    store.set_enabled(parse_input(input)?)
+    let result = store.set_enabled(parse_input(input)?);
+    if result.is_ok() {
+        let _ = window.emit_to("main", "public-plugin-permissions-changed", ());
+    }
+    result
 }
 #[tauri::command]
 pub(crate) fn delete_credential(
@@ -227,5 +235,9 @@ pub(crate) fn delete_credential(
     input: serde_json::Value,
 ) -> Result<Inventory, Error> {
     require_main_label(window.label())?;
-    store.delete(parse_input(input)?)
+    let result = store.delete(parse_input(input)?);
+    if result.is_ok() {
+        let _ = window.emit_to("main", "public-plugin-permissions-changed", ());
+    }
+    result
 }

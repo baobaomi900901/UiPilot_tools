@@ -632,7 +632,12 @@ impl From<ClipboardHistoryPasteError> for CommandError {
 }
 
 impl From<crate::panel_effects::EffectError> for CommandError {
-    fn from(error: crate::panel_effects::EffectError) -> Self { Self { code: error.code(), message: error.code() } }
+    fn from(error: crate::panel_effects::EffectError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.code(),
+        }
+    }
 }
 
 fn parse_canonical_nonzero_u64(value: &str) -> Option<u64> {
@@ -2550,6 +2555,121 @@ pub(crate) async fn plugin_youdao_translate(
         .manager()
         .map_err(|_| ServiceError::from("networkFailure"))?;
     manager.youdao_translate(caller, input, store.inner()).await
+}
+
+#[tauri::command]
+pub(crate) async fn plugin_baidu_ocr(
+    window: WebviewWindow,
+    service: State<'_, Arc<PublicPluginService>>,
+    store: State<'_, crate::credentials::CredentialStore>,
+    input: serde_json::Value,
+) -> Result<
+    crate::public_plugins::baidu_ocr::BaiduResponse,
+    crate::public_plugins::host_services::ServiceError,
+> {
+    use crate::public_plugins::host_services::ServiceError;
+    // Check the actual webview identity before decoding attacker-controlled request data.
+    let caller = crate::public_plugins::parse_runtime_label(window.label())
+        .ok_or(ServiceError::from("expiredRequest"))?;
+    let input: crate::public_plugins::baidu_ocr::BaiduCommandInput =
+        serde_json::from_value(input).map_err(|_| ServiceError::from("invalidServiceRequest"))?;
+    if caller.plugin_id != input.context.plugin_id
+        || caller.generation != input.context.plugin_generation
+    {
+        return Err(ServiceError::from("expiredRequest"));
+    }
+    service
+        .manager()
+        .map_err(|_| ServiceError::from("expiredRequest"))?
+        .baidu_ocr(caller, input, store.inner())
+        .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LauncherImageImportInput {
+    import_sequence: u64,
+    bytes: Option<Vec<u8>>,
+    mime_type: Option<String>,
+    clipboard_sequence: Option<u32>,
+}
+#[tauri::command]
+pub(crate) fn get_launcher_clipboard_sequence(window: WebviewWindow) -> Result<u32, CommandError> {
+    require_main_window(&window)?;
+    Ok(crate::clipboard_history::launcher_clipboard_sequence())
+}
+#[tauri::command]
+pub(crate) async fn import_launcher_image(
+    window: WebviewWindow,
+    input: serde_json::Value,
+) -> Result<crate::launcher_image::LauncherImage, crate::public_plugins::host_services::ServiceError>
+{
+    use crate::public_plugins::host_services::ServiceError;
+    require_main_window(&window).map_err(|_| ServiceError::from("invalidCaller"))?;
+    let input: LauncherImageImportInput =
+        serde_json::from_value(input).map_err(|_| ServiceError::from("invalidImage"))?;
+    let app = window.app_handle();
+    let service = app.state::<Arc<PublicPluginService>>();
+    let manager = service
+        .manager()
+        .map_err(|_| ServiceError::from("imageUnavailable"))?;
+    manager
+        .launcher_images
+        .begin_import(input.import_sequence)
+        .map_err(ServiceError::from)?;
+    let sequence = input.import_sequence;
+    let normalized = tauri::async_runtime::spawn_blocking(move || {
+        match (input.bytes, input.mime_type, input.clipboard_sequence) {
+            (Some(bytes), Some(mime), None) => {
+                crate::launcher_image::normalize_encoded(&bytes, &mime)
+            }
+            (None, None, Some(sequence)) => {
+                let image = crate::clipboard_history::read_launcher_clipboard_image(sequence)
+                    .map_err(|_| "clipboardImageUnavailable")?
+                    .ok_or("clipboardImageUnavailable")?;
+                crate::launcher_image::normalize_rgba(image.width, image.height, &image.rgba)
+            }
+            _ => Err("invalidImage"),
+        }
+    })
+    .await
+    .map_err(|_| ServiceError::from("invalidImage"))?
+    .map_err(ServiceError::from)?;
+    // Bad decodes leave the old image and result authority untouched.
+    let image = manager
+        .launcher_images
+        .finish_import_with(sequence, normalized, |contexts| {
+            manager.retire_image_contexts(contexts);
+            let _ = app
+                .state::<ResultRegistries>()
+                .main()
+                .invalidate_domain(QueryDomain::Plugin);
+        })
+        .map_err(ServiceError::from)?;
+    Ok(image)
+}
+#[tauri::command]
+pub(crate) fn clear_launcher_image(
+    window: WebviewWindow,
+    import_sequence: u64,
+) -> Result<(), crate::public_plugins::host_services::ServiceError> {
+    use crate::public_plugins::host_services::ServiceError;
+    require_main_window(&window).map_err(|_| ServiceError::from("invalidCaller"))?;
+    let service = window.state::<Arc<PublicPluginService>>();
+    let manager = service
+        .manager()
+        .map_err(|_| ServiceError::from("imageUnavailable"))?;
+    manager
+        .launcher_images
+        .clear_with(import_sequence, |contexts| {
+            manager.retire_image_contexts(contexts);
+            let _ = window
+                .state::<ResultRegistries>()
+                .main()
+                .invalidate_domain(QueryDomain::Plugin);
+        })
+        .map_err(ServiceError::from)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -4665,6 +4785,12 @@ async fn submit_plugin_panel_impl(
     );
     Ok(Some(result))
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImageCommandTarget {
+    plugin_id: String,
+    command_id: String,
+}
 #[tauri::command]
 pub(crate) async fn search_apps(
     window: WebviewWindow,
@@ -4675,6 +4801,8 @@ pub(crate) async fn search_apps(
     completion_origin: Option<CompletionOriginInput>,
     stable_command_target: Option<crate::command_hotkeys::CommandEntry>,
     stable_builtin_target: Option<ManagedBuiltinFeature>,
+    image_id: Option<String>,
+    image_command: Option<ImageCommandTarget>,
 ) -> Result<Option<SearchResponse>, CommandError> {
     require_main_window(&window)?;
     let submit = submit.unwrap_or(false);
@@ -4682,12 +4810,93 @@ pub(crate) async fn search_apps(
     let registries = app.state::<ResultRegistries>();
     let registry = registries.main();
     let public_cleanup = app.state::<Arc<PublicPluginService>>();
+    let mut image_registry_token = None;
+    if image_command.is_some() && image_id.is_none() {
+        return Err(CommandError::plugin_query_failed());
+    }
+    if let Some(image_id) = image_id.as_deref() {
+        if stable_command_target.is_some()
+            || stable_builtin_target.is_some()
+            || completion_origin.is_some()
+        {
+            return Err(CommandError::plugin_query_failed());
+        }
+        let manager = public_cleanup.manager()?;
+        manager
+            .launcher_images
+            .current(image_id)
+            .map_err(|_| CommandError::stale_request())?;
+        let Some(token) = manager
+            .launcher_images
+            .admit_intent(
+                image_id,
+                query_sequence,
+                image_command.is_some() && submit,
+                || registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence),
+                |contexts| manager.retire_image_contexts(contexts),
+            )
+            .map_err(|_| CommandError::stale_request())?
+        else {
+            return Ok(None);
+        };
+        image_registry_token = Some(token);
+        public_cleanup.cleanup_retired_result_actions(registry);
+        if image_command.is_none() || !submit {
+            let commands = manager.image_commands(query.trim())?;
+            let entries = commands
+                .into_iter()
+                .filter_map(|(suggestion, reason)| {
+                    let reason = if reason.is_none()
+                        && manager
+                            .uses_baidu_service(&suggestion.plugin_id)
+                            .unwrap_or(false)
+                    {
+                        app.state::<crate::credentials::CredentialStore>()
+                            .baidu_ocr_status()
+                            .err()
+                            .map(|code| {
+                                if code == "credentialDisabled" {
+                                    "请在设置中启用百度 OCR 配置"
+                                } else {
+                                    "请在设置中配置百度 OCR"
+                                }
+                            })
+                    } else {
+                        reason
+                    };
+                    let (mut item, action) =
+                        public_plugin_completion_result(suggestion, Some(query.as_str()))?;
+                    if let Some(reason) = reason {
+                        item.subtitle = Some(reason.into());
+                        item.activation = LauncherResultActivation::Informational;
+                    }
+                    Some((item, action))
+                })
+                .collect::<Vec<_>>();
+            let empty = entries.is_empty();
+            return Ok({
+                registry.publish_if_latest(
+                    token,
+                    entries,
+                    || true,
+                    |request, items| {
+                        let mut response = search_response(request, items);
+                        if empty {
+                            response.command_hint = Some("没有可用的 OCR 插件".into());
+                        }
+                        response
+                    },
+                )
+            });
+        }
+    }
     let _result_action_cleanup = ResultActionCleanup {
         service: public_cleanup.inner(),
         registry,
     };
     let normalized_query = query.trim().to_owned();
-    if stable_command_target.is_none()
+    if image_id.is_none()
+        && stable_command_target.is_none()
         && completion_origin.is_none()
         && !normalized_query.starts_with('/')
     {
@@ -4751,7 +4960,8 @@ pub(crate) async fn search_apps(
         ));
     }
     let mut matched_public_identity = None;
-    if stable_command_target.is_none()
+    if image_id.is_none()
+        && stable_command_target.is_none()
         && completion_origin.is_none()
         && normalized_query.starts_with('/')
         && normalized_query != "/"
@@ -4942,7 +5152,8 @@ pub(crate) async fn search_apps(
             return Ok(response);
         }
     }
-    if stable_command_target.is_none()
+    if image_id.is_none()
+        && stable_command_target.is_none()
         && completion_origin.is_none()
         && (!normalized_query.starts_with('/') || normalized_query == "/")
     {
@@ -4990,7 +5201,8 @@ pub(crate) async fn search_apps(
         }
         return Ok(response);
     }
-    if stable_command_target.is_none()
+    if image_id.is_none()
+        && stable_command_target.is_none()
         && completion_origin.is_none()
         && reserved_catalog_query(&normalized_query, &quicklink_items)
     {
@@ -5011,7 +5223,8 @@ pub(crate) async fn search_apps(
             |_| {},
         ));
     }
-    if stable_command_target.is_none()
+    if image_id.is_none()
+        && stable_command_target.is_none()
         && completion_origin.is_none()
         && plugin_discovery_prefix(&normalized_query).is_some()
     {
@@ -5035,7 +5248,13 @@ pub(crate) async fn search_apps(
     let route_query = completion_origin
         .as_ref()
         .map_or(normalized_query.as_str(), |_| query.as_str());
-    let route = if let Some(target) = &stable_command_target {
+    let route = if let Some(target) = &image_command {
+        Some(
+            public
+                .manager()?
+                .image_route(&target.plugin_id, &target.command_id, &query)?,
+        )
+    } else if let Some(target) = &stable_command_target {
         if !app
             .state::<Arc<LifecycleCoordinator>>()
             .command_entry_current(app, target)
@@ -5077,6 +5296,19 @@ pub(crate) async fn search_apps(
         public.manager()?.route(route_query)?
     };
     if let Some(route) = route {
+        if image_id.is_none()
+            && public
+                .manager()?
+                .command_uses_image(&route.plugin_id, &route.command_id)?
+        {
+            return Ok(public_plugin_prompt(
+                registry,
+                &invocation_id,
+                query_sequence,
+                Some("请粘贴一张图片".into()),
+                submitted_main_result_command(&route, submit),
+            ));
+        }
         // Hotkey entry prompts before the ordinary Window completion exception.
         if stable_command_target.is_some() && route.input_required && route.input.is_empty() {
             return Ok(public_plugin_prompt(
@@ -5110,20 +5342,21 @@ pub(crate) async fn search_apps(
         if route.output_mode == PublicOutputMode::Panel {
             return Err(CommandError::plugin_query_failed());
         }
-        let Some(registry_token) =
-            registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence)
+        let Some(registry_token) = image_registry_token
+            .or_else(|| registry.begin_query(QueryDomain::Plugin, &invocation_id, query_sequence))
         else {
             return Ok(None);
         };
         public.cleanup_retired_result_actions(registry);
         let theme = invocation_theme(app, settings.snapshot().theme);
         let invoked_at = invoked_at_rfc3339();
-        let submission = public.schedule_command(
-            route.clone(),
-            query_sequence,
-            query.clone(),
-            Instant::now(),
-        )?;
+        let submission = if let Some(image_id) = image_id.as_deref() {
+            let prepared = public.prepare_command(route.clone(), query_sequence, query.clone())?;
+            public.bind_prepared_image(&prepared, image_id, query_sequence)?;
+            public.admit_prepared_command(prepared, Instant::now())?
+        } else {
+            public.schedule_command(route.clone(), query_sequence, query.clone(), Instant::now())?
+        };
         let submission_token = submission.token.clone();
         let dispatch = if let Some(recovery) = submission.recovery.clone() {
             let service = Arc::clone(public.inner());
@@ -5180,6 +5413,8 @@ pub(crate) async fn search_apps(
                 if route.output_mode != PublicOutputMode::MainResult {
                     return Err(CommandError::plugin_query_failed());
                 }
+                let mut route = route.clone();
+                route.result_publication = Some(publication.clone());
                 app.state::<crate::credentials::CredentialStore>()
                     .with_revision(credential_revision, || {
                         public
@@ -5515,6 +5750,7 @@ fn publish_public_main_results(
         .into_iter()
         .map(|result| {
             let action = result.copy_text.clone().map(|text| ResultAction::CopyText {
+                authority: route.result_publication.clone(),
                 command_id: Some(route.command_id.clone()),
                 plugin_id: route.plugin_id.clone(),
                 generation: route.generation,
@@ -7394,6 +7630,10 @@ pub(crate) async fn execute_result(
     let settings = app.state::<SettingsStore>();
     let cache = app.state::<Arc<AppCache>>();
     let worker_index = Arc::clone(file_index.inner());
+    let copy_publication = match registry.resolve(&request_id, &result_id) {
+        Ok(ResultAction::CopyText { authority, .. }) => authority,
+        _ => None,
+    };
     execute_result_with_clipboard(
         (&request_id, &result_id),
         ClipboardExecution {
@@ -7437,9 +7677,21 @@ pub(crate) async fn execute_result(
                         }) {
                             return Err(PluginCopyError::PermissionDenied);
                         }
-                        app.clipboard()
-                            .write_text(text.to_owned())
-                            .map_err(|_| PluginCopyError::SideEffectFailed)
+                        let copy = || {
+                            app.clipboard()
+                                .write_text(text.to_owned())
+                                .map_err(|_| PluginCopyError::SideEffectFailed)
+                        };
+                        if let Some(publication) = copy_publication.as_ref() {
+                            public_plugins
+                                .manager()
+                                .map_err(|_| PluginCopyError::PermissionDenied)?
+                                .scheduler()
+                                .with_result_publication(plugin_id, publication, copy)
+                                .map_err(|_| PluginCopyError::PermissionDenied)?
+                        } else {
+                            copy()
+                        }
                     },
                     || {
                         plugins.copy_text(plugin_id, generation, || {
@@ -7527,12 +7779,16 @@ where
         return Ok(ExecuteOutcome::TextCopied);
     }
     if let ResultAction::CopyText {
+        authority,
         command_id,
         plugin_id,
         generation,
         text,
     } = &action
     {
+        if authority.as_ref().is_some_and(|lease| !lease.live()) {
+            return Err(CommandError::stale_request());
+        }
         copy_plugin(plugin_id, command_id.as_deref(), *generation, text).map_err(|error| {
             match error {
                 PluginCopyError::PermissionDenied => CommandError::plugin_permission_denied(),
@@ -7795,6 +8051,9 @@ pub(crate) fn clear_and_hide_window(
         || {
             registry.hide_and_clear();
             if let Some(public) = app.try_state::<Arc<PublicPluginService>>() {
+                if let Ok(manager) = public.manager() {
+                    manager.retire_launcher_images(true);
+                }
                 public.cleanup_retired_result_actions(registry);
             }
         },
@@ -13303,6 +13562,7 @@ mod tests",
                         .unwrap();
                     let route = manager.route("/demo first").unwrap().unwrap();
                     let action = ResultAction::CopyText {
+                        authority: None,
                         plugin_id: route.plugin_id.clone(),
                         command_id: Some("default".into()),
                         generation: route.generation,
@@ -13424,6 +13684,7 @@ mod tests",
 
         fn copy_action() -> ResultAction {
             ResultAction::CopyText {
+                authority: None,
                 command_id: None,
                 plugin_id: "plugin".into(),
                 generation: 1,

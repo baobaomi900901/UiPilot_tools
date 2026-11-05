@@ -70,8 +70,11 @@ export interface PublicCommandV1 {
   activationMode: 'live' | 'submit'
   outputMode: 'mainResult' | 'window' | 'panel'
   inputRequired: boolean
+  inputCapabilities?: PublicInputCapability[]
   inputPlaceholder?: string | null
 }
+
+export type PublicInputCapability = 'image.ocr'
 
 export interface PublicNamedCommandV1 extends PublicCommandV1 {
   id: string
@@ -281,7 +284,9 @@ function validCommand(command: PublicCommandV1): boolean {
   return /^[a-z][a-z0-9-]{0,31}$/u.test(command.defaultName) &&
     (command.summary == null || (command.summary.trim().length > 0 && [...command.summary].length <= 512 && !/\p{Cc}/u.test(command.summary))) &&
     (!command.inputRequired || !!command.inputPlaceholder?.trim()) &&
-    (command.inputPlaceholder == null || plainText(command.inputPlaceholder))
+    (command.inputPlaceholder == null || plainText(command.inputPlaceholder)) &&
+    !duplicates(command.inputCapabilities ?? []) &&
+    (!(command.inputCapabilities?.length) || (command.activationMode === 'submit' && command.outputMode === 'mainResult'))
 }
 
 function sharedSemanticPointers(manifest: PublicManifestV1): string[] {
@@ -410,6 +415,7 @@ function namedCommandIssues(manifest: PublicManifestV1 & { commands: PublicNamed
         /\p{Cc}/u.test(command.summary)), 'summary', 'Command summary must be nonempty, at most 512 Unicode scalars, and contain no control characters.'],
       [command.inputRequired && !command.inputPlaceholder?.trim(), 'inputPlaceholder', 'A command requiring input must have a nonempty placeholder.'],
       [command.inputPlaceholder != null && !plainText(command.inputPlaceholder), 'inputPlaceholder', 'Command inputPlaceholder must be plain text.'],
+      [duplicates(command.inputCapabilities ?? []) || (!!command.inputCapabilities?.length && (command.activationMode !== 'submit' || command.outputMode !== 'mainResult')), 'inputCapabilities', 'Image OCR requires unique capabilities and submit/mainResult output.'],
     ]
     for (const [invalid, field, message] of rules) if (invalid) issues.push({
       code: 'MANIFEST_SEMANTIC_INVALID', message,
@@ -506,6 +512,7 @@ function validateParsedManifest(
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
+    (normalizedCommands(manifest).some(({ command }) => !!command.inputCapabilities?.length) && (versionGreater([0, 20, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (manifest.permissions.includes('files.openText') && (versionGreater([0, 13, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.window') || !manifest.window || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'window' || manifest.commands !== undefined)) ||
     (manifest.permissions.includes('speech.speak') && (versionGreater([0, 18, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.panel') || !manifest.panel || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'panel' || manifest.commands !== undefined)) ||
     (manifest.permissions.includes('clipboard.history.copy') && (versionGreater([0, 17, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||

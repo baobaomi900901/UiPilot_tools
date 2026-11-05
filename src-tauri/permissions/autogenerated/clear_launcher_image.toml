@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clear-launcher-image"
+description = "Enables the clear_launcher_image command without any pre-configured scope."
+commands.allow = ["clear_launcher_image"]
+
+[[permission]]
+identifier = "deny-clear-launcher-image"
+description = "Denies the clear_launcher_image command without any pre-configured scope."
+commands.deny = ["clear_launcher_image"]

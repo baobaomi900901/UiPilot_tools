@@ -203,6 +203,7 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
     networkResponseInvalid: 'NetworkResponseInvalidError',
     networkLimitExceeded: 'NetworkLimitExceededError',
     expiredRequest: 'ExpiredRequestError',
+    serviceAlreadyUsed: 'InvalidServiceRequestError',
   }));
   const mapNetworkError = (error) => {
     try {
@@ -309,6 +310,29 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
                   || source.targetLanguage !== snapshot.to || typeof source.unchanged !== 'boolean' || !arrayIsArray(translations)
                   || !translations.length || arraySome(translations, (text) => typeof text !== 'string' || !text.length)) throw 0;
               return deepFreeze(nullRecord({ translations, sourceLanguage: source.sourceLanguage, targetLanguage: source.targetLanguage, unchanged: source.unchanged }));
+            } catch (_) { throw fail('NetworkResponseInvalidError'); }
+          },
+        }), baidu: nullRecord({
+          ocr: async function(input) {
+            let snapshot;
+            try {
+              if (arguments.length !== 1) throw 0;
+              snapshot = ownData(input, new SetConstructor(['imageId']));
+              if (reflectOwnKeys(snapshot).length !== 1 || typeof snapshot.imageId !== 'string'
+                  || !snapshot.imageId.length || snapshot.imageId.length > 512) throw 0;
+            } catch (_) { throw fail('InvalidServiceRequestError'); }
+            const requestContext = context();
+            let response;
+            try { response = await invoke('plugin_baidu_ocr', { input: { context: requestContext, input: snapshot } }); }
+            catch (error) { throw mapNetworkError(error); }
+            context();
+            try {
+              const source = ownData(response, new SetConstructor(['text', 'lines']));
+              const lines = copyJson(source.lines);
+              if (reflectOwnKeys(source).length !== 2 || typeof source.text !== 'string'
+                  || encodeText(source.text).length > 16384 || !arrayIsArray(lines)
+                  || arraySome(lines, (line) => typeof line !== 'string')) throw 0;
+              return deepFreeze(nullRecord({ text: source.text, lines }));
             } catch (_) { throw fail('NetworkResponseInvalidError'); }
           },
         }) });
@@ -952,6 +976,8 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PluginInvocation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image: Option<crate::launcher_image::ImageDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) command_id: Option<String>,
     pub(crate) api_version: u32,
     pub(crate) request_id: String,
@@ -1123,6 +1149,7 @@ mod tests {
     #[test]
     fn invocation_legacy_keys_are_exact_and_new_wire_includes_selected_command() {
         let mut invocation = PluginInvocation {
+            image: None,
             command_id: None,
             api_version: 1,
             request_id: "host-request".into(),

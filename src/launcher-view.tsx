@@ -35,7 +35,7 @@ import { OverlayScrollbarsComponent } from 'overlayscrollbars-react'
 import { sameFavoriteTarget, type HotkeyRecordingPhase, type LauncherCore } from './launcher-core'
 import { CredentialSettings, type CredentialSettingsHandle, type CredentialSettingsStatus } from './credential-settings'
 import { MessageCenterPanel } from './message-center-panel'
-import { bindNativeTextInput } from './native-input'
+import { bindNativeImagePaste, bindNativeTextInput } from './native-input'
 import { PluginIcon } from './plugin-icon'
 import { PublicPluginDetail, PublicPluginPanel, type PublicPluginRemovalOutcome } from './public-plugin-panel'
 import { PluginPermissionsPanel } from './plugin-permissions-panel'
@@ -69,6 +69,7 @@ interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
   onBound?: (input: HTMLInputElement) => void
   onUnbound?: (input: HTMLInputElement) => void
   onBindingFailed?: () => void
+  imagePaste?: boolean
 }
 
 export { HOTKEY_RECORDING_CURRENT_DOM_EVENT } from './hotkey-recorder-input'
@@ -83,7 +84,7 @@ type QuicklinksUiStatus = {
   tone: 'success' | 'error'
 }
 
-function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed, ...props }: BoundInputProps) {
+function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed, imagePaste = false, ...props }: BoundInputProps) {
   const ref = useRef<InputRef>(null)
   useLayoutEffect(() => {
     const input = ref.current?.input
@@ -107,7 +108,9 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
       }
     }
     try {
-      unbind = bindNativeTextInput(input, control, core.text)
+      const unbindText = bindNativeTextInput(input, control, core.text)
+      const unbindImage = imagePaste ? bindNativeImagePaste(input, (file) => { void core.importImage(file) }) : undefined
+      unbind = () => { unbindText(); unbindImage?.() }
       onBound?.(input)
       return cleanup
     } catch {
@@ -117,7 +120,7 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
       onBindingFailed?.()
       return () => undefined
     }
-  }, [control, core, onBindingFailed, onBound, onUnbound])
+  }, [control, core, imagePaste, onBindingFailed, onBound, onUnbound])
   return <Input {...props} ref={ref} value={value} onChange={() => {}} />
 }
 
@@ -822,7 +825,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const resultOperation = launcherResultsActive && statusResult && !snapshot.resultActionRerun
     ? statusResult.actions
       ? statusResult.defaultActionTitle ?? (statusResult.actions.length ? '选择动作' : '')
-      : statusResult.hasDefaultAction === false ? '' : snapshot.mainResultCommand ? '复制' : '执行'
+      : statusResult.hasDefaultAction === false ? '' : snapshot.mainResultCommand || snapshot.image?.phase === 'result' ? '复制' : '执行'
     : ''
   const status =
     operationsError ||
@@ -873,7 +876,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
         shortcut: action.actionId === statusResult.defaultActionId ? 'Enter' : undefined,
         icon: /复制/.test(action.title) ? 'copy' : 'arrow', disabledReason: snapshot.resultActionsDisabled ? '结果暂不可用，请重新运行' : undefined,
         run: owned(() => core.executeResultAction(snapshot.selectedIndex, action.actionId)) }))
-      else if (statusResult.hasDefaultAction !== false) context.push({ id: 'result-default', title: resultOperation || '执行', shortcut: 'Enter', icon: snapshot.mainResultCommand ? 'copy' : 'arrow', run: owned(() => core.activateResult(snapshot.selectedIndex)) })
+      else if (statusResult.hasDefaultAction !== false) context.push({ id: 'result-default', title: resultOperation || '执行', shortcut: 'Enter', icon: snapshot.mainResultCommand || snapshot.image?.phase === 'result' ? 'copy' : 'arrow', run: owned(() => core.activateResult(snapshot.selectedIndex)) })
       if (snapshot.resultActionRerun) context.push({ id: 'rerun', title: '重新运行', icon: 'arrow', run: owned(core.rerunResultCommand) })
     }
     if (quicklinks) {
@@ -949,7 +952,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     const isComposing = composing(event)
     if (!isComposing) event.preventDefault()
     if (event.key === 'Enter' && !isComposing && statusResult?.actions && !statusResult.hasDefaultAction) captureActionFocus()
-    core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing)
+    core.keyDown(event.key as 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing, event.repeat)
   }
   const launcherTabKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (hotkeyRecordingActive.current || event.target instanceof Element && event.target.closest('dialog, [role="dialog"]')) return
@@ -971,7 +974,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     const input = mainResultInputRef.current ?? queryRef.current
     if (!input || input.disabled) return
     const settingsButton = input.closest('.launcher-surface')?.querySelector<HTMLElement>('.launcher-settings-button') ?? null
-    const controls = [input, actionsButtonRef.current, rerunButtonRef.current, settingsButton]
+    const imageRemove = input.closest('.launcher-surface')?.querySelector<HTMLElement>('.launcher-image-remove') ?? null
+    const imageDetail = input.closest('.launcher-surface')?.querySelector<HTMLElement>('.launcher-image-result-detail') ?? null
+    const controls = [input, imageRemove, imageDetail, actionsButtonRef.current, rerunButtonRef.current, settingsButton]
       .filter((element): element is HTMLElement => element !== null && !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true')
     event.preventDefault()
     event.stopPropagation()
@@ -1307,7 +1312,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             ) : null}
           </span>
           {item.subtitle ? <span className="result-subtitle" title={item.subtitle}>{item.subtitle}</span> : null}
-          {item.detail ? <span className="result-detail">{item.detail}</span> : null}
+          {item.detail && !snapshot.image ? <span className="result-detail">{item.detail}</span> : null}
         </span>
       </div>
     )
@@ -1439,6 +1444,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               placeholder="请输入参数"
               role="combobox"
               spellCheck={false}
+              imagePaste
               onKeyDown={mainResultKeyDown}
               onBound={reportMainResultBound}
               onUnbound={reportMainResultUnbound}
@@ -1473,7 +1479,12 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               aria-activedescendant={
                 snapshot.selectedIndex >= 0 ? `launcher-result-${snapshot.results[snapshot.selectedIndex]?.key}` : undefined
               }
+              prefix={snapshot.image ? <span className="launcher-image-input">
+                <img src={snapshot.image.previewDataUrl} alt="已粘贴的图片" />
+                <Button className="launcher-image-remove" type="text" size="small" aria-label="移除图片" icon={<X aria-hidden size={14} />} onMouseDown={(event) => event.preventDefault()} onClick={() => { core.removeImage(); queryRef.current?.focus() }} />
+              </span> : undefined}
               suffix={settingsControl}
+              imagePaste
               onKeyDown={queryKeyDown}
               onBound={reportQueryBound}
               onBindingFailed={reportFailed}
@@ -1482,7 +1493,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
         )}
       </div>
 
-      <div className="launcher-results-region">
+      <div className={`launcher-results-region${snapshot.image?.phase === 'result' ? ' launcher-image-results' : ''}`}>
         <Spin spinning={snapshot.searchPending} size="small">
         <div className="launcher-result-surface">
           {snapshot.commandHint ? <div className="command-hint">{snapshot.commandHint}</div> : null}
@@ -1513,6 +1524,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 ))
               : indexedLauncherResults.map(({ item, index }) => renderLauncherResult(item, index))}
           </div>
+        {snapshot.image?.phase === 'result' && snapshot.results[snapshot.selectedIndex]?.detail ? (
+          <pre className="launcher-image-result-detail" aria-label="识别全文" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === 'Escape') queryKeyDown(event) }}>{snapshot.results[snapshot.selectedIndex].detail}</pre>
+        ) : null}
         </div>
         </Spin>
       </div>

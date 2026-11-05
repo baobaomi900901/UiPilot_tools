@@ -85,6 +85,9 @@ export const client: LauncherClient = {
     if (!snapshot) throw { code: 'MessageOperationFailed', storeStatus: 'ready' }
     return snapshot
   },
+  importLauncherImage: (input) => invoke('import_launcher_image', { input }),
+  clearLauncherImage: (input) => invoke('clear_launcher_image', { ...input }),
+  getLauncherClipboardSequence: () => invoke('get_launcher_clipboard_sequence'),
   searchApps: (input) => invoke<SearchResponse | null>('search_apps', { ...input }),
   listQuicklinks: () => invoke<QuicklinkListResponse>('list_quicklinks'),
   saveQuicklink: (input) => invoke<QuicklinkView>('save_quicklink', input),

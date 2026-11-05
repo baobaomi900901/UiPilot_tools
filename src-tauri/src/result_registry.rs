@@ -29,6 +29,7 @@ pub(crate) enum ResultAction {
         url: String,
     },
     CopyText {
+        authority: Option<crate::public_plugins::result_action::ResultActionLease>,
         // Public commands carry a saved ID; None belongs only to the internal legacy manager.
         command_id: Option<String>,
         plugin_id: String,
@@ -1448,6 +1449,7 @@ mod tests {
                 vec![(
                     item("", "Plugin"),
                     ResultAction::CopyText {
+                        authority: None,
                         command_id: None,
                         plugin_id: "plugin".into(),
                         generation: 1,
@@ -1462,6 +1464,7 @@ mod tests {
         assert_eq!(
             registry.resolve(&response.0, &response.1[0].0),
             Ok(ResultAction::CopyText {
+                authority: None,
                 command_id: None,
                 plugin_id: "plugin".into(),
                 generation: 1,
@@ -1792,6 +1795,7 @@ mod tests {
         registries.find().on_show("other-window".into());
         registry.on_show("invocation-1".into());
         let copy = |command_id: &str, text: &str| ResultAction::CopyText {
+            authority: None,
             plugin_id: "com.example.multi".into(),
             command_id: Some(command_id.into()),
             generation: 1,

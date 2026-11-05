@@ -568,6 +568,7 @@ pub(crate) struct ManagementEffects {
 }
 
 pub(crate) struct PublicPluginManager {
+    pub(crate) launcher_images: Arc<crate::launcher_image::LauncherImageStore>,
     host: PublicPluginHost,
     #[cfg(test)]
     app_data_dir: PathBuf,
@@ -609,6 +610,285 @@ pub(crate) struct PublicPluginManager {
 }
 
 impl PublicPluginManager {
+    pub(crate) fn uses_baidu_service(
+        &self,
+        plugin: &str,
+    ) -> Result<bool, PublicPluginManagementError> {
+        Ok(self
+            .bundles
+            .confirmed_bundle(plugin)?
+            .is_some_and(|bundle| {
+                bundle
+                    .runtime
+                    .manifest
+                    .permissions
+                    .contains(&PublicPermission::CredentialsBaiduOcr)
+            }))
+    }
+    pub(crate) fn command_uses_image(
+        &self,
+        plugin: &str,
+        command: &str,
+    ) -> Result<bool, PublicPluginManagementError> {
+        Ok(self
+            .bundles
+            .confirmed_bundle(plugin)?
+            .is_some_and(|bundle| {
+                bundle
+                    .runtime
+                    .manifest
+                    .command_by_id(command)
+                    .is_some_and(|command| {
+                        command
+                            .input_capabilities
+                            .contains(&super::manifest::PublicInputCapability::ImageOcr)
+                    })
+            }))
+    }
+    pub(crate) fn retire_launcher_images(&self, remove: bool) {
+        let contexts = if remove {
+            self.launcher_images.invalidate()
+        } else {
+            self.launcher_images.retire_bindings()
+        };
+        self.retire_image_contexts(contexts);
+    }
+    pub(crate) fn retire_image_contexts(&self, contexts: Vec<PluginRequestContext>) {
+        if let Ok(transition) = self.network_authority.begin_transition() {
+            for context in contexts {
+                let _ = self.scheduler.retire_service_request_context(&context);
+                transition.invalidate_context(&context);
+            }
+        }
+    }
+    pub(crate) fn image_commands(
+        &self,
+        query: &str,
+    ) -> Result<Vec<(PublicCommandSuggestion, Option<&'static str>)>, PublicPluginManagementError>
+    {
+        let mut result = Vec::new();
+        for suggestion in self.command_suggestions(query)? {
+            let Some(bundle) = self.bundles.confirmed_bundle(&suggestion.plugin_id)? else {
+                continue;
+            };
+            let Some(command) = bundle
+                .runtime
+                .manifest
+                .command_by_id(&suggestion.command_id)
+            else {
+                continue;
+            };
+            if !command
+                .input_capabilities
+                .contains(&super::manifest::PublicInputCapability::ImageOcr)
+            {
+                continue;
+            }
+            let reason = if bundle
+                .runtime
+                .manifest
+                .permissions
+                .iter()
+                .any(|p| !bundle.config.permission_grants.contains(p))
+            {
+                Some("请在设置中授予 OCR 所需权限")
+            } else if bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::CredentialsBaiduOcr)
+                && !bundle
+                    .config
+                    .network_https_hosts_grant
+                    .contains("aip.baidubce.com")
+            {
+                Some("请在设置中授权百度服务主机")
+            } else {
+                None
+            };
+            result.push((suggestion, reason));
+        }
+        result.sort_by_key(|(suggestion, _)| {
+            (
+                suggestion.plugin_id != "com.uipilot.baidu-ocr",
+                suggestion.display_name.clone(),
+                suggestion.command_id.clone(),
+            )
+        });
+        Ok(result)
+    }
+    pub(crate) fn image_route(
+        &self,
+        plugin: &str,
+        command_id: &str,
+        input: &str,
+    ) -> Result<PublicPluginRoute, PublicPluginManagementError> {
+        if !self.image_commands("")?.iter().any(|(entry, reason)| {
+            entry.plugin_id == plugin && entry.command_id == command_id && reason.is_none()
+        }) {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        let mut route = self
+            .route_by_id(plugin, command_id, input)?
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        route.input_required = false;
+        route.result_publication = Some(
+            self.scheduler
+                .capture_result_publication(
+                    plugin,
+                    route.generation,
+                    route.activation_id,
+                    route.admission_epoch,
+                )
+                .map_err(|_| PublicPluginManagementError::Unavailable)?,
+        );
+        Ok(route)
+    }
+    pub(crate) async fn baidu_ocr(
+        &self,
+        caller: PluginRuntimeIdentity,
+        input: super::baidu_ocr::BaiduCommandInput,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<super::baidu_ocr::BaiduResponse, super::host_services::ServiceError> {
+        use super::{
+            baidu_ocr as ocr,
+            host_services::{network_code, ServiceError},
+        };
+        let prepare = || -> Result<_, &'static str> {
+            let _mutation = self.lock_mutation().map_err(|_| "expiredRequest")?;
+            if caller.plugin_id != input.context.plugin_id
+                || caller.generation != input.context.plugin_generation
+            {
+                return Err("expiredRequest");
+            }
+            let bundle = self
+                .bundles
+                .confirmed_bundle(&caller.plugin_id)
+                .map_err(|_| "expiredRequest")?
+                .ok_or("expiredRequest")?;
+            if !bundle.config.enabled
+                || !bundle.config.installed
+                || bundle.config.fault.is_some()
+                || bundle.runtime.generation != caller.generation
+                || bundle.runtime_recovery_needed
+            {
+                return Err("expiredRequest");
+            }
+            if !bundle
+                .runtime
+                .manifest
+                .permissions
+                .contains(&PublicPermission::CredentialsBaiduOcr)
+                || !bundle
+                    .config
+                    .permission_grants
+                    .contains(&PublicPermission::CredentialsBaiduOcr)
+            {
+                return Err("servicePermissionDenied");
+            }
+            let image = self
+                .launcher_images
+                .claim(&input.context, &input.input.image_id)?;
+            let publication = self
+                .scheduler
+                .capture_result_publication(
+                    &caller.plugin_id,
+                    caller.generation,
+                    bundle.activation_id,
+                    bundle.admission_epoch,
+                )
+                .map_err(|_| "expiredRequest")?;
+            drop(_mutation);
+            let gate = Arc::clone(&self.network_authority);
+            let scheduler = Arc::clone(&self.scheduler);
+            let context = input.context.clone();
+            let revoke = publication.clone();
+            store.with_baidu_ocr(
+                &input.context,
+                publication,
+                Box::new(move || {
+                    revoke.revoke();
+                    if let Ok(transition) = gate.begin_transition() {
+                        let _ = scheduler.retire_service_request_context(&context);
+                        transition.invalidate_context(&context);
+                    }
+                }),
+                |revision, values| {
+                    let mut request = self
+                        .network_authority
+                        .admit(
+                            &caller.plugin_id,
+                            caller.generation,
+                            &input.context,
+                            self.scheduler.as_ref(),
+                            ocr::authentication(values)?,
+                        )
+                        .map_err(network_code)?;
+                    request.deny_redirects();
+                    Ok((revision, request, image))
+                },
+            )
+        };
+        let (revision, prepared, image) = prepare().map_err(ServiceError::from)?;
+        let pending = self
+            .network_authority
+            .broker()
+            .execute(
+                prepared,
+                self.network_authority
+                    .redirect_authority(Arc::clone(&self.scheduler)),
+            )
+            .await
+            .map_err(network_code)
+            .map_err(ServiceError::from)?;
+        let prepared = store
+            .with_revision(revision, || {
+                self.launcher_images
+                    .bound(&input.context, Some(&input.input.image_id))?;
+                let response = self
+                    .network_authority
+                    .deliver(pending, self.scheduler.as_ref())
+                    .map_err(network_code)?;
+                let token = ocr::access_token(response.status, &response.body)?;
+                let mut prepared = self
+                    .network_authority
+                    .admit(
+                        &caller.plugin_id,
+                        caller.generation,
+                        &input.context,
+                        self.scheduler.as_ref(),
+                        ocr::form_request(ocr::OCR_URL, BTreeMap::new()),
+                    )
+                    .map_err(network_code)?;
+                prepared
+                    .baidu_ocr_upload(&token, &image.png)
+                    .map_err(network_code)?;
+                Ok(prepared)
+            })
+            .map_err(ServiceError::from)?;
+        let pending = self
+            .network_authority
+            .broker()
+            .execute(
+                prepared,
+                self.network_authority
+                    .redirect_authority(Arc::clone(&self.scheduler)),
+            )
+            .await
+            .map_err(network_code)
+            .map_err(ServiceError::from)?;
+        store
+            .with_revision(revision, || {
+                self.launcher_images
+                    .bound(&input.context, Some(&input.input.image_id))?;
+                let response = self
+                    .network_authority
+                    .deliver(pending, self.scheduler.as_ref())
+                    .map_err(network_code)?;
+                ocr::parse_response(response.status, &response.body)
+            })
+            .map_err(ServiceError::from)
+    }
     pub(crate) fn load(
         app_data_dir: &Path,
         host: PublicPluginHost,
@@ -807,6 +1087,7 @@ impl PublicPluginManager {
             }
         }
         let manager = Self {
+            launcher_images: Arc::new(crate::launcher_image::LauncherImageStore::default()),
             host,
             #[cfg(test)]
             app_data_dir: app_data_dir.to_path_buf(),
@@ -10551,6 +10832,7 @@ mod tests {
             .begin_query(QueryDomain::Plugin, "copy-owner", 1)
             .unwrap();
         let action = ResultAction::CopyText {
+            authority: None,
             plugin_id: route.plugin_id.clone(),
             command_id: Some(route.command_id.clone()),
             generation: route.generation,
@@ -15523,6 +15805,280 @@ mod tests {
             "credentials.deepseek"
         ]);
         fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    fn write_baidu_ocr_package(dir: &TestDir) {
+        write_network_package(&dir.source(), "1.0.0", &["aip.baidubce.com"]);
+        let path = dir.source().join("plugin.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["minimumHostVersion"] = json!("0.20.0");
+        manifest["command"]["activationMode"] = json!("submit");
+        manifest["command"]["inputCapabilities"] = json!(["image.ocr"]);
+        manifest["permissions"] =
+            json!(["network.https", "credentials.baiduOcr", "clipboard.write"]);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    fn baidu_fixture(
+        dir: &TestDir,
+        gate: Arc<PluginNetworkAuthorityGate>,
+    ) -> (
+        Arc<PublicPluginManager>,
+        Arc<crate::credentials::CredentialStore>,
+        PluginRequestContext,
+        String,
+    ) {
+        write_baidu_ocr_package(dir);
+        let manager = Arc::new(manager_with_network_authority(dir, gate));
+        let now = Instant::now();
+        let prepared = manager.prepare("main", source(&dir.source()), now).unwrap();
+        manager
+            .commit_with_readiness(
+                "main",
+                &prepared.token,
+                BTreeSet::from([
+                    PublicPermission::NetworkHttps,
+                    PublicPermission::ClipboardWrite,
+                ]),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        manager
+            .set_permission_access_with_effects(
+                "com.example.network",
+                PublicPermission::CredentialsBaiduOcr,
+                true,
+                &manager.state.inventory_revision().unwrap().to_string(),
+                &mut ManagementEffects::default(),
+            )
+            .unwrap();
+        let store = Arc::new(crate::credentials::CredentialStore::new(
+            dir.path().join("synthetic-baidu"),
+        ));
+        store.synthetic_baidu_for_test();
+        manager.launcher_images.begin_import(1).unwrap();
+        let image = manager
+            .launcher_images
+            .finish_import(
+                1,
+                crate::launcher_image::normalize_rgba(1, 1, &[255, 0, 0, 255]).unwrap(),
+            )
+            .unwrap();
+        let route = manager
+            .image_route("com.example.network", "default", "")
+            .unwrap();
+        let context = dispatch_network_request(&manager);
+        manager
+            .launcher_images
+            .bind(&image.id, &context, route.result_publication.unwrap())
+            .unwrap();
+        let id = manager
+            .launcher_images
+            .bound(&context, None)
+            .unwrap()
+            .id
+            .clone();
+        (manager, store, context, id)
+    }
+    fn baidu_input(
+        context: &PluginRequestContext,
+        id: &str,
+    ) -> super::super::baidu_ocr::BaiduCommandInput {
+        serde_json::from_value(json!({"context":context,"input":{"imageId":id}})).unwrap()
+    }
+    #[test]
+    fn baidu_ocr_completed_result_can_return_to_list_and_run_again() {
+        let dir = TestDir::new("baidu-rerun");
+        let (gate, _) = PluginNetworkAuthorityGate::baidu_responses_for_test(Vec::new());
+        let (manager, _, context, _) = baidu_fixture(&dir, gate);
+        manager.scheduler.complete(&context, Instant::now()).unwrap();
+        manager.retire_launcher_images(false);
+        assert!(manager.image_route("com.example.network", "default", "").is_ok());
+    }
+    #[tokio::test]
+    async fn baidu_ocr_uses_exactly_one_authentication_and_one_bounded_fixed_upload() {
+        let dir = TestDir::new("baidu-success");
+        let (gate, requests) = PluginNetworkAuthorityGate::baidu_responses_for_test(vec![
+            (
+                200,
+                br#"{"access_token":"synthetic-token","scope":"brain_ocr","expires_in":3600}"#
+                    .to_vec(),
+            ),
+            (
+                200,
+                br#"{"words_result":[{"words":"first"},{"words":"second"}]}"#.to_vec(),
+            ),
+        ]);
+        let (manager, store, context, id) = baidu_fixture(&dir, gate);
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        assert_eq!(
+            manager
+                .baidu_ocr(caller.clone(), baidu_input(&context, &id), &store)
+                .await
+                .unwrap()
+                .text,
+            "first\nsecond"
+        );
+        assert_eq!(
+            manager
+                .baidu_ocr(caller, baidu_input(&context, &id), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "serviceAlreadyUsed"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "/oauth/2.0/token");
+        let auth: BTreeMap<_, _> = url::form_urlencoded::parse(&requests[0].1)
+            .into_owned()
+            .collect();
+        assert_eq!(
+            auth.get("client_id").map(String::as_str),
+            Some("synthetic-key")
+        );
+        assert_eq!(
+            auth.get("client_secret").map(String::as_str),
+            Some("synthetic-secret")
+        );
+        assert_eq!(
+            requests[1].0,
+            "/rest/2.0/ocr/v1/general_basic?access_token=synthetic-token"
+        );
+        let body: BTreeMap<_, _> = url::form_urlencoded::parse(&requests[1].1)
+            .into_owned()
+            .collect();
+        assert_eq!(body.len(), 1);
+        assert_eq!(
+            body["image"],
+            crate::launcher_image::base64(
+                &manager.launcher_images.bound(&context, None).unwrap().png
+            )
+        );
+    }
+    #[tokio::test]
+    async fn baidu_ocr_unknown_cross_plugin_and_revoked_images_cannot_send() {
+        let dir = TestDir::new("baidu-id-gates");
+        let (gate, requests) = PluginNetworkAuthorityGate::baidu_responses_for_test(Vec::new());
+        let (manager, store, context, id) = baidu_fixture(&dir, gate);
+        let caller = PluginRuntimeIdentity {
+            plugin_id: context.plugin_id.clone(),
+            generation: context.plugin_generation,
+        };
+        assert_eq!(
+            manager
+                .baidu_ocr(caller.clone(), baidu_input(&context, "unknown"), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "expiredRequest"
+        );
+        let mut foreign = context.clone();
+        foreign.plugin_id = "com.example.foreign".into();
+        assert_eq!(
+            manager
+                .baidu_ocr(caller.clone(), baidu_input(&foreign, &id), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "expiredRequest"
+        );
+        manager.retire_launcher_images(true);
+        assert_eq!(
+            manager
+                .baidu_ocr(caller, baidu_input(&context, &id), &store)
+                .await
+                .unwrap_err()
+                .code,
+            "expiredRequest"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn baidu_ocr_replacement_hide_and_credential_mutation_cancel_authentication() {
+        for mode in ["replace", "hide", "credentials", "permission"] {
+            let dir = TestDir::new(&format!("baidu-race-{mode}"));
+            let (gate, started) = PluginNetworkAuthorityGate::blocking_for_test();
+            let (manager, store, context, id) = baidu_fixture(&dir, gate);
+            let publication = manager
+                .scheduler
+                .capture_result_publication(
+                    &context.plugin_id,
+                    context.plugin_generation,
+                    manager
+                        .bundles
+                        .confirmed_bundle(&context.plugin_id)
+                        .unwrap()
+                        .unwrap()
+                        .activation_id,
+                    manager
+                        .bundles
+                        .confirmed_bundle(&context.plugin_id)
+                        .unwrap()
+                        .unwrap()
+                        .admission_epoch,
+                )
+                .unwrap();
+            let task = tokio::spawn({
+                let manager = manager.clone();
+                let store = store.clone();
+                let context = context.clone();
+                async move {
+                    manager
+                        .baidu_ocr(
+                            PluginRuntimeIdentity {
+                                plugin_id: context.plugin_id.clone(),
+                                generation: context.plugin_generation,
+                            },
+                            baidu_input(&context, &id),
+                            &store,
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            match mode {
+                "credentials" => store.disable_baidu_for_test(),
+                "permission" => {
+                    manager
+                        .set_permission_access_with_effects(
+                            &context.plugin_id,
+                            PublicPermission::CredentialsBaiduOcr,
+                            false,
+                            &manager.state.inventory_revision().unwrap().to_string(),
+                            &mut ManagementEffects::default(),
+                        )
+                        .unwrap();
+                }
+                "replace" => {
+                    manager.launcher_images.begin_import(2).unwrap();
+                    manager
+                        .launcher_images
+                        .finish_import_with(
+                            2,
+                            crate::launcher_image::normalize_rgba(1, 1, &[0, 255, 0, 255]).unwrap(),
+                            |contexts| manager.retire_image_contexts(contexts),
+                        )
+                        .unwrap();
+                }
+                _ => manager.retire_launcher_images(true),
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                "expiredRequest",
+                "{mode}"
+            );
+            assert!(!publication.live(), "{mode} must also revoke later copy");
+        }
     }
     #[tokio::test]
     async fn host_services_independent_grants_caller_and_config_mutation_retire_pending_request() {

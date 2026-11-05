@@ -841,6 +841,7 @@ mod tests {
             vec![(
                 (),
                 ResultAction::CopyText {
+                    authority: None,
                     command_id: None,
                     plugin_id: "test".into(),
                     generation: 1,
@@ -1346,6 +1347,7 @@ mod tests {
             vec![(
                 (),
                 ResultAction::CopyText {
+                    authority: None,
                     command_id: None,
                     plugin_id: "p".into(),
                     generation: 1,

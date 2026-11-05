@@ -70,7 +70,7 @@ pub(crate) enum PluginNetworkRequestBody {
     Form { value: BTreeMap<String, String> },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PluginNetworkRequest {
     pub(crate) url: String,
@@ -81,6 +81,21 @@ pub(crate) struct PluginNetworkRequest {
     pub(crate) body: Option<PluginNetworkRequestBody>,
     #[serde(default, deserialize_with = "deserialize_credential")]
     pub(crate) credential: Option<String>,
+}
+impl std::fmt::Debug for PluginNetworkRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginNetworkRequest")
+            .field("url", &"<redacted>")
+            .field("method", &self.method)
+            .field("headers", &"<redacted>")
+            .field("body", &"<redacted>")
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 fn deserialize_credential<'de, D: serde::Deserializer<'de>>(
@@ -145,6 +160,37 @@ pub(crate) struct PreparedPluginNetworkCall {
 }
 
 impl PreparedPluginNetworkCall {
+    /// Host business-service only. The public request validator remains capped at 64KiB.
+    pub(crate) fn baidu_ocr_upload(
+        &mut self,
+        token: &str,
+        png: &[u8],
+    ) -> Result<(), PluginNetworkErrorCode> {
+        if self.request.url.as_str() != super::super::baidu_ocr::OCR_URL
+            || self.request.method != PluginNetworkRequestMethod::Post
+            || png.is_empty()
+            || png.len() > crate::launcher_image::MAX_PNG
+            || token.is_empty()
+            || token.len() > 8192
+        {
+            return Err(PluginNetworkErrorCode::InvalidNetworkRequest);
+        }
+        self.request
+            .url
+            .query_pairs_mut()
+            .append_pair("access_token", token);
+        self.request.body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("image", &crate::launcher_image::base64(png))
+            .finish()
+            .into_bytes();
+        // The provider bounds the complete Base64/percent-encoded form to 8MiB.
+        if self.request.body.len() > 8 * 1024 * 1024 {
+            return Err(PluginNetworkErrorCode::InvalidNetworkRequest);
+        }
+        self.request.content_type = Some("application/x-www-form-urlencoded");
+        self.deny_redirects();
+        Ok(())
+    }
     pub(super) fn identity(&self) -> &PluginNetworkCallIdentity {
         self.call.identity()
     }
@@ -849,6 +895,46 @@ fn log_terminal(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn business_request_debug_does_not_expose_credentials_or_image() {
+        let mut request =
+            crate::public_plugins::baidu_ocr::authentication(&std::collections::BTreeMap::from([
+                ("apiKey".into(), "synthetic-key-private".into()),
+                ("secretKey".into(), "synthetic-secret-private".into()),
+            ]))
+            .unwrap();
+        request
+            .url
+            .push_str("?access_token=synthetic-token-private");
+        let debug = format!("{request:?}");
+        for value in [
+            "synthetic-key-private",
+            "synthetic-secret-private",
+            "synthetic-token-private",
+        ] {
+            assert!(!debug.contains(value));
+        }
+    }
+    #[test]
+    fn baidu_ocr_encoded_upload_obeys_eight_mib_provider_bound() {
+        let (broker, _) = broker(Vec::new());
+        let hosts = BTreeSet::from(["aip.baidubce.com".into()]);
+        let request = crate::public_plugins::baidu_ocr::form_request(
+            crate::public_plugins::baidu_ocr::OCR_URL,
+            std::collections::BTreeMap::new(),
+        );
+        let mut prepared = broker
+            .admit(&context("public-request-0000000000000001"), &hosts, request)
+            .unwrap();
+        // 0xff encodes to '/' and percent-escaping makes a 3MiB PNG body larger than8MiB.
+        assert_eq!(
+            prepared.baidu_ocr_upload(
+                "synthetic-token",
+                &vec![255; crate::launcher_image::MAX_PNG]
+            ),
+            Err(PluginNetworkErrorCode::InvalidNetworkRequest)
+        );
+    }
     use std::{
         collections::BTreeSet,
         net::SocketAddr,
@@ -935,6 +1021,50 @@ mod tests {
             body: None,
             credential: None,
         }
+    }
+    #[test]
+    fn baidu_ocr_upload_does_not_expand_public_network_body_limits() {
+        let (broker, _) = broker(Vec::new());
+        let hosts = BTreeSet::from(["aip.baidubce.com".into()]);
+        let mut generic = crate::public_plugins::baidu_ocr::form_request(
+            crate::public_plugins::baidu_ocr::OCR_URL,
+            std::collections::BTreeMap::from([("image".into(), "x".repeat(65_537))]),
+        );
+        assert!(matches!(
+            broker.admit(
+                &context("public-request-0000000000000001"),
+                &hosts,
+                generic.clone()
+            ),
+            Err(PluginNetworkErrorCode::InvalidNetworkRequest)
+        ));
+        generic.body = None;
+        let mut prepared = broker
+            .admit(&context("public-request-0000000000000002"), &hosts, generic)
+            .unwrap();
+        assert!(prepared
+            .baidu_ocr_upload("synthetic-token", &vec![1; 100_000])
+            .is_ok());
+        assert!(prepared.request.body.len() > 65_536);
+        assert!(prepared.request.deny_redirects);
+        assert_eq!(
+            prepared.baidu_ocr_upload(
+                "synthetic-token",
+                &vec![0; crate::launcher_image::MAX_PNG + 1]
+            ),
+            Err(PluginNetworkErrorCode::InvalidNetworkRequest)
+        );
+        let mut off_host = broker
+            .admit(
+                &context("public-request-0000000000000003"),
+                &super::tests::hosts(),
+                request(PluginNetworkRequestMethod::Post),
+            )
+            .unwrap();
+        assert_eq!(
+            off_host.baidu_ocr_upload("synthetic-token", &[1]),
+            Err(PluginNetworkErrorCode::InvalidNetworkRequest)
+        );
     }
 
     #[tokio::test]

@@ -74,12 +74,30 @@ export type CompletionOrigin = Readonly<{
   commandId?: string
 }>
 
+export interface LauncherImage {
+  readonly id: string
+  readonly mimeType: string
+  readonly width: number
+  readonly height: number
+  readonly byteLength: number
+  readonly previewDataUrl: string
+}
+export type LauncherImageState = LauncherImage & { readonly phase: 'list' | 'recognizing' | 'result' | 'error' }
+export interface ImportLauncherImageInput {
+  importSequence: number
+  bytes?: number[]
+  mimeType?: string
+  clipboardSequence?: number
+}
+
 export interface SearchAppsInput {
   query: string
   invocationId: string
   querySequence: number
   submit?: boolean
   completionOrigin?: CompletionOrigin
+  imageId?: string
+  imageCommand?: { pluginId: string; commandId: string }
   stableCommandTarget?: CommandHotkeyEntry
   stableBuiltinTarget?: ManagedBuiltinFeature
 }
@@ -454,6 +472,9 @@ export interface LauncherClient {
   credentials?: CredentialClient
   validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
+  importLauncherImage?(input: ImportLauncherImageInput): Promise<LauncherImage>
+  clearLauncherImage?(input: { importSequence: number }): Promise<void>
+  getLauncherClipboardSequence?(): Promise<number>
   listenHidden(handler: () => void): Promise<() => void>
   listenBuiltinFeaturesChanged?(handler: () => void): Promise<() => void>
   listenPublicPluginPermissionsChanged?(handler: () => void): Promise<() => void>
@@ -778,6 +799,7 @@ export interface MessageCenterStateSnapshot {
 }
 
 export interface LauncherSnapshot {
+  image?: LauncherImageState
   view: 'launcher' | 'settings'
   settingsTab: SettingsTabKey
   messageCenter: MessageCenterStateSnapshot

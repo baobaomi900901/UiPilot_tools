@@ -1034,6 +1034,21 @@ impl PluginRequestScheduler {
         }
         Ok(())
     }
+    /// Service results can outlive the physical request slot. Restore admission after
+    /// revoking their publication, without reviving the old result or an old generation.
+    pub(crate) fn retire_service_request_context(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), PluginScheduleError> {
+        self.retire_request_context(context)?;
+        let mut state = self.lock()?;
+        if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
+            if queue.generation == context.plugin_generation && !queue.result_publication.live() {
+                queue.result_publication = super::result_action::ResultActionLease::default();
+            }
+        }
+        Ok(())
+    }
 
     // Retire logical ownership while the Runtime still owns its execution slot.
     pub(crate) fn retire_plugin_requests(

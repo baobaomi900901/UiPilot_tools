@@ -1667,6 +1667,7 @@ impl PluginManager {
                         return Err(PluginQueryError::InvalidResponse);
                     }
                     ResultAction::CopyText {
+                        authority: None,
                         command_id: None,
                         plugin_id: entry.id.clone(),
                         generation: entry.generation,
@@ -7702,6 +7703,7 @@ mod tests {
                 .begin_query(QueryDomain::Plugin, "management-race", 1)
                 .unwrap();
             let action = ResultAction::CopyText {
+                authority: None,
                 plugin_id: "com.uipilot.demo".into(),
                 command_id: Some("default".into()),
                 generation: 1,
@@ -7890,6 +7892,7 @@ mod tests {
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
+                            authority: None,
                             command_id: None,
                             plugin_id: "plugin".into(),
                             generation: 1,
@@ -7976,6 +7979,7 @@ mod tests {
                             has_default_action: true,
                         },
                         crate::result_registry::ResultAction::CopyText {
+                            authority: None,
                             command_id: None,
                             plugin_id: "plugin".into(),
                             generation: 1,

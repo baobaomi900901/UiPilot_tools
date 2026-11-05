@@ -34,6 +34,44 @@ function validate(value: unknown, platform: 'windows' | 'macos' = 'windows') {
 }
 
 describe('validateManifest', () => {
+  function imageManifest() {
+    return {
+      schemaVersion: 1, pluginId: 'com.example.ocr', version: '1.0.0', apiVersion: 1,
+      minimumHostVersion: '0.20.0', name: 'OCR', supportedPlatforms: ['windows'],
+      runtime: { entry: 'dist/runtime.js' }, permissions: [],
+      command: { defaultName: 'ocr', activationMode: 'submit', outputMode: 'mainResult', inputRequired: false, inputCapabilities: ['image.ocr'] },
+    }
+  }
+
+  it('accepts opted-in image OCR on single and named commands while old commands omit capabilities', () => {
+    const value = imageManifest()
+    expect(validate(value)).toMatchObject({ ok: true })
+    const { command, ...base } = value
+    expect(validate({ ...base, commands: [{ ...command, id: 'ocr' }] })).toMatchObject({ ok: true })
+    const { inputCapabilities, ...legacy } = command
+    expect(validate({ ...base, minimumHostVersion: '0.2.0', command: legacy })).toMatchObject({ ok: true })
+  })
+
+  it.each([
+    ['unknown capability', (v: any) => { v.command.inputCapabilities = ['image.unknown'] }],
+    ['duplicate capability', (v: any) => { v.command.inputCapabilities.push('image.ocr') }],
+    ['live command', (v: any) => { v.command.activationMode = 'live' }],
+    ['panel output', (v: any) => { v.command.outputMode = 'panel'; v.panel = { entry: 'dist/panel.html' }; v.permissions = ['ui.panel'] }],
+    ['window output', (v: any) => { v.command.outputMode = 'window'; v.window = { entry: 'dist/window.html' }; v.permissions = ['ui.window'] }],
+    ['old host floor', (v: any) => { v.minimumHostVersion = '0.19.0' }],
+    ['macOS declaration', (v: any) => { v.supportedPlatforms = ['windows', 'macos'] }],
+  ])('rejects image OCR with %s', (_label, mutate) => {
+    const value = imageManifest()
+    mutate(value)
+    expect(validate(value).ok).toBe(false)
+    const { command, ...base } = value
+    expect(validate({ ...base, commands: [{ ...command, id: 'ocr' }] }).ok).toBe(false)
+  })
+
+  it('rejects OCR packages on older installed hosts', () => {
+    expect(validateManifest(Buffer.from(JSON.stringify(imageManifest())), 'windows', [0, 19, 0])).toMatchObject({ ok: false })
+  })
+
   it('accepts the current pomodoro manifest on Windows', async () => {
     const bytes = await readFile(
       resolve('../../examples/public-plugins/com.uipilot.pomodoro/package/plugin.json'),
@@ -99,7 +137,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.19.1'
+    tooNewHost.minimumHostVersion = '0.20.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],

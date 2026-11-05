@@ -80,6 +80,19 @@ pub(crate) struct CredentialStore {
     service_leases: Mutex<std::collections::BTreeMap<String, ServiceLease>>,
 }
 impl CredentialStore {
+    pub(crate) fn baidu_ocr_status(&self) -> Result<(), &'static str> {
+        let guard = self.lock().map_err(|_| "credentialUnavailable")?;
+        let document = guard.as_ref().ok_or("credentialUnavailable")?;
+        let record = document
+            .items
+            .iter()
+            .find(|record| record.service == Service::BaiduOcr && record.configured())
+            .ok_or("credentialNotConfigured")?;
+        if !record.enabled {
+            return Err("credentialDisabled");
+        }
+        Ok(())
+    }
     pub(crate) fn for_app_data(root: &Path) -> Self {
         Self::new(root.join("credentials"))
     }
@@ -106,6 +119,31 @@ impl CredentialStore {
         });
     }
     #[cfg(test)]
+    pub(crate) fn synthetic_baidu_for_test(&self) {
+        *self.state.lock().unwrap() = Some(Document {
+            revision: 1,
+            items: vec![Record {
+                service: Service::BaiduOcr,
+                name: "Synthetic".into(),
+                enabled: true,
+                values: BTreeMap::from([
+                    ("appId".into(), "synthetic-app".into()),
+                    ("apiKey".into(), "synthetic-key".into()),
+                    ("secretKey".into(), "synthetic-secret".into()),
+                ]),
+            }],
+        });
+    }
+    #[cfg(test)]
+    pub(crate) fn disable_baidu_for_test(&self) {
+        self.set_enabled(EnabledInput {
+            service: Service::BaiduOcr,
+            enabled: false,
+            expected_revision: "1".into(),
+        })
+        .unwrap();
+    }
+    #[cfg(test)]
     pub(crate) fn disable_youdao_for_test(&self) {
         self.set_enabled(EnabledInput {
             service: Service::YoudaoTranslation,
@@ -128,12 +166,43 @@ impl CredentialStore {
         invalidate: Box<dyn Fn() + Send + Sync>,
         use_record: impl FnOnce(u64, &BTreeMap<String, String>) -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
+        self.with_service(
+            Service::YoudaoTranslation,
+            context,
+            publication,
+            invalidate,
+            use_record,
+        )
+    }
+    pub(crate) fn with_baidu_ocr<T>(
+        &self,
+        context: &crate::public_plugins::PluginRequestContext,
+        publication: crate::public_plugins::result_action::ResultActionLease,
+        invalidate: Box<dyn Fn() + Send + Sync>,
+        use_record: impl FnOnce(u64, &BTreeMap<String, String>) -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        self.with_service(
+            Service::BaiduOcr,
+            context,
+            publication,
+            invalidate,
+            use_record,
+        )
+    }
+    fn with_service<T>(
+        &self,
+        service: Service,
+        context: &crate::public_plugins::PluginRequestContext,
+        publication: crate::public_plugins::result_action::ResultActionLease,
+        invalidate: Box<dyn Fn() + Send + Sync>,
+        use_record: impl FnOnce(u64, &BTreeMap<String, String>) -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
         let guard = self.lock().map_err(|_| "credentialUnavailable")?;
         let document = guard.as_ref().ok_or("credentialUnavailable")?;
         let record = document
             .items
             .iter()
-            .find(|r| r.service == Service::YoudaoTranslation)
+            .find(|r| r.service == service)
             .filter(|r| r.configured())
             .ok_or("credentialNotConfigured")?;
         if !record.enabled {

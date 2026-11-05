@@ -53,6 +53,7 @@ import {
   type ViewResult,
   type WebSearchEngine,
 } from './protocol'
+import { imageBytes, imageImportError } from './launcher-image'
 import { createMessageCenterCore } from './message-center-core'
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
@@ -65,8 +66,10 @@ export interface LauncherCore {
   readonly failInitialization: () => void
   readonly shown: (payload: unknown) => void
   readonly text: (record: ClassifiedTextRecord) => void
+  readonly importImage: (file?: Blob) => Promise<void>
+  readonly removeImage: () => void
   readonly retireControl: (control: ControlKey) => void
-  readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean) => void
+  readonly keyDown: (key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean, repeat?: boolean) => void
   readonly routePanelHostKey: (input: PluginPanelHostKeyPhysicalInput) => boolean
   readonly navigate: (target: ShowTarget) => void
   readonly selectSettingsTab: (key: SettingsTabKey) => void
@@ -200,6 +203,7 @@ interface PrivateMainResultCommandState {
 }
 
 interface Model {
+  image?: import('./protocol').LauncherImageState
   view: 'launcher' | 'settings'
   settingsTab: SettingsTabKey
   messageCenter: MessageCenterStateSnapshot
@@ -881,6 +885,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
       })()
     : undefined
   return Object.freeze({
+    ...(model.image ? { image: Object.freeze({ ...model.image }) } : {}),
     view: model.view,
     settingsTab: model.settingsTab,
     messageCenter: model.messageCenter,
@@ -968,6 +973,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let token = 0
   let searchToken = 0
   let quicklinksToken = 0
+  let imageImportSequence = 0
+  let imageImportPending = false
+  let imageAuthorityUnlisten: (() => void) | undefined
+  let imageAuthorityRegistration: Promise<void> | undefined
+  let imageCommand: { pluginId: string; commandId: string } | undefined
   let quicklinksOperationToken = 0
   let slashSearchTimer: ReturnType<typeof setTimeout> | undefined
   let executeToken = 0
@@ -1967,12 +1977,110 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     minuteRefresh = owner
   }
 
+  function invalidateImageWork(): void {
+    imageCommand = undefined
+    searchToken = ++token
+    executeToken = ++token
+    model.searchPending = false
+    model.executePending = false
+    pendingDefaultActivation = undefined
+    retireResultActionSource()
+    cancelMinuteRefresh()
+    cancelSlashSearch()
+    clearResults()
+  }
+
+  function discardImage(): boolean {
+    const hadImage = model.image !== undefined
+    const hadImport = imageImportPending
+    imageImportPending = false
+    imageImportSequence += 1
+    if (hadImage) invalidateImageWork()
+    model.image = undefined
+    if (hadImage || hadImport) {
+      try { void Promise.resolve(client.clearLauncherImage?.({ importSequence: imageImportSequence })).catch(() => {}) } catch { /* native lifecycle also clears its snapshot */ }
+    }
+    return hadImage
+  }
+
+  function removeImage(): void {
+    if (destroyed || !model.image) return
+    discardImage()
+    if (advanceApplicationSequence()) beginSearch()
+    model.status = ''
+    publish(true)
+  }
+
+  async function importImage(file?: Blob): Promise<void> {
+    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'applications' || !model.invocationId || !client.importLauncherImage) return
+    imageImportPending = true
+    const owner = { sequence: ++imageImportSequence, epoch: model.viewEpoch, invocationId: model.invocationId }
+    const owns = () => !destroyed && owner.sequence === imageImportSequence && owner.epoch === model.viewEpoch && owner.invocationId === model.invocationId && !model.hidePending
+    try {
+      // Start the native clipboard-version read synchronously in the paste callback.
+      const clipboardSequence = file ? undefined : client.getLauncherClipboardSequence?.()
+      const source = file ? { bytes: await imageBytes(file), mimeType: file.type } : { clipboardSequence: await clipboardSequence }
+      if (!owns()) return
+      if (!imageAuthorityRegistration && client.listenPublicPluginPermissionsChanged) {
+        imageAuthorityRegistration = client.listenPublicPluginPermissionsChanged(() => {
+          if (!destroyed && model.image) returnToImageList()
+        }).then((unlisten) => {
+          if (destroyed) unlisten()
+          else imageAuthorityUnlisten = unlisten
+        })
+      }
+      await imageAuthorityRegistration
+      if (!owns()) return
+      if (!file && source.clipboardSequence === undefined) { imageImportPending = false; return }
+      const image = await client.importLauncherImage({ importSequence: owner.sequence, ...source })
+      if (!owns()) return
+      imageImportPending = false
+      invalidateImageWork()
+      if (model.mainResultCommand) {
+        model.query = model.mainResultCommand.suffix.draft
+        model.queryControlValue = model.query
+      }
+      model.mainResultCommand = undefined
+      stableCommandTarget = undefined
+      stableBuiltinTarget = undefined
+      completionOrigin = undefined
+      model.image = { ...image, phase: 'list' }
+      model.status = ''
+      if (advanceApplicationSequence()) beginSearch()
+      publish(true)
+    } catch (error) {
+      if (!owns()) return
+      imageImportPending = false
+      model.status = imageImportError(error)
+      publish(true)
+    }
+  }
+
+  function returnToImageList(): void {
+    if (!model.image) return
+    invalidateImageWork()
+    model.image = { ...model.image, phase: 'list' }
+    if (advanceApplicationSequence()) beginSearch()
+    model.status = ''
+    publish(true)
+  }
+
+  function submitImageCommand(activation: Extract<LauncherResultActivation, { kind: 'mainResultActivation' }>): void {
+    if (!model.image || model.image.phase === 'recognizing' || !advanceApplicationSequence()) return
+    invalidateImageWork()
+    imageCommand = { pluginId: activation.pluginId, commandId: activation.commandId }
+    model.image = { ...model.image, phase: 'recognizing' }
+    model.status = '正在识别…'
+    beginSearch(true)
+    publish(true)
+  }
+
   function beginSearch(submit = false, showPending = true, quietRefresh = false): void {
     if (stableCommandTarget && stableCommandOutputMode === 'panel') { model.searchPending = false; return }
     retireResultActionSource()
     if (!quietRefresh) cancelMinuteRefresh()
     const invocationId = model.invocationId
-    if (!invocationId || (model.query !== '/find' && fileCommand(model.query) !== null) || sequenceExhausted) return
+    if (!invocationId || (!model.image && model.query !== '/find' && fileCommand(model.query) !== null) || sequenceExhausted) return
     let ownedOrigin: ApplicationSearchOwner['completionOrigin']
     if (ownsCompletionOrigin(completionOrigin)) {
       if (!submit && completionOrigin.phase === 'armed') {
@@ -1998,11 +2106,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     try {
       pending = client.searchApps({
         query: captured.query,
+        ...(model.image ? { imageId: model.image.id, ...(submit && imageCommand ? { imageCommand: { ...imageCommand } } : {}) } : {}),
         ...(stableBuiltinTarget ? { stableBuiltinTarget: stableBuiltinTarget.feature } : {}),
         ...(stableCommandTarget ? { stableCommandTarget: { ...stableCommandTarget } } : {}),
         invocationId,
         querySequence: captured.sequence,
-        ...(captured.query.startsWith('/') ? { submit } : {}),
+        ...(captured.query.startsWith('/') || model.image ? { submit } : {}),
         ...(captured.completionOrigin === undefined
           ? {}
           : {
@@ -2031,7 +2140,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
   function scheduleSearch(): void {
     cancelSlashSearch()
-    if (!model.query.startsWith('/')) {
+    if (model.image || !model.query.startsWith('/')) {
       beginSearch()
       return
     }
@@ -2145,7 +2254,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         publish(true)
         return
       }
-      if (mainResultCommand) activateMainResultCommand(mainResultCommand)
+      if (mainResultCommand && !model.image) activateMainResultCommand(mainResultCommand)
       retireResultActionSource()
       model.requestId = response.requestId
       model.commandHint = safeCommandHint(response.commandHint)
@@ -2193,16 +2302,17 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.resultActionsDisabled = false
       model.resultActionRerun = false
       model.selectedIndex = model.results.length ? 0 : -1
-      model.status = model.results.length || model.commandHint ? '' : '未找到应用'
+      if (model.image) model.image = { ...model.image, phase: captured.submit ? 'result' : 'list' }
+      model.status = model.results.length || model.commandHint ? '' : model.image ? (captured.submit ? '未识别到文字' : '没有可用的 OCR 插件') : '未找到应用'
       scheduleMinuteRefresh(captured, response.refreshAtUtc)
-      const autoExecuteIndex = captured.submit && typeof response.autoExecuteResultId === 'string'
+      const autoExecuteIndex = !model.image && captured.submit && typeof response.autoExecuteResultId === 'string'
         ? applications.findIndex((item) =>
             item.resultId === response.autoExecuteResultId &&
             item.activation.kind === 'executeResult' &&
             item.hasDefaultAction !== false)
         : -1
       if (autoExecuteIndex >= 0) model.selectedIndex = autoExecuteIndex
-      const activateDefault =
+      const activateDefault = !model.image &&
         pendingDefaultActivation?.epoch === captured.epoch &&
         pendingDefaultActivation.invocationId === captured.invocationId &&
         pendingDefaultActivation.sequence === captured.sequence &&
@@ -2210,7 +2320,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       if (activateDefault) pendingDefaultActivation = undefined
       publish(true)
       if (
-        captured.submit &&
+        !model.image && captured.submit &&
         applications.length === 1 &&
         (applications[0]?.activation.kind === 'panelActivation' ||
           applications[0]?.activation.kind === 'openQuicklinks')
@@ -2235,6 +2345,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!ownsSearch(captured)) return
     settleCompletionCommit(captured)
     model.searchPending = false
+    if (model.image) model.image = { ...model.image, phase: 'error' }
     model.status = errorText(error)
     publish(true)
   }
@@ -2318,6 +2429,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function applyEdit(value: string): void {
+    if (model.image) {
+      invalidateImageWork()
+      model.image = { ...model.image, phase: 'list' }
+    }
     commandEntryToken++
     if (stableBuiltinTarget && completionCommand(value) !== stableBuiltinTarget.command) stableBuiltinTarget = undefined
     if (!model.mainResultCommand) stableCommandTarget = undefined
@@ -2510,6 +2625,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     notice: import('./protocol').LifecycleNotice | null,
     source: 'native' | 'local',
   ): void {
+    discardImage()
     commandEntryToken++
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
@@ -3206,6 +3322,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function hidden(): void {
     if (destroyed) return
+    const discardedImage = discardImage()
     commandEntryToken++
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
@@ -3216,7 +3333,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     const wasHiding = model.hidePending
     model.hidePending = false
     const resetView = resetHiddenNonLauncherView()
-    publish(retiredActions || discardedPanel || discardedQuicklinks || wasHiding || resetView)
+    publish(discardedImage || retiredActions || discardedPanel || discardedQuicklinks || wasHiding || resetView)
   }
 
   let recordingQueue: Promise<void> = Promise.resolve()
@@ -3873,6 +3990,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         return
       }
       if (selected.activation.kind === 'mainResultActivation') {
+        if (model.image) { submitImageCommand(selected.activation); return }
         applyMainResultActivation(selected)
         return
       }
@@ -3917,6 +4035,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         if (outcome.status === 'activationRefusedLaunchRequested') activationNoticePending = true
         if (destroyed || captured.token !== executeToken || captured.epoch !== model.viewEpoch || captured.invocationId !== model.invocationId) return
         model.executePending = false
+        if (model.image?.phase === 'result' && outcome.status === 'textCopied') model.status = '已复制'
         publish(true)
       },
       (error: unknown) => {
@@ -4055,6 +4174,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
     if (destroyed || model.hidePending) return
+    discardImage()
     retireResultActionSource()
     cancelMinuteRefresh()
     model.shownNotice = undefined
@@ -4143,16 +4263,23 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     return true
   }
 
-  function keyDown(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean): void {
+  function keyDown(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean, repeat = false): void {
     if (destroyed || isComposing) return
     if (key === 'Escape') {
       if (model.resultActionMenu) { closeResultActionMenu(); return }
+      if (model.image) {
+        if (model.image.phase === 'list') removeImage()
+        else returnToImageList()
+        return
+      }
       if (model.view === 'settings') navigate('launcher')
       else if (model.launcherMode === 'quicklinks') closeQuicklinks()
       else void requestHide()
       return
     }
     if (key === 'Enter') {
+      if (model.image && (repeat || model.searchPending || model.image.phase === 'recognizing')) return
+      if (model.image && model.results.length === 0) return
       if (sequenceExhausted) return
       if (model.view === 'launcher' && model.launcherMode === 'applications' && stableCommandTarget && stableCommandOutputMode === 'panel' && model.mainResultCommand) {
         if (model.executePending) return
@@ -4350,6 +4477,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
     if (destroyed) return
+    discardImage()
+    imageAuthorityUnlisten?.()
+    imageAuthorityUnlisten = undefined
     retireResultActionSource()
     cancelMinuteRefresh()
     destroyed = true
@@ -4485,6 +4615,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     shown,
     text,
     retireControl,
+    importImage,
+    removeImage,
     keyDown,
     routePanelHostKey,
     navigate,

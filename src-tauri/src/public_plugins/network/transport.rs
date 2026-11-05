@@ -172,10 +172,10 @@ impl std::fmt::Debug for NativeHttpsRequest {
             .field("hostname", &self.hostname)
             .field("addresses", &self.addresses)
             .field("method", &self.method)
-            .field("path_and_query", &self.path_and_query)
+            .field("path_and_query", &"<redacted>")
             .field("headers", &headers)
             .field("sensitive_headers", &sensitive_headers)
-            .field("body", &self.body)
+            .field("body_bytes", &self.body.len())
             .field("max_response_body_bytes", &self.max_response_body_bytes)
             .field("deadline", &self.deadline)
             .finish()
@@ -431,6 +431,31 @@ impl Drop for AbortOnDrop {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_redacts_service_token_credentials_and_image_body() {
+        let request = super::NativeHttpsRequest {
+            hostname: "aip.baidubce.com".into(),
+            addresses: Vec::new(),
+            method: hyper::Method::POST,
+            path_and_query: "/rest/2.0/ocr/v1/general_basic?access_token=synthetic-access-secret".into(),
+            headers: Vec::new(),
+            sensitive_headers: Vec::new(),
+            body: b"client_id=synthetic-api-secret&client_secret=synthetic-client-secret&image=synthetic-image-data".to_vec(),
+            max_response_body_bytes: 1024,
+            deadline: tokio::time::Instant::now(),
+        };
+        let debug = format!("{request:?}");
+        for sensitive in [
+            "synthetic-access-secret",
+            "synthetic-api-secret",
+            "synthetic-client-secret",
+            "synthetic-image-data",
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
+        assert!(!debug.contains("access_token="));
+        assert!(!debug.contains(&format!("{:?}", request.body)));
+    }
     use std::{
         future::{poll_fn, Future},
         io,
@@ -561,10 +586,9 @@ mod tests {
         );
         let legacy_token = "Bearer legacy-debug-token";
         let legacy_bytes = format!("{:?}", legacy_token.as_bytes());
-        request.headers.push((
-            "aUtHoRiZaTiOn".to_owned(),
-            legacy_token.as_bytes().to_vec(),
-        ));
+        request
+            .headers
+            .push(("aUtHoRiZaTiOn".to_owned(), legacy_token.as_bytes().to_vec()));
         request.sensitive_headers.push((
             hyper::header::HeaderName::from_static("authorization"),
             hyper::header::HeaderValue::from_static("Bearer injected-debug-token"),

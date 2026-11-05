@@ -219,6 +219,79 @@ fn current_clipboard_sequence() -> u32 {
     0
 }
 
+pub(crate) fn launcher_clipboard_sequence() -> u32 {
+    current_clipboard_sequence()
+}
+
+pub(crate) fn read_launcher_clipboard_image(
+    expected_sequence: u32,
+) -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
+    #[cfg(windows)]
+    {
+        platform::read_launcher_image(expected_sequence)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = expected_sequence;
+        Err(ClipboardReadError::Unavailable)
+    }
+}
+
+fn read_image_at_sequence(
+    expected_sequence: u32,
+    mut sequence: impl FnMut() -> u32,
+    read: impl FnOnce() -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError>,
+) -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
+    if expected_sequence == 0 || sequence() != expected_sequence {
+        return Err(ClipboardReadError::Unavailable);
+    }
+    let image = read()?;
+    // Delayed clipboard rendering may change the sequence while the read runs.
+    if sequence() != expected_sequence {
+        return Err(ClipboardReadError::Unavailable);
+    }
+    Ok(image)
+}
+
+#[cfg(test)]
+mod launcher_paste_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn launcher_paste_rejects_stale_or_zero_sequence_before_reading() {
+        for expected in [0, 11] {
+            let read = Cell::new(false);
+            assert_eq!(
+                read_image_at_sequence(expected, || 12, || {
+                    read.set(true);
+                    Ok(None)
+                }),
+                Err(ClipboardReadError::Unavailable)
+            );
+            assert!(!read.get());
+        }
+    }
+
+    #[test]
+    fn launcher_paste_rejects_changes_during_delayed_rendering() {
+        let sequence = Cell::new(12);
+        let result = read_image_at_sequence(12, || sequence.get(), || {
+            sequence.set(13);
+            Ok(Some(ClipboardImageSnapshot { rgba: vec![0; 4], width: 1, height: 1 }))
+        });
+        assert_eq!(result, Err(ClipboardReadError::Unavailable));
+    }
+
+    #[test]
+    fn launcher_paste_returns_only_image_snapshot_from_stable_sequence() {
+        let image = ClipboardImageSnapshot { rgba: vec![7; 4], width: 1, height: 1 };
+        assert_eq!(read_image_at_sequence(12, || 12, || Ok(Some(image.clone()))), Ok(Some(image)));
+        assert_eq!(read_image_at_sequence(12, || 12, || Ok(None)), Ok(None));
+        assert_eq!(read_image_at_sequence(12, || 12, || Err(ClipboardReadError::Busy)), Err(ClipboardReadError::Busy));
+    }
+}
+
 #[cfg(windows)]
 mod platform {
     use std::{mem, path::PathBuf, ptr, slice};
@@ -260,11 +333,26 @@ mod platform {
     }
 
     fn read_first_available_image() -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
+        read_first_available_image_with_limits(None)
+    }
+
+    pub(super) fn read_launcher_image(
+        expected_sequence: u32,
+    ) -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
+        let _guard = ClipboardGuard::open()?;
+        super::read_image_at_sequence(expected_sequence, super::current_clipboard_sequence, || {
+            read_first_available_image_with_limits(Some((4096, 16_000_000)))
+        })
+    }
+
+    fn read_first_available_image_with_limits(
+        limits: Option<(u32, u64)>,
+    ) -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
         if format_available(CF_DIBV5) {
-            return read_image(CF_DIBV5);
+            return read_image(CF_DIBV5, limits);
         }
         if format_available(CF_DIB) {
-            return read_image(CF_DIB);
+            return read_image(CF_DIB, limits);
         }
         Ok(None)
     }
@@ -317,9 +405,9 @@ mod platform {
         Ok(paths)
     }
 
-    fn read_image(format: u32) -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
+    fn read_image(format: u32, limits: Option<(u32, u64)>) -> Result<Option<ClipboardImageSnapshot>, ClipboardReadError> {
         let memory = GlobalClipboardMemory::for_format(format)?;
-        Ok(decode_dib(memory.bytes()))
+        Ok(decode_dib(memory.bytes(), limits))
     }
 
     struct GlobalClipboardMemory {
@@ -364,7 +452,7 @@ mod platform {
         }
     }
 
-    fn decode_dib(bytes: &[u8]) -> Option<ClipboardImageSnapshot> {
+    fn decode_dib(bytes: &[u8], limits: Option<(u32, u64)>) -> Option<ClipboardImageSnapshot> {
         if bytes.len() < mem::size_of::<BITMAPINFOHEADER>() {
             return None;
         }
@@ -383,6 +471,11 @@ mod platform {
         }
         let width = u32::try_from(header.biWidth).ok()?;
         let height = header.biHeight.unsigned_abs();
+        if limits.is_some_and(|(max_edge, max_pixels)| {
+            width > max_edge || height > max_edge || u64::from(width) * u64::from(height) > max_pixels
+        }) {
+            return None;
+        }
         let bytes_per_pixel = usize::from(header.biBitCount / 8);
         let width_usize = usize::try_from(width).ok()?;
         let height_usize = usize::try_from(height).ok()?;
@@ -431,5 +524,30 @@ mod platform {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|_| ClipboardReadError::Unavailable)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn dib(width: u32) -> Vec<u8> {
+            let mut bytes = vec![0; 40 + width as usize * 4];
+            bytes[0..4].copy_from_slice(&40_u32.to_le_bytes());
+            bytes[4..8].copy_from_slice(&width.to_le_bytes());
+            bytes[8..12].copy_from_slice(&1_i32.to_le_bytes());
+            bytes[12..14].copy_from_slice(&1_u16.to_le_bytes());
+            bytes[14..16].copy_from_slice(&32_u16.to_le_bytes());
+            bytes
+        }
+
+        #[test]
+        fn launcher_paste_dib_limits_do_not_change_history_decoding() {
+            let wide = dib(4097);
+            assert!(decode_dib(&wide, None).is_some());
+            assert!(decode_dib(&wide, Some((4096, 16_000_000))).is_none());
+            let valid = decode_dib(&dib(16), Some((4096, 16_000_000))).unwrap();
+            assert_eq!((valid.width, valid.height, valid.rgba.len()), (16, 1, 64));
+            assert!(valid.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        }
     }
 }

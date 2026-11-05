@@ -4243,11 +4243,13 @@ fn file_open_manager_requires_declarations_grants_and_current_identity() {
     assert!(!m.files_open_enabled(&i.owner));
 }
 
-
 #[test]
 fn current_host_matches_compiled_release_version() {
     let current = PublicPluginHost::current(PublicPlatform::Windows);
-    let version = format!("{}.{}.{}", current.version[0], current.version[1], current.version[2]);
+    let version = format!(
+        "{}.{}.{}",
+        current.version[0], current.version[1], current.version[2]
+    );
     assert_eq!(version, env!("CARGO_PKG_VERSION"));
     let tauri: Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
     let frontend: Value = serde_json::from_str(include_str!("../../../package.json")).unwrap();
@@ -4258,11 +4260,16 @@ fn current_host_matches_compiled_release_version() {
 #[test]
 fn current_host_accepts_translation_package_directory_and_archive() {
     let root = TestRoot::new("current-host-translation");
-    let package = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
         .join("examples/public-plugins/com.uipilot.translate/package");
     let archive = root.0.join("translation.uipilot-plugin");
     archive_directory(&package, &archive);
-    let mut sources = vec![PublicPackageSource::DevelopmentDirectory(package), PublicPackageSource::Archive(archive)];
+    let mut sources = vec![
+        PublicPackageSource::DevelopmentDirectory(package),
+        PublicPackageSource::Archive(archive),
+    ];
     // Release verification can include the exact archive delivered to the user.
     if let Some(archive) = std::env::var_os("UIPILOT_TEST_TRANSLATION_ARCHIVE") {
         sources.push(PublicPackageSource::Archive(archive.into()));
@@ -4270,7 +4277,10 @@ fn current_host_accepts_translation_package_directory_and_archive() {
     for source in sources {
         let prepared = stage_public_package(source, &root.staging(), &host()).unwrap();
         assert_eq!(prepared.manifest.plugin_id, "com.uipilot.translate");
-        assert_eq!(prepared.manifest.legacy_command().unwrap().output_mode, PublicOutputMode::Panel);
+        assert_eq!(
+            prepared.manifest.legacy_command().unwrap().output_mode,
+            PublicOutputMode::Panel
+        );
         assert_eq!(prepared.revalidate(), Ok(()));
     }
 }
@@ -4282,5 +4292,9 @@ fn current_host_still_rejects_packages_requiring_a_future_release() {
     let mut value = manifest("panel");
     value["minimumHostVersion"] = json!(format!("{}.0.0", host().version[0] + 1));
     write_package(&package, &value);
-    assert_rejected(PublicPackageSource::DevelopmentDirectory(package), &root, PublicPackageError::IncompatibleApi);
+    assert_rejected(
+        PublicPackageSource::DevelopmentDirectory(package),
+        &root,
+        PublicPackageError::IncompatibleApi,
+    );
 }

@@ -373,6 +373,7 @@ function fakeClient() {
   let panelResetHandler: ((payload: unknown) => void) | undefined
   let panelFocusHandler: ((payload: unknown) => void) | undefined
   let screenshotErrorHandler: ((payload: unknown) => void) | undefined
+  let imageAuthorityChangedHandler: (() => void) | undefined
   const unlisten = vi.fn()
   const client = {
     listenShown: vi.fn(async (handler) => {
@@ -383,6 +384,7 @@ function fakeClient() {
       hiddenHandler = handler
       return vi.fn()
     }),
+    listenPublicPluginPermissionsChanged: vi.fn(async (handler) => { imageAuthorityChangedHandler = handler; return vi.fn() }),
     listenBuiltinFeaturesChanged: vi.fn(async (handler) => {
       builtinFeaturesChangedHandler = handler
       return vi.fn()
@@ -492,6 +494,7 @@ function fakeClient() {
       if (!hiddenHandler) throw new Error('hidden listener is not installed')
       hiddenHandler()
     },
+    emitImageAuthorityChanged() { imageAuthorityChangedHandler?.() },
     emitBuiltinFeaturesChanged() {
       if (!builtinFeaturesChangedHandler) throw new Error('builtin feature listener is not installed')
       builtinFeaturesChangedHandler()
@@ -5351,8 +5354,8 @@ describe('R3 correlated composition boundary', () => {
     expect(endBody.indexOf("kind: 'compositionBoundary'")).toBeGreaterThan(endBody.indexOf('compositionActive = false'))
     expect(endBody).not.toContain('.data')
     expect(endBody).not.toContain('.value')
-    expect(nativeInputSource.match(/input\.addEventListener\(/g)).toHaveLength(3)
-    expect(nativeInputSource.match(/input\.removeEventListener\(/g)).toHaveLength(3)
+    expect(nativeInputSource.split('/** Bind only')[0].match(/input\.addEventListener\(/g)).toHaveLength(3)
+    expect(nativeInputSource.split('/** Bind only')[0].match(/input\.removeEventListener\(/g)).toHaveLength(3)
   })
 
   it('keeps untrusted, no-start, wrong-target, and post-unbind DOM events inert', () => {
@@ -11230,5 +11233,252 @@ describe('builtin settings query preservation', () => {
       expect(core.getSnapshot().results).toEqual([])
       await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
     } finally { core.destroy() }
+  })
+})
+
+describe('launcher image OCR workflow', () => {
+  const image = { id: 'image-1', mimeType: 'image/png', width: 12, height: 8, byteLength: 32, previewDataUrl: 'data:image/png;base64,AA==' }
+  const command = { resultId: 'ocr-command', title: '百度 OCR', hasDefaultAction: true, activation: { kind: 'mainResultActivation' as const, pluginId: 'com.uipilot.baidu-ocr', commandId: 'baidu-ocr', commandLabel: 'baidu-ocr', initialArgument: '', favorite: false } }
+  async function setup() {
+    const fake = fakeClient()
+    const importLauncherImage = vi.fn(async () => image)
+    const clearLauncherImage = vi.fn(async () => undefined)
+    Object.assign(fake.client, { importLauncherImage, clearLauncherImage, getLauncherClipboardSequence: vi.fn(async () => 42) })
+    vi.mocked(fake.client.searchApps).mockImplementation(async (input) => ({ requestId: input.submit ? 'ocr-output' : 'ocr-list', autoExecuteResultId: input.submit ? 'ocr-text' : undefined, items: input.submit ? [{ resultId: 'ocr-text', title: 'Text', detail: '# <b>literal</b>\nsecond line', hasDefaultAction: true, activation: { kind: 'executeResult' } }] : [command] }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('ocr-invocation'))
+    await core.importImage(new Blob(['image'], { type: 'image/png' }))
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    return { ...fake, core, importLauncherImage, clearLauncherImage }
+  }
+  it('lists image commands without upload, submits on first Enter and requires a fresh Enter to copy', async () => {
+    const { core, client } = await setup()
+    expect(core.getSnapshot().image?.id).toBe('image-1')
+    expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ imageId: 'image-1', query: '' }))
+    expect(vi.mocked(client.searchApps).mock.calls.some(([input]) => input.submit)).toBe(false)
+    core.keyDown('Enter', false)
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('result'))
+    expect(vi.mocked(client.searchApps).mock.calls.filter(([input]) => input.submit)).toHaveLength(1)
+    expect(client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ submit: true, imageCommand: { pluginId: 'com.uipilot.baidu-ocr', commandId: 'baidu-ocr' } }))
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.keyDown('Enter', false, true)
+    expect(client.executeResult).not.toHaveBeenCalled()
+    vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'ocr-output', resultId: 'ocr-text' }))
+    expect(core.getSnapshot().status).toBe('已复制')
+    core.destroy()
+  })
+  it('Esc invalidates recognition, returns to the image list, then removes the image', async () => {
+    const { core, client, clearLauncherImage } = await setup()
+    const recognition = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockImplementation((input) => input.submit ? recognition.promise : Promise.resolve({ requestId: 'list', items: [command] }))
+    core.keyDown('Enter', false)
+    core.keyDown('Escape', false)
+    await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('list'))
+    recognition.resolve({ requestId: 'stale', items: [{ resultId: 'old', title: 'old', activation: { kind: 'executeResult' } }] })
+    await Promise.resolve()
+    expect(core.getSnapshot().results[0]?.title).toBe('百度 OCR')
+    core.keyDown('Escape', false)
+    expect(core.getSnapshot().image).toBeUndefined()
+    expect(clearLauncherImage).toHaveBeenCalled()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('keeps a valid image after a failed replacement and ignores imports resolved after hide', async () => {
+    const { core, client, importLauncherImage, emitHidden } = await setup()
+    importLauncherImage.mockRejectedValueOnce({ code: 'imageTooLarge' })
+    await core.importImage(new Blob(['bad']))
+    expect(core.getSnapshot().image?.id).toBe('image-1')
+    expect(core.getSnapshot().status).toContain('图片超限')
+    const late = deferred<typeof image>()
+    importLauncherImage.mockReturnValueOnce(late.promise)
+    const importing = core.importImage(new Blob(['late']))
+    emitHidden()
+    late.resolve({ ...image, id: 'late-image' })
+    await importing
+    expect(core.getSnapshot().image).toBeUndefined()
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('retires pending and completed recognition after plugin permissions or credentials change', async () => {
+    const { core, client, emitImageAuthorityChanged } = await setup()
+    const recognition = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockImplementation((input) => input.submit ? recognition.promise : Promise.resolve({ requestId: 'updated-list', items: [command] }))
+    core.keyDown('Enter', false)
+    emitImageAuthorityChanged()
+    recognition.resolve({ requestId: 'expired-text', items: [{ resultId: 'expired', title: 'expired', hasDefaultAction: true, activation: { kind: 'executeResult' } }] })
+    await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+    expect(core.getSnapshot().image?.phase).toBe('list')
+    expect(core.getSnapshot().results[0]?.title).toBe('百度 OCR')
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('rejects out-of-order imports and recognition returned for a replaced picture', async () => {
+    const { core, client, importLauncherImage } = await setup()
+    const recognition = deferred<SearchResponse | null>()
+    vi.mocked(client.searchApps).mockImplementation((input) => input.submit ? recognition.promise : Promise.resolve({ requestId: 'list', items: [command] }))
+    core.keyDown('Enter', false)
+    const a = deferred<typeof image>()
+    const b = deferred<typeof image>()
+    importLauncherImage.mockReturnValueOnce(a.promise).mockReturnValueOnce(b.promise)
+    const importA = core.importImage(new Blob(['a']))
+    await vi.waitFor(() => expect(importLauncherImage).toHaveBeenCalledTimes(2))
+    const importB = core.importImage(new Blob(['b']))
+    await vi.waitFor(() => expect(importLauncherImage).toHaveBeenCalledTimes(3))
+    b.resolve({ ...image, id: 'image-b' })
+    await importB
+    a.resolve({ ...image, id: 'image-a' })
+    recognition.resolve({ requestId: 'old-recognition', items: [{ resultId: 'expired', title: 'expired', activation: { kind: 'executeResult' } }] })
+    await importA
+    await Promise.resolve()
+    expect(core.getSnapshot().image?.id).toBe('image-b')
+    expect(core.getSnapshot().results[0]?.title).toBe('百度 OCR')
+    core.destroy()
+  })
+  it('preserves the result after a clipboard failure and allows an explicit retry', async () => {
+    const { core, client } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('result'))
+    vi.mocked(client.executeResult).mockRejectedValueOnce({ code: 'clipboardWriteFailed' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot().results[0]?.detail).toContain('second line')
+    expect(core.getSnapshot().status).toContain('无法复制')
+    vi.mocked(client.executeResult).mockResolvedValueOnce({ status: 'textCopied' })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().status).toBe('已复制'))
+    expect(client.executeResult).toHaveBeenCalledTimes(2)
+    core.destroy()
+  })
+  it('never copies an empty or failed recognition result', async () => {
+    const { core, client } = await setup()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({ requestId: 'empty', items: [{ resultId: 'no-text', title: '未识别到文字', activation: { kind: 'executeResult' }, hasDefaultAction: false }] })
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('result'))
+    core.keyDown('Enter', false)
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('captures native clipboard authority before awaiting any subscription or file work', async () => {
+    const fake = fakeClient()
+    const registration = deferred<() => void>()
+    const getSequence = vi.fn(async () => 73)
+    const importing = vi.fn(async () => image)
+    Object.assign(fake.client, { getLauncherClipboardSequence: getSequence, importLauncherImage: importing,
+      listenPublicPluginPermissionsChanged: vi.fn(() => registration.promise) })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('paste-fallback'))
+    const pasted = core.importImage()
+    expect(getSequence).toHaveBeenCalledOnce()
+    registration.resolve(() => {})
+    await pasted
+    expect(importing).toHaveBeenCalledWith(expect.objectContaining({ clipboardSequence: 73 }))
+    core.destroy()
+  })
+  it('keeps the native query input and its focus when removing an image', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core } = await setup()
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input[role="combobox"]')!
+      input.focus()
+      await act(async () => core.removeImage())
+      expect(mounted.host.querySelector('input[role="combobox"]')).toBe(input)
+      expect(document.activeElement).toBe(input)
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+  it('imports a trusted image from a manually entered command suffix while preserving its text and focus', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const fake = fakeClient()
+    const importing = vi.fn(async () => image)
+    Object.assign(fake.client, { importLauncherImage: importing })
+    vi.mocked(fake.client.searchApps).mockImplementation(async (input) => input.imageId
+      ? { requestId: 'image-list', items: [command] }
+      : { requestId: 'manual-command', mainResultCommand: { pluginId: command.activation.pluginId, commandId: command.activation.commandId, commandLabel: 'baidu-ocr', argument: input.query.slice('/baidu-ocr'.length).trim() }, items: [] })
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('manual-image-command'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/baidu-ocr 保留文本', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().mainResultCommand?.suffix).toBe('保留文本'))
+    const listenerSpy = vi.spyOn(HTMLInputElement.prototype, 'addEventListener')
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input[role="combobox"]')!
+      expect(document.activeElement).toBe(input)
+      const index = listenerSpy.mock.calls.findIndex(([type], index) => type === 'paste' && listenerSpy.mock.contexts[index] === input)
+      expect(index).toBeGreaterThanOrEqual(0)
+      const listener = listenerSpy.mock.calls[index][1] as EventListener
+      const textPaste = { isTrusted: true, target: input, preventDefault: vi.fn(), clipboardData: { items: [], getData: () => '普通文本' } }
+      listener(textPaste as unknown as Event)
+      expect(textPaste.preventDefault).not.toHaveBeenCalled()
+      expect(importing).not.toHaveBeenCalled()
+      const file = new File(['bitmap'], 'image.png', { type: 'image/png' })
+      const pasted = { isTrusted: true, target: input, preventDefault: vi.fn(), clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }], getData: () => '' } }
+      await act(async () => { listener(pasted as unknown as Event) })
+      await act(async () => { await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('list')) })
+      expect(pasted.preventDefault).toHaveBeenCalledOnce()
+      expect(core.getSnapshot().mainResultCommand).toBeUndefined()
+      expect(core.getSnapshot().queryControlValue).toBe('保留文本')
+      expect(fake.client.searchApps).toHaveBeenLastCalledWith(expect.objectContaining({ imageId: image.id, query: '保留文本' }))
+      const query = mounted.host.querySelector<HTMLInputElement>('input[role="combobox"]')!
+      expect(query.value).toBe('保留文本')
+      expect(document.activeElement).toBe(query)
+    } finally { listenerSpy.mockRestore(); await mounted.unmount(); core.destroy() }
+  })
+  it('includes full OCR detail in forward and backward Tab order and leaves scrolling keys native', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('result'))
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input[role="combobox"]')!
+      const remove = mounted.host.querySelector<HTMLElement>('[aria-label="移除图片"]')!
+      const detail = mounted.host.querySelector<HTMLElement>('.launcher-image-result-detail')!
+      const actions = mounted.host.querySelector<HTMLElement>('[aria-label="操作 Ctrl+K"]')!
+      const tab = async (shiftKey = false) => act(async () => { document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true })) })
+      input.focus()
+      await tab()
+      expect(document.activeElement).toBe(remove)
+      await tab()
+      expect(document.activeElement).toBe(detail)
+      for (const key of ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End']) {
+        const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+        await act(async () => { detail.dispatchEvent(event) })
+        expect(event.defaultPrevented).toBe(false)
+        expect(document.activeElement).toBe(detail)
+      }
+      expect(client.executeResult).not.toHaveBeenCalled()
+      await tab()
+      expect(document.activeElement).toBe(actions)
+      await tab(true)
+      expect(document.activeElement).toBe(detail)
+      await tab(true)
+      expect(document.activeElement).toBe(remove)
+      await tab(true)
+      expect(document.activeElement).toBe(input)
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+  it('renders the thumbnail removal control and complete OCR detail as plain text', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().image?.phase).toBe('result'))
+    const mounted = await mountLauncherView(core)
+    try {
+      expect(mounted.host.querySelector('img[alt="已粘贴的图片"]')).not.toBeNull()
+      expect(mounted.host.querySelector('[aria-label="移除图片"]')).not.toBeNull()
+      const detail = mounted.host.querySelector('.launcher-image-result-detail')!
+      expect(detail.textContent).toBe('# <b>literal</b>\nsecond line')
+      expect(detail.querySelector('b')).toBeNull()
+    } finally { await mounted.unmount(); core.destroy() }
   })
 })

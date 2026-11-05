@@ -14,11 +14,23 @@ export interface PluginInvocation {
    * getter is exposed to plugins; ordinary command input uses the same contract.
    */
   input: string
+  /** Windows Host 0.20.0+: explicitly pasted image for an image.ocr command.
+   * Opaque request-bound authority; never a path or a clipboard getter.
+   */
+  readonly image?: Readonly<PluginImageInput>
   context: {
     platform: 'windows' | 'macos'
     theme: 'dark' | 'light'
     invokedAt: string
   }
+}
+
+export interface PluginImageInput {
+  readonly id: string
+  readonly mimeType: string
+  readonly width: number
+  readonly height: number
+  readonly byteLength: number
 }
 
 export type PluginNetworkRequestBody =
@@ -197,6 +209,13 @@ export interface PluginYoudaoTranslationResponse {
  readonly unchanged: boolean
 }
 export interface PluginServicesApi {
+ readonly baidu: {
+  /** Windows Host 0.20.0+, submit/mainResult with image.ocr. Requires current
+   * credentials.baiduOcr, network.https and aip.baidubce.com authorization.
+   * Only the invocation image ID is accepted; no credentials reach the plugin.
+   */
+  ocr(input: Readonly<PluginBaiduOcrInput>): Promise<Readonly<PluginBaiduOcrResponse>>
+ }
  readonly youdao: {
   /** Legacy mainResult remains supported. Host 0.18.0+ also permits legacy
    * submit+panel Runtime actions with ui.panel granted and panel.runtimeActions.
@@ -207,6 +226,13 @@ export interface PluginServicesApi {
    */
   translate(input: Readonly<PluginYoudaoTranslationInput>): Promise<Readonly<PluginYoudaoTranslationResponse>>
  }
+}
+export interface PluginBaiduOcrInput {
+ readonly imageId: string
+}
+export interface PluginBaiduOcrResponse {
+ readonly text: string
+ readonly lines: readonly string[]
 }
 export type PluginServiceErrorName = PluginNetworkErrorName
  | 'InvalidServiceRequestError' | 'ServicePermissionDeniedError'

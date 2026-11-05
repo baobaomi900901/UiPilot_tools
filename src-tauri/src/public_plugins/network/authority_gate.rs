@@ -30,6 +30,42 @@ struct LifecycleBlockingTransport {
 }
 
 #[cfg(test)]
+struct RecordedServiceTransport {
+    outcomes: Mutex<std::collections::VecDeque<(u16, Vec<u8>)>>,
+    requests: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+}
+
+#[cfg(test)]
+impl HttpsTransport for RecordedServiceTransport {
+    fn execute<'a>(
+        &'a self,
+        request: NativeHttpsRequest,
+        cancellation: &'a tokio_util::sync::CancellationToken,
+    ) -> HttpsTransportFuture<'a> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(NativeTransportError::Cancelled);
+            }
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.path_and_query, request.body));
+            let (status, body) = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(NativeTransportError::Protocol)?;
+            Ok(super::transport::NativeHttpsResponse {
+                status,
+                headers: Vec::new(),
+                body,
+            })
+        })
+    }
+}
+
+#[cfg(test)]
 impl HttpsTransport for LifecycleBlockingTransport {
     fn execute<'a>(
         &'a self,
@@ -405,6 +441,26 @@ impl PluginNetworkAuthorityGate {
         status: u16,
     ) -> (Arc<Self>, Arc<LifecycleNetworkBarrier>) {
         Self::paused_body_for_test(status, b"synthetic-response".to_vec())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn baidu_responses_for_test(
+        responses: Vec<(u16, Vec<u8>)>,
+    ) -> (Arc<Self>, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = Arc::new(RecordedServiceTransport {
+            outcomes: Mutex::new(responses.into()),
+            requests: requests.clone(),
+        });
+        let resolver = BoundedDnsResolver::with_lookup(1, 2, |_host, port| {
+            Ok(vec![std::net::SocketAddr::from(([8, 8, 8, 8], port))])
+        });
+        let broker = Arc::new(PluginHttpsBroker::with_dependencies(
+            PluginNetworkRequestRegistry::default(),
+            resolver,
+            transport,
+        ));
+        (Arc::new(Self::with_broker(broker)), requests)
     }
     #[cfg(test)]
     pub(crate) fn paused_body_for_test(

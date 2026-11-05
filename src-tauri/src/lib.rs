@@ -574,6 +574,10 @@ pub fn run() {
             commands::uninstall_plugin,
             commands::plugin_network_request,
             commands::plugin_youdao_translate,
+            commands::plugin_baidu_ocr,
+            commands::import_launcher_image,
+            commands::clear_launcher_image,
+            commands::get_launcher_clipboard_sequence,
             commands::plugin_api_call,
             commands::complete_plugin_command,
             commands::plugin_window_content_ready,
@@ -995,6 +999,10 @@ mod tests {
             "commands::uninstall_plugin",
             "commands::plugin_network_request",
             "commands::plugin_youdao_translate",
+            "commands::plugin_baidu_ocr",
+            "commands::import_launcher_image",
+            "commands::clear_launcher_image",
+            "commands::get_launcher_clipboard_sequence",
             "commands::plugin_api_call",
             "commands::complete_plugin_command",
             "commands::plugin_window_content_ready",
@@ -1247,6 +1255,9 @@ mod tests {
         let find = include_str!("../capabilities/find.json");
         for command in [
             "list_public_plugins",
+            "import_launcher_image",
+            "clear_launcher_image",
+            "get_launcher_clipboard_sequence",
             "cancel_translation_selection",
             "get_translation_selection_settings",
             "set_translation_selection_hotkey",
@@ -1277,6 +1288,7 @@ mod tests {
             "plugin_api_call",
             "plugin_network_request",
             "plugin_youdao_translate",
+            "plugin_baidu_ocr",
             "complete_plugin_command",
         ] {
             assert!(build.contains(&format!("\"{command}\",")));
@@ -1389,6 +1401,30 @@ mod tests {
         assert!(!content.contains("plugin-panel-"));
         assert!(!panel.contains("plugin-window-"));
         assert!(!panel.contains("timer"));
+    }
+
+    #[test]
+    fn launcher_image_commands_have_exact_window_capabilities() {
+        let main = include_str!("../capabilities/main.json");
+        let runtime = include_str!("../capabilities/plugin-runtime.json");
+        let build = include_str!("../build.rs");
+        for command in ["import_launcher_image", "clear_launcher_image", "get_launcher_clipboard_sequence"] {
+            assert!(build.contains(&format!("\"{command}\",")));
+            let permission = format!("allow-{}", command.replace('_', "-"));
+            assert!(main.contains(&permission));
+            assert!(!runtime.contains(&permission));
+            for capability in [
+                include_str!("../capabilities/find.json"),
+                include_str!("../capabilities/plugin-panel-content.json"),
+                include_str!("../capabilities/plugin-window-content.json"),
+                include_str!("../capabilities/screenshot.json"),
+            ] {
+                assert!(!capability.contains(&permission));
+            }
+        }
+        assert!(build.contains("\"plugin_baidu_ocr\","));
+        assert!(runtime.contains("allow-plugin-baidu-ocr"));
+        assert!(!main.contains("allow-plugin-baidu-ocr"));
     }
 
     #[test]
@@ -2204,3 +2240,4 @@ mod lib {
         }
     }
 }
+mod launcher_image;

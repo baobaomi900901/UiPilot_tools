@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-baidu-ocr"
+description = "Enables the plugin_baidu_ocr command without any pre-configured scope."
+commands.allow = ["plugin_baidu_ocr"]
+
+[[permission]]
+identifier = "deny-plugin-baidu-ocr"
+description = "Denies the plugin_baidu_ocr command without any pre-configured scope."
+commands.deny = ["plugin_baidu_ocr"]

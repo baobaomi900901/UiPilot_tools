@@ -40,3 +40,24 @@ export function bindNativeTextInput(
     input.removeEventListener('compositionend', onEnd)
   }
 }
+
+/** Bind only the launcher's main input; synthetic clipboard events never import. */
+export function bindNativeImagePaste(input: HTMLInputElement, receive: (file?: Blob) => void): () => void {
+  const onPaste = (event: Event) => {
+    if (!event.isTrusted || event.target !== input) return
+    const data = (event as ClipboardEvent).clipboardData
+    if (!data) return
+    const items = Array.from(data.items)
+    const bitmap = items.find((item) => item.kind === 'file' && item.type.startsWith('image/'))?.getAsFile()
+    if (bitmap) {
+      event.preventDefault()
+      receive(bitmap)
+    } else if (!items.some((item) => item.kind === 'file') && !data.getData('text/plain')) {
+      // Windows may omit the bitmap in the WebView event. The native import must
+      // capture/check this paste's clipboard sequence before reading the bitmap.
+      receive()
+    }
+  }
+  input.addEventListener('paste', onPaste)
+  return () => input.removeEventListener('paste', onPaste)
+}

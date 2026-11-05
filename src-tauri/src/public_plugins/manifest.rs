@@ -108,6 +108,12 @@ pub(crate) enum PublicOutputMode {
     Panel,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+pub(crate) enum PublicInputCapability {
+    #[serde(rename = "image.ocr")]
+    ImageOcr,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicCommandV1 {
@@ -117,6 +123,8 @@ pub(crate) struct PublicCommandV1 {
     pub(crate) activation_mode: PublicActivationMode,
     pub(crate) output_mode: PublicOutputMode,
     pub(crate) input_required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) input_capabilities: Vec<PublicInputCapability>,
     #[serde(default)]
     pub(crate) input_placeholder: Option<String>,
 }
@@ -596,6 +604,10 @@ fn valid_command(command: &PublicCommandV1) -> bool {
                 .as_deref()
                 .is_some_and(nonempty_plain_text))
         && command.input_placeholder.as_deref().is_none_or(plain_text)
+        && !has_duplicates(command.input_capabilities.iter().copied())
+        && (command.input_capabilities.is_empty()
+            || (command.activation_mode == PublicActivationMode::Submit
+                && command.output_mode == PublicOutputMode::MainResult))
 }
 
 fn validate_manifest(
@@ -700,7 +712,9 @@ fn validate_manifest(
     let has_clipboard_history_paste = manifest
         .permissions
         .contains(&PublicPermission::ClipboardHistoryPaste);
-    let has_clipboard_history_copy = manifest.permissions.contains(&PublicPermission::ClipboardHistoryCopy);
+    let has_clipboard_history_copy = manifest
+        .permissions
+        .contains(&PublicPermission::ClipboardHistoryCopy);
     if let Some(command) = manifest.legacy_command() {
         match command.output_mode {
             PublicOutputMode::Window
@@ -757,7 +771,8 @@ fn validate_manifest(
                 || manifest.window.is_some()
                 || !manifest.permissions.contains(&PublicPermission::UiPanel)
                 || manifest.permissions.contains(&PublicPermission::UiWindow)
-                || ((has_clipboard_history_paste || has_clipboard_history_copy) && !has_clipboard_history_read))
+                || ((has_clipboard_history_paste || has_clipboard_history_copy)
+                    && !has_clipboard_history_read))
         {
             return Err(PublicPackageError::InvalidPackage);
         }
@@ -768,17 +783,35 @@ fn validate_manifest(
     }
     let minimum_host = parse_canonical_version(&manifest.minimum_host_version)
         .ok_or(PublicPackageError::InvalidPackage)?;
+    if manifest
+        .normalized_commands()
+        .any(|(_, command)| !command.input_capabilities.is_empty())
+        && (minimum_host < [0, 20, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest.permissions.iter().any(|p| p.is_host_service())
         && (minimum_host < [0, 15, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
-    if manifest.permissions.contains(&PublicPermission::SpeechSpeak) && (minimum_host < [0,18,0] || manifest.supported_platforms != [PublicPlatform::Windows]
-        || !manifest.permissions.contains(&PublicPermission::UiPanel) || manifest.panel.is_none()
-        || !manifest.legacy_command().is_some_and(|c| c.activation_mode == PublicActivationMode::Submit && c.output_mode == PublicOutputMode::Panel)) {
+    if manifest
+        .permissions
+        .contains(&PublicPermission::SpeechSpeak)
+        && (minimum_host < [0, 18, 0]
+            || manifest.supported_platforms != [PublicPlatform::Windows]
+            || !manifest.permissions.contains(&PublicPermission::UiPanel)
+            || manifest.panel.is_none()
+            || !manifest.legacy_command().is_some_and(|c| {
+                c.activation_mode == PublicActivationMode::Submit
+                    && c.output_mode == PublicOutputMode::Panel
+            }))
+    {
         return Err(PublicPackageError::IncompatibleApi);
     }
-    if has_clipboard_history_copy && (minimum_host < [0, 17, 0] || manifest.supported_platforms != [PublicPlatform::Windows]) {
+    if has_clipboard_history_copy
+        && (minimum_host < [0, 17, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
         return Err(PublicPackageError::IncompatibleApi);
     }
     if manifest.api_version != 1
@@ -867,9 +900,11 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
-    if manifest.panel.as_ref().is_some_and(|panel| {
-        panel.host_keys.contains(&PanelHostKeyDeclaration::Delete)
-    }) && minimum_host < [0, 16, 0]
+    if manifest
+        .panel
+        .as_ref()
+        .is_some_and(|panel| panel.host_keys.contains(&PanelHostKeyDeclaration::Delete))
+        && minimum_host < [0, 16, 0]
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -902,7 +937,9 @@ fn validate_manifest(
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
-    if (has_clipboard_history_read || has_clipboard_history_paste || has_clipboard_history_copy) && minimum_host < [0, 3, 3] {
+    if (has_clipboard_history_read || has_clipboard_history_paste || has_clipboard_history_copy)
+        && minimum_host < [0, 3, 3]
+    {
         return Err(PublicPackageError::IncompatibleApi);
     }
     if manifest
@@ -1092,8 +1129,83 @@ mod schema_tests {
     }
 
     #[test]
+    fn image_ocr_capability_contract() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.20.0");
+        value["command"]["inputCapabilities"] = serde_json::json!(["image.ocr"]);
+        let current_host = PublicPluginHost {
+            version: [0, 20, 0],
+            ..PublicPluginHost::current(PublicPlatform::Windows)
+        };
+        let parse_image =
+            |v: &Value| parse_manifest(&serde_json::to_vec(v).unwrap(), &current_host);
+        assert!(parse_image(&value).is_ok());
+        let mut multi = value.clone();
+        let mut command = multi.as_object_mut().unwrap().remove("command").unwrap();
+        command["id"] = serde_json::json!("ocr");
+        multi["commands"] = serde_json::json!([command]);
+        assert!(parse_image(&multi).is_ok());
+        for original in [&value, &multi] {
+            for (field, invalid) in [
+                ("inputCapabilities", serde_json::json!(["image.other"])),
+                (
+                    "inputCapabilities",
+                    serde_json::json!(["image.ocr", "image.ocr"]),
+                ),
+                ("activationMode", serde_json::json!("live")),
+                ("outputMode", serde_json::json!("panel")),
+                ("outputMode", serde_json::json!("window")),
+            ] {
+                let mut invalid_value = original.clone();
+                let command = if invalid_value.get("commands").is_some() {
+                    &mut invalid_value["commands"][0]
+                } else {
+                    &mut invalid_value["command"]
+                };
+                command[field] = invalid.clone();
+                if original.get("command").is_some() && field == "outputMode" {
+                    let output = invalid.as_str().unwrap();
+                    invalid_value[output] =
+                        serde_json::json!({"entry": format!("dist/{output}.html")});
+                    invalid_value["permissions"] = serde_json::json!([format!("ui.{output}")]);
+                }
+                assert!(parse_image(&invalid_value).is_err(), "{field}");
+            }
+            for (field, invalid) in [
+                ("minimumHostVersion", serde_json::json!("0.19.0")),
+                (
+                    "supportedPlatforms",
+                    serde_json::json!(["windows", "macos"]),
+                ),
+            ] {
+                let mut invalid_value = original.clone();
+                invalid_value[field] = invalid;
+                assert!(parse_image(&invalid_value).is_err(), "{field}");
+            }
+        }
+        let legacy = parse_image(&manifest(None)).unwrap();
+        assert!(legacy
+            .command_by_id("default")
+            .unwrap()
+            .input_capabilities
+            .is_empty());
+        assert!(serde_json::to_value(legacy).unwrap()["command"]
+            .get("inputCapabilities")
+            .is_none());
+        let old_host = PublicPluginHost {
+            version: [0, 19, 0],
+            ..current_host
+        };
+        assert_eq!(
+            parse_manifest(&serde_json::to_vec(&value).unwrap(), &old_host),
+            Err(PublicPackageError::IncompatibleApi)
+        );
+    }
+
+    #[test]
     fn speech_schema_artifact_matches_the_rust_generator() {
-        let mut generated = serde_json::to_string_pretty(&crate::public_plugin_manifest_schema()).unwrap();
+        let mut generated =
+            serde_json::to_string_pretty(&crate::public_plugin_manifest_schema()).unwrap();
         generated.push('\n');
         assert_eq!(
             generated,
@@ -1129,7 +1241,11 @@ mod schema_tests {
         value["minimumHostVersion"] = serde_json::json!("0.17.0");
         value["command"] = serde_json::json!({"defaultName":"copy", "activationMode":"submit", "outputMode":"panel", "inputRequired":false});
         value["panel"] = serde_json::json!({"entry":"dist/panel.html"});
-        value["permissions"] = serde_json::json!(["ui.panel", "clipboard.history.read", "clipboard.history.copy"]);
+        value["permissions"] = serde_json::json!([
+            "ui.panel",
+            "clipboard.history.read",
+            "clipboard.history.copy"
+        ]);
         assert!(parse(&value).is_ok());
         let mut invalid = value.clone();
         invalid["minimumHostVersion"] = serde_json::json!("0.16.0");
@@ -1149,11 +1265,17 @@ mod schema_tests {
     fn selection_read_requires_windows_and_version_0_16() {
         let mut value = manifest(None);
         value["permissions"] = serde_json::json!(["selection.read"]);
-        assert!(matches!(parse(&value), Err(PublicPackageError::IncompatibleApi)));
+        assert!(matches!(
+            parse(&value),
+            Err(PublicPackageError::IncompatibleApi)
+        ));
         value["minimumHostVersion"] = serde_json::json!("0.16.0");
         assert!(parse(&value).is_ok());
         value["supportedPlatforms"] = serde_json::json!(["windows", "macos"]);
-        assert!(matches!(parse(&value), Err(PublicPackageError::IncompatibleApi)));
+        assert!(matches!(
+            parse(&value),
+            Err(PublicPackageError::IncompatibleApi)
+        ));
     }
 
     #[test]
@@ -1529,10 +1651,14 @@ mod schema_tests {
         panel["command"] = serde_json::json!({
             "defaultName": "panel", "activationMode": "submit", "outputMode": "panel", "inputRequired": false
         });
-        panel["panel"] = serde_json::json!({ "entry": "dist/panel.html", "hostKeys": ["Delete", "Tab"] });
+        panel["panel"] =
+            serde_json::json!({ "entry": "dist/panel.html", "hostKeys": ["Delete", "Tab"] });
         panel["permissions"] = serde_json::json!(["ui.panel"]);
         let parsed = parse(&panel).expect("Delete is supported on 0.16.0");
-        assert_eq!(serde_json::to_value(parsed).unwrap()["panel"]["hostKeys"], serde_json::json!(["Tab", "Delete"]));
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["panel"]["hostKeys"],
+            serde_json::json!(["Tab", "Delete"])
+        );
         panel["minimumHostVersion"] = serde_json::json!("0.15.0");
         assert_eq!(parse(&panel), Err(PublicPackageError::IncompatibleApi));
     }

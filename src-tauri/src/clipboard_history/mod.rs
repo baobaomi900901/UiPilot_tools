@@ -18,6 +18,7 @@ pub(crate) use model::{
     IgnoredCaptureReason,
 };
 pub(crate) use observer::{
+    launcher_clipboard_sequence, read_launcher_clipboard_image,
     normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
     ClipboardObserver, ClipboardObserverHandle, ClipboardReadError, ClipboardReader,
 };

@@ -2884,6 +2884,13 @@ pub(crate) fn start_find_transfer(
         .and_then(|()| find.set_focus())
         .and_then(|()| find.as_ref().set_focus())
         .and_then(|()| main.hide());
+    if native_result.is_ok() {
+        if let Some(public) = app.try_state::<Arc<crate::public_plugins::PublicPluginService>>() {
+            if let Ok(manager) = public.manager() {
+                manager.retire_launcher_images(true);
+            }
+        }
+    }
     if native_result.is_err() {
         if let Some(snapshot) = transfers.rollback(&lease) {
             let _ = main.set_always_on_top(snapshot.always_on_top);

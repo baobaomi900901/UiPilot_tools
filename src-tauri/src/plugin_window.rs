@@ -1927,6 +1927,11 @@ pub(crate) fn commit(
             return Err(());
         }
         main.hide().map_err(|_| ())?;
+        if let Some(public) = app.try_state::<Arc<crate::public_plugins::PublicPluginService>>() {
+            if let Ok(manager) = public.manager() {
+                manager.retire_launcher_images(true);
+            }
+        }
         eprintln!(
             "[DEBUG-plugin-window-focus] main-hide-ok plugin_id={}",
             owner.plugin_id

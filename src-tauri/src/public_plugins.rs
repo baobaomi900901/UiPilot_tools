@@ -1,12 +1,13 @@
-pub(crate) mod host_services;
 mod activation;
 mod activation_bundle;
 mod alarm_asset;
+pub(crate) mod baidu_ocr;
 pub(crate) mod content_action;
 mod data_call_gate;
 mod delayed_messages;
 pub(crate) mod diagnostics;
 pub(crate) mod file_open;
+pub(crate) mod host_services;
 mod icon;
 mod manifest;
 pub(crate) mod window_action;
@@ -583,6 +584,42 @@ impl PublicPluginService {
             route,
             request,
         })
+    }
+
+    pub(crate) fn bind_prepared_image(
+        &self,
+        prepared: &PreparedPublicSubmission,
+        image_id: &str,
+        query_sequence: u64,
+    ) -> Result<(), PublicPluginManagementError> {
+        let publication = prepared
+            .route
+            .result_publication
+            .clone()
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let manager = self.manager()?;
+        if manager
+            .launcher_images
+            .plugin_context(&prepared.route.plugin_id)
+            .is_some_and(|context| {
+                manager.scheduler().context_status(&context) == PluginContextStatus::Current
+            })
+        {
+            self.settle_submission(&prepared.token, None);
+            return Err(PublicPluginManagementError::Unavailable);
+        }
+        manager
+            .launcher_images
+            .bind_intent(
+                image_id,
+                query_sequence,
+                &prepared.request.context,
+                publication,
+            )
+            .map_err(|_| {
+                self.settle_submission(&prepared.token, None);
+                PublicPluginManagementError::Unavailable
+            })
     }
 
     pub(crate) fn admit_prepared_command(
@@ -1292,10 +1329,25 @@ impl PublicPluginService {
             theme,
             invoked_at,
         };
+        let image = self
+            .manager()?
+            .launcher_images
+            .bound(&request.context, None)
+            .ok()
+            .map(|image| image.descriptor);
+        if matches!(request.candidate.owner, PluginRequestOwner::Command(_))
+            && self
+                .manager()?
+                .command_uses_image(&request.context.plugin_id, &request.candidate.command_id)?
+            && image.is_none()
+        {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         let (kind, invocation) = match &request.candidate.owner {
             PluginRequestOwner::Command(_) => (
                 "command",
                 serde_json::to_value(PluginInvocation {
+                    image,
                     command_id: self.manager()?.invocation_command_id(request)?,
                     api_version: 1,
                     request_id: request.context.request_id.clone(),
@@ -1571,12 +1623,19 @@ impl PublicPluginService {
                     )
                 });
                 let result = result.map(|result| {
-                    result.map(|response| match (response, outcome.credential_publication) {
-                        (PublicPluginResponse::MainResults(results), Some((credential_revision, publication))) => {
-                            PublicPluginResponse::ServiceMainResults { results, credential_revision, publication }
-                        }
-                        (response, _) => response,
-                    })
+                    result.map(
+                        |response| match (response, outcome.credential_publication) {
+                            (
+                                PublicPluginResponse::MainResults(results),
+                                Some((credential_revision, publication)),
+                            ) => PublicPluginResponse::ServiceMainResults {
+                                results,
+                                credential_revision,
+                                publication,
+                            },
+                            (response, _) => response,
+                        },
+                    )
                 });
                 let _ = pending.sender.send(result);
             }
@@ -2215,7 +2274,10 @@ impl PublicPluginHost {
             env!("CARGO_PKG_VERSION_MINOR"),
             env!("CARGO_PKG_VERSION_PATCH"),
         ]
-        .map(|part| part.parse::<u32>().expect("Cargo release version must fit u32"));
+        .map(|part| {
+            part.parse::<u32>()
+                .expect("Cargo release version must fit u32")
+        });
         Self {
             platform,
             version,
