@@ -29,9 +29,9 @@
 
 **Files:** `src-tauri/src/public_plugins/manifest.rs`, `src-tauri/src/public_plugins/tests.rs`, `src-tauri/src/bin/generate_public_plugin_schema.rs`, `packages/plugin-cli/src/manifest.ts`, `packages/plugin-cli/tests/manifest.test.ts`, `packages/plugin-cli/src/contracts.ts`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`，生成的两份 Schema/validator，以及宿主版本文件。
 
-- [ ] 依设计“宿主与插件合同”定义可选图片 OCR 能力，只允许 Windows submit/mainResult、无重复且有正确版本门槛。
-- [ ] 定义只读图片描述符与百度服务入参/输出；缺省字段保持旧包兼容。
-- [ ] 同步 Rust/CLI 语义验证、生成 schema、SDK 和 Host 版本。
+- [x] 依设计“宿主与插件合同”定义可选图片 OCR 能力，只允许 Windows submit/mainResult、无重复且有正确版本门槛。
+- [x] 定义只读图片描述符与百度服务入参/输出；缺省字段保持旧包兼容。
+- [x] 同步 Rust/CLI 语义验证、生成 schema、SDK 和 Host 版本。
 
 **Distinct test coverage:** 旧包缺省成功；单命令/多命令 OCR 能力成功；未知/重复能力、live、Panel/window、旧最低版本、不支持的平台拒绝；生成合同一致。
 
@@ -43,10 +43,10 @@
 
 **Dependencies:** Task 1；设计“主界面交互”“图片生命周期与异步顺序”“宿主与插件合同”。
 
-- [ ] 有界解码、标准化 PNG、内存图片存储及不透明图片 ID。
-- [ ] 仅主窗口可导入/清除；采用导入序号与会话归属防止迟到覆盖。
-- [ ] 主列表按命令能力匹配并显示不可执行原因；执行时复核插件代际、授权和当前图片，再向 Runtime 传递描述符。
-- [ ] 替换、清除、隐藏、撤权、更新时使图片请求和旧结果动作失效。
+- [x] 有界解码、标准化 PNG、内存图片存储及不透明图片 ID。
+- [x] 仅主窗口可导入/清除；采用导入序号与会话归属防止迟到覆盖。
+- [x] 主列表按命令能力匹配并显示不可执行原因；执行时复核插件代际、授权和当前图片，再向 Runtime 传递描述符。
+- [x] 替换、清除、隐藏、撤权、更新时使图片请求和旧结果动作失效。
 
 **Distinct test coverage:** 损坏/MIME 不符/超限图片不替换旧图；A 导入后 B 先完成、A 迟到仍保持 B；图片删除后旧 ID 与跨插件 ID 拒绝；非 main 调用在读状态前拒绝；A 识别期间替换为 B 或隐藏后 A 响应不能发布/复制；只匹配显式声明的启用兼容命令。
 
@@ -58,9 +58,9 @@
 
 **Dependencies:** Tasks 1/2 的图片与请求合同；设计“百度服务与凭据”。共享 activation/commands 由同一后端负责人顺序修改。
 
-- [ ] 请求绑定的服务 facade、当前授权/凭据检查、固定官方主机及 general_basic 请求。
-- [ ] 单次认证和 OCR、图片业务专用上限、固定超时及取消复核；不给通用网络方法提高限额。
-- [ ] 有界解析 lines/text，固定脱敏错误，不向 Runtime 下发令牌或凭据。
+- [x] 请求绑定的服务 facade、当前授权/凭据检查、固定官方主机及 general_basic 请求。
+- [x] 单次认证和 OCR、图片业务专用上限、固定超时及取消复核；不给通用网络方法提高限额。
+- [x] 有界解析 lines/text，固定脱敏错误，不向 Runtime 下发令牌或凭据。
 
 **Distinct test coverage:** 假传输验证表单/端点；未授权、无配置、关闭配置、错误认证/额度/超时/坏 JSON/无文字；请求中凭据变更或撤权后旧成功无效；图片 ID 与上下文不匹配不能产生网络请求；不自动重试，不回传认证材料。
 
@@ -68,18 +68,18 @@
 
 ### Task 4: 启动器图片输入与结果状态
 
-**Files:** 新增 `src/launcher-image.ts` 及聚焦测试；`src/native-input.ts`, `src/protocol.ts`, `src/launcher-core.ts`, `src/launcher-effects.ts`, `src/launcher-view.tsx`, `src/launcher.css`, `src/tauri-client.ts`（实际端口文件以现有结构为准），相应 launcher/core/client 测试。
+**Files:** 新增 `src/launcher-image.ts`、`src/native-input.test.ts`；`src/native-input.ts`, `src/protocol.ts`, `src/launcher-core.ts`, `src/launcher-view.tsx`, `src/styles.css`, `src/main.ts`，以及 `src/launcher.test.tsx`。
 
 **Dependencies:** Tasks 1/2 协议；可先使用假端口实现，最终必须连接真实宿主入口。设计“主界面交互”“图片生命周期与异步顺序”。
 
-- [ ] 粘贴图片检测、缩略图/移除按钮、文字筛选与图像状态，保留普通输入路径。
-- [ ] 插件列表/识别中/结果/错误/Esc 分层；原主列表及复制动作复用。
-- [ ] 新图/会话归属守卫，迟到搜索/识别/导入丢弃；按键 repeat 不能跨状态提交或复制。
-- [ ] 双主题、纯文字详情、焦点及固定输入区尺寸。
+- [x] 粘贴图片检测、缩略图/移除按钮、文字筛选与图像状态，保留普通输入路径。
+- [x] 插件列表/识别中/结果/错误/Esc 分层；原主列表及复制动作复用。
+- [x] 新图/会话归属守卫，迟到搜索/识别/导入丢弃；按键 repeat 不能跨状态提交或复制。
+- [x] 双主题、纯文字详情、焦点及固定输入区尺寸。
 
 **Distinct test coverage:** 粘贴不执行插件；第一次 Enter 只识别，第二次独立按键复制；长按与 pending 不重复；文字粘贴和 IME 不回归；替换失败保留原图；清除/隐藏后旧结果不回填；无插件/无文字/错误/复制失败；Esc 菜单优先级。
 
-**Verify:** `npm.cmd test -- src/launcher-image.test.ts src/native-input.test.ts src/launcher-core.test.ts src/launcher.test.tsx`; `npm.cmd run build`。
+**Verify:** `npm.cmd test -- src/native-input.test.ts src/launcher.test.tsx`; `npm.cmd run build`。
 
 ### Task 5: 百度 OCR 业务插件与开发文档
 
@@ -87,9 +87,9 @@
 
 **Dependencies:** Tasks 1/3；设计“插件交付”“验收”。
 
-- [ ] 按最小 mainResult 插件模式声明能力/权限/主机/版本，执行服务并返回纯文字及全文 copyText。
-- [ ] 错误与空结果不提供误导性复制；输出超过合同限额时明确失败，不截断全文。
-- [ ] 同步现有文档中“OCR 无公开方法”的说明，保留此前用户文档调整。
+- [x] 按最小 mainResult 插件模式声明能力/权限/主机/版本，执行服务并返回纯文字及全文 copyText。
+- [x] 错误与空结果不提供误导性复制；输出超过合同限额时明确失败，不截断全文。
+- [x] 同步现有文档中“OCR 无公开方法”的说明，保留此前用户文档调整。
 
 **Distinct test coverage:** Fake API 验证 imageId 精确传递、requestId 保持；全文/换行/特殊文本；无图片/服务缺失/空文字/服务失败/输出过长；类型检查与 CLI 打包往返。
 
@@ -101,10 +101,10 @@
 
 **Dependencies:** Tasks 1–5；设计“验收”全部九项。
 
-- [ ] 完整前端、Rust/CLI 相关回归，生成合同检查和生产构建。
+- [x] 完整前端、Rust/CLI 相关回归，生成合同检查和生产构建。
 - [ ] 在实际主窗口验证双主题、截图粘贴与七步闭环；使用专用无隐私测试图调用一次百度并核对复制文字。
-- [ ] 审查当前变更的请求/图片/结果归属和权限边界；修复后按影响范围复验。
-- [ ] 输出可安装插件包及实际完成/尚未验证项目，不把静态测试结果当原生验证。
+- [x] 审查当前变更的请求/图片/结果归属和权限边界；修复后按影响范围复验。
+- [x] 输出可安装插件包及实际完成/尚未验证项目，不把静态测试结果当原生验证。
 
 **Distinct test coverage:** 宿主与插件真实组装、安装版本兼容、开启关闭主窗口与重复输入、复制后图钉行为；供应商验收独立于假服务单元测试。
 
@@ -114,3 +114,14 @@
 
 - 初始前端基线首次运行遇到沙箱 `spawn EPERM`；以同一命令申请沙箱外运行，不改测试配置绕过。
 - 2026-11-05：设计获用户确认，任务映射及基线检查进行中。
+- 用户指定真实验收图片 `C:\Users\moby\Downloads\Snipaste_2026-11-05_22-16-57.png`；279×282，包含六个文件名。只使用此图进行供应商验收。
+- Manifest/CLI 合同、SDK 类型、插件 19 项单元测试通过；插件包已生成并通过 archive 校验：`artifacts/ocr-delivery/com.uipilot.baidu-ocr-1.0.0.uipilot-plugin`。
+- 前端审查发现命令参数框粘贴和全文 Tab 顺序两处缺口，已补失败测试后修复；TypeScript 与生产构建通过。
+- Rust 首轮完整回归：1983 通过、11 忽略、2 个既有原生进程 fixture 测试失败；对应进程控制组串行复跑 9 通过、1 忽略。OCR 相关测试通过；最终审查新增时序回归继续验证。
+
+- 最终前端回归分两组执行：launcher/native 396 通过、18 跳过；其余 35 个文件共 353 通过。合计 749 通过、18 跳过。两处界面修复的复审通过。
+
+- 2026-11-06：后端审查的取消/入队时序、完成后再次识别、请求调试脱敏均修复并复审通过。最终 Rust 完整串行回归 1990 通过、0 失败、11 忽略；日志 `artifacts/ocr-backend-rust-serial.log`。
+- 最新开发版已由既有 dev 会话构建并启动；额外启动的验收 dev 会话遇到已有 Everything 资源占用后退出，未停止用户既有会话。
+- 原生工具窗口访问未获批准。用户明确选择自行测试并禁止使用 Computer Use，已停止 GUI 自动化。真实百度调用、截图粘贴、双主题和系统剪贴板七步闭环交由用户手动验收，不声明已通过。
+- 交付包：`artifacts/ocr-delivery/com.uipilot.baidu-ocr-1.0.0.uipilot-plugin`；使用主程序设置导入并确认权限，沿用已启用的百度 OCR 配置。

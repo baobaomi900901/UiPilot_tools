@@ -420,7 +420,7 @@ Host 0.15.0–0.17.x 仅允许 `en` → `zh-CHS` 或反向。text 不 trim，须
 
 固定错误名：`InvalidServiceRequestError`、`ServicePermissionDeniedError`、`CredentialNotConfiguredError`、`CredentialDisabledError`、`CredentialUnavailableError`、`PermissionDeniedError`、`NetworkTargetDeniedError`、`NetworkTimeoutError`、`NetworkFailureError`、`NetworkResponseTooLargeError`、`NetworkResponseInvalidError`、`NetworkLimitExceededError`、`ExpiredRequestError`、`ProviderAuthenticationError`、`ProviderQuotaError`、`ProviderFailureError`。错误不包含真实凭据或供应商原始响应。
 
-`credentials.baiduOcr` 和 `credentials.deepseek` 是独立的默认关闭授权，目前没有公开业务 API，也不能替代有道授权。声明服务权限仅支持 Windows，最低 Host 为 0.15.0。翻译示例申报三项服务权限，但仅调用有道服务。
+`credentials.baiduOcr` 和 `credentials.deepseek` 是独立的默认关闭授权，不能替代有道授权。声明服务权限仅支持 Windows，最低 Host 为 0.15.0；百度 OCR 业务方法从 Host 0.20.0 起提供，DeepSeek 尚无公开业务方法。翻译示例申报三项服务权限，但仅调用有道服务。
 ## Host 0.16.0：划词翻译入口
 
 `selection.read` 是 Windows Host 0.16.0+ 的独立权限，表示用户主动按取词快捷键时允许宿主将本次选中文字作为插件输入。它不开放任意剪贴板读取、后台选区监控或输入模拟 API；`clipboard.read` 仍保留且未支持。安装、升级不默认授予该权限，已有明确授权/撤销保持不变。
@@ -553,3 +553,23 @@ update, PREPARE (even with the same epoch), teardown or unsubscribe invalidates
 queued callbacks. The Host does not await the receiver; thrown/rejected errors
 are contained without exposing exception details, retrying, or ACKing again.
 The hook grants no effect permission and does not authorize automatic speech.
+
+## Host 0.20.0：图片输入与百度 OCR
+
+Windows 的 `submit + mainResult` 命令可声明 `inputCapabilities: ["image.ocr"]`，要求 `minimumHostVersion >= 0.20.0`。单命令和多命令包均可使用；未知或重复能力、live、Panel/window 及其他平台组合被拒绝。省略该字段保留原文字合同。此声明表示图片 OCR 输入能力，不代表网络或凭据授权。
+
+主输入框粘贴图片后，宿主列出已启用且兼容的 OCR 命令，用户回车选择后才调用 Runtime。`PluginInvocation.input` 仍是字符串，图片请求另含只读 `image: {id, mimeType, width, height, byteLength}`。图片满足 OCR 命令的必需输入，无需额外输入文字；无图片时不能执行识别。
+
+图片 ID 是宿主内存快照的不透明引用，绑定启动器会话、图片版本、插件身份/代际和本次 Runtime 请求。它不是路径或剪贴板 getter。插件不能枚举图片、读取其他插件图片或跨请求保留权限。替换/移除图片、退出图片流程、隐藏主窗口、插件失效或授权撤销会使旧操作失效；迟到结果不得发布或复制。
+
+`api.services.baidu.ocr({imageId})` 返回深只读 `{text: string, lines: readonly string[]}`。`text` 按识别行顺序以换行连接。调用需要当前请求绑定的图片、`credentials.baiduOcr` 和 `network.https` 声明与授权，以及 `network.httpsHosts: ["aip.baidubce.com"]`。复制结果还需 `clipboard.write`。设置中已配置且启用的百度 OCR 服务由宿主使用，API Key、Secret Key、访问令牌和原始供应商响应不传给插件。
+
+首版使用通用文字识别标准版 `general_basic`。每次显式识别最多一次认证和一次 OCR 请求，不自动重试，不因粘贴或选中列表项发送图片。此服务的有界图片上传能力不改变普通 `api.network.request` 的请求大小限制。
+
+宿主接受 PNG/JPEG/BMP 单图，输入编码最大 8 MiB、最长边 4096px、最多 1600 万像素，标准化 PNG 最大 3 MiB；这些是产品边界。坏图片或超限导入不替换原有效图片。无文字时返回空文本/空行数组；插件应返回无默认动作的说明项，不复制空值。
+
+服务使用现有固定错误名，包括权限/凭据不可用、认证失败、额度不足、网络失败/超时、无效或过大的响应及 `ExpiredRequestError`。错误不携带密钥、令牌、图片或原始响应。请求结束后保存的方法和旧图片 ID 均不能借用新请求。
+
+OCR 结果沿用 `mainResult` 与 `defaultAction: {type: "copyText", text}`。识别完成不自动复制，用户再次按下 Enter 才执行复制。宿主在图片结果流程中按纯文字渲染详情，保留换行；插件应保留全文并检查现有 16 KiB 详情及 64 KiB 整体响应限制，超过时明确失败，不能静默截断后复制。
+
+业务参考包：`examples/public-plugins/com.uipilot.baidu-ocr/`。

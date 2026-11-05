@@ -1128,7 +1128,7 @@ Host 0.15.0–0.17.x 仅允许 `en` → `zh-CHS` 或反向。text 不 trim，须
 
 固定错误名：`InvalidServiceRequestError`、`ServicePermissionDeniedError`、`CredentialNotConfiguredError`、`CredentialDisabledError`、`CredentialUnavailableError`、`PermissionDeniedError`、`NetworkTargetDeniedError`、`NetworkTimeoutError`、`NetworkFailureError`、`NetworkResponseTooLargeError`、`NetworkResponseInvalidError`、`NetworkLimitExceededError`、`ExpiredRequestError`、`ProviderAuthenticationError`、`ProviderQuotaError`、`ProviderFailureError`。错误不包含真实凭据或供应商原始响应。
 
-`credentials.baiduOcr` 和 `credentials.deepseek` 是独立的默认关闭授权，目前没有公开业务 API，也不能替代有道授权。声明服务权限仅支持 Windows，最低 Host 为 0.15.0。翻译示例申报三项服务权限，但仅调用有道服务。
+`credentials.baiduOcr` 和 `credentials.deepseek` 是独立的默认关闭授权，不能替代有道授权。声明服务权限仅支持 Windows，最低 Host 为 0.15.0；百度 OCR 业务方法从 Host 0.20.0 起提供，DeepSeek 尚无公开业务方法。翻译示例申报三项服务权限，但仅调用有道服务。
 
 ## Panel 操作提示
 
@@ -1253,3 +1253,27 @@ The hook grants no effect permission and does not authorize automatic speech.
 ## Host 0.19.0 多语言翻译
 
 有道文本翻译和本地朗读使用 [112 种规范语言代码](./youdao-languages.json)。新增翻译语言要求 `minimumHostVersion >= 0.19.0`；源语言可用 `auto`，目标语言不能用 `auto`。目录同时记录服务支持自动识别的 83 种语言，其余请提供手动选择。`speech.voices()` 仅报告系统实际安装且能匹配的 SAPI 声音，翻译语种可用不代表朗读可用。参考 `examples/public-plugins/com.uipilot.translate/package/` 的多语言 Panel。
+
+## Host 0.20.0 图片 OCR 插件
+
+参考 [百度 OCR](../../examples/public-plugins/com.uipilot.baidu-ocr/README.md)。它使用宿主图片输入、已保存的百度配置和主结果复制流程，插件无需读取剪贴板或再次保存密钥。
+
+命令声明 `inputCapabilities: ["image.ocr"]`，使用 Windows、`submit + mainResult` 和 `minimumHostVersion: "0.20.0"`。声明并获得 `credentials.baiduOcr`、`network.https`、`clipboard.write` 授权，网络主机固定为 `aip.baidubce.com`。图片 capability 不代替这些授权。
+
+```javascript
+export async function onCommand(invocation, api) {
+  if (!invocation.image) {
+    return { requestId: invocation.requestId, results: [{ id: 'missing', title: '请粘贴一张图片' }] }
+  }
+  const { text } = await api.services.baidu.ocr({ imageId: invocation.image.id })
+  return {
+    requestId: invocation.requestId,
+    results: text ? [{ id: 'text', title: '识别结果', detail: text, defaultAction: { type: 'copyText', text } }]
+      : [{ id: 'empty', title: '未识别到文字' }],
+  }
+}
+```
+
+示例片段展示正常调用；正式包还需像参考包一样处理固定错误、过期请求和结果大小限制。不要持久化图片 ID，或把它当文件路径。主程序在粘贴后列出 OCR 插件，第一次回车识别，结果出现后再次回车复制；结果不能自动复制，长按回车也不能触发第二个动作。
+
+自动测试替换服务实现，并验证图片 ID、完整换行、空结果、错误及不自动重试。打包和 SDK 类型检查完成后，再用用户指定图片在真实 Host 中验证；离线通过不代表供应商请求、原生粘贴和复制已经验收。详细资源边界、权限与生命周期见 API v1 的“Host 0.20.0：图片输入与百度 OCR”。
