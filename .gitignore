@@ -259,3 +259,6 @@ __marimo__/
 /artifacts/provider-build/
 /artifacts/test-temp/
 /.uipilot-local.json
+
+# Locally signed macOS smoke-test bundles
+/artifacts/macos-internal/
