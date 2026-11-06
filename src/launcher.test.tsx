@@ -295,10 +295,11 @@ describe('plugin protocol', () => {
 })
 
 const configCapture = vi.hoisted(() => ({ values: [] as unknown[] }))
-const tauriCapture = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }))
+const tauriCapture = vi.hoisted(() => ({ capabilities: vi.fn(), invoke: vi.fn(), listen: vi.fn() }))
 const windowCapture = vi.hoisted(() => ({ label: 'main' }))
 
-vi.mock('@tauri-apps/api/core', () => ({ invoke: tauriCapture.invoke }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: (command: string, ...args: unknown[]) =>
+  command === 'get_host_capabilities' ? tauriCapture.capabilities(...args) : tauriCapture.invoke(command, ...args) }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: tauriCapture.listen }))
 
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ label: windowCapture.label }) }))
@@ -9125,10 +9126,18 @@ describe('React view and accessibility', () => {
 })
 
 describe('real adapter and startup', () => {
+  function hostSnapshot(platform: 'windows' | 'macos'): import('./host-capabilities').HostCapabilities {
+    const enabled = platform === 'windows'
+    return { version: 1, platform, plugins: enabled, files: enabled, screenshot: enabled,
+      messages: enabled, credentials: enabled, builtinFeatures: enabled, commandHotkeys: enabled,
+      autostart: enabled, doubleTap: enabled }
+  }
   function resetAdapterDocument() {
     vi.resetModules()
     document.body.innerHTML = '<main id="app"></main>'
     installMatchMedia(false)
+    windowCapture.label = 'main'
+    tauriCapture.capabilities.mockReset().mockResolvedValue(hostSnapshot('windows'))
     tauriCapture.invoke.mockReset()
     tauriCapture.listen.mockReset()
   }
@@ -9136,6 +9145,91 @@ describe('real adapter and startup', () => {
   async function pagehide() {
     await act(async () => window.dispatchEvent(new Event('pagehide')))
   }
+
+  it('boots the Mac launcher without optional listeners and exposes only supported settings', async () => {
+    resetAdapterDocument()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    tauriCapture.capabilities.mockResolvedValue(hostSnapshot('macos'))
+    const subscriptions = new Map<string, { handler: (event: {payload: unknown}) => void; stop: ReturnType<typeof vi.fn> }>()
+    tauriCapture.listen.mockImplementation(async (name: string, handler) => {
+      expect(tauriCapture.capabilities).toHaveBeenCalledOnce()
+      if (!['launcher://shown', 'launcher://hidden', 'hotkey-recording://current'].includes(name)) throw new Error(name)
+      const stop = vi.fn()
+      subscriptions.set(name, { handler, stop })
+      return stop
+    })
+    tauriCapture.invoke.mockImplementation(async (name) => {
+      if (name === 'load_settings') return emptySettings
+      if (name === 'execute_result') return { status: 'launchRequested' }
+      if (name === 'search_apps') return { requestId: 'current', items: [
+        { resultId: 'app', title: 'Calculator', activation: { kind: 'executeResult' } },
+        { resultId: 'find', title: '/find', activation: { kind: 'openFind', query: '' } },
+      ] }
+      throw new Error(name)
+    })
+    try {
+      await act(async () => { await import('./main') })
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+      await act(async () => subscriptions.get('launcher://shown')!.handler({payload: shown('mac-apps')}))
+      await vi.waitFor(() => expect(document.body.textContent).toContain('Calculator'))
+      expect(document.body.textContent).not.toContain('/find')
+      await act(async () => {
+        document.querySelector('[role="combobox"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      })
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('execute_result', {requestId: 'current', resultId: 'app'}))
+      await act(async () => subscriptions.get('launcher://shown')!.handler({payload: shown('mac-settings', 'settings')}))
+      await vi.waitFor(() => expect(document.querySelectorAll('[role="tab"]')).toHaveLength(1))
+      expect(document.querySelector('[role="tab"]')?.textContent).toContain('通用')
+      expect(document.body.textContent).not.toMatch(/截图快捷键|开机启动|搜索引擎|恢复初始化/)
+      expect(tauriCapture.invoke.mock.calls.map(([name]) => name).every(name => ['load_settings', 'search_apps', 'execute_result'].includes(name))).toBe(true)
+      expect(tauriCapture.listen.mock.calls).toHaveLength(3)
+    } finally { await pagehide() }
+    for (const { stop } of subscriptions.values()) expect(stop).toHaveBeenCalledOnce()
+  })
+
+  it('routes Mac text and slash queries through application search only', async () => {
+    const { client, emit } = fakeClient()
+    client.cancelTranslationSelection = vi.fn(async () => {})
+    const core = createLauncherCore(client, undefined, hostSnapshot('macos'))
+    await core.start()
+    try {
+      emit(shown('mac-typing'))
+      for (const value of ['Calc', '/find something']) {
+        core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value, inputType: 'insertText' })
+        await vi.waitFor(() => expect(client.searchApps).toHaveBeenCalledWith(expect.objectContaining({query: value})))
+      }
+      core.keyDown('Enter', false)
+      expect(client.openFind).not.toHaveBeenCalled()
+      expect(client.cancelTranslationSelection).not.toHaveBeenCalled()
+    } finally { core.destroy() }
+  })
+
+  it('drops a pending capability snapshot when its window unloads', async () => {
+    resetAdapterDocument()
+    const result = deferred<ReturnType<typeof hostSnapshot>>()
+    tauriCapture.capabilities.mockReturnValue(result.promise)
+    await act(async () => { await import('./main') })
+    await pagehide()
+    await act(async () => { result.resolve(hostSnapshot('macos')) })
+    expect(document.querySelector('#app')?.childElementCount).toBe(0)
+    expect(tauriCapture.listen).not.toHaveBeenCalled()
+  })
+
+  it('retries a failed capability read without mounting optional services', async () => {
+    resetAdapterDocument()
+    tauriCapture.capabilities.mockResolvedValueOnce({version: 99}).mockResolvedValue(hostSnapshot('macos'))
+    tauriCapture.listen.mockResolvedValue(vi.fn())
+    tauriCapture.invoke.mockResolvedValue(emptySettings)
+    try {
+      await act(async () => { await import('./main') })
+      expect(tauriCapture.listen).not.toHaveBeenCalled()
+      const retry = document.querySelector<HTMLButtonElement>('#app button')
+      expect(retry?.textContent).toBe('重试')
+      await act(async () => retry!.click())
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+      expect(tauriCapture.capabilities).toHaveBeenCalledTimes(2)
+    } finally { await pagehide() }
+  })
 
   it('renders but does not report startup readiness until the focus listener is installed', async () => {
     resetAdapterDocument()

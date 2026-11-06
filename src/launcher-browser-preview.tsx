@@ -1,6 +1,7 @@
 import { createRoot } from 'react-dom/client'
 import { createPreviewCredentialClient } from './credential-preview'
 
+import { previewCapabilities, type HostCapabilities } from './host-capabilities'
 import { createLauncherCore } from './launcher-core'
 import { LauncherView } from './launcher-view'
 import {
@@ -17,6 +18,10 @@ import {
 } from './protocol'
 
 const previewParameters = new URLSearchParams(window.location.search)
+const capabilities: HostCapabilities = previewParameters.get('platform') === 'macos' ? {
+  version: 1, platform: 'macos', plugins: false, files: false, screenshot: false, messages: false,
+  credentials: false, builtinFeatures: false, commandHotkeys: false, autostart: false, doubleTap: false,
+} : previewCapabilities
 const previewTheme = previewParameters.get('theme') === 'light' ? 'light' : 'dark'
 const settings: SettingsView = {
   screenshotHotkey: null,
@@ -262,6 +267,12 @@ function loadAppIcon(): Promise<string | null> {
 }
 
 async function searchResponse(query: string, querySequence: number): Promise<SearchResponse> {
+  if (capabilities.platform === 'macos') {
+    const apps = ['Calculator', 'Safari', '备忘录'].filter(title => title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
+    return { requestId: `browser-preview-${querySequence}`, items: apps.map(title => ({
+      title, resultId: `preview-${title}`, activation: {kind: 'executeResult'}, hasDefaultAction: true,
+    })) }
+  }
   if (mainResultPreview && query.startsWith('/translate')) {
     const argument = query.slice('/translate'.length).trimStart()
     const scenario = previewParameters.get('scenario')
@@ -617,7 +628,7 @@ function mountPanelContentPreview(hostElement: HTMLElement): () => void {
   }
 }
 
-const core = createLauncherCore(client)
+const core = createLauncherCore(client, undefined, capabilities)
 const root = createRoot(host)
 let started = false
 let panelActivationQueued = false

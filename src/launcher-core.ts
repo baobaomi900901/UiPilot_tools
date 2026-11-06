@@ -53,10 +53,12 @@ import {
   type ViewResult,
   type WebSearchEngine,
 } from './protocol'
+import { previewCapabilities, resultAvailable, settingsTabAvailable, type HostCapabilities } from './host-capabilities'
 import { createMessageCenterCore } from './message-center-core'
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 
 export interface LauncherCore {
+  readonly capabilities: HostCapabilities
   readonly client: LauncherClient
   readonly getSnapshot: () => LauncherSnapshot
   readonly subscribe: (listener: () => void) => () => void
@@ -917,7 +919,8 @@ function projectSnapshot(model: Model): LauncherSnapshot {
   })
 }
 
-export function createLauncherCore(client: LauncherClient, maximumQuerySequence = Number.MAX_SAFE_INTEGER): LauncherCore {
+export function createLauncherCore(client: LauncherClient, maximumQuerySequence = Number.MAX_SAFE_INTEGER,
+  capabilities: HostCapabilities = previewCapabilities): LauncherCore {
   const messageCenter = createMessageCenterCore(client)
   const model: Model = {
     view: 'launcher',
@@ -1577,6 +1580,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function fileCommand(value: string): string | null {
+    if (!capabilities.files) return null
     if (value === '/find') return ''
     return value.startsWith('/find ') ? value.slice(6) : null
   }
@@ -2107,7 +2111,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!ownsSearch(captured)) return
     settleCompletionCommit(captured)
     const transferToken = response?.windowTransferToken
-    if (transferToken !== undefined) {
+    if (capabilities.plugins && transferToken !== undefined) {
       let pending: Promise<void>
       try {
         pending = client.commitPluginWindowTransfer({ transferToken })
@@ -2137,7 +2141,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     model.searchPending = false
     if (response !== null) {
-      const mainResultCommand = safeMainResultCommand(response.mainResultCommand)
+      const mainResultCommand = capabilities.plugins ? safeMainResultCommand(response.mainResultCommand) : undefined
       const activeCommand = model.mainResultCommand
       if ((response.mainResultCommand !== undefined && !mainResultCommand) ||
           (mainResultCommand && activeCommand &&
@@ -2153,7 +2157,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         const actionMetadata = parseResultActionMetadata(item)
         if (actionMetadata === null) return []
         const activation = safeLauncherActivation(item.activation)
-        if (activation === undefined || typeof item.resultId !== 'string' ||
+        if (activation === undefined || !resultAvailable(capabilities, activation, item) || typeof item.resultId !== 'string' ||
             (actionMetadata !== undefined && activation.kind !== 'executeResult') ||
             (activation.kind === 'executeResult' && item.resultId.length === 0) ||
             (activation.kind === 'informational' && item.hasDefaultAction !== false)) return []
@@ -2600,6 +2604,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   const consumedSelectionIds = new Set<string>()
   function commandHotkeyEntry(payload: unknown, selectionText?: string, selectionError?: string): void {
+    if (!capabilities.commandHotkeys || !capabilities.plugins) return
     const entry = parseCommandHotkeyEntry(payload)
     if (destroyed || !entry || consumeHotkeyRecording(entry) || !model.invocationId) return
     // A new entry owns the source immediately, including while its resolve is awaiting.
@@ -2672,7 +2677,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   function shown(payload: unknown): void {
     if (destroyed) return
     const event = parseLauncherShown(payload)
-    if (!event) return
+    if (!event || (event.target === 'messages' && !capabilities.messages) ||
+        (event.commandEntry && (!capabilities.commandHotkeys || !capabilities.plugins)) ||
+        (event.builtinEntry && (!capabilities.commandHotkeys || !capabilities.builtinFeatures))) return
     if (event.selectionTranslation && consumedSelectionIds.has(event.selectionTranslation.id)) return
     if (event.selectionTranslation) consumedSelectionIds.add(event.selectionTranslation.id)
     if (event.target === 'launcher' && (hotkeyRecording || (model.view === 'settings' && Date.now() <= hotkeyShowGraceUntil)) && consumeHotkeyRecording(event.commandEntry)) {
@@ -2705,10 +2712,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       publish(true)
     } else if (event.commandEntry) commandHotkeyEntry(event.commandEntry, event.selectionTranslation?.text)
     else if (event.builtinEntry) builtinHotkeyEntry(event.builtinEntry)
-    void messageCenter.refresh()
+    if (capabilities.messages) void messageCenter.refresh()
   }
 
   function navigate(target: ShowTarget): void {
+    if (target === 'messages' && !capabilities.messages) return
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
     const nextTab = target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
     if (
@@ -2725,7 +2733,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     commandEntryToken++
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
-    if (destroyed || model.view !== 'settings' || model.settingsTab === key) return
+    if (destroyed || model.view !== 'settings' || model.settingsTab === key || !settingsTabAvailable(capabilities, key)) return
     messageCenter.leave()
     model.settingsTab = key
     publish(true)
@@ -2746,7 +2754,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       !ownsComposition(composition, record.control)) return
     if (record.kind === 'ordinaryInput' || record.kind === 'compositionStart') {
       commandEntryToken++
-      void client.cancelTranslationSelection?.().catch(() => {})
+      if (capabilities.plugins) void client.cancelTranslationSelection?.().catch(() => {})
     }
     if (record.kind === 'ordinaryInput') {
       if (ownsComposition(composition, record.control)) composition = undefined
@@ -2814,7 +2822,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function setAutostart(checked: boolean): void {
-    if (!settingsEditable() || model.settings!.autostart === checked) return
+    if (!capabilities.autostart || !settingsEditable() || model.settings!.autostart === checked) return
     const operation = startSettingsOperation('save')
     if (!operation) return
     model.settings!.autostart = checked
@@ -2844,7 +2852,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function setWebSearchEngine(engine: WebSearchEngine): void {
-    if (!settingsEditable() || model.settings?.webSearchEngine === engine) return
+    if (!capabilities.builtinFeatures || !settingsEditable() || model.settings?.webSearchEngine === engine) return
     const operation = startSettingsOperation('webSearchEngine')
     if (!operation) return
     model.settings!.webSearchEngine = engine
@@ -3079,7 +3087,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function resetSettings(): Promise<void> {
-    if (!settingsEditable() || !model.settings) return
+    if (capabilities.platform !== 'windows' || !settingsEditable() || !model.settings) return
     const operation = startSettingsOperation('save')
     if (!operation) return
     setControlDraft(model.settings.hotkey.key, 'Shift+Space')
@@ -3115,7 +3123,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function changeScreenshotSaveDirectory(restore: boolean): Promise<void> {
-    if (!settingsEditable() || !model.settings) return
+    if (!capabilities.screenshot || !settingsEditable() || !model.settings) return
     const operation = startSettingsOperation('screenshotDirectory')
     if (!operation) return
     try {
@@ -3140,7 +3148,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   const restoreScreenshotSaveDirectory = () => changeScreenshotSaveDirectory(true)
 
   async function saveScreenshotHotkey(value: string | null): Promise<void> {
-    if (!settingsEditable() || !model.settings) return
+    if (!capabilities.screenshot || !settingsEditable() || !model.settings) return
     const operation = startSettingsOperation('hotkey')
     if (!operation) return
     try {
@@ -3325,6 +3333,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function preparePanelHostInputFocusListener(): Promise<boolean> {
+    if (!capabilities.plugins) return Promise.resolve(true)
     if (panelFocusListenerRegistration) return panelFocusListenerRegistration
     panelFocusListenerRegistration = (async () => {
       let registered: (() => void) | undefined
@@ -4050,7 +4059,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function requestHide(): Promise<void> {
-    void client.cancelTranslationSelection?.().catch(() => {})
+    if (capabilities.plugins) void client.cancelTranslationSelection?.().catch(() => {})
     commandEntryToken++
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
@@ -4272,11 +4281,13 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     try {
       registered = await client.listenShown(shown)
       hiddenRegistered = await client.listenHidden(hidden)
-      builtinFeaturesChangedRegistered = await client.listenBuiltinFeaturesChanged?.(builtinFeaturesChanged)
-      panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
-      panelStatusRegistered = await client.listenPluginPanelStatus?.(handlePanelStatus)
-      panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
-      screenshotErrorsRegistered = await client.listenScreenshotError((payload) => {
+      if (capabilities.builtinFeatures) builtinFeaturesChangedRegistered = await client.listenBuiltinFeaturesChanged?.(builtinFeaturesChanged)
+      if (capabilities.plugins) {
+        panelErrorsRegistered = await client.listenPluginPanelError(handlePanelError)
+        panelStatusRegistered = await client.listenPluginPanelStatus?.(handlePanelStatus)
+        panelResetsRegistered = await client.listenPluginPanelReset(handlePanelReset)
+      }
+      if (capabilities.screenshot) screenshotErrorsRegistered = await client.listenScreenshotError((payload) => {
         const error = exactPlainRecord(payload, ['code', 'invocationId', 'querySequence'])
         if (destroyed || !error || typeof error.code !== 'string' || model.view !== 'launcher' ||
             error.invocationId !== model.invocationId || error.querySequence !== model.querySequence) return
@@ -4301,10 +4312,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       registered()
       hiddenRegistered()
       builtinFeaturesChangedRegistered?.()
-      panelErrorsRegistered()
+      panelErrorsRegistered?.()
       panelStatusRegistered?.()
-      panelResetsRegistered()
-      screenshotErrorsRegistered()
+      panelResetsRegistered?.()
+      screenshotErrorsRegistered?.()
       return
     }
     unlisten = registered
@@ -4314,7 +4325,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     unlistenPanelStatus = panelStatusRegistered
     unlistenPanelReset = panelResetsRegistered
     unlistenScreenshotError = screenshotErrorsRegistered
-    await messageCenter.start()
+    if (capabilities.messages) await messageCenter.start()
     if (destroyed) return
     const operation = startSettingsOperation('load', {
       scope: 'startup',
@@ -4477,6 +4488,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   return {
     client,
+    capabilities,
     getSnapshot,
     subscribe,
     start,

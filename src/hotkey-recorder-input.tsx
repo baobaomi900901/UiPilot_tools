@@ -22,6 +22,7 @@ function publishOwner(owner: typeof recordingOwner): void {
 interface HotkeyRecorderInputProps {
   onCommit: (canonical: string) => void | Promise<void>
   onRecordingPhase?: (phase: HotkeyRecordingPhase) => void | Promise<void>
+  platform?: 'windows' | 'macos'
   allowDoubleTap?: boolean
   allowSameValue?: boolean
   label?: string
@@ -31,7 +32,7 @@ interface HotkeyRecorderInputProps {
   name?: string
 }
 
-export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, allowDoubleTap = true, allowSameValue = false, label = '快捷键', value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
+export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, platform, allowDoubleTap = true, allowSameValue = false, label = '快捷键', value, disabled, id, name }: HotkeyRecorderInputProps): React.JSX.Element {
   const [ownerId] = useState(() => Symbol('hotkey-recorder'))
   const owner = useSyncExternalStore(subscribeOwner, getOwner, getOwner)
   const blockedByOwner = owner !== undefined && (owner.id !== ownerId || owner.releasing)
@@ -92,7 +93,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, al
   }, [releaseRecording, ownerId, onCommit, allowDoubleTap, allowSameValue, value, updateRecorderState])
 
   const display =
-    recording ? '按下快捷键…' : value ? formatHotkeyDisplay(value) : ''
+    recording ? '按下快捷键…' : value ? formatHotkeyDisplay(value, platform) : ''
 
   useLayoutEffect(() => {
     if (recording) {

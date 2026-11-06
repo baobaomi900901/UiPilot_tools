@@ -35,11 +35,15 @@ const RECORDING_DISPLAY = '按下快捷键…'
 
 type KeydownEvent = Extract<RecorderEvent, { type: 'keydown' }>
 
-export function formatHotkeyDisplay(canonical: string): string {
+export function formatHotkeyDisplay(canonical: string, platform: 'windows' | 'macos' = 'windows'): string {
   if (canonical === 'DoubleCtrl') return '双击 Ctrl'
   if (canonical === 'DoubleAlt') return '双击 Alt'
   if (canonical.includes('+')) {
-    return canonical.split('+').join(' + ')
+    return canonical.split('+').map(key => {
+      if (platform === 'macos' && key === 'Alt') return 'Option'
+      if (platform === 'macos' && key === 'Meta') return 'Command'
+      return key
+    }).join(' + ')
   }
   return canonical
 }
