@@ -110,7 +110,7 @@ Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 
 
 ### Task 7: Launcher share selector and recovery UI
 
-**Files:** `src/launcher-{core,view}.tsx` or existing `.ts` equivalent, `protocol.ts`, `public-plugin-panel.tsx`, focused share components/styles/tests, `panel-context-actions.js` if needed.
+**Files:** `src/launcher-core.ts`, `src/launcher-view.tsx`, `src/main.ts`, `src/protocol.ts`, `src/native-input.ts`, focused share components/styles/tests, `src/panel-context-actions.js` if needed.
 
 **Dependencies:** Task 6 frontend wire interfaces; design sections 6, 8; `docs/ui-guidelines.md`.
 
