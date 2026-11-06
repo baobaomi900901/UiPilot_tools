@@ -1,4 +1,4 @@
-import { readdirSync, lstatSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -87,10 +87,23 @@ export function buildStages(root, found, { npmCli = resolveNpmCli() } = {}) {
     ]),
     {
       name: 'reference package validation',
-      commands: found.packages.map(pkg => node(pkg, [
-        path.join(root, 'packages/plugin-cli/dist/cli.mjs'),
-        'validate', pkg, '--platform', 'windows',
-      ])),
+      commands: found.packages.flatMap(pkg => {
+        const { supportedPlatforms } = JSON.parse(readFileSync(path.join(pkg, 'plugin.json'), 'utf8'));
+        if (!Array.isArray(supportedPlatforms) || supportedPlatforms.length === 0 ||
+            !supportedPlatforms.every(platform => ['windows','macos'].includes(platform))) {
+          throw new Error('Invalid supportedPlatforms in ' + pkg);
+        }
+        return ['windows','macos'].map(platform => {
+          const item = node(pkg + ' (' + platform + ')', [
+            path.join(root, 'packages/plugin-cli/dist/cli.mjs'), 'validate', pkg, '--platform', platform,
+          ]);
+          if (!supportedPlatforms.includes(platform)) {
+            item.args.push('--json');
+            item.expectIncompatible = platform;
+          }
+          return item;
+        });
+      }),
     },
   ];
 }
@@ -101,12 +114,20 @@ export async function runStages(stages, spawn = spawnSync, log = console.log) {
     for (const item of stage.commands ?? [stage]) {
       let result;
       try {
-        result = spawn(item.command, item.args, { cwd: item.cwd, stdio: 'inherit', shell: false });
+        result = spawn(item.command, item.args, { cwd: item.cwd, stdio: item.expectIncompatible ? ['ignore','pipe','inherit'] : 'inherit', encoding: 'utf8', shell: false });
       } catch (error) {
         throw new Error(`${stage.name}: spawn failed: ${error.message}`);
       }
       if (result.error) {
         throw new Error(`${stage.name}: spawn failed: ${result.error.message}`);
+      }
+      if (item.expectIncompatible) {
+        const report = result.status === 1 ? JSON.parse(result.stdout) : null;
+        if (report?.valid !== false || report.target?.platform !== item.expectIncompatible ||
+            !report.issues?.some(issue => issue.code === 'PLATFORM_INCOMPATIBLE')) {
+          throw new Error(stage.name + ': expected PLATFORM_INCOMPATIBLE for ' + item.name);
+        }
+        continue;
       }
       if (result.status !== 0) {
         throw new Error(`${stage.name}: ${item.name} exited ${result.status ?? result.signal ?? 'unknown'}`);

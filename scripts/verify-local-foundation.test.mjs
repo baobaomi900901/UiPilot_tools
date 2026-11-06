@@ -13,7 +13,7 @@ function fixture(t) {
     const base = path.join(root, 'examples/public-plugins', name);
     mkdirSync(path.join(base, 'package'), { recursive: true });
     mkdirSync(path.join(base, 'tests'));
-    writeFileSync(path.join(base, 'package/plugin.json'), '{}');
+    writeFileSync(path.join(base, 'package/plugin.json'), JSON.stringify({ supportedPlatforms: name === 'a plugin' ? ['windows','macos'] : ['windows'] }));
     writeFileSync(path.join(base, 'tests/runtime.test.js'), '');
     writeFileSync(path.join(base, 'tests/sdk-contract.ts'), '');
   }
@@ -37,7 +37,24 @@ test('discovery sorts all collections and preserves spaced paths as argv', t => 
   assert.equal(stages[4].args.at(-1), '--check');
   assert.equal(stages[1].command, process.execPath);
   assert.equal(stages[1].args[0], 'C:/npm cli/npm-cli.js');
-  assert.deepEqual(stages[8].commands.map(item => item.args[2]), found.packages);
+  assert.deepEqual([...new Set(stages[8].commands.map(item => item.args[2]))], found.packages);
+});
+
+test('reference validation exercises both platforms and requires an explicit incompatibility', async t => {
+  const root = fixture(t);
+  const stage = buildStages(root, discover(root), { npmCli: 'unused' })[8];
+  const [supportedWin, supportedMac, winOnly, rejectedMac] = stage.commands;
+  assert.deepEqual(stage.commands.map(c => c.args.slice(3,5)), [
+    ['--platform','windows'], ['--platform','macos'], ['--platform','windows'], ['--platform','macos'],
+  ]);
+  assert.ok([supportedWin, supportedMac, winOnly].every(c => !c.expectIncompatible));
+  assert.equal(rejectedMac.expectIncompatible, 'macos');
+  const run = (status, issue) => runStages([{...stage, commands: [rejectedMac]}], () => ({
+    status, stdout: JSON.stringify({valid:false,target:{platform:'macos'},issues:[{code:issue}]}),
+  }), () => {});
+  await run(1,'PLATFORM_INCOMPATIBLE');
+  await assert.rejects(run(0,'PLATFORM_INCOMPATIBLE'));
+  await assert.rejects(run(1,'CLI_INTERNAL'));
 });
 
 test('missing root and empty collections fail closed', t => {
@@ -200,13 +217,13 @@ test('unreleased multi-package fixture adds tests and SDK contracts without rele
   assert.ok(found.contracts.includes(path.join(base, 'sdk-contract.ts')));
   const stages = buildStages(root, found, { npmCli: 'C:/npm cli/npm-cli.js' });
   assert.deepEqual(stages[7].args.slice(-found.contracts.length), found.contracts);
-  assert.deepEqual(stages[8].commands.map(item => item.args[2]), found.packages);
+  assert.deepEqual([...new Set(stages[8].commands.map(item => item.args[2]))], found.packages);
   assert.ok(stages[8].commands.every(item => !item.args.includes(pkg)));
 });
 
 test('release repository inventory includes the complete multi-command package', () => {
   const found = discover(repositoryRoot);
-  assert.equal(found.tests.length, 21);
+  assert.equal(found.tests.length, 29);
   assert.equal(found.contracts.length, 14);
   assert.equal(found.packages.length, 17);
   assert.ok(found.tests.some(file => file.includes('com.uipilot.auth-check')));
