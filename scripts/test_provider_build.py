@@ -131,7 +131,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_bundle_hooks_and_resources_use_relative_paths(self):
         import json
-        config=json.loads((p.ROOT/'src-tauri/tauri.conf.json').read_text(encoding='utf-8'))
+        config=json.loads((p.ROOT/'src-tauri/tauri.windows.conf.json').read_text(encoding='utf-8'))
         self.assertTrue(config['build']['beforeBuildCommand'].startswith('python scripts/provider_build.py prepare &&'))
         self.assertTrue(config['build']['beforeBundleCommand'].startswith('python scripts/provider_build.py validate &&'))
         for name in (p.EXE,p.MANIFEST): self.assertIn('resources/provider/'+name,config['bundle']['resources'])

@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "dev": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-with-everything.ps1",
+    "dev": "node scripts/platform-launcher.mjs dev",
     "dev:vite": "vite",
     "preview:settings": "vite --host 127.0.0.1 --port 14339 --strictPort",
     "build": "tsc --noEmit && vite build",
@@ -15,7 +15,7 @@
     "stage:managed-everything:production": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode ProductionBundleInput",
     "stage:managed-everything:vm": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-managed-everything-installer.ps1 -Configuration Release -Mode VmInstrumentedBundleInput",
     "test:managed-everything": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-managed-everything-installer.ps1 -Mode Source",
-    "tauri": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1",
+    "tauri": "node scripts/platform-launcher.mjs tauri",
     "verify": "node scripts/verify-local-foundation.mjs",
     "verify:local": "node scripts/verify-local-foundation.mjs"
   },

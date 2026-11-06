@@ -29,6 +29,17 @@ try {
     $occupiedPort = [int]$listener.LocalEndpoint.Port
     $selectedPort = Get-UiPilotAvailableDevPort -StartPort $occupiedPort
     Assert-Condition ($selectedPort -gt $occupiedPort) 'Dev port selection must advance past an occupied port'
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $provider = Join-Path $repoRoot 'example dev directory\UIAutoma.UIAutomation.Provider.exe'
+    $dev = New-UiPilotDevConfigOverride -RepositoryRoot $repoRoot -Port $selectedPort -ProviderExe $provider
+    Assert-Condition ($dev.build.devUrl -eq "http://127.0.0.1:$selectedPort") 'devUrl must use the selected port'
+    $map = $dev.bundle.resources
+    Assert-Condition ($map['resources/everything/Everything.exe'] -eq 'resources/everything/Everything.exe') 'Keep Windows Everything'
+    Assert-Condition ($map['resources/sounds/message-notification.wav'] -eq 'resources/sounds/message-notification.wav') 'Keep shared sound'
+    Assert-Condition ($map[$provider] -eq 'resources/provider/UIAutoma.UIAutomation.Provider.exe') 'Use the development Provider'
+    $manifest = Join-Path (Split-Path -Parent $provider) 'asset-manifest.json'
+    Assert-Condition ($map[$manifest] -eq 'resources/provider/asset-manifest.json') 'Use the paired development manifest'
+    Assert-Condition (-not $map.ContainsKey('resources/provider/UIAutoma.UIAutomation.Provider.exe')) 'Do not retain the production Provider source'
 }
 finally {
     $listener.Stop()

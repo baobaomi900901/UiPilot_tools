@@ -1,0 +1,34 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "build": {
+    "beforeBuildCommand": "python scripts/provider_build.py prepare && npm run build && npm run build:managed-everything",
+    "beforeBundleCommand": "python scripts/provider_build.py validate && npm run stage:managed-everything:production"
+  },
+  "bundle": {
+    "resources": [
+      "resources/everything/Everything.exe",
+      "resources/everything/LICENSE.txt",
+      "resources/everything/everything.lock.json",
+      "resources/everything/Everything-UiPilot.ini",
+      "resources/sounds/message-notification.wav",
+      "resources/provider/UIAutoma.UIAutomation.Provider.exe",
+      "resources/provider/asset-manifest.json"
+    ],
+    "icon": [
+      "icons/icon16.png",
+      "icons/icon32.png",
+      "icons/icon48.png",
+      "icons/icon64.png",
+      "icons/icon128.png",
+      "icons/icon256.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "windows/nsis-hooks.nsh",
+        "template": "windows/installer.nsi"
+      }
+    }
+  }
+}
