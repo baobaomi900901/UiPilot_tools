@@ -6,10 +6,11 @@ const invocation = { requestId: 'r1', action: 'recognize', payload: { providerId
 const service = fn => ({ services: { baidu: { ocr: fn } } })
 test('new identity declares minimal image Panel contract', async () => {
  const m = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url)))
- assert.equal(m.pluginId, 'com.uipilot.ocr'); assert.equal(m.name, 'ocr'); assert.equal(m.version, '1.0.0')
- assert.equal(m.minimumHostVersion, '0.21.0'); assert.equal(m.command.defaultName, 'ocr')
+ assert.equal(m.pluginId, 'com.uipilot.ocr'); assert.equal(m.name, 'ocr'); assert.equal(m.version, '1.1.0')
+ assert.equal(m.minimumHostVersion, '0.22.0'); assert.equal(m.command.defaultName, 'ocr')
  assert.equal(m.command.outputMode, 'panel'); assert.equal(m.command.inputRequired, false); assert.equal(m.command.inputPlaceholder, '粘贴图片')
  assert.deepEqual(m.command.inputCapabilities, ['image.ocr'])
+ assert.deepEqual(m.share, { version: 1, source: true })
  assert.deepEqual(m.permissions.sort(), ['clipboard.write', 'credentials.baiduOcr', 'network.https', 'ui.panel'])
  assert.deepEqual(m.panel, { entry: 'dist/panel.html', runtimeActions: true, hostKeys: ['Enter', 'Tab', 'Shift+Tab'], hostKeyFocus: 'content' })
 })

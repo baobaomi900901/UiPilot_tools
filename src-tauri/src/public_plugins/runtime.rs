@@ -630,12 +630,6 @@ impl PluginRuntimeApi {
         manifest: &PublicManifestV1,
         current: &mut PluginCurrentRequest<'_>,
     ) -> PluginApiExecution {
-        if !current.effects_allowed()
-            && !matches!(request.operation, PluginApiOperation::StorageGet
-                | PluginApiOperation::SettingGet | PluginApiOperation::SecretConfigured)
-        {
-            return PluginApiExecution::failed(PluginRuntimeError::PermissionDenied);
-        }
         if request.operation == PluginApiOperation::NotificationPublish {
             return self.publish_notification(request, manifest, current);
         }
@@ -994,17 +988,9 @@ pub(crate) struct PluginInvocation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PluginInvocationEnvironment {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) entry: Option<PluginInvocationEntry>,
     pub(crate) platform: PluginInvocationPlatform,
     pub(crate) theme: PluginInvocationTheme,
     pub(crate) invoked_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) enum PluginInvocationEntry {
-    SharePrepare { #[serde(rename = "receiverId")] receiver_id: String },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1169,7 +1155,6 @@ mod tests {
             request_id: "host-request".into(),
             input: "A  B".into(),
             context: PluginInvocationEnvironment {
-                entry: None,
                 platform: PluginInvocationPlatform::Windows,
                 theme: PluginInvocationTheme::Dark,
                 invoked_at: "2026-10-24T00:00:00Z".into(),
@@ -2049,54 +2034,4 @@ mod tests {
             Ok(Value::Null)
         );
     }
-    #[test]
-    fn share_prepare_runtime_api_allows_only_current_own_reads_even_with_grants() {
-        use crate::public_plugins::share_prepare::{SharePrepareLease, SharePrepareOwner};
-        use crate::public_plugins::PluginRequestOwner;
-        let dir = TestDir::new();
-        let manifest = notification_manifest();
-        let publisher = Arc::new(FakePublisher::new([FakePublishOutcome::Succeed]));
-        let (api, scheduler, _, delayed, initial, label) = runtime_fixture(
-            &dir, &manifest, BTreeSet::from([PublicPermission::NotificationsPublish]), publisher.clone());
-        let mut seed = request(initial.context.clone(), PluginApiOperation::StorageSet);
-        seed.value = Some(json!("preserved"));
-        assert!(api.execute(&label, seed, &manifest).result.is_ok());
-        scheduler.complete(&initial.context, Instant::now()).unwrap();
-        let mut candidate = initial.candidate.clone();
-        candidate.input.clear();
-        let lease = SharePrepareLease::default();
-        candidate.owner = PluginRequestOwner::SharePrepare(SharePrepareOwner {
-            receiver: crate::plugin_share::catalog::Receiver {
-                plugin: crate::plugin_share::types::PluginIdentity {
-                    plugin_id: manifest.plugin_id.clone(), generation: 1, activation_id: 1,
-                    admission_epoch: 1, inventory_revision: 1,
-                },
-                plugin_name: "Receiver".into(), receiver_id: "receive".into(), title: "Receive".into(),
-                command_id: "default".into(), max_bytes: 8192,
-            }, prepare_id: "opaque-transfer".into(), lease: lease.clone(),
-        });
-        let PluginScheduleOutcome::Dispatched(prepared) = scheduler.enqueue(candidate, Instant::now()).unwrap() else { panic!() };
-        for operation in [PluginApiOperation::StorageSet, PluginApiOperation::StorageRemove,
-            PluginApiOperation::NotificationPublish, PluginApiOperation::NotificationSchedule] {
-            let mut request = request(prepared.context.clone(), operation);
-            if operation == PluginApiOperation::StorageSet { request.value = Some(json!("changed")); }
-            if operation == PluginApiOperation::NotificationPublish { request.notification = Some(json!({"content":"denied"})); }
-            if operation == PluginApiOperation::NotificationSchedule { request.notification = Some(json!({"content":"denied","delayMs":1000})); }
-            assert_eq!(api.execute(&label, request, &manifest).result, Err(PluginRuntimeError::PermissionDenied));
-        }
-        assert!(publisher.calls.lock().unwrap().is_empty());
-        assert!(delayed.claim_due(Instant::now() + std::time::Duration::from_secs(2)).unwrap().is_none());
-        assert_eq!(api.execute(&label, request(prepared.context.clone(), PluginApiOperation::StorageGet), &manifest).result, Ok(json!("preserved")));
-        for (operation, key, value) in [(PluginApiOperation::SettingGet,"prefix",json!("ok")), (PluginApiOperation::SecretConfigured,"token",json!(false))] {
-            let mut r = request(prepared.context.clone(), operation); r.key = Some(key.into());
-            assert_eq!(api.execute(&label, r, &manifest).result, Ok(value));
-        }
-        let foreign = runtime_label("com.example.other", 1).unwrap();
-        assert_eq!(api.execute(&foreign, request(prepared.context.clone(), PluginApiOperation::StorageGet), &manifest).result, Err(PluginRuntimeError::InvalidContext));
-        lease.cancel();
-        for operation in [PluginApiOperation::StorageGet, PluginApiOperation::SettingGet, PluginApiOperation::SecretConfigured] {
-            assert_eq!(api.execute(&label, request(prepared.context.clone(), operation), &manifest).result, Err(PluginRuntimeError::ExpiredRequest));
-        }
-    }
-
 }

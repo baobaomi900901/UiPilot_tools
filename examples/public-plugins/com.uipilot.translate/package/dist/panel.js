@@ -278,10 +278,26 @@ export function mountPanel(document, host, { createCapabilities = createPanelCap
     pumpSave()
     render()
   }))
+  if (host.share?.onSource) cleanup.push(host.share.onSource(() => {
+    const state = model.getState()
+    return !disposed && !modal && session?.ready && state.status === 'success' && state.translation.trim()
+      ? { type: 'text/plain', text: state.translation } : null
+  }))
+  if (host.share?.onReceive) cleanup.push(host.share.onReceive(event => {
+    if (disposed || modal || !session?.ready || session.received || event?.version !== 1 || event.receiverId !== 'translate' || event.sessionEpoch !== session.sessionEpoch || event.payload?.type !== 'text/plain' || typeof event.payload.text !== 'string' || !event.payload.text.trim() || new TextEncoder().encode(event.payload.text).length > 8192) return { accepted: false }
+    session.received = true
+    session.capabilities.invalidate()
+    // Store synchronously. Business work is scheduled by the existing model timer.
+    model.editText(event.payload.text)
+    model.submit()
+    return { accepted: true }
+  }))
   cleanup.push(host.onUpdate(update => {
     if (disposed) return
     const previous = session
     const sameSession = previous?.sessionEpoch === update.sessionEpoch
+    document.documentElement.dataset.theme = update.theme === 'light' ? 'light' : 'dark'
+    if (sameSession && previous.received && previous.requestId === update.requestId && update.input === '' && !update.data?.text) return
     const preferences = sameSession ? model.getPreferences() : sanitizePreferences(update.data?.preferences)
     const queued = sameSession ? pendingSave?.preferences : null
     previous?.capabilities.dispose()

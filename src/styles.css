@@ -3109,3 +3109,16 @@ label,
   min-height: 0;
   max-height: none;
 }
+
+.plugin-share-surface { height:100%; width:100%; background:var(--uipilot-ui-background); color:var(--uipilot-ui-foreground); display:flex; flex-direction:column; font-size:14px; }
+.plugin-share-toolbar { display:flex; gap:8px; padding:12px; border-bottom:1px solid var(--uipilot-ui-border); }
+.plugin-share-toolbar input { flex:1; min-width:0; height:36px; padding:0 10px; background:var(--uipilot-ui-surface-elevated); border:1px solid var(--uipilot-ui-border); border-radius:8px; color:inherit; }
+.plugin-share-surface button { border:1px solid var(--uipilot-ui-border); border-radius:6px; background:var(--uipilot-ui-surface-elevated); color:inherit; padding:6px 12px; font:inherit; }
+.plugin-share-surface :focus-visible { outline:2px solid var(--uipilot-ui-hairline-strong); outline-offset:1px; }
+.plugin-share-receivers { overflow:auto; padding:8px 14px 8px 8px; }
+.plugin-share-receivers button { display:flex; width:100%; min-height:53px; justify-content:space-between; align-items:center; text-align:left; border-color:transparent; background:transparent; }
+.plugin-share-receivers button[aria-selected=true] { background:var(--uipilot-ui-selection); border-color:var(--uipilot-ui-selection-border); }
+.plugin-share-receivers small { display:block; color:var(--uipilot-ui-muted-foreground); font-size:12px; }
+.plugin-share-receivers button:disabled { opacity:.6; }
+.plugin-share-message { margin:auto; padding:16px; text-align:center; }
+.plugin-share-message [role=alert] { color:var(--uipilot-ui-destructive); }

@@ -1,6 +1,15 @@
 // @vitest-environment jsdom
 
 import { existsSync, readFileSync } from 'node:fs'
+import vm from 'node:vm'
+// @ts-expect-error The maintained plugin package is executable JavaScript.
+import { mountPanel as mountOcrSharePanel } from '../examples/public-plugins/com.uipilot.ocr/package/dist/panel.js'
+// @ts-expect-error The maintained plugin package is executable JavaScript.
+import { mountPanel as mountTranslateSharePanel } from '../examples/public-plugins/com.uipilot.translate/package/dist/panel.js'
+// @ts-expect-error The maintained plugin package is executable JavaScript.
+import * as ocrShareRuntime from '../examples/public-plugins/com.uipilot.ocr/package/dist/runtime.js'
+// @ts-expect-error The maintained plugin package is executable JavaScript.
+import * as translateShareRuntime from '../examples/public-plugins/com.uipilot.translate/package/dist/runtime.js'
 
 import { describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
@@ -11737,5 +11746,183 @@ describe('launcher image OCR workflow', () => {
       expect(detail.textContent).toBe('# <b>literal</b>\nsecond line')
       expect(detail.querySelector('b')).toBeNull()
     } finally { await mounted.unmount(); core.destroy() }
+  })
+})
+
+
+describe('single Panel production share flow', () => {
+  it.each([false, true])('edited OCR → real host selector → translation fake service; failure=%s stays target', async (businessFailure) => {
+    installMatchMedia(false)
+    const fake = fakeClient()
+    let state: import('./protocol').PluginShareView | null = null
+    let payload: any = null, claimed = false, selectCount = 0
+    let source: any, target: any
+    const serviceCalls: any[] = [], ipc: any[] = [], documents: any[] = []
+    const edited = '  edited OCR\n原文😀  '
+    expect(JSON.parse(readFileSync('examples/public-plugins/com.uipilot.ocr/package/plugin.json', 'utf8')).share).toEqual({ version: 1, source: true })
+    const api = { storage: { get: async () => ({ providerId: 'youdao', sourceLanguage: 'auto', targetLanguage: 'en' }) }, services: {
+      baidu: { ocr: async () => ({ text: 'original OCR' }) },
+      youdao: { translate: async (input: any) => { serviceCalls.push(input); if (businessFailure) throw { name: 'ProviderFailureError' }; return { translations: ['translated edited text'], sourceLanguage: 'zh-CHS', targetLanguage: 'en', unchanged: false } } },
+    } }
+    function bridge(kind: 'ocr' | 'translate', epoch: string) {
+      const frame = document.createElement('iframe'); document.body.append(frame)
+      const doc = frame.contentDocument!, win = frame.contentWindow! as any
+      doc.open(); doc.write(readFileSync(`examples/public-plugins/com.uipilot.${kind}/package/dist/panel.html`, 'utf8')); doc.close()
+      const runtime = kind === 'ocr' ? ocrShareRuntime : translateShareRuntime
+      const context = vm.createContext({ window: win, document: doc, Object, Function, Array, JSON, Reflect, WeakSet, Set, Number, TextEncoder, queueMicrotask, setTimeout, clearTimeout, setInterval, clearInterval })
+      let active = true
+      const invoke = vi.fn(async (command: string, args: any = {}) => {
+        ipc.push({ kind, command, args })
+        if (command === 'plugin_panel_request_hide_admit') return { outcome: 'noop' }
+        if (!active) throw new Error('ExpiredPanelSession')
+        if (command === 'plugin_panel_request') {
+          const result = await runtime.onPanelAction({ requestId: `${epoch}-action`, ...args.request, ...(kind === 'ocr' ? { image: { id: 'fake-image' } } : {}) }, api)
+          return result.data
+        }
+        if (command === 'plugin_share_begin') {
+          payload = args.payload
+          state = { transferId: '1', sourceEpoch: '7', phase: 'choosing', target: null, targetLabel: null, error: null, receivers: [
+            { pluginId: 'com.test.draft', pluginName: 'Draft', receiverId: 'draft', commandId: 'default', title: '保留草稿', maxBytes: 16384, disabledReason: null },
+            { pluginId: 'com.uipilot.translate', pluginName: '翻译', receiverId: 'translate', commandId: 'default', title: '翻译文字', maxBytes: 8192, disabledReason: null },
+          ] }
+        }
+        if (command === 'plugin_share_claim' && kind === 'translate' && state?.phase === 'delivering') {
+          if (claimed) throw new Error('already claimed')
+          claimed = true
+          return { version: 1, transferId: '1', receiverId: 'translate', sessionEpoch: epoch, payload }
+        }
+        if (command === 'plugin_share_received') {
+          expect(args.accepted).toBe(true)
+          state = { ...state!, phase: 'accepted' }; payload = null
+        }
+        return undefined
+      })
+      win.__TAURI_INTERNALS__ = { invoke }
+      const rust = readFileSync('src-tauri/src/plugin_panel.rs', 'utf8')
+      const script = rust.match(/PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"([\s\S]*?)"#;/u)![1]!
+        .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function'))
+        .replace('__PANEL_EFFECTS__', readFileSync('src-tauri/src/panel_effects.js', 'utf8'))
+        .replace('__PANEL_IMAGE_BRIDGE__', readFileSync('src-tauri/src/panel_image_bridge.js', 'utf8'))
+        .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
+        .replace('__IMAGES_ENABLED__', String(kind === 'ocr')).replace('__CLIPBOARD_ENABLED__', 'false').replace('__SPEECH_ENABLED__', 'false')
+        .replace('__RUNTIME_ACTIONS__', 'true').replaceAll('__SESSION_EPOCH__', epoch).replace('__HOST_KEYS__', JSON.stringify(JSON.parse(readFileSync(`examples/public-plugins/com.uipilot.${kind}/package/plugin.json`, 'utf8')).panel.hostKeys ?? []))
+      vm.runInContext(script, context)
+      const mounted = (kind === 'ocr' ? mountOcrSharePanel : mountTranslateSharePanel)(doc, win.uipilotPluginPanel)
+      const result = { win, doc, invoke, epoch,
+        async initialize() {
+          const command = await runtime.onCommand({ requestId: `${epoch}-init`, commandId: 'default', input: '' }, api)
+          await win.__UIPILOT_PLUGIN_PANEL_UPDATE__({ requestId: `${epoch}-init`, sessionEpoch: epoch, input: '', data: command.data, theme: 'dark' })
+          win.__UIPILOT_PLUGIN_PANEL_READY__({ requestId: `${epoch}-init`, sessionEpoch: epoch })
+        },
+        dispose() { if (!active) return; active = false; win.dispatchEvent(new win.Event('pagehide')); mounted.dispose(); frame.remove() },
+        image() { win.dispatchEvent(new win.CustomEvent('uipilot-plugin-panel-image-changed', { detail: { sessionEpoch: '7', revision: '1', image: { id:'fake-image',mimeType:'image/png',width:2,height:2,byteLength:3,previewDataUrl:'data:image/png;base64,AAAA' } } })) },
+      }
+      documents.push(result); return result
+    }
+    fake.client.getPluginShareState = vi.fn(async () => state)
+    fake.client.selectPluginShare = vi.fn(async input => {
+      expect(input).toEqual({ transferId: '1', pluginId: 'com.uipilot.translate', receiverId: 'translate' }); selectCount++
+      state = { ...state!, phase: 'opening', receivers: [], targetLabel: '翻译' }
+      source.dispose()
+      target = bridge('translate', '8')
+      state = { ...state!, phase: 'delivering', target: { sessionEpoch: u64('8'), pluginId: 'com.uipilot.translate', commandLabel: 'translate', hostKeys: [] } }
+      await target.initialize()
+      // Duplicate native Ready notification must not receive or translate again.
+      target.win.__UIPILOT_PLUGIN_PANEL_READY__({ requestId: '8-init', sessionEpoch: '8' })
+    })
+    fake.client.endPluginShare = vi.fn(async () => { state = null })
+    vi.mocked(fake.client.openPluginPanel).mockImplementation(async () => { source = bridge('ocr', '7'); return { sessionEpoch: u64('7'), pluginId: 'com.uipilot.ocr', commandLabel: 'ocr', hostKeys: [], inputCapabilities: ['image.ocr'] } })
+    vi.mocked(fake.client.submitPluginPanel).mockImplementation(async () => { await source.initialize(); source.image(); return { sessionEpoch: u64('7'), pluginId: 'com.uipilot.ocr', commandLabel: 'ocr', hostKeys: [], inputCapabilities: ['image.ocr'] } })
+    vi.mocked(fake.client.searchApps).mockResolvedValue({ requestId: 'ocr-results', items: [panelItem('', 'com.uipilot.ocr')] } as SearchResponse)
+    const core = createLauncherCore(fake.client)
+    await core.start(); fake.emit(shown('share-flow'))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.selectResult(0); core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(source?.doc.getElementById('ocr-text').value).toBe('original OCR'))
+    const editor = source.doc.getElementById('ocr-text'); editor.value = edited; editor.dispatchEvent(new source.win.Event('input', { bubbles: true }))
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => source.doc.dispatchEvent(new source.win.KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })))
+      const share = [...source.doc.querySelectorAll('.uipilot-context-action')].find((node: any) => node.textContent.includes('分享')) as HTMLButtonElement
+      expect(share).toBeDefined(); await act(async () => share.click())
+      await vi.waitFor(() => expect(mounted.host.querySelector('[aria-label="分享文字"]')).not.toBeNull())
+      expect(selectCount).toBe(0); expect(serviceCalls).toHaveLength(0)
+      expect(mounted.host.textContent).toContain('保留草稿'); expect(mounted.host.textContent).toContain('翻译文字')
+      const search = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索分享接收者"]')!
+      await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(search, '翻译'); search.dispatchEvent(new Event('input', { bubbles: true })) })
+      expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1)
+      const choice = [...mounted.host.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(row => row.textContent?.includes('翻译文字'))!
+      await act(async () => { choice.click(); choice.click() })
+      await vi.waitFor(() => expect(core.getSnapshot().panel?.pluginId).toBe('com.uipilot.translate'))
+      await vi.waitFor(() => expect(serviceCalls).toHaveLength(1))
+      await vi.waitFor(() => expect(target.doc.getElementById(businessFailure ? 'translation-status' : 'translation').textContent).toContain(businessFailure ? '翻译服务暂时不可用' : 'translated edited text'))
+      expect(target.doc.getElementById('source-text').value).toBe(edited)
+      expect(core.getSnapshot().panel?.suffix).toBe(''); expect(core.getSnapshot().query).toBe('')
+      expect(core.getSnapshot().share?.phase).toBe('accepted')
+      expect(fake.client.openPluginPanel).toHaveBeenCalledTimes(1); expect(fake.client.submitPluginPanel).toHaveBeenCalledTimes(1)
+      expect(selectCount).toBe(1); expect(serviceCalls[0]).toMatchObject({ text: edited, to: 'en' })
+      expect(ipc.filter(call => call.kind === 'translate' && call.command === 'plugin_share_claim')).toHaveLength(1)
+      expect(ipc.some(call => call.command.includes('clipboard'))).toBe(false)
+      expect(JSON.stringify(vi.mocked(fake.client.searchApps).mock.calls)).not.toContain(edited)
+      expect(core.getSnapshot().panel?.pluginId).not.toBe('com.uipilot.ocr')
+    } finally { await mounted.unmount(); core.destroy(); documents.forEach(doc => doc.dispose()) }
+  })
+})
+
+
+describe('single Panel share ownership', () => {
+  async function setup() {
+    const fake = fakeClient()
+    let state: import('./protocol').PluginShareView | null = null
+    fake.client.getPluginShareState = vi.fn(async () => state)
+    fake.client.selectPluginShare = vi.fn(async () => {})
+    fake.client.endPluginShare = vi.fn(async () => { state = null })
+    vi.mocked(fake.client.searchApps).mockResolvedValue({ requestId: 'source', items: [panelItem('', 'com.uipilot.ocr')] } as SearchResponse)
+    const descriptor = { sessionEpoch: u64('7'), pluginId: 'com.uipilot.ocr', commandLabel: 'ocr', hostKeys: [] }
+    vi.mocked(fake.client.openPluginPanel).mockResolvedValue(descriptor)
+    vi.mocked(fake.client.submitPluginPanel).mockResolvedValue(descriptor)
+    const core = createLauncherCore(fake.client)
+    await core.start(); fake.emit(shown('share-ownership'))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1)); core.selectResult(0); core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('7'))
+    const view: import('./protocol').PluginShareView = { transferId: '1', sourceEpoch: '7', phase: 'choosing', receivers: [{ pluginId: 'com.uipilot.translate', pluginName: '翻译', receiverId: 'translate', commandId: 'default', title: '翻译文字', maxBytes: 8192, disabledReason: null }], target: null, targetLabel: null, error: null }
+    return { ...fake, core, view, setState(next: import('./protocol').PluginShareView | null) { state = next } }
+  }
+  it('target loading/receive error retains target label and blocks ordinary input without source rollback', async () => {
+    installMatchMedia(false)
+    const a = await setup(); a.setState(a.view)
+    await vi.waitFor(() => expect(a.core.getSnapshot().share?.phase).toBe('choosing'))
+    const oldBounds = deferred<void>()
+    vi.mocked(a.client.setPluginPanelBounds).mockReturnValueOnce(oldBounds.promise)
+    a.core.setPanelBounds({ sessionEpoch: u64('7'), bounds: { x: 0, y: 60, width: 500, height: 400 } })
+    await a.core.selectShareReceiver('com.uipilot.translate', 'translate')
+    a.setState({ ...a.view, phase: 'error', receivers: [], targetLabel: '翻译', error: '目标加载失败' })
+    await vi.waitFor(() => expect(a.core.getSnapshot().share?.phase).toBe('error'))
+    const mounted = await mountLauncherView(a.core)
+    try {
+      expect(mounted.host.querySelector('[role="alert"]')?.textContent).toBe('目标加载失败')
+      expect(mounted.host.querySelector('.panel-input-region')?.textContent).toContain('翻译')
+      const panel = a.core.getSnapshot().panel!
+      a.core.text({ kind: 'ordinaryInput', control: panel.suffixControl, value: 'must not submit', inputType: 'insertText' })
+      a.core.keyDown('Enter', false); oldBounds.reject({ code: 'staleRequest' }); await Promise.resolve()
+      expect(a.client.submitPluginPanel).toHaveBeenCalledTimes(1)
+      expect(a.client.openPluginPanel).toHaveBeenCalledTimes(1)
+      expect(a.client.endPluginShare).not.toHaveBeenCalled()
+      expect(a.core.getSnapshot().share?.phase).toBe('error')
+      expect(a.core.getSnapshot().panel?.suffix).toBe('')
+    } finally { await mounted.unmount(); a.core.destroy() }
+  })
+  it('late state after cancellation/navigation cannot adopt a target or submit payload again', async () => {
+    const a = await setup(); a.setState(a.view)
+    await vi.waitFor(() => expect(a.core.getSnapshot().share?.phase).toBe('choosing'))
+    const late = deferred<import('./protocol').PluginShareView | null>()
+    vi.mocked(a.client.getPluginShareState!).mockReturnValueOnce(late.promise)
+    await new Promise(resolve => setTimeout(resolve, 180))
+    await a.core.endShare()
+    late.resolve({ ...a.view, phase: 'accepted', target: { sessionEpoch: u64('8'), pluginId: 'com.uipilot.translate', commandLabel: 'translate', hostKeys: [] } })
+    await Promise.resolve(); await Promise.resolve()
+    expect(a.core.getSnapshot().share).toBeUndefined(); expect(a.core.getSnapshot().panel?.sessionEpoch).toBe('7')
+    expect(a.client.submitPluginPanel).toHaveBeenCalledTimes(1)
+    a.core.destroy()
   })
 })

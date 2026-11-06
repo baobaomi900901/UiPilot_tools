@@ -169,6 +169,10 @@ export function mountPanel(document, host) {
   else if (event.key === 'Tab') { const order = focusOrder(); (event.shiftKey ? order.at(-1) : order[0])?.focus() }
   // No awaited effect: Host may immediately accept another paste after this ACK.
  }))
+ if (host.share?.onSource) cleanup.push(host.share.onSource(() => {
+  if (disposed || modal || !session?.ready || !model.canCopy() || !validText(output.value)) return null
+  return { type: 'text/plain', text: output.value }
+ }))
  cleanup.push(host.onUpdate(update => {
   if (disposed) return
   const same = session?.sessionEpoch === update.sessionEpoch

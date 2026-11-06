@@ -43,7 +43,6 @@ pub(crate) struct PluginSubmissionOwner {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PluginRequestOwner {
     Command(PluginSubmissionOwner),
-    SharePrepare(super::share_prepare::SharePrepareOwner),
     ResultAction(super::result_action::ResultActionOrigin),
     WindowAction {
         identity: crate::plugin_window::WindowActionIdentity,
@@ -58,7 +57,6 @@ pub(crate) enum PluginRequestOwner {
 impl PluginRequestOwner {
     pub(crate) fn live(&self) -> bool {
         match self {
-            Self::SharePrepare(owner) => owner.lease.live(),
             Self::ResultAction(origin) => {
                 origin.lease.live()
                     && origin
@@ -102,7 +100,6 @@ impl PluginRequestCandidate {
             && self.input.len() <= 64 * 1024
             && !self.input.contains('\0')
             && match &self.owner {
-                PluginRequestOwner::SharePrepare(owner) => owner.valid_for(self),
                 PluginRequestOwner::Command(owner) => {
                     owner.ui_intent_epoch != 0 && !owner.submission_token.is_empty()
                 }
@@ -181,7 +178,6 @@ pub(crate) enum PluginScheduleOutcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginCompletionOutcome {
-    pub(crate) completed_owner: PluginRequestOwner,
     pub(crate) credential_publication: Option<(u64, super::result_action::ResultActionLease)>,
     pub(crate) accepted: bool,
     pub(crate) next: Option<ScheduledPluginRequest>,
@@ -219,13 +215,10 @@ struct RunningRequest {
     // Preserve logical retirement across physical completion and controller settlement.
     action_retirement: Option<super::content_action::ContentActionError>,
     notification_published: bool,
-    // Claimed under the scheduler lock immediately before the native emit.
-    share_prepare_emission_started: bool,
 }
 
 pub(crate) struct PluginCurrentRequest<'a> {
     panel_action: bool,
-    effects_allowed: bool,
     plugin_generation: u64,
     activation_id: u64,
     admission_epoch: u64,
@@ -233,10 +226,6 @@ pub(crate) struct PluginCurrentRequest<'a> {
 }
 
 impl PluginCurrentRequest<'_> {
-    pub(crate) fn effects_allowed(&self) -> bool {
-        self.effects_allowed
-    }
-
     pub(crate) fn is_panel_action(&self) -> bool {
         self.panel_action
     }
@@ -481,23 +470,11 @@ impl PluginRequestScheduler {
         self.enqueue_reserved(reserved, now)
     }
 
-    #[cfg(test)]
     pub(crate) fn enqueue_reserved(
         &self,
         reserved: ReservedPluginRequest,
         now: Instant,
     ) -> Result<PluginScheduleOutcome, PluginScheduleError> {
-        self.enqueue_reserved_with_retired_contexts(reserved, now)
-            .map(|(outcome, _)| outcome)
-    }
-
-    /// Capture retirement identities under the same lock as enqueue. A later
-    /// service cleanup must not rediscover owners from a changing generation.
-    pub(crate) fn enqueue_reserved_with_retired_contexts(
-        &self,
-        reserved: ReservedPluginRequest,
-        now: Instant,
-    ) -> Result<(PluginScheduleOutcome, Vec<PluginRequestContext>), PluginScheduleError> {
         if matches!(
             reserved.candidate.owner,
             PluginRequestOwner::ResultAction(_)
@@ -525,27 +502,9 @@ impl PluginRequestScheduler {
         {
             return Err(PluginScheduleError::GenerationMismatch);
         }
-        let mut retired_contexts = Vec::new();
-        // A never-emitted prepare has no physical handler to wait for. A
-        // command supersedes it atomically; the service settles its channel.
-        // Once emission is claimed, retain the existing waiting/deadline path.
-        if matches!(reserved.candidate.owner, PluginRequestOwner::Command(_))
-            && queue.running.as_ref().is_some_and(|running| {
-                !running.share_prepare_emission_started
-                    && matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_))
-            })
-        {
-            if let Some(running) = queue.running.take() {
-                if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
-                    owner.lease.cancel();
-                }
-                retired_contexts.push(running.request.context);
-            }
-        }
         if matches!(
             reserved.candidate.owner,
-            PluginRequestOwner::SharePrepare(_)
-                | PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::PanelAction { .. }
                 | PluginRequestOwner::WindowAction { .. }
                 | PluginRequestOwner::ResultAction(_)
         ) && (queue.rebuilding || queue.running.is_some() || queue.waiting.is_some())
@@ -554,17 +513,15 @@ impl PluginRequestScheduler {
         }
         match &reserved.candidate.owner {
             PluginRequestOwner::Command(_) => {
-                if let Some((context, reason)) = queue
+                if let Some((_, reason)) = queue
                     .action_completion
                     .as_mut()
                     .filter(|(_, reason)| reason.is_none())
                 {
                     *reason = Some(super::content_action::ContentActionError::Cancelled);
-                    retired_contexts.push(context.clone());
                 }
             }
-            PluginRequestOwner::SharePrepare(_)
-            | PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::PanelAction { .. }
             | PluginRequestOwner::WindowAction { .. }
             | PluginRequestOwner::ResultAction(_) => {
                 if queue
@@ -594,21 +551,17 @@ impl PluginRequestScheduler {
                 .as_ref()
                 .map(|running| running.request.context.clone())
                 .ok_or(PluginScheduleError::Unavailable)?;
-            return Ok((
-                PluginScheduleOutcome::Waiting {
-                    expired,
-                    request_context: reserved.context,
-                    replaced_submission_token,
-                },
-                retired_contexts,
-            ));
+            return Ok(PluginScheduleOutcome::Waiting {
+                expired,
+                request_context: reserved.context,
+                replaced_submission_token,
+            });
         }
         if let Some(running) = queue.running.as_mut() {
             if running.current
                 && matches!(
                     running.request.candidate.owner,
-                    PluginRequestOwner::SharePrepare(_)
-                        | PluginRequestOwner::PanelAction { .. }
+                    PluginRequestOwner::PanelAction { .. }
                         | PluginRequestOwner::WindowAction { .. }
                         | PluginRequestOwner::ResultAction(_)
                 )
@@ -617,11 +570,7 @@ impl PluginRequestScheduler {
                     Some(super::content_action::ContentActionError::Cancelled);
             }
             running.current = false;
-            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
-                owner.lease.cancel();
-            }
             let expired = running.request.context.clone();
-            retired_contexts.push(expired.clone());
             let replaced_submission_token =
                 queue.waiting.replace(reserved.clone()).map(|request| {
                     request
@@ -632,17 +581,14 @@ impl PluginRequestScheduler {
                         .submission_token
                         .clone()
                 });
-            return Ok((
-                PluginScheduleOutcome::Waiting {
-                    expired,
-                    request_context: reserved.context,
-                    replaced_submission_token,
-                },
-                retired_contexts,
-            ));
+            return Ok(PluginScheduleOutcome::Waiting {
+                expired,
+                request_context: reserved.context,
+                replaced_submission_token,
+            });
         }
         let request = dispatch(&mut state, reserved, now)?;
-        Ok((PluginScheduleOutcome::Dispatched(request), retired_contexts))
+        Ok(PluginScheduleOutcome::Dispatched(request))
     }
 
     // Pending -> admission -> mutation -> authority -> scheduler -> registry.
@@ -706,7 +652,6 @@ impl PluginRequestScheduler {
             current: true,
             action_retirement: None,
             notification_published: false,
-            share_prepare_emission_started: false,
         });
         Ok(request)
     }
@@ -764,8 +709,7 @@ impl PluginRequestScheduler {
         let accepted = running.current && running.request.candidate.owner.live();
         if matches!(
             running.request.candidate.owner,
-            PluginRequestOwner::SharePrepare(_)
-                | PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::PanelAction { .. }
                 | PluginRequestOwner::WindowAction { .. }
                 | PluginRequestOwner::ResultAction(_)
         ) {
@@ -786,7 +730,6 @@ impl PluginRequestScheduler {
             None
         };
         Ok(PluginCompletionOutcome {
-            completed_owner: running.request.candidate.owner.clone(),
             credential_publication: None,
             accepted,
             next,
@@ -862,49 +805,6 @@ impl PluginRequestScheduler {
         reason.map_or(Ok(()), Err)
     }
 
-    /// Serialize emission against abort and command replacement. After this
-    /// claim, cancellation must preserve physical occupancy even if emit fails.
-    pub(crate) fn claim_share_prepare_emission(
-        &self,
-        context: &PluginRequestContext,
-    ) -> Result<(), PluginScheduleError> {
-        let mut state = self.lock()?;
-        let running = state.by_plugin.get_mut(&context.plugin_id)
-            .and_then(|queue| queue.running.as_mut())
-            .filter(|running| {
-                running.request.context == *context
-                    && running.current
-                    && running.request.candidate.owner.live()
-                    && matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_))
-                    && !running.share_prepare_emission_started
-            })
-            .ok_or(PluginScheduleError::GenerationMismatch)?;
-        running.share_prepare_emission_started = true;
-        Ok(())
-    }
-
-    /// Called after logical retirement. Both this abort and emission claim use
-    /// the scheduler lock, so a released slot can never subsequently emit.
-    pub(crate) fn abort_unemitted_share_prepare(
-        &self,
-        context: &PluginRequestContext,
-    ) -> Result<(), PluginScheduleError> {
-        let mut state = self.lock()?;
-        if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
-            if queue.running.as_ref().is_some_and(|running| {
-                running.request.context == *context
-                    && !running.current
-                    && !running.share_prepare_emission_started
-                    && matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_))
-            }) {
-                // enqueue_reserved never queues behind an unclaimed prepare.
-                debug_assert!(queue.waiting.is_none());
-                queue.running = None;
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn retire_context(
         &self,
         context: &PluginRequestContext,
@@ -924,9 +824,6 @@ impl PluginRequestScheduler {
                 .filter(|r| r.request.context == *context)
             {
                 running.current = false;
-                if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
-                    owner.lease.cancel();
-                }
                 running.action_retirement =
                     Some(super::content_action::ContentActionError::Expired);
             }
@@ -950,13 +847,10 @@ impl PluginRequestScheduler {
             running.request.context == *context
                 && matches!(
                     running.request.candidate.owner,
-                    PluginRequestOwner::ResultAction(_) | PluginRequestOwner::SharePrepare(_)
+                    PluginRequestOwner::ResultAction(_)
                 )
         }) {
             running.current = false;
-            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
-                owner.lease.cancel();
-            }
             running.action_retirement = Some(super::content_action::ContentActionError::Cancelled);
             return Ok(None);
         }
@@ -1013,7 +907,6 @@ impl PluginRequestScheduler {
                 .as_mut()
                 .ok_or(PluginContextAccessError::Unavailable)?;
             Ok(operation(&mut PluginCurrentRequest {
-                effects_allowed: !matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_)),
                 panel_action: matches!(
                     running.request.candidate.owner,
                     PluginRequestOwner::PanelAction { .. }
@@ -1124,9 +1017,6 @@ impl PluginRequestScheduler {
             .filter(|r| r.request.context == *context)
         {
             running.current = false;
-            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
-                owner.lease.cancel();
-            }
             running.action_retirement = Some(super::content_action::ContentActionError::Expired);
             changed = true;
         }
@@ -1178,9 +1068,6 @@ impl PluginRequestScheduler {
         }
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
-            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
-                owner.lease.cancel();
-            }
             running.action_retirement = Some(super::content_action::ContentActionError::Expired);
             retired.push((
                 running.request.context.clone(),
@@ -1288,7 +1175,6 @@ fn dispatch(
         current: true,
         action_retirement: None,
         notification_published: false,
-        share_prepare_emission_started: false,
     });
     Ok(request)
 }
@@ -1305,7 +1191,7 @@ mod tests {
         }
     }
 
-    pub(super) fn candidate(
+    fn candidate(
         value: &str,
         generation: u64,
         mode: PublicActivationMode,
@@ -2017,6 +1903,3 @@ mod tests {
         assert!(!token.live());
     }
 }
-
-#[cfg(test)]
-mod share_prepare_tests;

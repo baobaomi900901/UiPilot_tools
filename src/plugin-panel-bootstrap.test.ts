@@ -478,7 +478,7 @@ describe('Panel settled readiness', () => {
     ;(hostWindow.__UIPILOT_PLUGIN_PANEL_READY__ as Function)(update('a'))
     await Promise.resolve(); await Promise.resolve()
     expect(ready).toHaveBeenCalledOnce()
-    expect(invoke.mock.calls).toHaveLength(count)
+    expect(invoke.mock.calls.filter(([command]) => command !== 'plugin_share_ready_failed')).toHaveLength(count)
   })
   it('assigns new update ownership before its asynchronous handler settles', async () => {
     const queue: (() => void)[] = []

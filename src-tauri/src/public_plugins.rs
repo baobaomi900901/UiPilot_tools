@@ -21,7 +21,6 @@ mod panel_image_authority;
 pub(crate) mod result_action;
 mod runtime;
 mod scheduler;
-pub(crate) mod share_prepare;
 mod secrets;
 mod state;
 mod storage;
@@ -264,7 +263,6 @@ pub(crate) struct PublicPluginService {
     submissions: Mutex<PublicSubmissionState>,
     content_actions: Mutex<HashMap<PluginRequestContext, PendingContentAction>>,
     result_action: Mutex<Option<PendingResultAction>>,
-    share_preparations: Mutex<HashMap<PluginRequestContext, Arc<share_prepare::PendingSharePrepare>>>,
     recoveries: Mutex<RuntimeRecoveryState>,
     recovery_changed: Condvar,
     next_submission: AtomicU64,
@@ -465,7 +463,6 @@ impl PublicPluginService {
         // Waiting submissions may never have been bound to a request. Settle the
         // exact token as well as its context, never a plugin-wide moving target.
         for (context, token) in &effects.retired {
-            self.settle_share_prepare(context, share_prepare::SharePrepareError::Expired);
             self.settle_result_action(
                 context,
                 result_action::ResultActionErrorCode::ActionCancelled,
@@ -483,7 +480,6 @@ impl PublicPluginService {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.retire_share_preparations(None, None);
         let result_context = self
             .result_action
             .lock()
@@ -689,10 +685,7 @@ impl PublicPluginService {
                 recovery: Some(recovery),
             });
         }
-        let (outcome, retired_contexts) = match self
-            .manager()?
-            .enqueue_reserved_with_retired_contexts(request, now)
-        {
+        let outcome = match self.manager()?.enqueue_reserved(request, now) {
             Ok(outcome) => outcome,
             Err(_) => {
                 self.settle_submission(&token, None);
@@ -700,9 +693,6 @@ impl PublicPluginService {
             }
         };
         after_enqueue();
-        for context in retired_contexts {
-            self.settle_share_prepare(&context, share_prepare::SharePrepareError::Cancelled);
-        }
         let result_context = self.result_action.lock().ok().and_then(|slot| {
             slot.as_ref()
                 .filter(|p| {
@@ -1359,6 +1349,9 @@ impl PublicPluginService {
         theme: PluginInvocationTheme,
         invoked_at: String,
     ) -> Result<(), PublicPluginManagementError> {
+        if !request.candidate.owner.live() {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         if !matches!(request.candidate.owner, PluginRequestOwner::ResultAction(_)) {
             let service = Arc::clone(self);
             let watchdog_app = app.clone();
@@ -1367,25 +1360,6 @@ impl PublicPluginService {
                 thread::sleep(deadline.saturating_duration_since(Instant::now()));
                 let _ = service.expire_runtime_timeouts(&watchdog_app, Instant::now());
             });
-        }
-        let result = self.dispatch_inner(app, request, theme, invoked_at);
-        if result.is_err() && matches!(request.candidate.owner, PluginRequestOwner::SharePrepare(_)) {
-            // Emit may already have delivered. Retire logically without freeing
-            // the physical handler or resetting its original watchdog deadline.
-            self.retire_share_prepare(&request.context);
-        }
-        result
-    }
-
-    fn dispatch_inner(
-        self: &Arc<Self>,
-        app: &AppHandle,
-        request: &ScheduledPluginRequest,
-        theme: PluginInvocationTheme,
-        invoked_at: String,
-    ) -> Result<(), PublicPluginManagementError> {
-        if !request.candidate.owner.live() {
-            return Err(PublicPluginManagementError::Unavailable);
         }
         if self.manager()?.scheduler().context_status(&request.context)
             != PluginContextStatus::Current
@@ -1396,14 +1370,10 @@ impl PublicPluginService {
         let label = runtime_label(&request.context.plugin_id, request.context.plugin_generation)
             .ok_or(PublicPluginManagementError::Unavailable)?;
         let window = app.get_webview_window(&label).ok_or(PublicPluginManagementError::Unavailable)?;
-        let emit = || window.emit("uipilot-public-plugin-command", PluginCommandDispatch {
+        window.emit("uipilot-public-plugin-command", PluginCommandDispatch {
             context: request.context.clone(), kind: kind.into(), invocation,
-        }).map_err(|_| PublicPluginManagementError::Unavailable);
-        if matches!(request.candidate.owner, PluginRequestOwner::SharePrepare(_)) {
-            self.emit_share_prepare_with(request, emit)
-        } else {
-            emit()
-        }
+        }).map_err(|_| PublicPluginManagementError::Unavailable)?;
+        Ok(())
     }
 
     pub(crate) fn dispatch_invocation(&self, request: &ScheduledPluginRequest, theme: PluginInvocationTheme, invoked_at: String) -> Result<(&'static str, serde_json::Value), PublicPluginManagementError> {
@@ -1411,16 +1381,15 @@ impl PublicPluginService {
             return Err(PublicPluginManagementError::Unavailable);
         }
         let environment = PluginInvocationEnvironment {
-            entry: None,
             platform: PluginInvocationPlatform::Windows,
             theme,
             invoked_at,
         };
-        let image = if matches!(request.candidate.owner, PluginRequestOwner::SharePrepare(_)) {
-            None
-        } else {
-            self.manager()?.bound_ocr_image(&request.context, None).ok().map(|image| image.descriptor)
-        };
+        let image = self
+            .manager()?
+            .bound_ocr_image(&request.context, None)
+            .ok()
+            .map(|image| image.descriptor);
         if matches!(request.candidate.owner, PluginRequestOwner::Command(_))
             && self
                 .manager()?
@@ -1431,20 +1400,6 @@ impl PublicPluginService {
             return Err(PublicPluginManagementError::Unavailable);
         }
         let (kind, invocation) = match &request.candidate.owner {
-            PluginRequestOwner::SharePrepare(owner) => (
-                "command",
-                serde_json::to_value(PluginInvocation {
-                    image: None,
-                    command_id: self.manager()?.invocation_command_id(request)?,
-                    api_version: 1,
-                    request_id: request.context.request_id.clone(),
-                    input: String::new(),
-                    context: PluginInvocationEnvironment {
-                        entry: Some(runtime::PluginInvocationEntry::SharePrepare { receiver_id: owner.receiver.receiver_id.clone() }),
-                        ..environment
-                    },
-                }).map_err(|_| PublicPluginManagementError::Unavailable)?,
-            ),
             PluginRequestOwner::Command(_) => (
                 "command",
                 serde_json::to_value(PluginInvocation {
@@ -1496,23 +1451,6 @@ impl PublicPluginService {
         outcome: PluginCompletionOutcome,
         now: Instant,
     ) -> Result<Option<ScheduledPluginRequest>, PluginRuntimeError> {
-        if let PluginRequestOwner::SharePrepare(owner) = &outcome.completed_owner {
-            if let Some(success) = self.complete_share_prepare_with(completion, &outcome, || {}) {
-                let plugin = &owner.receiver.plugin;
-                let disabled = self.manager().map_err(|_| PluginRuntimeError::Unavailable)?
-                    .record_runtime_result(&plugin.plugin_id, plugin.generation, plugin.activation_id, success, now)
-                    .map_err(|_| PluginRuntimeError::Unavailable)?;
-                if disabled {
-                    self.settle_plugin_submissions(&plugin.plugin_id);
-                    Self::destroy_runtime(app, runtime_label(&plugin.plugin_id, plugin.generation).as_deref());
-                    return Ok(None);
-                }
-            }
-            // Discriminator survives cancellation/map removal: never fall into
-            // ordinary Command/launcher response handling for late preparation.
-            return outcome.next.map(|next| self.bind_unsent_dispatch(next, now)).transpose()
-                .map(Option::flatten).map_err(|_| PluginRuntimeError::Unavailable);
-        }
         if let Some((origin, success, fault)) =
             self.complete_result_action(completion, outcome.accepted)
         {
@@ -1787,7 +1725,6 @@ impl PublicPluginService {
             .expire_network_timeouts(now)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
         for replacement in replacements {
-            self.settle_share_prepare(&replacement.expired, share_prepare::SharePrepareError::TimedOut);
             self.settle_result_action(
                 &replacement.expired,
                 result_action::ResultActionErrorCode::ActionTimedOut,
@@ -1912,7 +1849,6 @@ impl PublicPluginService {
     }
 
     fn settle_panel_generation(&self, plugin_id: &str, generation: u64) {
-        self.retire_share_preparations(Some(plugin_id), Some(generation));
         let result_context = self.result_action.lock().ok().and_then(|slot| {
             slot.as_ref()
                 .filter(|p| {
@@ -1955,7 +1891,6 @@ impl PublicPluginService {
         plugin_id: &str,
         result: Option<PublicSubmissionResult>,
     ) {
-        self.retire_share_preparations(Some(plugin_id), None);
         let pending = self.lock_submissions().ok().map(|mut submissions| {
             let tokens = submissions
                 .by_token

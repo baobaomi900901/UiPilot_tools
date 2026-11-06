@@ -13,8 +13,9 @@ async function setup(t, options = {}) {
   const dom = new JSDOM(html)
   const document = dom.window.document
   const order = [], calls = [], saves = [], statuses = []
-  let update, ready, actions, hostKey, inUpdate = false, current = 'A'
+  let update, ready, actions, hostKey, sourceProvider, receiver, inUpdate = false, current = 'A'
   const host = {
+    share: { onSource(fn) { sourceProvider = fn; return () => {} }, onReceive(fn) { receiver = fn; return () => {} } },
     onReady(fn) { order.push('ready'); ready = fn; return () => {} },
     onUpdate(fn) { order.push('update'); update = fn; return () => {} },
     onActions(fn) { actions = fn; return () => {} },
@@ -27,8 +28,8 @@ async function setup(t, options = {}) {
   const app = mountPanel(document, host, options.adapter ? { createCapabilities: options.adapter } : {})
   t.after(() => { app.dispose(); dom.window.close() })
   const node = id => document.getElementById(id)
-  const api = { app, dom, document, node, order, calls, saves, statuses, actions: () => actions({ source: 'content' }),
-    update(owner = 'A', text = 'hello', preferences) { current = owner; inUpdate = true; try { const result = update({ sessionEpoch: owner, requestId: owner, input: text, theme: owner === 'B' ? 'light' : 'dark', data: { text, preferences } }); assert.equal(result, undefined) } finally { inUpdate = false } },
+  const api = { receive: event => receiver(event), shareSource: () => sourceProvider?.(), app, dom, document, node, order, calls, saves, statuses, actions: () => actions({ source: 'content' }),
+    update(owner = 'A', text = 'hello', preferences, requestId = owner) { current = owner; inUpdate = true; try { const result = update({ sessionEpoch: owner, requestId, input: text, theme: owner === 'B' ? 'light' : 'dark', data: { text, preferences } }); assert.equal(result, undefined) } finally { inUpdate = false } },
     ready(owner = current) { ready({ sessionEpoch: owner, requestId: owner }) },
     key(id, key, props = {}) { const event = new dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...props }); node(id).dispatchEvent(event); return event },
     input(id, value) { node(id).value = value; node(id).dispatchEvent(new dom.window.Event('input', { bubbles: true })) },
@@ -272,4 +273,26 @@ test('keyboard navigation keeps the active language visible in a long list', asy
   a.key('choice-search','ArrowUp')
   assert.match(scrolled.at(-1)?.text ?? '', /祖鲁/)
   assert.equal(scrolled.at(-1).options.block,'nearest')
+})
+
+test('share accepts exact text once after preferences/Ready, translates once and exposes output source', async t => {
+ const a = await setup(t); a.update('A', '', { sourceLanguage: 'auto', targetLanguage: 'en', providerId: 'youdao' }); a.ready(); await flush()
+ const event = { version: 1, transferId: 's1', receiverId: 'translate', sessionEpoch: 'A', payload: { type: 'text/plain', text: ' edited\n原文  ' } }
+ assert.deepEqual(a.receive(event), { accepted: true }); assert.deepEqual(a.receive(event), { accepted: false })
+ await flush(); assert.equal(a.calls.length, 1); assert.equal(a.calls[0].payload.text, event.payload.text); assert.equal(a.calls[0].payload.targetLanguage, 'en')
+ assert.equal(a.node('source-text').value, event.payload.text)
+ assert.equal(a.shareSource().text, a.node('translation').textContent)
+ a.update('A', ''); a.ready(); await flush(); assert.equal(a.calls.length, 1); assert.equal(a.node('source-text').value, event.payload.text)
+})
+test('shared translation business failure keeps received original and target UI without retry', async t => {
+ const a = await setup(t, { request: async () => ({ ok: false, code: 'SERVICE_ERROR', message: '服务暂不可用' }) }); a.update('A', ''); a.ready()
+ assert.deepEqual(a.receive({ version: 1, transferId: 's1', receiverId: 'translate', sessionEpoch: 'A', payload: { type: 'text/plain', text: '  keep\nthis ' } }), { accepted: true })
+ await flush(); assert.equal(a.calls.length, 1); assert.equal(a.node('source-text').value, '  keep\nthis '); assert.equal(a.node('translation-status').textContent, '服务暂不可用'); assert.equal(a.shareSource(), null)
+})
+
+test('new empty submission after sharing clears source while same-request theme update preserves it', async t => {
+ const a = await setup(t); a.update('A', ''); a.ready()
+ a.receive({ version: 1, transferId: 's1', receiverId: 'translate', sessionEpoch: 'A', payload: { type: 'text/plain', text: 'shared' } }); await flush()
+ a.update('A', ''); assert.equal(a.node('source-text').value, 'shared')
+ a.update('A', '', undefined, 'new-empty-submit'); assert.equal(a.node('source-text').value, ''); assert.equal(a.node('translation').textContent, '')
 })

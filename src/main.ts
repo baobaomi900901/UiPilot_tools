@@ -105,6 +105,9 @@ export const client: LauncherClient = {
     if (!result) throw { code: 'windowFailed', message: 'panel open failed' }
     return result
   },
+  getPluginShareState: () => invoke('plugin_share_state'),
+  selectPluginShare: (input) => invoke('plugin_share_select', input),
+  endPluginShare: (input) => invoke('plugin_share_end', input),
   submitPluginPanel: async (input) => {
     const value = await invoke<unknown>('submit_plugin_panel', { input })
     const result = parsePluginPanelCommandResult(value)

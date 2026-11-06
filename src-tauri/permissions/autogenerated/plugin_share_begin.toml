@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-share-begin"
+description = "Enables the plugin_share_begin command without any pre-configured scope."
+commands.allow = ["plugin_share_begin"]
+
+[[permission]]
+identifier = "deny-plugin-share-begin"
+description = "Denies the plugin_share_begin command without any pre-configured scope."
+commands.deny = ["plugin_share_begin"]

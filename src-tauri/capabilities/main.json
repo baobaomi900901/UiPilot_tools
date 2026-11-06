@@ -4,6 +4,9 @@
   "description": "Exact permissions for the local launcher WebView",
   "webviews": ["main"],
   "permissions": [
+    "allow-plugin-share-state",
+    "allow-plugin-share-select",
+    "allow-plugin-share-end",
     "dialog:allow-open",
     "core:app:allow-version",
     "allow-list-credentials",

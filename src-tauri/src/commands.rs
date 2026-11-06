@@ -2980,6 +2980,7 @@ pub(crate) fn plugin_panel_host_key_enqueue(
     input: PluginPanelHostKeyEnqueueInput,
 ) -> Result<PluginPanelHostKeyEnqueueResult, CommandError> {
     require_main_label(webview.label())?;
+    if controller.share_locked() { return Err(CommandError::window_failed()); }
     let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
     let client_sequence = parse_panel_session_epoch(&input.client_sequence)?;
     let decision = controller
@@ -3518,6 +3519,7 @@ pub(crate) fn open_plugin_panel_actions(
     ticket: String,
 ) -> Result<(), CommandError> {
     require_main_label(webview.label())?;
+    if controller.share_locked() { return Err(CommandError::window_failed()); }
     let epoch = parse_panel_session_epoch(&session_epoch)?;
     if !matches!(source.as_str(), "hostInput" | "content") || ticket.len() > 64 {
         return Err(CommandError::window_failed());
@@ -3556,6 +3558,7 @@ pub(crate) fn plugin_panel_actions_submit(
     ticket: String,
 ) -> Result<(), CommandError> {
     let epoch = parse_panel_session_epoch(&session_epoch)?;
+    if controller.share_locked() { return Err(CommandError::window_failed()); }
     controller
         .begin_content_call(webview.label(), epoch, true)
         .map_err(map_storage_panel_call_error)?;
@@ -4272,7 +4275,7 @@ pub(crate) async fn open_plugin_panel(
     input: OpenPluginPanelInput,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
     require_main_window(&window)?;
-    open_plugin_panel_impl(app, public, controller, input).await
+    open_plugin_panel_impl(app, public, controller, input, None).await
 }
 
 #[tauri::command]
@@ -4285,6 +4288,7 @@ pub(crate) async fn submit_plugin_panel(
     input: SubmitPluginPanelInput,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
     require_main_label(webview.label())?;
+    if controller.share_locked() { return Err(CommandError::window_failed()); }
     submit_plugin_panel_impl(app, public, controller, settings, input).await
 }
 
@@ -4713,6 +4717,7 @@ async fn open_plugin_panel_impl(
     public: State<'_, Arc<PublicPluginService>>,
     controller: State<'_, Arc<PluginPanelController>>,
     input: OpenPluginPanelInput,
+    share_id: Option<String>,
 ) -> Result<Option<PluginPanelCommandResult>, CommandError> {
     let route = if let Some(target) = &input.stable_command_target {
         if target.plugin_id != input.plugin_id
@@ -4768,7 +4773,10 @@ async fn open_plugin_panel_impl(
     let mount_app = app.clone();
     let mount_controller = Arc::clone(controller.inner());
     let identity = tauri::async_runtime::spawn_blocking(move || {
-        plugin_panel::mount(&mount_app, mount_controller, owner, &panel_entry, images)
+        match share_id {
+            Some(id) => plugin_panel::mount_shared(&mount_app, mount_controller, owner, &panel_entry, images, &id),
+            None => plugin_panel::mount(&mount_app, mount_controller, owner, &panel_entry, images),
+        }
     })
     .await
     .map_err(|_| CommandError::plugin_query_failed())??;
@@ -14544,3 +14552,6 @@ mod command_management_ipc_tests {
 #[cfg(test)]
 #[path = "commands/launcher_image_ipc_tests.rs"]
 mod launcher_image_ipc_tests;
+
+mod sharing;
+pub(crate) use sharing::*;

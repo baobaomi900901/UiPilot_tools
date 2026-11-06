@@ -389,10 +389,19 @@ struct LiveSession {
 }
 
 mod image_session;
+mod sharing;
 pub(crate) use image_session::deliver_image_change;
 
 fn invalidate_session_locked(core: &mut ControllerCore) -> Option<LiveSession> {
     let mut session = core.session.take()?;
+    if let Some(share) = core.share.as_mut() {
+        match share.view.phase {
+            crate::plugin_share::Phase::Opening if share.source == session.identity => {},
+            crate::plugin_share::Phase::Error => {},
+            crate::plugin_share::Phase::Delivering => share.fail(),
+            _ => { core.share = None; },
+        }
+    }
     session.images.take();
     session.speech_lease.revoke();
     session.runtime_request.take();
@@ -402,6 +411,8 @@ fn invalidate_session_locked(core: &mut ControllerCore) -> Option<LiveSession> {
 #[derive(Default)]
 struct ControllerCore {
     next_epoch: u64,
+    next_share: u64,
+    share: Option<crate::plugin_share::Session>,
     next_focus_request_id: u64,
     next_hide_ticket_id: u64,
     session: Option<LiveSession>,
@@ -469,7 +480,45 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     active: () => documentActive, registered: () => updateRegistered,
     invoke: (...args) => invoke(...args), json: panelJson });
   window.addEventListener?.('uipilot-plugin-panel-image-changed', event => imageBridge.receive(event.detail));
-  const contextActions = installPanelContextActions({ document, window, createMenu: createContextActionsMenu,
+  let shareSource = null, shareReceiver = null;
+  const shareSnapshot = () => {
+    if (!shareSource || !documentActive || !readyUpdate?.notified) return null;
+    const started = Date.now();
+    try {
+      const value = shareSource();
+      if (Date.now() - started > 2000 || !value || typeof value.then === 'function' ||
+          value.type !== 'text/plain' || typeof value.text !== 'string' || !value.text.trim() ||
+          value.text.includes('\0') || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value.text) ||
+          new TextEncoder().encode(value.text).length > 16384) return null;
+      return { type: 'text/plain', text: value.text };
+    } catch (_) { return null; }
+  };
+  const shareAction = () => {
+    if (!shareSource) return null;
+    const available = shareSnapshot();
+    return { id: 'host-share', title: '分享', icon: 'arrow',
+      ...(available ? {} : { disabledReason: '没有可分享的有效文字（最多 16 KiB）' }),
+      run: async () => {
+        const payload = shareSnapshot();
+        if (!payload || !invoke) return;
+        await invoke('plugin_share_begin', { sessionEpoch: liveSessionEpoch, payload });
+      } };
+  };
+  const receiveShare = async current => {
+    if (!documentActive || readyUpdate !== current || current.generation !== readyGeneration) return;
+    const args = { sessionEpoch: current.sessionEpoch, requestId: current.requestId };
+    const event = await invoke('plugin_share_claim', args);
+    if (!event || !documentActive || readyUpdate !== current || current.generation !== readyGeneration) return;
+    // Claim precedes return on the host; mark locally before invoking untrusted plugin code.
+    let accepted = false;
+    try {
+      const result = shareReceiver?.(deepFreeze(event));
+      accepted = !!result && typeof result.then !== 'function' && Object.keys(result).length === 1 && result.accepted === true;
+      if (result && typeof result.then === 'function') Promise.resolve(result).catch(() => {});
+    } catch (_) {}
+    if (documentActive && readyUpdate === current) await invoke('plugin_share_received', { ...args, transferId: event.transferId, accepted });
+  };
+  const contextActions = installPanelContextActions({ document, window, createMenu: createContextActionsMenu, getShare: shareAction,
     getEpoch: () => liveSessionEpoch, invoke: (...args) => invoke(...args) });
   const deepFreeze = (value, seen = new WeakSet()) => {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null || seen.has(value)) return value;
@@ -793,6 +842,18 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   };
   let statusSequence = 0n;
   const apiShape = {
+    share: {
+      onSource(next) {
+        if (shareSource || typeof next !== 'function') throw new TypeError('one source provider required');
+        shareSource = next;
+        return () => { if (shareSource === next) shareSource = null; };
+      },
+      onReceive(next) {
+        if (shareReceiver || typeof next !== 'function') throw new TypeError('one share receiver required');
+        shareReceiver = next;
+        return () => { if (shareReceiver === next) shareReceiver = null; };
+      },
+    },
     onActions(next) { return contextActions.register(next); },
     get setStatus() {
       const epoch = liveSessionEpoch;
@@ -935,9 +996,17 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       current.notified = true;
       const receiver = readyReceiver;
       const event = deepFreeze({ sessionEpoch: current.sessionEpoch, requestId: current.requestId });
-      if (receiver) queueMicrotask(() => {
+      queueMicrotask(async () => {
         if (!documentActive || readyUpdate !== current || current.generation !== readyGeneration || readyReceiver !== receiver) return;
-        try { Promise.resolve(receiver.handler(event)).catch(() => undefined); } catch (_) {}
+        try {
+          if (receiver) await receiver.handler(event);
+          await receiveShare(current);
+        } catch (_) {
+          // Target initialization errors stay target-owned; a failed receive ends delivery.
+          if (documentActive && readyUpdate === current) {
+            void invoke('plugin_share_ready_failed', { sessionEpoch: current.sessionEpoch, requestId: current.requestId }).catch(() => {});
+          }
+        }
       });
       imageBridge.markReady();
     },
@@ -947,6 +1016,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     readyGeneration++;
     readyUpdate = null;
     readyReceiver = null;
+    shareSource = null; shareReceiver = null;
     imageBridge.close();
   });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_HOST_KEY__', {
@@ -1125,6 +1195,7 @@ fn finish_host_key_ack_locked(
 impl PluginPanelController {
     pub(crate) fn host_shown(&self) -> Option<u64> {
         let mut core = self.core.lock().ok()?;
+        core.share = None;
         let show_generation = core.show_generation.checked_add(1)?;
         let focus_revision = core.focus_revision.checked_add(1)?;
         core.show_generation = show_generation;
@@ -1209,7 +1280,17 @@ impl PluginPanelController {
     }
 
     pub(crate) fn open_session(&self, owner: PanelOwner) -> Option<PanelSessionIdentity> {
+        self.replace_session(owner, None).map(|(identity, _)| identity)
+    }
+    fn replace_session(&self, owner: PanelOwner, share_id: Option<&str>) -> Option<(PanelSessionIdentity, Option<PanelSessionIdentity>)> {
         let mut core = self.core.lock().ok()?;
+        if share_id.is_none() { core.share = None; }
+        if let Some(id) = share_id {
+            let current = core.session.as_ref()?.identity.clone();
+            let share = core.share.as_ref()?;
+            if share.view.transfer_id != id || share.view.phase != crate::plugin_share::Phase::Opening || share.source != current || share.target.is_some() || Instant::now() >= share.deadline { return None; }
+        }
+        let previous = core.session.as_ref().map(|s| s.identity.clone());
         let session_epoch = core.next_epoch.checked_add(1)?;
         let content_label = plugin_panel_content_label(&owner.plugin_id, session_epoch)?;
         core.next_epoch = session_epoch;
@@ -1226,6 +1307,11 @@ impl PluginPanelController {
         };
         let show_generation = core.show_generation;
         invalidate_session_locked(&mut core);
+        if let Some(share) = core.share.as_mut().filter(|s| s.view.phase == crate::plugin_share::Phase::Opening) {
+            if share.selected.as_ref().is_some_and(|r| r.plugin_id == identity.plugin_id && r.generation == identity.generation && r.activation_id == identity.activation_id && r.admission_epoch == identity.admission_epoch) {
+                share.target = Some(identity.clone());
+            } else { share.fail(); }
+        }
         core.session = Some(LiveSession {
             images: None,
             delivered_image_revision: None,
@@ -1247,7 +1333,7 @@ impl PluginPanelController {
         core.host_input_focus = None;
         core.internal_blur_until = None;
         self.changed.notify_all();
-        Some(identity)
+        Some((identity, previous))
     }
 
     pub(crate) fn admit_hide(
@@ -1853,6 +1939,7 @@ impl PluginPanelController {
         core.show_generation = core.show_generation.saturating_add(1);
         core.main_content_focused = false;
         core.internal_blur_until = None;
+        core.share = None;
         invalidate_session_locked(&mut core);
         core.hide_ticket = None;
         core.host_input_focus = None;
@@ -3126,8 +3213,13 @@ pub(crate) fn set_bounds(
         )
     });
     controller.claim_bounds_identity(session_epoch)?;
-    content.show().map_err(|_| PanelBoundsError::Unavailable)?;
-    controller.mark_content_visible(session_epoch)?;
+    {
+        let mut core = controller.core.lock().map_err(|_| PanelBoundsError::Unavailable)?;
+        if core.share.as_ref().is_some_and(|s| s.locked()) { return Ok(()); }
+        let session = core.session.as_mut().filter(|s| s.identity == identity).ok_or(PanelBoundsError::Stale)?;
+        content.show().map_err(|_| PanelBoundsError::Unavailable)?;
+        session.content_visible = true;
+    }
     trace_panel_focus(app, controller, "content-show", || {
         format!("sessionEpoch={session_epoch}")
     });
@@ -3141,10 +3233,20 @@ pub(crate) fn mount(
     panel_entry: &str,
     image: Option<Option<crate::launcher_image::LauncherImage>>,
 ) -> Result<PanelSessionIdentity, PublicPluginManagementError> {
-    teardown(app, controller.as_ref(), None);
-    let identity = controller
-        .open_session(owner)
-        .ok_or(PublicPluginManagementError::Unavailable)?;
+    mount_scoped(app, controller, owner, panel_entry, image, None)
+}
+pub(crate) fn mount_shared(
+    app: &AppHandle, controller: Arc<PluginPanelController>, owner: PanelOwner, panel_entry: &str,
+    image: Option<Option<crate::launcher_image::LauncherImage>>, share_id: &str,
+) -> Result<PanelSessionIdentity, PublicPluginManagementError> {
+    mount_scoped(app, controller, owner, panel_entry, image, Some(share_id))
+}
+fn mount_scoped(
+    app: &AppHandle, controller: Arc<PluginPanelController>, owner: PanelOwner, panel_entry: &str,
+    image: Option<Option<crate::launcher_image::LauncherImage>>, share_id: Option<&str>,
+) -> Result<PanelSessionIdentity, PublicPluginManagementError> {
+    let (identity, previous) = controller.replace_session(owner, share_id).ok_or(PublicPluginManagementError::Unavailable)?;
+    if let Some(previous) = previous { destroy_content(app, &previous.content_label); }
     if let Some(image) = image {
         controller.configure_images(identity.session_epoch, image).map_err(|_| PublicPluginManagementError::Unavailable)?;
     }
@@ -6336,6 +6438,7 @@ mod tests {
         assert_eq!(
             public_members,
             vec![
+                "share: {",
                 "onActions(next) { return contextActions.register(next); },",
                 "get setStatus() {",
                 "onReady(next) {",

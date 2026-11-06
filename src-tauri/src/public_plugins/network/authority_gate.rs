@@ -629,15 +629,18 @@ fn current_context_identity(
     context: &PluginRequestContext,
     scheduler: &PluginRequestScheduler,
 ) -> Result<PluginNetworkContextIdentity, PluginNetworkErrorCode> {
-    scheduler.with_current(context, |current| {
-        // Host-owned scheduler authority, never the serialized invocation entry.
-        // Run before broker admission and any bearer credential read.
-        if !current.effects_allowed() { return Err(PluginNetworkErrorCode::PermissionDenied); }
-        PluginNetworkContextIdentity::new(
-            &context.plugin_id, current.plugin_generation(), current.activation_id(),
-            current.admission_epoch(), &context.request_id,
-        ).map_err(|_| PluginNetworkErrorCode::NetworkFailure)
-    }).map_err(map_context_error)?
+    scheduler
+        .with_current(context, |current| {
+            PluginNetworkContextIdentity::new(
+                &context.plugin_id,
+                current.plugin_generation(),
+                current.activation_id(),
+                current.admission_epoch(),
+                &context.request_id,
+            )
+        })
+        .map_err(map_context_error)?
+        .map_err(|_| PluginNetworkErrorCode::NetworkFailure)
 }
 
 fn call_is_current_locked(

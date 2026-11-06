@@ -40,25 +40,6 @@ const context = { pluginId: 'com.example.panel', pluginGeneration: 1, requestId:
 const invocation = { apiVersion: 1, requestId: context.requestId, action: 'preview', payload: { body: 'Hi', values: [1, 2] }, context: { platform: 'windows', theme: 'dark', invokedAt: '2026-10-24T00:00:00Z' } }
 
 describe('panel action executable bridges', () => {
-  it('dispatches body-free share preparation through onCommand and preserves optional entry', async () => {
-    const handler = vi.fn(async (next: any) => {
-      expect(next.input).toBe('')
-      expect(next.image).toBeUndefined()
-      expect(next.context.entry).toEqual({ kind: 'sharePrepare', receiverId: 'receive' })
-      expect(Object.isFrozen(next.context.entry)).toBe(true)
-      return { requestId: next.requestId, data: { initialized: true } }
-    })
-    const r = await runtime({ onCommand: handler }, false)
-    const prepare = { apiVersion: 1, requestId: context.requestId, input: '', context: {
-      platform: 'windows', theme: 'dark', invokedAt: 'now', entry: { kind: 'sharePrepare', receiverId: 'receive' },
-    } }
-    await r.callback({ payload: { context, kind: 'command', invocation: prepare } })
-    expect(handler).toHaveBeenCalledTimes(1)
-    expect(r.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: {
-      context, response: { requestId: context.requestId, data: { initialized: true } },
-    } })
-  })
-
   it('delivers the host request-scoped image as a frozen Panel action descriptor', async () => {
     const descriptor = { id: 'request-image', mimeType: 'image/png', width: 10, height: 20, byteLength: 80 }
     const handler = vi.fn(async (next: any) => {
@@ -190,4 +171,63 @@ it('requires onWindowAction at opt-in readiness and dispatches fresh frozen Wind
   const failed = await runtime({ onCommand: commands, onWindowAction: async () => { throw new Error('secret stack') } }, false, true)
   await failed.callback({ payload: { context, kind: 'windowAction', invocation: structuredClone(invocation) } })
   expect(failed.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: { context, failed: true } })
+})
+
+
+describe('single Panel share bridge', () => {
+  it('exposes synchronous source and receive registration without preparation APIs', () => {
+    const p = panel()
+    expect(typeof p.api.share?.onSource).toBe('function')
+    expect(typeof p.api.share?.onReceive).toBe('function')
+    expect(p.api.share?.invalidateSource).toBeUndefined()
+    expect(p.api.share?.sharePrepare).toBeUndefined()
+    const off = p.api.share.onSource(() => ({ type: 'text/plain', text: ' edited\ntext ' }))
+    expect(() => p.api.share.onSource(() => null)).toThrow()
+    off()
+    expect(() => p.api.share.onSource(() => null)).not.toThrow()
+  })
+  it('waits for async Ready and claims once even after duplicate notifications', async () => {
+    const p = panel()
+    let release!: () => void
+    const receive = vi.fn((_event: any) => ({ accepted: true }))
+    p.invoke.mockImplementation(async (command: string) => command === 'plugin_share_claim' ? {
+      version: 1, transferId: '1', receiverId: 'translate', sessionEpoch: '7', payload: { type: 'text/plain', text: ' edited\ntext ' },
+    } : undefined)
+    p.api.share.onReceive(receive)
+    p.api.onReady(() => new Promise<void>(resolve => { release = resolve }))
+    p.api.onUpdate(() => undefined)
+    await p.window.__UIPILOT_PLUGIN_PANEL_UPDATE__({ sessionEpoch: '7', requestId: 'share-init', theme: 'dark' })
+    p.window.__UIPILOT_PLUGIN_PANEL_READY__({ sessionEpoch: '7', requestId: 'share-init' })
+    p.window.__UIPILOT_PLUGIN_PANEL_READY__({ sessionEpoch: '7', requestId: 'share-init' })
+    await Promise.resolve()
+    expect(receive).not.toHaveBeenCalled()
+    release(); await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1))
+    expect(p.invoke.mock.calls.filter(([command]) => command === 'plugin_share_claim')).toHaveLength(1)
+    expect(p.invoke).toHaveBeenCalledWith('plugin_share_received', { sessionEpoch: '7', requestId: 'share-init', transferId: '1', accepted: true })
+    expect(receive.mock.calls[0]![0].payload.text).toBe(' edited\ntext ')
+  })
+})
+
+
+describe('single Panel receive errors', () => {
+  it.each(['missing', 'promise', 'throw', 'invalid'])('ends delivery without retry for %s receiver', async kind => {
+    const p = panel()
+    p.invoke.mockImplementation(async (command: string) => command === 'plugin_share_claim' ? { version: 1, transferId: '1', receiverId: 'draft', sessionEpoch: '7', payload: { type: 'text/plain', text: 'keep original' } } : undefined)
+    if (kind !== 'missing') p.api.share.onReceive(() => { if (kind === 'throw') throw new Error('private'); return kind === 'promise' ? Promise.resolve({ accepted: true }) : { accepted: true, invalid: true } })
+    p.api.onUpdate(() => undefined)
+    await p.window.__UIPILOT_PLUGIN_PANEL_UPDATE__({ sessionEpoch: '7', requestId: 'init', theme: 'dark' })
+    p.window.__UIPILOT_PLUGIN_PANEL_READY__({ sessionEpoch: '7', requestId: 'init' })
+    await vi.waitFor(() => expect(p.invoke).toHaveBeenCalledWith('plugin_share_received', { sessionEpoch: '7', requestId: 'init', transferId: '1', accepted: false }))
+    expect(p.invoke.mock.calls.filter(([command]) => command === 'plugin_share_claim')).toHaveLength(1)
+  })
+  it('a draft receiver accepts into memory without executing business requests', async () => {
+    const p = panel(); let draft = ''
+    p.invoke.mockImplementation(async (command: string) => command === 'plugin_share_claim' ? { version: 1, transferId: '1', receiverId: 'draft', sessionEpoch: '7', payload: { type: 'text/plain', text: ' independent draft ' } } : undefined)
+    p.api.share.onReceive((event: any) => { draft = event.payload.text; return { accepted: true } })
+    p.api.onUpdate(() => undefined)
+    await p.window.__UIPILOT_PLUGIN_PANEL_UPDATE__({ sessionEpoch: '7', requestId: 'init', theme: 'light' })
+    p.window.__UIPILOT_PLUGIN_PANEL_READY__({ sessionEpoch: '7', requestId: 'init' })
+    await vi.waitFor(() => expect(draft).toBe(' independent draft '))
+    expect(p.invoke.mock.calls.some(([command]) => command === 'plugin_panel_request')).toBe(false)
+  })
 })

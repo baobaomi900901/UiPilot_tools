@@ -470,6 +470,9 @@ export type ClassifiedTextRecord =
   | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
+  getPluginShareState?(): Promise<PluginShareView | null>
+  selectPluginShare?(input: { transferId: string; pluginId: string; receiverId: string }): Promise<void>
+  endPluginShare?(input: { transferId: string }): Promise<void>
   credentials?: CredentialClient
   validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>
   listenShown(handler: (payload: unknown) => void): Promise<() => void>
@@ -654,6 +657,25 @@ export interface PluginPanelCommandResult {
   hostKeys: readonly PanelHostKeyDeclaration[]
 }
 
+export interface PluginShareReceiver {
+  pluginId: string
+  pluginName: string
+  receiverId: string
+  title: string
+  commandId: string
+  maxBytes: number
+  disabledReason: string | null
+}
+export interface PluginShareView {
+  transferId: string
+  sourceEpoch: string
+  phase: 'choosing' | 'opening' | 'delivering' | 'accepted' | 'error'
+  receivers: readonly PluginShareReceiver[]
+  target: PluginPanelCommandResult | null
+  targetLabel: string | null
+  error: string | null
+}
+
 /** Physical client pixels, converted from DOM coordinates by the main WebView. */
 export interface PluginPanelBounds {
   x: number
@@ -802,6 +824,7 @@ export interface MessageCenterStateSnapshot {
 }
 
 export interface LauncherSnapshot {
+  share?: PluginShareView
   image?: LauncherImageState
   view: 'launcher' | 'settings'
   settingsTab: SettingsTabKey

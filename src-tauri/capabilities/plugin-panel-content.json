@@ -4,6 +4,10 @@
   "description": "Ready/ack and storage bridge for isolated public plugin panel content",
   "webviews": ["plugin-panel-content-*"],
   "permissions": [
+    "allow-plugin-share-begin",
+    "allow-plugin-share-claim",
+    "allow-plugin-share-received",
+    "allow-plugin-share-ready-failed",
     "allow-plugin-panel-content-ready",
     "allow-plugin-panel-content-ack",
     "allow-plugin-panel-host-key-ack",

@@ -76,6 +76,8 @@ export interface LauncherCore {
   readonly requestHide: () => Promise<void>
   readonly closeMainResultCommand: () => void
   readonly closePanel: () => Promise<void>
+  readonly selectShareReceiver: (pluginId: string, receiverId: string) => Promise<void>
+  readonly endShare: () => Promise<void>
   readonly closeQuicklinks: () => void
   readonly newQuicklink: () => void
   readonly closeNewQuicklink: () => void
@@ -204,6 +206,7 @@ interface PrivateMainResultCommandState {
 }
 
 interface Model {
+  share?: import('./protocol').PluginShareView
   image?: import('./protocol').LauncherImageState
   view: 'launcher' | 'settings'
   settingsTab: SettingsTabKey
@@ -887,6 +890,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
       })()
     : undefined
   return Object.freeze({
+    ...(model.share ? { share: model.share } : {}),
     ...(model.image ? { image: Object.freeze({ ...model.image }) } : {}),
     view: model.view,
     settingsTab: model.settingsTab,
@@ -954,6 +958,64 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   let snapshot = projectSnapshot(model)
   let destroyed = false
   let started = false
+  let shareTimer: ReturnType<typeof setTimeout> | undefined
+  let shareOwner = 0
+  let shareSelecting = false
+  const shareLocked = () => !!model.share && model.share.phase !== 'accepted'
+  async function pollShare(): Promise<void> {
+    if (destroyed || !client.getPluginShareState) return
+    const owner = shareOwner, viewEpoch = model.viewEpoch
+    try {
+      const next = await client.getPluginShareState()
+      if (destroyed || owner !== shareOwner || viewEpoch !== model.viewEpoch || model.view !== 'launcher' || !model.panel) return
+      if (next && next.sourceEpoch !== model.panel.sessionEpoch && next.target?.sessionEpoch !== model.panel.sessionEpoch && next.transferId !== model.share?.transferId) return
+      if (JSON.stringify(next) === JSON.stringify(model.share ?? null)) return
+      model.share = next ?? undefined
+      if (next) {
+        panelSubmissionToken++; panelActionToken++; panelBoundsToken++
+        imageImportSequence++; imageImportPending = false
+        pendingPanelFocusRequest = undefined
+        if (next.target && next.target.sessionEpoch !== model.panel.sessionEpoch) {
+          const identity = next.target
+          discardImage(); model.query = ''; model.queryControlValue = ''; clearResults()
+          model.panel = { ...identity, hostKeys: Object.freeze([...identity.hostKeys]), suffix: newTextControl(''), submitPending: false, closePending: false }
+          model.launcherMode = 'panel'; model.executePending = false
+          panelHostKeyEpoch = identity.sessionEpoch
+          nextPanelHostKeyClientSequence = 1n; panelHostKeyEnqueueTail = Promise.resolve()
+        }
+        if (next.phase !== 'choosing') {
+          model.panel.suffix = model.panel.suffix.value === '' ? model.panel.suffix : newTextControl('')
+          model.panel.submitPending = false
+          model.panel.focusRequestId = undefined
+        }
+      }
+      publish(true)
+    } catch { /* No payload or catalog goes through the general event bus. */ }
+    finally { if (!destroyed) shareTimer = setTimeout(() => { void pollShare() }, 150) }
+  }
+  async function selectShareReceiver(pluginId: string, receiverId: string): Promise<void> {
+    const share = model.share
+    if (destroyed || shareSelecting || share?.phase !== 'choosing' || !client.selectPluginShare) return
+    shareSelecting = true
+    model.share = { ...share, phase: 'opening', targetLabel: share.receivers.find(r => r.pluginId === pluginId && r.receiverId === receiverId)?.pluginName ?? null, receivers: [] }
+    publish(true)
+    try { await client.selectPluginShare({ transferId: share.transferId, pluginId, receiverId }) }
+    catch { /* Native state owns the target error. */ }
+    finally { shareSelecting = false }
+  }
+  async function endShare(): Promise<void> {
+    const share = model.share
+    if (!share || !client.endPluginShare) return
+    const owner = ++shareOwner
+    try {
+      await client.endPluginShare({ transferId: share.transferId })
+      if (destroyed || owner !== shareOwner) return
+      model.share = undefined
+      if (share.phase !== 'choosing') resetPanelUi('')
+      publish(true)
+    } catch { if (!destroyed) { model.status = '分享未能关闭，请重试'; publish(true) } }
+  }
+
   let unlisten: (() => void) | undefined
   let unlistenHidden: (() => void) | undefined
   let unlistenBuiltinFeaturesChanged: (() => void) | undefined
@@ -2014,6 +2076,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function importImage(file?: Blob): Promise<void> {
+    if (shareLocked()) return
     if (destroyed || model.view !== 'launcher' || model.hidePending || !model.invocationId || !client.importLauncherImage) return
     const panel = model.launcherMode === 'panel' ? model.panel : undefined
     if (model.launcherMode !== 'applications' && !panel) return
@@ -2800,6 +2863,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function shown(payload: unknown): void {
+    shareOwner++; model.share = undefined
     if (destroyed) return
     const event = parseLauncherShown(payload)
     if (!event) return
@@ -2839,6 +2903,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function navigate(target: ShowTarget): void {
+    if (shareLocked()) { void endShare().then(() => { if (!shareLocked()) navigate(target) }); return }
+    shareOwner++; model.share = undefined
     const nextView = target === 'launcher' ? 'launcher' : 'settings'
     const nextTab = target === 'messages' ? 'messages' : target === 'settings' ? 'general' : model.settingsTab
     if (
@@ -2863,6 +2929,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function text(record: ClassifiedTextRecord): void {
+    if (shareLocked()) return
     if (destroyed) return
     const queryControl = record.control === model.queryControl
     const mainResultControl = record.control === model.mainResultCommand?.suffix.key
@@ -3305,6 +3372,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     model.executePending = false
     model.launcherMode = 'applications'
     model.panel = undefined
+    model.share = undefined
+    shareOwner++
     model.query = ''
     model.queryControlValue = ''
     clearResults()
@@ -3337,6 +3406,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function hidden(): void {
+    shareOwner++; model.share = undefined
     if (destroyed) return
     const discardedImage = discardImage()
     commandEntryToken++
@@ -3449,7 +3519,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     void pending.catch((error: unknown) => {
       const current = model.panel
       if (
-        destroyed || owner.token !== panelBoundsToken || owner.viewEpoch !== model.viewEpoch ||
+        destroyed || shareLocked() || owner.token !== panelBoundsToken || owner.viewEpoch !== model.viewEpoch ||
         model.launcherMode !== 'panel' || !current || current.closePending ||
         current.sessionEpoch !== owner.sessionEpoch
       ) return
@@ -3477,6 +3547,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function submitPanel(argument: string): void {
+    if (shareLocked()) return
     const panel = model.panel
     if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'panel' || !panel || panel.closePending) {
       return
@@ -3651,6 +3722,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function closePanel(status = '', notice?: string): Promise<void> {
+    if (shareLocked()) { await endShare(); return }
     const panel = model.panel
     if (destroyed || model.launcherMode !== 'panel' || !panel || panel.closePending) return
     const owner = {
@@ -3691,6 +3763,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function handlePanelError(payload: unknown): void {
+    if (shareLocked()) return
     const event = parsePluginPanelErrorEvent(payload)
     const panel = model.panel
     if (!event || !panel || event.sessionEpoch !== panel.sessionEpoch) return
@@ -3708,6 +3781,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function handlePanelReset(payload: unknown): void {
+    if (shareLocked()) return
     const event = parsePluginPanelErrorEvent(payload)
     const panel = model.panel
     if (!event || !panel || event.sessionEpoch !== panel.sessionEpoch) return
@@ -4229,6 +4303,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function routePanelHostKey(input: PluginPanelHostKeyPhysicalInput): boolean {
+    if (shareLocked()) return true
     const panel = model.panel
     if (destroyed || input.isComposing || !panel || panel.closePending || panelHostKeyEpoch !== panel.sessionEpoch) {
       return false
@@ -4282,7 +4357,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     }
     nextPanelHostKeyClientSequence += 1n
     panelHostKeyEnqueueTail = panelHostKeyEnqueueTail.then(async () => {
-      if (destroyed || model.panel?.sessionEpoch !== owner.sessionEpoch || panelHostKeyEpoch !== owner.sessionEpoch) return
+      if (destroyed || shareLocked() || model.panel?.sessionEpoch !== owner.sessionEpoch || panelHostKeyEpoch !== owner.sessionEpoch) return
       try {
         const result = await client.enqueuePluginPanelHostKey(owner)
         if (result.outcome === 'protocolViolation') await requestHide()
@@ -4294,6 +4369,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   function keyDown(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Escape', isComposing: boolean, repeat = false): void {
+    if (shareLocked()) { if (key === 'Escape' && !isComposing && !repeat) void endShare(); return }
     if (destroyed || isComposing) return
     if (key === 'Escape') {
       if (model.resultActionMenu) { closeResultActionMenu(); return }
@@ -4416,6 +4492,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   async function start(): Promise<void> {
     if (started || destroyed) return
     started = true
+    void pollShare()
     if (!await preparePanelHostInputFocusListener()) {
       failInitialization()
       return
@@ -4514,6 +4591,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     retireResultActionSource()
     cancelMinuteRefresh()
     destroyed = true
+    shareOwner++
+    if (shareTimer !== undefined) clearTimeout(shareTimer)
+    if (shareLocked() && model.share) void client.endPluginShare?.({ transferId: model.share.transferId }).catch(() => {})
+    model.share = undefined
     cancelSlashSearch()
     searchToken = ++token
     executeToken = ++token
@@ -4668,6 +4749,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     saveNewQuicklink,
     deleteQuicklink,
     setPanelBounds,
+    selectShareReceiver,
+    endShare,
     settlePanelHostInputFocus,
     selectResult,
     activateResult,

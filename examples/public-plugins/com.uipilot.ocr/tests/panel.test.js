@@ -6,8 +6,9 @@ const flush = () => new Promise(resolve => setImmediate(resolve))
 async function setup(t, overrides = {}) {
  const { mountPanel } = await import('../package/dist/panel.js')
  const dom = new JSDOM(await readFile(new URL('../package/dist/panel.html', import.meta.url), 'utf8'))
- let update, ready, changed, key, actions; let epoch = '1'; const calls = [], copies = [], statuses = [], focus = []; const order = []
+ let update, ready, changed, key, actions, sourceProvider; let epoch = '1'; const calls = [], copies = [], statuses = [], focus = []; const order = []
  const host = {
+  share: { onSource(fn) { sourceProvider = fn; return () => { sourceProvider = null } } },
   onUpdate(fn) { order.push('update'); update = fn; return () => { update = null } },
   onReady(fn) { order.push('ready'); ready = fn; return () => { ready = null } },
   onImageChanged(fn) { order.push('image'); changed = fn; return () => { changed = null } },
@@ -26,7 +27,7 @@ async function setup(t, overrides = {}) {
  const image = (id = 'A', revision = '1', sessionEpoch = '1') => changed({ sessionEpoch, revision, image: id ? { id, width: 100, height: 80, previewDataUrl: 'data:image/png;base64,AAAA' } : null })
  const edit = text => { node('ocr-text').value = text; node('ocr-text').dispatchEvent(new dom.window.Event('input', { bubbles: true })) }
  const localKey = (target, key, extra = {}) => { const event = new dom.window.KeyboardEvent('keydown', { key, cancelable: true, bubbles: true, ...extra }); target.dispatchEvent(event); return event }
- return { app, dom, node, calls, copies, statuses, focus, order, install, signal, image, edit, localKey, hostKey: extra => key({ key: 'Enter', sessionEpoch: '1', routeSequence: '1', ...extra }), actions: () => actions({ source: 'content' }) }
+ return { shareSource: () => sourceProvider?.(), app, dom, node, calls, copies, statuses, focus, order, install, signal, image, edit, localKey, hostKey: extra => key({ key: 'Enter', sessionEpoch: '1', routeSequence: '1', ...extra }), actions: () => actions({ source: 'content' }) }
 }
 test('receivers register before update; no autofocus; readiness and image initialize once', async t => {
  const a = await setup(t); assert.deepEqual(a.order, ['image', 'ready', 'key', 'update']); a.install(); a.image(); await flush()
@@ -82,4 +83,12 @@ test('new image arriving before deferred clear IPC revokes the old clear intent'
  let clearCalls = 0; const a = await setup(t, { clear: async () => { clearCalls++ } })
  a.install(); a.signal(); a.image(); await flush(); a.node('clear-image').click(); a.image('NEW', '2'); await flush()
  assert.equal(clearCalls, 0); assert.equal(a.node('image').getAttribute('src'), 'data:image/png;base64,AAAA'); assert.equal(a.calls.length, 2)
+})
+
+test('share snapshots current edited multiline OCR text and rejects loading/empty/error states', async t => {
+ const a = await setup(t); a.install(); a.signal(); assert.equal(a.shareSource(), null)
+ a.image(); await flush(); a.edit('  edited\n原文😀  ')
+ assert.deepEqual(a.shareSource(), { type: 'text/plain', text: '  edited\n原文😀  ' })
+ a.edit('  '); assert.equal(a.shareSource(), null)
+ a.edit('有效'); a.image(null, '2'); assert.equal(a.shareSource(), null)
 })

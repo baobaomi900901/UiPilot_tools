@@ -1,3 +1,4 @@
+import { ShareSurface } from './plugin-share'
 import { BuiltinFeatureDetail } from './builtin-feature-panel'
 import {
   App,
@@ -308,6 +309,7 @@ function scrollFileResultIntoView(container: HTMLElement | null, selected: HTMLE
 
 export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewProps): React.JSX.Element {
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
+  const shareLocked = !!snapshot.share && snapshot.share.phase !== 'accepted'
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
   const [publicPluginRemovalOutcome, setPublicPluginRemovalOutcome] = useState<PublicPluginRemovalOutcome | null>(null)
@@ -538,10 +540,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }, [])
   const reportPanelBound = useCallback((input: HTMLInputElement) => {
     panelInputRef.current = input
+    if (shareLocked) return
     input.focus()
     const caret = input.value.length
     input.setSelectionRange(caret, caret)
-  }, [panel?.sessionEpoch, panel?.suffixControl])
+  }, [panel?.sessionEpoch, panel?.suffixControl, shareLocked])
   const reportPanelUnbound = useCallback((input: HTMLInputElement) => {
     if (panelInputRef.current === input) panelInputRef.current = null
   }, [])
@@ -654,7 +657,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }, [clearQuicklinksStatus, quicklinks])
 
   useLayoutEffect(() => {
-    if (!panel?.focusRequestId || panel.closePending) return
+    if (!panel?.focusRequestId || panel.closePending || shareLocked) return
     const input = panelInputRef.current
     let focused = false
     if (input?.isConnected) {
@@ -666,7 +669,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       focusRequestId: panel.focusRequestId,
       focused,
     })
-  }, [core, panel?.closePending, panel?.focusRequestId, panel?.sessionEpoch, panel?.suffixControl])
+  }, [core, panel?.closePending, panel?.focusRequestId, panel?.sessionEpoch, panel?.suffixControl, shareLocked])
 
   useLayoutEffect(() => {
     if (snapshot.view !== 'launcher' || !panel || panel.closePending) return
@@ -715,7 +718,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       window.removeEventListener('resize', schedule)
       if (frame !== undefined) window.cancelAnimationFrame(frame)
     }
-  }, [core, panel?.closePending, panel?.sessionEpoch, snapshot.view])
+  }, [core, panel?.closePending, panel?.sessionEpoch, snapshot.view, snapshot.share?.phase])
 
   useLayoutEffect(() => {
     if (!snapshot.invocationId) return
@@ -853,6 +856,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }
   const openActions = () => { captureActionFocus(); core.openResultActionMenu() }
   const openOperations = () => {
+    if (shareLocked) return
     if (panel) {
       const ticket = window.crypto.randomUUID()
       panelMenuTicket.current = { ticket, sessionEpoch: panel.sessionEpoch, suffix: panel.suffix }
@@ -1663,11 +1667,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     </section>
   ) : null
   const panelLauncher = panel ? (
-    <section className="panel-launcher" aria-label={`${panel.commandLabel} 面板`}>
+    <section className="panel-launcher" aria-label={`${snapshot.share?.targetLabel && shareLocked && snapshot.share.phase !== 'choosing' ? snapshot.share.targetLabel : panel.commandLabel} 面板`}>
       <div className="panel-input-region">
         <div className="panel-input-row panel-input-shell">
           <CommandTag
-            commandLabel={panel.commandLabel}
+            commandLabel={snapshot.share?.targetLabel && snapshot.share.phase !== 'choosing' && shareLocked ? snapshot.share.targetLabel : panel.commandLabel}
             disabled={panel.closePending}
             exitLabel={`退出 ${panel.commandLabel} 面板`}
             exitTitle="退出面板"
@@ -1686,10 +1690,10 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             name={`launcher-panel-suffix-${panel.suffixControl}`}
             aria-label={`${panel.commandLabel} argument`}
             placeholder={panel.inputPlaceholder}
-            imagePaste={panel.inputCapabilities?.includes('image.ocr') === true}
+            imagePaste={!shareLocked && panel.inputCapabilities?.includes('image.ocr') === true}
             autoComplete="off"
             spellCheck={false}
-            disabled={!snapshot.invocationId || panel.closePending}
+            disabled={!snapshot.invocationId || panel.closePending || shareLocked}
             onKeyDown={panelKeyDown}
             onBound={reportPanelBound}
             onUnbound={reportPanelUnbound}
@@ -1698,7 +1702,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
         </div>
       </div>
       <div className="panel-content-divider" aria-hidden="true" />
-      <div ref={panelHostRef} className="panel-host-region" aria-label="插件面板内容" />
+      <div ref={panelHostRef} className="panel-host-region" aria-label="插件面板内容">
+        {shareLocked && snapshot.share && <ShareSurface share={snapshot.share} select={(plugin, receiver) => { void core.selectShareReceiver(plugin, receiver) }} close={() => { void core.endShare() }} />}
+      </div>
     </section>
   ) : null
 
@@ -2485,7 +2491,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
         <main
           className={panelActive ? 'launcher-surface is-panel-active' : 'launcher-surface'}
           data-color-scheme={colorScheme}
-          onKeyDownCapture={(event) => { preventBrowserFind(event); launcherTabKeyDown(event) }}
+          onKeyDownCapture={(event) => { preventBrowserFind(event); if (!shareLocked) launcherTabKeyDown(event) }}
         >
           <div className="launcher-region launcher-section-region">
             {snapshot.view === 'launcher' ? (quicklinksPanel ?? panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
@@ -2504,7 +2510,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               <div className="launcher-status-actions">
               {snapshot.view === 'settings' ? <AppVersion /> : null}
               <button ref={actionsButtonRef} className="launcher-operations-trigger" type="button" aria-label="操作 Ctrl+K"
-                aria-haspopup="dialog" aria-expanded={panel ? undefined : operationsOpen} onPointerDown={(event) => event.preventDefault()} onClick={openOperations}>
+                disabled={shareLocked} aria-haspopup="dialog" aria-expanded={panel ? undefined : operationsOpen} onPointerDown={(event) => event.preventDefault()} onClick={openOperations}>
                 操作 <kbd>Ctrl+K</kbd>
               </button>
               </div>

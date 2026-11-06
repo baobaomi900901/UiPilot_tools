@@ -1,5 +1,5 @@
 // Host-only adapter, injected alongside the shared menu into the Panel document.
-export function installPanelContextActions({ document, window, getEpoch, invoke, createMenu }) {
+export function installPanelContextActions({ document, window, getEpoch, invoke, createMenu, getShare }) {
   let provider = null
   let revision = 0
   const reportError = () => { void window.uipilotPluginPanel.setStatus({ message: '操作未完成，请重试', tone: 'error' }).catch(() => {}) }
@@ -25,6 +25,8 @@ export function installPanelContextActions({ document, window, getEpoch, invoke,
       } })
       const context = [...(supplied.context ?? [])].map(wrap)
       const global = [...(supplied.global ?? [])].map(wrap)
+      const share = getShare?.()
+      if (share) context.push(wrap(share))
       if (source === 'hostInput' && ticket) context.unshift({ id: 'host-submit', title: '搜索', shortcut: 'Enter', icon: 'search', run: async () => {
         if (sessionEpoch !== getEpoch() || captured !== revision) return
         await window.uipilotPluginPanel.focusHostInput()

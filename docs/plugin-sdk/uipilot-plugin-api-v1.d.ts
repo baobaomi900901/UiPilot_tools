@@ -22,7 +22,6 @@ export interface PluginInvocation {
     platform: 'windows' | 'macos'
     theme: 'dark' | 'light'
     invokedAt: string
-    readonly entry?: PluginShareEntry
   }
 }
 
@@ -443,23 +442,11 @@ export interface PluginPanelUpdate {
   invokedAt: string
   sessionEpoch: U64Decimal
   data: JsonValue
-  readonly entry?: PluginShareEntry
-}
-
-/** Windows Host 0.22.0+: no body is supplied during restricted preparation. */
-export interface PluginShareEntry {
-  readonly kind: 'sharePrepare'
-  readonly receiverId: string
 }
 
 export interface PluginSharePayload {
   readonly type: 'text/plain'
   readonly text: string
-}
-
-export interface PluginShareSourceSnapshot {
-  readonly revision: U64Decimal
-  readonly payload: PluginSharePayload
 }
 
 export interface PluginShareReceiveEvent {
@@ -471,12 +458,8 @@ export interface PluginShareReceiveEvent {
 }
 
 export interface UiPilotPluginPanelShareApiV1 {
-  /** One synchronous provider; publish the initial revision before registration.
-   * Null means unavailable. Text is preserved and bounded to 16384 UTF-8 bytes.
-   */
-  onSource(provider: () => PluginShareSourceSnapshot | null): () => void
-  /** Session revisions start at 1 and strictly increase; carries no body. */
-  invalidateSource(revision: U64Decimal): Promise<void>
+  /** One synchronous source provider. Null disables sharing; text is preserved. */
+  onSource(provider: () => PluginSharePayload | null): () => void
   /** Register before first onUpdate. Synchronously accept into memory, then
    * schedule business work separately. Promise returns are invalid.
    */
