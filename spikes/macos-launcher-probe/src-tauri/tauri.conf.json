@@ -1,0 +1,36 @@
+{
+  "productName": "UiPilot macOS Probe",
+  "version": "0.1.0",
+  "identifier": "com.uipilot.launcher-port-probe",
+  "build": {
+    "devUrl": "http://127.0.0.1:14327",
+    "frontendDist": "../web"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "UiPilot macOS Probe",
+        "width": 600,
+        "height": 360
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "icon": [
+      "../../../src-tauri/icons/icon.png",
+      "../../../src-tauri/icons/icon.icns"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "15.7.4"
+    }
+  }
+}
