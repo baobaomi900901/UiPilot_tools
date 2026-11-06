@@ -42,6 +42,15 @@ async function digest(file) {
   for await (const data of createReadStream(file)) hash.update(data)
   return hash.digest('hex')
 }
+export async function checkSharedResources(resources, bundleRoot, projectRoot) {
+  for (const relative of resources) {
+    const bundled = realpathSync(path.join(bundleRoot, relative))
+    if (!bundled.startsWith(realpathSync(bundleRoot) + path.sep) ||
+        await digest(bundled) !== await digest(path.join(projectRoot, relative))) {
+      throw new Error('Incorrect bundled resource: ' + relative)
+    }
+  }
+}
 async function inspectApp(app) {
   app = realpathSync(app)
   const info = JSON.parse(run('plutil', '-convert','json','-o','-',path.join(app,'Contents/Info.plist')))
@@ -54,7 +63,7 @@ async function inspectApp(app) {
   if (path.basename(info.CFBundleIconFile) !== info.CFBundleIconFile ||
       !existsSync(path.join(app,'Contents/Resources',info.CFBundleIconFile))) throw new Error('Missing application icon')
   const main = path.join(app,'Contents/MacOS',base.mainBinaryName)
-  if (!isMachO(main)) throw new Error('Missing Mach-O executable: ' + main)
+  if (!lstatSync(main).isFile() || !isMachO(main)) throw new Error('Expected a regular Mach-O executable: ' + main)
   function visit(dir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const file = path.join(dir, entry.name)
@@ -68,6 +77,7 @@ async function inspectApp(app) {
     }
   }
   visit(app)
+  await checkSharedResources(base.bundle.resources, path.join(app, 'Contents/Resources'), path.join(root, 'src-tauri'))
   run('codesign','--verify','--deep','--strict',app)
   console.log('Verified signed arm64 app; minimum', minimum, 'executable SHA-256', await digest(main))
 }

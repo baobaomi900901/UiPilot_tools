@@ -12,6 +12,8 @@ jobs:
           persist-credentials: false
       - name: Verify native toolchain
         run: |
+          target_dir=$(mktemp -d "$RUNNER_TEMP/uipilot-arm64.XXXXXXXX")
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
           test "$(uname -m)" = arm64
           rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
           node -e "if(process.arch !== 'arm64' || Number(process.versions.node.split('.')[0]) < 22) process.exit(1)"
@@ -49,6 +51,16 @@ jobs:
       # The owned Tauri build stages the Provider files required by tauri-build during cargo test.
       - name: Build Windows installer
         run: npm run tauri -- build -- --locked
+      - name: Record Windows installer SHA-256
+        run: |
+          $metadata = cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $dir = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'release/bundle/nsis'
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $installer = Get-Item -LiteralPath (Join-Path $dir "UiPilot_tools_${version}_x64-setup.exe") -ErrorAction Stop
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash
+          Write-Output "$($installer.Name) SHA-256 $hash"
+          "$($installer.Name) SHA-256 $hash" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - name: Run local checks
         run: npm run verify:local
       - name: Verify platform entry and staging
