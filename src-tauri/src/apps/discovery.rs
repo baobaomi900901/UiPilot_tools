@@ -23,12 +23,8 @@ use windows::{
 use super::{
     app_id, appsfolder,
     shortcut::{load_shortcut, ShortcutError, ShortcutMetadata},
-    Application, ApplicationEntryKind, ApplicationLaunchTarget, DiscoveryDiagnostics,
+    Application, ApplicationLaunchTarget, DiscoveryDiagnostics,
     DiscoveryError, DiscoverySnapshot, RootKind, StartMenuRoot,
-};
-use crate::{
-    model::{LauncherResultActivation, ResultItem},
-    result_registry::ResultAction,
 };
 
 #[link(name = "shell32")]
@@ -374,33 +370,6 @@ pub(crate) fn discover() -> Result<DiscoverySnapshot, DiscoveryError> {
     discover_with(roots, load_shortcut, appsfolder::discover)
 }
 
-pub(crate) fn registry_entry(application: &Application) -> (ResultItem, ResultAction) {
-    (
-        ResultItem {
-            result_actions: None,
-            result_id: String::new(),
-            activation: LauncherResultActivation::ExecuteResult,
-            title: application.display_name.clone(),
-            subtitle: Some(
-                match application.entry_kind() {
-                    ApplicationEntryKind::DesktopShortcut => "应用程序",
-                    ApplicationEntryKind::PackagedApp => "打包的应用程序",
-                }
-                .into(),
-            ),
-            icon: application.icon.clone(),
-            plugin_icon_url: None,
-            icon_kind: None,
-            detail: None,
-            favorite: None,
-            has_default_action: true,
-        },
-        ResultAction::LaunchApplication {
-            app_id: application.app_id.clone(),
-            target: application.target.clone(),
-        },
-    )
-}
 
 #[cfg(test)]
 mod tests {

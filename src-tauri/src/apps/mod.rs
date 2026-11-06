@@ -1,26 +1,39 @@
 use std::{
-    fmt::{self, Write},
+    fmt,
     path::PathBuf,
 };
 
+#[cfg(windows)]
+use std::fmt::Write;
+#[cfg(windows)]
 use windows::Win32::Security::Cryptography::{
     BCryptCloseAlgorithmProvider, BCryptHash, BCryptOpenAlgorithmProvider, BCRYPT_ALG_HANDLE,
     BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
 };
 
+#[cfg(windows)]
 mod action;
+#[cfg(windows)]
 mod appsfolder;
 mod cache;
+#[cfg(windows)]
 mod discovery;
+#[cfg(windows)]
 mod icon;
 mod rank;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_backend;
+#[cfg(windows)]
 mod shortcut;
+#[cfg(windows)]
 mod windows_backend;
 
+#[cfg(windows)]
 pub(crate) use action::{execute_application, ApplicationActionOutcome};
-#[cfg(any(test, not(feature = "test-instrumentation")))]
+#[cfg(all(windows, any(test, not(feature = "test-instrumentation"))))]
 pub(crate) use cache::start_initial_refresh;
 pub(crate) use cache::AppCache;
+#[cfg(windows)]
 pub(crate) use icon::thumbnail_from_path;
 
 pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application> {
@@ -28,7 +41,10 @@ pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application
 }
 
 pub(crate) fn discover() -> Result<DiscoverySnapshot, DiscoveryError> {
-    discovery::discover()
+    #[cfg(windows)]
+    return discovery::discover();
+    #[cfg(target_os = "macos")]
+    macos_backend::discover()
 }
 
 pub(crate) fn registry_entry(
@@ -37,7 +53,34 @@ pub(crate) fn registry_entry(
     crate::model::ResultItem,
     crate::result_registry::ResultAction,
 ) {
-    discovery::registry_entry(application)
+    use crate::{model::{ResultItem, LauncherResultActivation}, result_registry::ResultAction};
+    (
+        ResultItem {
+            result_actions: None,
+            result_id: String::new(),
+            activation: LauncherResultActivation::ExecuteResult,
+            title: application.display_name.clone(),
+            subtitle: Some(
+                match application.entry_kind() {
+                    ApplicationEntryKind::DesktopShortcut => "应用程序",
+                    #[cfg(target_os = "macos")]
+                    ApplicationEntryKind::Bundle => "应用程序",
+                    ApplicationEntryKind::PackagedApp => "打包的应用程序",
+                }
+                .into(),
+            ),
+            icon: application.icon.clone(),
+            plugin_icon_url: None,
+            icon_kind: None,
+            detail: None,
+            favorite: None,
+            has_default_action: true,
+        },
+        ResultAction::LaunchApplication {
+            app_id: application.app_id.clone(),
+            target: application.target.clone(),
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +99,8 @@ pub(crate) struct StartMenuRoot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ApplicationLaunchTarget {
+    #[cfg(target_os = "macos")]
+    Bundle(macos_backend::BundleTarget),
     Shortcut {
         shortcut: PathBuf,
         executable: Option<PathBuf>,
@@ -67,6 +112,8 @@ pub(crate) enum ApplicationLaunchTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApplicationEntryKind {
+    #[cfg(target_os = "macos")]
+    Bundle,
     DesktopShortcut,
     PackagedApp,
 }
@@ -74,6 +121,8 @@ pub(crate) enum ApplicationEntryKind {
 impl ApplicationLaunchTarget {
     pub(crate) fn entry_kind(&self) -> ApplicationEntryKind {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::Bundle(_) => ApplicationEntryKind::Bundle,
             Self::Shortcut { .. } => ApplicationEntryKind::DesktopShortcut,
             Self::PackagedApp { .. } => ApplicationEntryKind::PackagedApp,
         }
@@ -159,8 +208,10 @@ impl fmt::Display for DiscoveryError {
 
 impl std::error::Error for DiscoveryError {}
 
+#[cfg(windows)]
 struct AlgorithmHandle(BCRYPT_ALG_HANDLE);
 
+#[cfg(windows)]
 impl Drop for AlgorithmHandle {
     fn drop(&mut self) {
         unsafe {
@@ -169,6 +220,7 @@ impl Drop for AlgorithmHandle {
     }
 }
 
+#[cfg(windows)]
 fn app_id(root_kind: RootKind, relative_shortcut_path: &str) -> Result<String, DiscoveryError> {
     let preimage = format!(
         "start-menu-v1\0{}\0{}",
@@ -178,10 +230,12 @@ fn app_id(root_kind: RootKind, relative_shortcut_path: &str) -> Result<String, D
     hashed_app_id(&preimage)
 }
 
+#[cfg(windows)]
 fn packaged_app_id(aumid: &str) -> Result<String, DiscoveryError> {
     hashed_app_id(&format!("packaged-aumid-v1\0{}", aumid.to_lowercase()))
 }
 
+#[cfg(windows)]
 fn hashed_app_id(preimage: &str) -> Result<String, DiscoveryError> {
     let mut raw_handle = BCRYPT_ALG_HANDLE::default();
     let open_status = unsafe {
@@ -210,7 +264,7 @@ fn hashed_app_id(preimage: &str) -> Result<String, DiscoveryError> {
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use std::path::PathBuf;
 

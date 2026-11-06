@@ -14,6 +14,14 @@ mod settings;
 #[cfg(target_os = "macos")]
 mod webview_reload_guard;
 #[cfg(target_os = "macos")]
+mod apps;
+#[cfg(target_os = "macos")]
+mod result_registry;
+#[cfg(target_os = "macos")]
+mod model;
+#[cfg(target_os = "macos")]
+mod macos_apps;
+#[cfg(target_os = "macos")]
 mod macos_host;
 #[cfg(target_os = "macos")]
 pub use macos_host::run;

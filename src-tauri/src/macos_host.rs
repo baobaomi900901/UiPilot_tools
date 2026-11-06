@@ -56,12 +56,13 @@ fn present(app: &AppHandle, id: u64) {
         if state.quitting || state.invocation != id { return; }
     }
     let Some(window) = app.get_webview_window("main") else { return; };
+    crate::macos_apps::begin_invocation(app, id);
     let result = window.show().and_then(|_| window.set_focus()).and_then(|_| {
         window.emit("launcher://shown", serde_json::json!({
             "invocationId": id.to_string(), "target": "launcher", "notice": null
         }))
     });
-    if let Err(error) = result { eprintln!("UiPilot: could not show the launcher: {error}"); }
+    if let Err(error) = result { crate::macos_apps::end_invocation(app); eprintln!("UiPilot: could not show the launcher: {error}"); }
 }
 
 #[tauri::command]
@@ -100,13 +101,26 @@ fn set_theme_preference(window: WebviewWindow, preference: ThemeUpdate) -> Resul
 #[tauri::command]
 fn hide_launcher(window: WebviewWindow) -> Result<(), &'static str> {
     require_main(&window)?;
-    window.hide().and_then(|_| window.emit("launcher://hidden", ())).map_err(|_| "windowFailed")
+    window.hide().map_err(|_| "windowFailed")?;
+    crate::macos_apps::end_invocation(window.app_handle());
+    window.emit("launcher://hidden", ()).map_err(|_| "windowFailed")
+}
+
+// Called on the UI thread after an accepted application action.
+pub(crate) fn hide_if_current(app: &AppHandle, invocation: u64) -> Result<(), ()> {
+    let state = app.state::<Mutex<Presentation>>();
+    if state.lock().expect("presentation state").invocation != invocation { return Ok(()); }
+    let window = app.get_webview_window("main").ok_or(())?;
+    window.hide().map_err(|_| ())?;
+    crate::macos_apps::end_invocation(app);
+    window.emit("launcher://hidden", ()).map_err(|_| ())
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     let settings = SettingsStore::load(&app.path().app_data_dir()?)?;
     app.manage(settings);
+    crate::macos_apps::setup(app);
     let open = MenuItem::with_id(app, "show", "显示 UiPilot", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
@@ -134,12 +148,12 @@ pub fn run() {
                 webview.label(), url, webview.app_handle().config()))
             .build())
         .manage(Mutex::new(Presentation::default()))
-        .invoke_handler(tauri::generate_handler![crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference, hide_launcher])
+        .invoke_handler(tauri::generate_handler![crate::host_capabilities::get_host_capabilities, crate::macos_apps::search_apps, crate::macos_apps::execute_result, load_settings, set_theme_preference, hide_launcher])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting {
                     api.prevent_close();
-                    if window.hide().is_ok() { let _ = window.emit("launcher://hidden", ()); }
+                    if window.hide().is_ok() { crate::macos_apps::end_invocation(window.app_handle()); let _ = window.emit("launcher://hidden", ()); }
                 }
             }
         })
