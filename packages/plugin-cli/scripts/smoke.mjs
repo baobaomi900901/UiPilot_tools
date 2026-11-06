@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, realpath, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const repositoryRoot = join(packageRoot, '..', '..')
-const temporaryRoot = await mkdtemp(join(tmpdir(), 'uipilot-plugin-cli-smoke-'))
+const hostVersion = JSON.parse(await readFile(join(repositoryRoot, 'package.json'), 'utf8')).version
+const temporaryRoot = await mkdtemp(join(await realpath(tmpdir()), 'uipilot-plugin-cli-smoke-'))
 const packDirectory = join(temporaryRoot, 'pack')
 const projectDirectory = join(temporaryRoot, 'consumer')
 const cacheDirectory = join(temporaryRoot, 'empty-cache')
@@ -161,7 +162,7 @@ try {
     assert.deepEqual({ ...archiveReport, source: directoryReport.source }, directoryReport)
     assert.deepEqual(packedReport.validation, directoryReport)
     if (name === 'com.uipilot.demo-multi') {
-      assert.deepEqual(directoryReport.target, { platform: 'windows', hostVersion: '0.6.0', apiVersion: 1 })
+      assert.deepEqual(directoryReport.target, { platform: 'windows', hostVersion, apiVersion: 1 })
       assert.deepEqual(directoryReport.plugin.commands, [
         { commandId: 'upper', defaultName: 'demo-upper', activationMode: 'live', outputMode: 'mainResult' },
         { commandId: 'lower', defaultName: 'demo-lower', activationMode: 'submit', outputMode: 'mainResult' },

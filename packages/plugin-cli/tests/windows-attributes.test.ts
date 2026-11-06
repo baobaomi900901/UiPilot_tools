@@ -33,7 +33,7 @@ vi.mock('node:child_process', () => ({
 import { createWindowsAttributeProbe, withWindowsAttributeProbe } from '../src/windows-attributes.js'
 
 beforeEach(() => { state.children = []; state.attributes = 0x20; state.reply = true; state.malformed = false })
-afterEach(() => vi.useRealTimers())
+afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs() })
 const environment = { SystemRoot: 'C:\\Windows', WINDIR: 'C:\\Windows' }
 
 it('reuses one process but reads fresh attributes on every request', async () => {
@@ -72,6 +72,8 @@ it('times out and terminates an unresponsive process', async () => {
 })
 
 it.each([false, true])('releases its process when the scoped operation fails: %s', async (fail) => {
+  vi.stubEnv('SystemRoot', environment.SystemRoot)
+  vi.stubEnv('WINDIR', environment.WINDIR)
   const operation = withWindowsAttributeProbe('win32', undefined, async (probe) => {
     await probe!('D:\\package', ['file'])
     if (fail) throw new Error('read failed')

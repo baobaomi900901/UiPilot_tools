@@ -1,4 +1,4 @@
-import { link, mkdtemp, mkdir, readFile, readdir, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
+import { link, mkdtemp, realpath, mkdir, readFile, readdir, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
@@ -13,7 +13,7 @@ import { multiCommandManifest } from './multi-command-fixture.js'
 const roots: string[] = []
 const options = { hostPlatform: 'linux' as const }
 async function setup() {
-  const root = await mkdtemp(join(tmpdir(), 'uipilot pack '))
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'uipilot pack '))
   roots.push(root)
   const source = join(root, 'source')
   await mkdir(join(source, 'dist'), { recursive: true })
