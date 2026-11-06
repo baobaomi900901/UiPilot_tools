@@ -1,6 +1,6 @@
 # UiPilot macOS 移植逐步实施与验收
 
-目标是在 M1 及后续 Apple Silicon 上交付原生 arm64 启动器。共享 React 界面、Tauri IPC、Rust 排名与结果注册表；系统调用、生产装配、资源和打包按目标分开。本文细化[总计划](2026-11-06-macos-port.md)，保留其任务编号、依赖与发布范围。下文均为**待执行的工作和预期结果**；这里只审查文档，不代表已编译、已签名或已通过实机验收。
+目标是在 M1 及后续 Apple Silicon 上交付原生 arm64 启动器，并让使用共同 SDK 能力的插件以同一发布包在 Windows 和 Mac 运行。共享 React 界面、Tauri IPC、Rust 排名与结果注册表；系统调用、生产装配、资源和打包按目标分开。本文细化[总计划](2026-11-06-macos-port.md)，保留其任务编号、依赖与发布范围。下文均为**待执行的工作和预期结果**；这里只审查文档，不代表已编译、已签名或已通过实机验收。
 
 **实施顺序**：1 → 2 → 3 → 4 → 5 → 6 → 7 为首版。发布后 8、10 可独立开展，两者的支持矩阵均确定后才进行 9。Task 1 的新设计在批准后成为接口、状态、失败语义的唯一合同；Tasks 8–10 各自需要后续规格。本文按该合同组织实施，不预先定义新的 IPC 字段、默认按键或授权规则。
 
@@ -133,6 +133,9 @@
 - [ ] **9.2 先验证隐藏 runtime。** mainResult 也需惰性创建 WKWebView。安装来源、导航/下载边界 → 原生静音 → 注册 unmute → 读回静音 → 复核 generation → 导航受信包入口 → 第一条包指令。为各导航前步骤注入失败，要求零包指令、撤销 generation/拒绝 RPC、销毁实例。成功后触发 unmute，同样先撤销权限再销毁；旧回调晚于同标签新实例时只能指向旧 generation。生产 WKWebView 不能证明顺序就继续关闭 mainResult。
 - [ ] **9.3 将宿主凭据与插件秘密隔离。** 分别接入 credentials/ 与 public_plugins/secrets.rs 的 Keychain 后端，按 approved 命名与所有者检查。测试创建/读取/更新/删除、Keychain 锁定、写入失败、撤权和插件冒用 ID；验证未授权请求不触及 Keychain，失败保留旧记录、状态不报成功、日志/JSON 不含测试秘密。
 - [ ] **9.4 分别开放可见界面。** 仅在 9.2 通过后，对 Panel 和 Window 各运行生产 origin、导航/下载/音频边界、销毁重建、崩溃恢复、旧 RPC 重放与跨插件访问。新实例只接受自己的 RPC；达不到边界的 surface 继续关闭。用匹配权限的 tracked reference 验证 host/CLI/schema/types 一致（例如 demo-return 声明 clipboard.write，须先取得 Task 10 对应证据）。对 Windows-only 示例仍要求 Mac 校验拒绝。
+
+- [ ] **9.5 用同一插件包在两个生产宿主验收。** 每个版本只打包一次，记录包 SHA-256、两端 UiPilot 版本、主要操作和结果。先用 `demo-settings` 安装、改设置、执行并显示主结果，重启和兼容升级后核对设置；升级版本的新包也在两端使用同一哈希。再用 `demo-return` 验主结果与授权复制、`demo-multi` 验实时/提交两种命令、`note` 验打开独立窗口、写笔记并重开读回。需要授权的操作分别走允许/拒绝路径。Mac 上对声明仅 Windows 的包在安装或恢复阶段拒绝，保留 Windows 的正向验证。
+- [ ] **9.6 给出可复核的覆盖结果。** 以 17 个参考包为起点，列出逐包状态、未通过的能力及真实平台限制。对仅声明 Windows 但主要用途可移植的包列出宿主待补能力，在开发候选中验证能力与平台声明，通过后才发布扩大的 manifest。面板优先用 demo-panel 验证焦点与键盘，再以 notes 或 templates 验证一项完整用户流程（例如保存模板、退出重开、调用模板）；同时核对宿主实际提供的平台值、CLI、schema 和 SDK 类型。分别统计声明双平台数、实机双端通过数和平台专属数。旧插件单列，不计入公开 SDK 包分母。
 
 **Distinct test coverage:** 导航前失败、导航后失去静音与旧回调迟到是三条不同序列，分别留 guard 状态/包代码执行次数/实例销毁日志。另查升级新增权限、跨 ID 与两套 Keychain 存储。
 **Verify:** `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib public_plugins::webview_audio_guard::`；同命令分别过滤 `public_plugins::`、`credentials::`；`npm run verify --workspace @uipilot/plugin-cli`、`npm test -- src/public-plugin-recovery.test.tsx src/public-plugin-diagnostics-acl.test.ts`。保留真实 WKWebView 时序、隔离 Keychain CRUD/拒绝记录及各 surface 的开放决定。
