@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File, Metadata},
     io::{self, Read},
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -17,7 +17,8 @@ use super::{
     Application, ApplicationLaunchTarget, DiscoveryDiagnostics, DiscoveryError, DiscoverySnapshot,
 };
 
-const MAX_ENTRIES: usize = 65_536;
+const MAX_ROOT_ENTRIES: usize = 65_536;
+const MAX_DIRECTORY_ENTRIES: usize = 8_192;
 const MAX_DEPTH: usize = 8;
 const PLIST_LIMIT: usize = 1024 * 1024;
 const ICON_LIMIT: usize = 8 * 1024 * 1024;
@@ -146,27 +147,46 @@ pub(crate) fn discover() -> Result<DiscoverySnapshot, DiscoveryError> {
 }
 
 fn discover_roots(roots: &[PathBuf]) -> Result<DiscoverySnapshot, DiscoveryError> {
+    discover_limited(roots, MAX_ROOT_ENTRIES, MAX_DIRECTORY_ENTRIES)
+}
+
+fn discover_limited(roots: &[PathBuf], root_limit: usize, directory_limit: usize) -> Result<DiscoverySnapshot, DiscoveryError> {
     let mut diagnostics = DiscoveryDiagnostics::default();
     let mut accepted = BTreeMap::new();
     let mut accessible = false;
-    let mut visited = 0;
     for root in roots {
         if fs::canonicalize(root).ok().as_deref() != Some(root) {
             diagnostics.missing_roots += 1;
             continue;
         }
         let mut candidates = Vec::new();
-        let mut directories = vec![(root.clone(), 0)];
-        while let Some((directory, depth)) = directories.pop() {
+        let mut remaining = root_limit;
+        let mut directories = VecDeque::from([(root.clone(), 0)]);
+        while let Some((directory, depth)) = directories.pop_front() {
+            if remaining == 0 { break; }
             let Ok(entries) = fs::read_dir(&directory) else {
                 diagnostics.inaccessible_entries += 1;
                 continue;
             };
+            let limit = directory_limit.min(remaining);
+            let batch: Vec<_> = entries.take(limit + 1).collect();
+            remaining = remaining.saturating_sub(batch.len());
+            if batch.len() > limit {
+                // read_dir order is unspecified. Skip this directory as a unit, retaining
+                // completed siblings/roots, instead of selecting an arbitrary prefix.
+                diagnostics.limited_directories += 1;
+                continue;
+            }
             accessible = true;
-            for entry in entries {
-                visited += 1;
-                if visited > MAX_ENTRIES { return Err(DiscoveryError::RootUnavailable); }
-                let Ok(entry) = entry else { diagnostics.inaccessible_entries += 1; continue; };
+            let mut sorted = Vec::new();
+            for item in batch {
+                match item {
+                    Ok(entry) => sorted.push(entry),
+                    Err(_) => diagnostics.inaccessible_entries += 1,
+                }
+            }
+            sorted.sort_by_key(|entry| entry.file_name());
+            for entry in sorted {
                 let Ok(kind) = entry.file_type() else { diagnostics.inaccessible_entries += 1; continue; };
                 if kind.is_symlink() { diagnostics.reparse_entries += 1; continue; }
                 if !kind.is_dir() { continue; }
@@ -174,7 +194,7 @@ fn discover_roots(roots: &[PathBuf]) -> Result<DiscoverySnapshot, DiscoveryError
                 if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app")) {
                     candidates.push(path);
                 } else if depth < MAX_DEPTH && !entry.file_name().to_string_lossy().starts_with('.') {
-                    directories.push((path, depth + 1));
+                    directories.push_back((path, depth + 1));
                 }
             }
         }
@@ -191,6 +211,11 @@ fn discover_roots(roots: &[PathBuf]) -> Result<DiscoverySnapshot, DiscoveryError
 #[serde(tag = "status", rename_all = "camelCase")]
 pub(crate) enum OpenOutcome { LaunchRequested, ActivationRequested }
 
+pub(crate) enum OpenAttempt {
+    Confirmed(OpenOutcome),
+    SubmittedUnconfirmed,
+}
+
 fn with_verified_url<T>(target: &BundleTarget, open: impl FnOnce(&NSURL) -> io::Result<T>) -> io::Result<T> {
     fn unavailable() -> io::Error { io::Error::other("application entry unavailable") }
     let reference = NSURL::from_file_path(&target.path)
@@ -202,7 +227,7 @@ fn with_verified_url<T>(target: &BundleTarget, open: impl FnOnce(&NSURL) -> io::
     open(&reference)
 }
 
-pub(crate) fn open_application(target: &BundleTarget, admit: &dyn Fn() -> io::Result<()>) -> io::Result<OpenOutcome> {
+pub(crate) fn open_application(target: &BundleTarget, admit: &dyn Fn() -> io::Result<()>) -> io::Result<OpenAttempt> {
     with_verified_url(target, |reference| {
         let running = NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(&target.identifier));
         let existing = running.iter().any(|app| !app.isTerminated()
@@ -223,9 +248,9 @@ pub(crate) fn open_application(target: &BundleTarget, admit: &dyn Fn() -> io::Re
         NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(
             reference, &configuration, Some(&done));
         if received.recv_timeout(std::time::Duration::from_secs(30)) != Ok(true) {
-            return Err(io::Error::other("Launch Services did not confirm the requested application"));
+            return Ok(OpenAttempt::SubmittedUnconfirmed);
         }
-        Ok(if existing { OpenOutcome::ActivationRequested } else { OpenOutcome::LaunchRequested })
+        Ok(OpenAttempt::Confirmed(if existing { OpenOutcome::ActivationRequested } else { OpenOutcome::LaunchRequested }))
     })
 }
 
@@ -287,6 +312,24 @@ pub(crate) mod tests {
         assert!(expected.icon.is_none());
         assert_eq!(super::super::rank(&apps, "中文").len(), 2);
         assert!(discover_roots(&[f.0.join("absent")]).is_err());
+    }
+
+    #[test]
+    fn oversized_roots_and_siblings_cannot_discard_results_from_other_directories() {
+        let f = Fixture::new();
+        f.bundle("system/Calc.app", "com.fixture.calc", "Calc");
+        f.bundle("common/Tools/Notes.app", "com.fixture.notes", "Notes");
+        for dir in ["common/Many", "user"] {
+            let path = f.0.join(dir);
+            fs::create_dir_all(&path).unwrap();
+            for entry in ["z", "y", "x", "w"] { fs::write(path.join(entry), b"").unwrap(); }
+        }
+        let roots = ["system", "common", "user"].map(|root| f.0.join(root));
+        let scan = discover_limited(&roots, 20, 3).unwrap();
+        assert_eq!(scan.applications.len(), 2);
+        assert_eq!(scan.diagnostics.limited_directories, 2);
+        assert_eq!(discover_limited(&roots, 20, 3).unwrap().applications, scan.applications);
+        assert!(discover_limited(&[f.0.join("user")], 3, 3).is_err());
     }
 
     #[test]

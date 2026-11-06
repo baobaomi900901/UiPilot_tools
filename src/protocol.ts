@@ -374,6 +374,7 @@ export type CommandErrorCode =
   | 'staleRequest'
   | 'unknownResult'
   | 'applicationEntryUnavailable'
+  | 'applicationLaunchUnconfirmed'
   | 'settingsFailed'
   | 'hotkeyConflict'
   | 'windowFailed'
