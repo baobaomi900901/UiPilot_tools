@@ -171,6 +171,7 @@ pub(crate) type WindowActionRegistration = ContentActionRegistration;
 pub(crate) type PanelActionRegistration = ContentActionRegistration;
 
 pub(crate) struct ContentActionRegistration {
+    image_bound: bool,
     image_cancelled: Arc<AtomicBool>,
     context: PluginRequestContext,
     service: std::sync::Weak<PublicPluginService>,
@@ -187,6 +188,9 @@ impl ContentActionRegistration {
         self.active.store(false, Ordering::Release);
     }
     pub(crate) fn cancel_image(&self) {
+        if !self.image_bound {
+            return;
+        }
         // Revoke service authority immediately, but let physical completion settle the
         // promise. Otherwise the plugin pumps its newest image into a still-busy Runtime.
         if !self.image_cancelled.swap(true, Ordering::AcqRel) && self.active() {
@@ -1169,6 +1173,7 @@ impl PublicPluginService {
             },
         );
         let registration = PanelActionRegistration {
+            image_bound: image_id.is_some(),
             image_cancelled,
             context: request.context.clone(),
             service: Arc::downgrade(self),
@@ -1215,6 +1220,7 @@ impl PublicPluginService {
             },
         );
         let registration = PanelActionRegistration {
+            image_bound: false,
             image_cancelled,
             context: request.context.clone(),
             service: Arc::downgrade(self),

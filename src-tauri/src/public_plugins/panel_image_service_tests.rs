@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn panel_image_replace_preserves_ordinary_action_without_image_id() {
+    assert_panel_image_change_preserves_ordinary_action("replace");
+}
+
+#[test]
+fn panel_image_clear_preserves_ordinary_action_without_image_id() {
+    assert_panel_image_change_preserves_ordinary_action("clear");
+}
+
+fn assert_panel_image_change_preserves_ordinary_action(mode: &str) {
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture_with_image(&format!("ordinary-image-{mode}"), true);
+    let image = crate::launcher_image::normalize_rgba(1, 1, &[1, 2, 3, 255]).unwrap();
+    controller
+        .begin_image_import(&manager, "main", identity.session_epoch, 1)
+        .unwrap();
+    controller
+        .finish_image_import(&manager, "main", identity.session_epoch, 1, image.clone())
+        .unwrap();
+    let (dispatch, receiver) = controller
+        .admit_panel_action(
+            &service,
+            &identity.content_label,
+            identity.session_epoch,
+            panel_action_input(),
+        )
+        .unwrap();
+    let invocation = || {
+        service
+            .dispatch_invocation(
+                &dispatch,
+                crate::public_plugins::PluginInvocationTheme::Dark,
+                "2026-11-06T00:00:00Z".into(),
+            )
+            .unwrap()
+    };
+    let (kind, before) = invocation();
+    assert_eq!(kind, "panelAction");
+    assert!(before.get("image").is_none());
+    match mode {
+        "replace" => {
+            controller
+                .begin_image_import(&manager, "main", identity.session_epoch, 2)
+                .unwrap();
+            controller
+                .finish_image_import(&manager, "main", identity.session_epoch, 2, image)
+                .unwrap();
+        }
+        "clear" => controller
+            .clear_image(&manager, &identity.content_label, identity.session_epoch)
+            .unwrap(),
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        manager.scheduler().context_status(&dispatch.context),
+        crate::public_plugins::PluginContextStatus::Current,
+        "image changes must retain ordinary action authority"
+    );
+    assert_eq!(invocation().1, before);
+    assert!(receiver.try_recv().is_err());
+    assert!(manager
+        .scheduler()
+        .complete(&dispatch.context, Instant::now())
+        .unwrap()
+        .accepted);
+    let data = json!({"saved": true, "title": "draft"});
+    assert!(service.settle_panel_action(&dispatch.context, Ok(data.clone()), true));
+    assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(Ok(data)));
+}
+
+#[test]
 fn image_commands_discover_two_plugins_in_the_shared_order_without_vendor_priority() {
     let (root, _service, manager, _controller, _identity) =
         panel_action_fixture_with_image("image-order", true);
