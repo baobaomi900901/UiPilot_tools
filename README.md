@@ -6,7 +6,14 @@ Windows x64 启动器与本地公开插件宿主（当前版本 0.19.0）。宿�
 
 Mac 移植在开发中。构建入口支持原生 arm64，首版目标是通过菜单栏或全局快捷键唤起、搜索并打开应用。候选最低系统为 macOS 15.7.4，当前进度可在[逐步实施与验收](docs/superpowers/plans/2026-11-06-macos-port-steps.md)查看。
 
-在 arm64 的 Node 22 环境运行 `npm ci`，再运行 `npm run dev` 预览前端，或用 `npm run build` 检查 TypeScript 并构建页面。Mac 原生入口为 `npm run tauri -- dev`，要求 aarch64-apple-darwin Rust 1.96.1 和 macOS SDK。当前 Rust 宿主仍含 Windows 专用模块；上述原生入口用于移植开发，完整 Mac 启动器尚不可用。前端预览不覆盖原生快捷键、窗口焦点或 IPC。
+在 arm64 的 Node 22 环境运行 `npm ci`，再运行 `npm run dev` 预览前端，或用 `npm run build` 检查 TypeScript 并构建页面。Mac 原生入口为 `npm run tauri -- dev`，要求 aarch64-apple-darwin Rust 1.96.1 和 macOS SDK。Mac 核心宿主与前端已可一起打包。内部测试包使用本机临时签名：
+
+```sh
+npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg --config src-tauri/tauri.macos-internal.conf.json -- --locked
+node scripts/verify-macos-bundle.mjs
+```
+
+校验脚本只读挂载本次 DMG，检查签名、arm64 架构、最低系统版本及资源，并输出 SHA-256。内部包用于本机测试；公开发布另需 Developer ID 签名与公证。前端预览不覆盖原生快捷键、窗口焦点或 IPC。
 
 ## 工具链与开发
 
