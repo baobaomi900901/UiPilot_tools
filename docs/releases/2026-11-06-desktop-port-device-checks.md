@@ -28,11 +28,11 @@
 
 2026-11-06，测试者在原生 Windows x64 的 VS x64 开发者环境中复检通过。候选源码、Everything 及打包输入通过，MSVC 编译器、链接器和 Windows SDK 工具均已找到。独立 Provider 为 `0bb397e0f9ea0caf1a05d25193f44a364c8de5dc`。
 
-**Windows x64 构建通过。** 恢复下述两份许可证的原始换行后，从固定源码归档运行受管 Python 构建入口。Rust release 构建完成，日志包含 `UIPILOT_PROVIDER_VALIDATED`、`MANAGED_EVERYTHING_BUNDLE_INPUT_PASS` 和 `Finished 2 bundles`。产物为 `UiPilot_tools_0.19.0_x64-setup.exe`（NSIS）及 `UiPilot_tools_0.19.0_x64_en-US.msi`。待回传 NSIS 的 SHA-256、Windows 本地验证和安装启动结果。
+**Windows x64 构建通过。** 恢复下述两份许可证的原始换行后，从固定源码归档运行受管 Python 构建入口。Rust release 构建完成，日志包含 `UIPILOT_PROVIDER_VALIDATED`、`MANAGED_EVERYTHING_BUNDLE_INPUT_PASS` 和 `Finished 2 bundles`。产物为 `UiPilot_tools_0.19.0_x64-setup.exe`（NSIS）及 `UiPilot_tools_0.19.0_x64_en-US.msi`。测试者用 certutil 核对 NSIS 的 SHA-256 为 `7744753a04167393a9f48a33ee082b496f078821385e52c261581c7826cf1fc5`，从该文件安装后反馈「可以正常使用」。Windows 安装启动已通过。升级、卸载和插件授权等专项用例仍待单独验证。
 
 同日，固定源码包 `a79f612` 已完成 npm 安装和 Cargo 依赖下载。首次打包在 `tauri.ps1` 接收 `build` 参数时报告 `PositionalParameterNotFound`。使用该源码包时，从源码根目录运行 `python scripts/provider_build.py build-session -- build -- --locked` 执行下方第 3 步的打包命令；此入口会建立同一受管构建会话并执行原有钩子。
 
-Windows 本地回归首次运行到公开插件测试时，322/323 通过。设置示例的升级测试把编码后的中文目录名交给 Node，导致子进程找不到脚本。修复仅涉及测试文件；Mac 上已用含中文、空格、百分号和井号的源码及临时目录验证，公开插件测试 323/323 通过。Windows 全量复验待回传。
+Windows 本地回归首次运行到公开插件测试时，322/323 通过。设置示例的升级测试把编码后的中文目录名交给 Node，导致子进程找不到脚本。修复测试文件后，Windows 在原中文路径复验，323/323 通过，零失败、零跳过。SDK 合约检查已完成，参考插件验证已输出至 `com.uipilot.translate@1.4.3`。测试者在同一窗口回传 `npm run verify:local` 退出码 `0`，Windows 全量本地回归通过。
 
 仅做安装实测时，直接使用 Windows 构建者交付的 NSIS 与哈希，从第 4 步开始；测试机无需安装 Rust、Node 或独立 Provider 源码。
 
