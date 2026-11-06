@@ -443,3 +443,142 @@ fn share_prepare_emitted_replacement_by_ordinary_command_waits_for_physical_comp
         PluginRequestOwner::Command(_)
     ));
 }
+
+fn assert_share_prepare_cleanup_keeps_newer_request(replace_old: bool) {
+    let (_root, service, manager, receiver) = fixture(if replace_old {
+        "share-prepare-old-enqueue-cleanup"
+    } else {
+        "share-prepare-idle-enqueue-cleanup"
+    });
+    let now = Instant::now();
+    let old = replace_old.then(|| {
+        service
+            .begin_share_prepare(receiver.clone(), "old".into(), now)
+            .unwrap()
+    });
+    let ordinary = service
+        .prepare_command(
+            manager.route("/demo ordinary").unwrap().unwrap(),
+            1,
+            "/demo ordinary".into(),
+        )
+        .unwrap();
+    let ordinary_context = ordinary.request_context().clone();
+    let ordinary_token = ordinary.token.clone();
+    let newer = std::cell::RefCell::new(None);
+    let ordinary = service
+        .admit_prepared_command_with(ordinary, now, || {
+            // Pause after the scheduler released B's enqueue lock and before its
+            // cleanup. Another host task already holds B's prepared context/token.
+            assert!(service
+                .abort_submission_request(&ordinary_context, &ordinary_token, now)
+                .unwrap()
+                .is_none());
+            *newer.borrow_mut() = Some(
+                service
+                    .begin_share_prepare(receiver, "newer".into(), now)
+                    .unwrap(),
+            );
+        })
+        .unwrap();
+    assert!(ordinary.dispatch.is_none());
+    if let Some(old) = old {
+        assert_eq!(
+            old.receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(E::Cancelled)
+        );
+        assert!(!old.registration.result_is_current());
+        assert!(service
+            .emit_share_prepare_with(&old.dispatch, || panic!("replaced request emitted"))
+            .is_err());
+    }
+    let newer = newer.into_inner().unwrap();
+    assert_eq!(
+        manager.scheduler().context_status(&newer.dispatch.context),
+        PluginContextStatus::Current,
+        "cleanup of old B must not retire C admitted after B was aborted"
+    );
+    assert!(newer.registration.result_is_current());
+    assert!(matches!(
+        newer.receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    let emitted = std::cell::Cell::new(false);
+    service
+        .emit_share_prepare_with(&newer.dispatch, || {
+            emitted.set(true);
+            Ok(())
+        })
+        .unwrap();
+    assert!(emitted.get());
+    let done = completion(&newer.dispatch);
+    let outcome = manager
+        .complete(
+            &runtime_label(&done.context.plugin_id, done.context.plugin_generation).unwrap(),
+            &done,
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        service.complete_share_prepare_with(&done, &outcome, || {}),
+        Some(true)
+    );
+    assert_eq!(
+        newer.receiver.recv().unwrap().unwrap().data,
+        json!({"draft":"initialized"})
+    );
+}
+
+#[test]
+fn share_prepare_replaced_cleanup_does_not_cancel_newer_prepare_after_ordinary_abort() {
+    assert_share_prepare_cleanup_keeps_newer_request(true);
+}
+
+#[test]
+fn share_prepare_idle_enqueue_cleanup_does_not_cancel_newer_prepare_after_ordinary_abort() {
+    assert_share_prepare_cleanup_keeps_newer_request(false);
+}
+
+#[test]
+fn share_prepare_completed_owner_is_settled_when_ordinary_enqueue_retires_completion() {
+    let (_root, service, manager, receiver) = fixture("share-prepare-completion-retired");
+    let now = Instant::now();
+    let pending = service
+        .begin_share_prepare(receiver, "transfer".into(), now)
+        .unwrap();
+    service
+        .emit_share_prepare_with(&pending.dispatch, || Ok(()))
+        .unwrap();
+    let done = completion(&pending.dispatch);
+    let outcome = manager
+        .complete(
+            &runtime_label(&done.context.plugin_id, done.context.plugin_generation).unwrap(),
+            &done,
+            now,
+        )
+        .unwrap();
+    assert!(outcome.accepted);
+    // Physical completion has ended; the owning initialization has not yet
+    // been claimed by its service settlement callback.
+    let ordinary = service
+        .schedule_command(
+            manager.route("/demo ordinary").unwrap().unwrap(),
+            1,
+            "/demo ordinary".into(),
+            now,
+        )
+        .unwrap();
+    assert!(ordinary.dispatch.is_some());
+    assert_eq!(
+        pending
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        Err(E::Cancelled)
+    );
+    assert!(!pending.registration.result_is_current());
+    assert_eq!(
+        service.complete_share_prepare_with(&done, &outcome, || {}),
+        None
+    );
+}

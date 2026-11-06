@@ -689,15 +689,20 @@ impl PublicPluginService {
                 recovery: Some(recovery),
             });
         }
-        let outcome = match self.manager()?.enqueue_reserved(request, now) {
+        let (outcome, retired_contexts) = match self
+            .manager()?
+            .enqueue_reserved_with_retired_contexts(request, now)
+        {
             Ok(outcome) => outcome,
             Err(_) => {
                 self.settle_submission(&token, None);
                 return Err(PublicPluginManagementError::Unavailable);
             }
         };
-        self.retire_share_preparations(Some(&route.plugin_id), Some(route.generation));
         after_enqueue();
+        for context in retired_contexts {
+            self.settle_share_prepare(&context, share_prepare::SharePrepareError::Cancelled);
+        }
         let result_context = self.result_action.lock().ok().and_then(|slot| {
             slot.as_ref()
                 .filter(|p| {

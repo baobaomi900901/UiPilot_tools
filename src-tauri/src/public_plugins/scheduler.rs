@@ -481,11 +481,23 @@ impl PluginRequestScheduler {
         self.enqueue_reserved(reserved, now)
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_reserved(
         &self,
         reserved: ReservedPluginRequest,
         now: Instant,
     ) -> Result<PluginScheduleOutcome, PluginScheduleError> {
+        self.enqueue_reserved_with_retired_contexts(reserved, now)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Capture retirement identities under the same lock as enqueue. A later
+    /// service cleanup must not rediscover owners from a changing generation.
+    pub(crate) fn enqueue_reserved_with_retired_contexts(
+        &self,
+        reserved: ReservedPluginRequest,
+        now: Instant,
+    ) -> Result<(PluginScheduleOutcome, Vec<PluginRequestContext>), PluginScheduleError> {
         if matches!(
             reserved.candidate.owner,
             PluginRequestOwner::ResultAction(_)
@@ -513,6 +525,7 @@ impl PluginRequestScheduler {
         {
             return Err(PluginScheduleError::GenerationMismatch);
         }
+        let mut retired_contexts = Vec::new();
         // A never-emitted prepare has no physical handler to wait for. A
         // command supersedes it atomically; the service settles its channel.
         // Once emission is claimed, retain the existing waiting/deadline path.
@@ -526,6 +539,7 @@ impl PluginRequestScheduler {
                 if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
                     owner.lease.cancel();
                 }
+                retired_contexts.push(running.request.context);
             }
         }
         if matches!(
@@ -540,12 +554,13 @@ impl PluginRequestScheduler {
         }
         match &reserved.candidate.owner {
             PluginRequestOwner::Command(_) => {
-                if let Some((_, reason)) = queue
+                if let Some((context, reason)) = queue
                     .action_completion
                     .as_mut()
                     .filter(|(_, reason)| reason.is_none())
                 {
                     *reason = Some(super::content_action::ContentActionError::Cancelled);
+                    retired_contexts.push(context.clone());
                 }
             }
             PluginRequestOwner::SharePrepare(_)
@@ -579,11 +594,14 @@ impl PluginRequestScheduler {
                 .as_ref()
                 .map(|running| running.request.context.clone())
                 .ok_or(PluginScheduleError::Unavailable)?;
-            return Ok(PluginScheduleOutcome::Waiting {
-                expired,
-                request_context: reserved.context,
-                replaced_submission_token,
-            });
+            return Ok((
+                PluginScheduleOutcome::Waiting {
+                    expired,
+                    request_context: reserved.context,
+                    replaced_submission_token,
+                },
+                retired_contexts,
+            ));
         }
         if let Some(running) = queue.running.as_mut() {
             if running.current
@@ -603,6 +621,7 @@ impl PluginRequestScheduler {
                 owner.lease.cancel();
             }
             let expired = running.request.context.clone();
+            retired_contexts.push(expired.clone());
             let replaced_submission_token =
                 queue.waiting.replace(reserved.clone()).map(|request| {
                     request
@@ -613,14 +632,17 @@ impl PluginRequestScheduler {
                         .submission_token
                         .clone()
                 });
-            return Ok(PluginScheduleOutcome::Waiting {
-                expired,
-                request_context: reserved.context,
-                replaced_submission_token,
-            });
+            return Ok((
+                PluginScheduleOutcome::Waiting {
+                    expired,
+                    request_context: reserved.context,
+                    replaced_submission_token,
+                },
+                retired_contexts,
+            ));
         }
         let request = dispatch(&mut state, reserved, now)?;
-        Ok(PluginScheduleOutcome::Dispatched(request))
+        Ok((PluginScheduleOutcome::Dispatched(request), retired_contexts))
     }
 
     // Pending -> admission -> mutation -> authority -> scheduler -> registry.

@@ -5446,15 +5446,29 @@ impl PublicPluginManager {
         request: ReservedPluginRequest,
         now: Instant,
     ) -> Result<PluginScheduleOutcome, PluginScheduleError> {
+        self.enqueue_reserved_with_retired_contexts(request, now)
+            .map(|(outcome, _)| outcome)
+    }
+
+    pub(crate) fn enqueue_reserved_with_retired_contexts(
+        &self,
+        request: ReservedPluginRequest,
+        now: Instant,
+    ) -> Result<(PluginScheduleOutcome, Vec<PluginRequestContext>), PluginScheduleError> {
         let network_transition = self
             .network_authority
             .begin_transition()
             .map_err(|_| PluginScheduleError::Unavailable)?;
-        let outcome = self.scheduler.enqueue_reserved(request, now)?;
+        let (outcome, retired_contexts) = self
+            .scheduler
+            .enqueue_reserved_with_retired_contexts(request, now)?;
         if let PluginScheduleOutcome::Waiting { expired, .. } = &outcome {
             network_transition.invalidate_context(expired);
         }
-        Ok(outcome)
+        for context in &retired_contexts {
+            network_transition.invalidate_context(context);
+        }
+        Ok((outcome, retired_contexts))
     }
 
     pub(crate) fn files_open_enabled(
