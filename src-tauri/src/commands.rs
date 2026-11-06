@@ -2610,21 +2610,21 @@ pub(crate) struct PanelImageImportTarget {
     session_epoch: String,
 }
 #[tauri::command]
-pub(crate) fn get_launcher_clipboard_sequence(window: WebviewWindow) -> Result<u32, CommandError> {
-    require_main_window(&window)?;
+pub(crate) fn get_launcher_clipboard_sequence<R: tauri::Runtime>(webview: tauri::Webview<R>) -> Result<u32, CommandError> {
+    require_main_label(webview.label())?;
     Ok(crate::clipboard_history::launcher_clipboard_sequence())
 }
 #[tauri::command]
-pub(crate) async fn import_launcher_image(
-    window: WebviewWindow,
+pub(crate) async fn import_launcher_image<R: tauri::Runtime>(
+    webview: tauri::Webview<R>,
     input: serde_json::Value,
 ) -> Result<crate::launcher_image::LauncherImage, crate::public_plugins::host_services::ServiceError>
 {
     use crate::public_plugins::host_services::ServiceError;
-    require_main_window(&window).map_err(|_| ServiceError::from("invalidCaller"))?;
+    require_main_label(webview.label()).map_err(|_| ServiceError::from("invalidCaller"))?;
     let input: LauncherImageImportInput =
         serde_json::from_value(input).map_err(|_| ServiceError::from("invalidImage"))?;
-    let app = window.app_handle();
+    let app = webview.app_handle();
     let service = app.state::<Arc<PublicPluginService>>();
     let manager = service
         .manager()
@@ -2632,7 +2632,7 @@ pub(crate) async fn import_launcher_image(
     let panel_epoch = input.panel.as_ref().map(|panel| crate::public_plugins::panel_action::parse_epoch(&panel.session_epoch).map_err(|_| ServiceError::from("expiredImage"))).transpose()?;
     let controller = app.state::<Arc<PluginPanelController>>();
     if let Some(epoch) = panel_epoch {
-        controller.begin_image_import(&manager, window.label(), epoch, input.import_sequence).map_err(ServiceError::from)?;
+        controller.begin_image_import(&manager, webview.label(), epoch, input.import_sequence).map_err(ServiceError::from)?;
     } else {
         manager.launcher_images.begin_import(input.import_sequence).map_err(ServiceError::from)?;
     }
@@ -2656,7 +2656,7 @@ pub(crate) async fn import_launcher_image(
     .map_err(ServiceError::from)?;
     // Bad decodes leave the old image and result authority untouched.
     if let Some(epoch) = panel_epoch {
-        let image = controller.finish_image_import(&manager, window.label(), epoch, sequence, normalized).map_err(ServiceError::from)?;
+        let image = controller.finish_image_import(&manager, webview.label(), epoch, sequence, normalized).map_err(ServiceError::from)?;
         plugin_panel::deliver_image_change(app, controller.inner(), epoch).map_err(|_| ServiceError::from("imageUnavailable"))?;
         return Ok(image);
     }
@@ -2673,13 +2673,13 @@ pub(crate) async fn import_launcher_image(
     Ok(image)
 }
 #[tauri::command]
-pub(crate) fn clear_launcher_image(
-    window: WebviewWindow,
+pub(crate) fn clear_launcher_image<R: tauri::Runtime>(
+    webview: tauri::Webview<R>,
     import_sequence: u64,
 ) -> Result<(), crate::public_plugins::host_services::ServiceError> {
     use crate::public_plugins::host_services::ServiceError;
-    require_main_window(&window).map_err(|_| ServiceError::from("invalidCaller"))?;
-    let service = window.state::<Arc<PublicPluginService>>();
+    require_main_label(webview.label()).map_err(|_| ServiceError::from("invalidCaller"))?;
+    let service = webview.state::<Arc<PublicPluginService>>();
     let manager = service
         .manager()
         .map_err(|_| ServiceError::from("imageUnavailable"))?;
@@ -2687,7 +2687,7 @@ pub(crate) fn clear_launcher_image(
         .launcher_images
         .clear_with(import_sequence, |contexts| {
             manager.retire_image_contexts(contexts);
-            let _ = window
+            let _ = webview
                 .state::<ResultRegistries>()
                 .main()
                 .invalidate_domain(QueryDomain::Plugin);
@@ -14540,3 +14540,7 @@ mod command_management_ipc_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "commands/launcher_image_ipc_tests.rs"]
+mod launcher_image_ipc_tests;

@@ -342,3 +342,37 @@ fn panel_image_import_session_and_sequence_guards_preserve_newer_state() {
         .is_err());
     assert!(!b.id.is_empty());
 }
+
+#[test]
+fn panel_image_clear_then_reimport_admits_new_recognition_in_same_session() {
+    let (_root, service, manager, controller, identity) =
+        panel_action_fixture_with_image("panel-image-repaste", true);
+    let first = crate::launcher_image::normalize_rgba(1, 1, &[1, 2, 3, 255]).unwrap();
+    controller.begin_image_import(&manager, "main", identity.session_epoch, 1).unwrap();
+    let first = controller.finish_image_import(&manager, "main", identity.session_epoch, 1, first).unwrap();
+    let action = |id: &str| crate::public_plugins::panel_action::PanelActionRequest::from_value(
+        json!({"action": "recognize", "imageId": id, "payload": null}),
+    ).unwrap();
+    let (dispatch, receiver) = controller.admit_panel_action(
+        &service, &identity.content_label, identity.session_epoch, action(&first.id),
+    ).unwrap();
+    assert!(manager.scheduler().complete(&dispatch.context, Instant::now()).unwrap().accepted);
+    assert!(service.settle_panel_action(&dispatch.context, Ok(json!({"text": "first"})), true));
+    assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(Ok(json!({"text": "first"}))));
+    controller.clear_image(&manager, &identity.content_label, identity.session_epoch).unwrap();
+    let second = crate::launcher_image::normalize_rgba(1, 1, &[4, 5, 6, 255]).unwrap();
+    controller.begin_image_import(&manager, "main", identity.session_epoch, 2).unwrap();
+    let second = controller.finish_image_import(&manager, "main", identity.session_epoch, 2, second).unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(controller.admit_panel_action(
+        &service, &identity.content_label, identity.session_epoch, action(&first.id),
+    ).is_err());
+    let (dispatch, _receiver) = controller.admit_panel_action(
+        &service, &identity.content_label, identity.session_epoch, action(&second.id),
+    ).unwrap();
+    let (kind, invocation) = service.dispatch_invocation(
+        &dispatch, crate::public_plugins::PluginInvocationTheme::Dark, "2026-11-06T00:00:00Z".into(),
+    ).unwrap();
+    assert_eq!(kind, "panelAction");
+    assert!(invocation["image"]["id"].as_str().unwrap().starts_with(&second.id));
+}

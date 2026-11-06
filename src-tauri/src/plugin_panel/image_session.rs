@@ -149,8 +149,8 @@ impl PluginPanelController {
     }
 }
 
-pub(crate) fn deliver_image_change(
-    app: &AppHandle,
+pub(crate) fn deliver_image_change<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     controller: &PluginPanelController,
     epoch: u64,
 ) -> Result<bool, PanelSettlementError> {
