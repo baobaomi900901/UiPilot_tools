@@ -2,7 +2,7 @@
 
 目标是在 M1 及后续 Apple Silicon 上交付原生 arm64 启动器，并让使用共同 SDK 能力的插件以同一发布包在 Windows 和 Mac 运行。共享 React 界面、Tauri IPC、Rust 排名与结果注册表；系统调用、生产装配、资源和打包按目标分开。本文细化[总计划](2026-11-06-macos-port.md)，保留其任务编号、依赖与发布范围。下文均为**待执行的工作和预期结果**；这里只审查文档，不代表已编译、已签名或已通过实机验收。
 
-**实施顺序**：1 → 2 → 3 → 4 → 5 → 6 → 7 为首版。发布后 8、10 可独立开展，两者的支持矩阵均确定后才进行 9。Task 1 的新设计在批准后成为接口、状态、失败语义的唯一合同；Tasks 8–10 各自需要后续规格。本文按该合同组织实施，不预先定义新的 IPC 字段、默认按键或授权规则。
+**实施顺序**：1 → 2 → 3 → 4 → 5 → 6 → 7 为首版。8、10 可分别推进。按本轮决定，非阻塞人工用例留待集中验收，主线可继续实现和自动验证；公开发布仍须完成对应门禁。两者的支持矩阵均确定后才开放 9 的对应能力。Task 1 的新设计在批准后成为接口、状态、失败语义的唯一合同；Tasks 8–10 各自需要后续规格。本文按该合同组织实施，不预先定义新的 IPC 字段、默认按键或授权规则。
 
 **技术边界**：0.19.0 基线，Rust 1.96.1、锁定的 Tauri 2 与 React 19；Windows 原生构建链继续回归。仅发布 aarch64-apple-darwin，不发布 Intel 或 Universal，不以 Rosetta 启动。最低版本候选 15.7.4；本轮验证 M1 + 精确最低系统；按用户决定跳过较新芯片和系统组合，未实测。macOS SIP、Gatekeeper、TCC 与 CSP 按正常设置运行。
 
@@ -163,6 +163,6 @@
 | 10.3 | `screenshot::` | `npm test -- src/screenshot-view.test.tsx`；测试图的尺寸与释放事件 |
 | 10.4 | `native_attention::`、`process_control::` | 通知拒绝/撤销及进程身份替换记录 |
 | 10.5 | `macos_login_item`（在 lifecycle/settings 新增聚焦用例） | `npm test -- src/launcher.test.tsx`；系统面板与应用状态的对应记录 |
-| 10.6 | `double_tap::` | `npm test -- src/hotkey-recorder.test.ts`；普通组合键继续有效的实机记录 |
+| 10.6 | Mac `macos_command_tap::`、`macos_host::hotkey::`；Windows `double_tap::` | `npm test -- src/hotkey-recorder.test.ts`；普通组合键继续有效的实机记录 |
 
 每个子项成功需具备自动断言与获准的实机证据。未具备条件的子项记录原因、负责人及下一次验证条件，继续关闭对应能力。

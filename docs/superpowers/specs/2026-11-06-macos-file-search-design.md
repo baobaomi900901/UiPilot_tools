@@ -1,6 +1,6 @@
 # macOS Find 与 Spotlight 文件搜索设计
 
-**状态：待单独批准的 Task 8 设计输入。** 基线 `37d1bca`，适用 M1 系列及后续 Apple Silicon。当前生产 Mac 仍只开放核心启动器，`HostCapabilities.files=false`。本次只验证只读系统 API；首版 Task 7 的 Windows 原生交付进展见设备验收单；按用户决定跳过后续芯片/较新系统实机行。公开分发的公证与 Gatekeeper 验收仍单列。Task 8 产品实现依赖 Task 7 通过与本规格获批。参见[首版支持矩阵及 Task 8](../plans/2026-11-06-macos-port.md)和[逐步验收 §8](../plans/2026-11-06-macos-port-steps.md)。
+**状态：待单独批准的 Task 8 设计输入。** 基线 `37d1bca`，适用 M1 系列及后续 Apple Silicon。当前生产 Mac 仍只开放核心启动器，`HostCapabilities.files=false`。已接入宿主私有的 Spotlight 候选查询和文件身份复验模块，尚未向 WebView 提供文件搜索 IPC；首版 Task 7 的 Windows 原生交付进展见设备验收单；按用户决定跳过后续芯片/较新系统实机行。公开分发的公证与 Gatekeeper 验收仍单列。按本轮决定先做不依赖范围选择的查询、取消和身份校验，非阻塞人工测试后补。开放产品入口仍需完成范围选择及相应的授权边界验证。参见[首版支持矩阵及 Task 8](../plans/2026-11-06-macos-port.md)和[逐步验收 §8](../plans/2026-11-06-macos-port-steps.md)。
 
 ## 用户可见范围与默认行为
 
@@ -66,6 +66,12 @@ A 中每个允许访问的本地卷须绑定挂载身份，按当前 OS 权限�
 执行顺序为 **验证调用者 → Find 可见性 → 解析 current ticket → 从原根重新鉴别路径及对象 → 确认 file-reference URL 与原对象一致 → 最终 ticket/范围核验 → 系统调用**。用户重命名、删除、同路径替换、替换父目录或撤权都返回固定错误，系统调用次数为零。对同一 ticket 的双击、Enter 与菜单选择只允许一次系统提交；新 query 或退出在最终 admission 之前先到达则拒绝。日志只记计数、状态和错误类别，不写查询、文件路径或元数据内容。
 
 Finder 定位使用 `NSWorkspace.activateFileViewerSelectingURLs`，它没有成功回调，返回值只表示已发出请求。打开文件使用 `openURL:configuration:completionHandler:`；打开目录请求 Finder 对应本地目录。继续使用现有 `fileRevealRequested/folderOpenRequested`；显式文档打开新增 `fileOpenRequested`，同步前端协议与状态处理。已向系统提交但结果无法确认则消费该 ticket、保持窗口并提示用户检查，不自动重试。尚未提交的错误允许重新搜索/再次尝试。Finder 实际选中什么、默认文档应用是否打开及焦点切换，均需经授权的实机验收。
+
+## 私有后端实现进展
+
+`207d590` 的查询桥在后台 run loop 运行 NSMetadataQuery，保留独立观察者和取消标记；按同一截止时间限制收集及复制。文件名作为字面参数，最多复制 400 条内部候选。已通过 8 个确定性查询测试，并在指定的系统字体目录中命中 `Andale Mono.ttf`。文件身份模块从已验证的根目录描述符逐组件拒绝符号链接和跨挂载，在重新鉴别时检查父目录、叶子和身份是否变化；6 项测试通过。
+
+以上实现尚未注册 Find IPC。默认范围授权、本地卷/包/别名识别、有效访问校验、结果发布、执行前复验和 Finder 操作仍未完成。非阻塞设备交互按本轮安排后补。
 
 ## 本次只读证据
 
