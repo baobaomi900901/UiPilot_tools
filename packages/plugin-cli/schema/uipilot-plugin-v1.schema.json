@@ -454,6 +454,94 @@
         }
       ]
     },
+    "PublicShareReceiverV1": {
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "const": "default"
+        },
+        "id": {
+          "not": {
+            "enum": [
+              "__proto__",
+              "prototype",
+              "constructor"
+            ]
+          },
+          "pattern": "^[a-z][a-z0-9.-]{0,63}$",
+          "type": "string"
+        },
+        "maxBytes": {
+          "format": "uint32",
+          "maximum": 16384,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "title": {
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]*$",
+          "type": "string"
+        },
+        "types": {
+          "const": [
+            "text/plain"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "commandId",
+        "types",
+        "maxBytes"
+      ],
+      "type": "object"
+    },
+    "PublicShareV1": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "source": true
+          },
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "properties": {
+            "receivers": true
+          },
+          "required": [
+            "receivers"
+          ]
+        }
+      ],
+      "properties": {
+        "receivers": {
+          "items": {
+            "$ref": "#/$defs/PublicShareReceiverV1"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
+        "source": {
+          "const": true
+        },
+        "version": {
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "type": "object"
+    },
     "PublicWindowV1": {
       "additionalProperties": false,
       "properties": {
@@ -609,6 +697,9 @@
         "$ref": "#/$defs/PublicSettingV1"
       },
       "type": "array"
+    },
+    "share": {
+      "$ref": "#/$defs/PublicShareV1"
     },
     "supportedPlatforms": {
       "items": {

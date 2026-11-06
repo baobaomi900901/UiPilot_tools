@@ -161,7 +161,7 @@ try {
     assert.deepEqual({ ...archiveReport, source: directoryReport.source }, directoryReport)
     assert.deepEqual(packedReport.validation, directoryReport)
     if (name === 'com.uipilot.demo-multi') {
-      assert.deepEqual(directoryReport.target, { platform: 'windows', hostVersion: '0.21.0', apiVersion: 1 })
+      assert.deepEqual(directoryReport.target, { platform: 'windows', hostVersion: '0.22.0', apiVersion: 1 })
       assert.deepEqual(directoryReport.plugin.commands, [
         { commandId: 'upper', defaultName: 'demo-upper', activationMode: 'live', outputMode: 'mainResult' },
         { commandId: 'lower', defaultName: 'demo-lower', activationMode: 'submit', outputMode: 'mainResult' },

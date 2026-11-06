@@ -42,6 +42,20 @@ export interface PublicNetworkV1 {
   credentials?: PluginNetworkCredential[]
 }
 
+export interface PublicShareReceiverV1 {
+  id: string
+  title: string
+  commandId: 'default'
+  types: ['text/plain']
+  maxBytes: number
+}
+
+export interface PublicShareV1 {
+  version: 1
+  source?: true
+  receivers?: PublicShareReceiverV1[]
+}
+
 interface PublicManifestBase {
   schemaVersion: number
   pluginId: string
@@ -60,6 +74,7 @@ interface PublicManifestBase {
     runtimeActions?: boolean
   } | null
   network?: PublicNetworkV1
+  share?: PublicShareV1
   permissions: PublicPermission[]
   settings?: PublicSettingV1[]
 }
@@ -88,6 +103,7 @@ export type PublicManifestV1 = PublicManifestBase & (
 
 export const MULTI_COMMAND_MIN_HOST = [0, 5, 0] as const
 export const MAX_PUBLIC_COMMANDS = 16
+export const SHARE_MIN_HOST = [0, 22, 0] as const
 
 export function normalizedCommands(manifest: PublicManifestV1): ReadonlyArray<{ commandId: string; command: PublicCommandV1 }> {
   return manifest.commands !== undefined
@@ -307,6 +323,7 @@ function sharedSemanticPointers(manifest: PublicManifestV1): string[] {
     [duplicates(manifest.permissions), '/permissions'],
     [settings.some(setting => !validSetting(setting)) || duplicates(settings.map(setting => setting.key)), '/settings'],
     [(manifest.network != null) !== manifest.permissions.includes('network.https'), '/network'],
+    [manifest.share !== undefined && !validShare(manifest.share), '/share'],
   ]
   if (manifest.network?.credentials) {
     const credentials = manifest.network.credentials
@@ -318,6 +335,17 @@ function sharedSemanticPointers(manifest: PublicManifestV1): string[] {
       ), '/network/credentials'])
   }
   return rules.filter(([invalid]) => invalid).map(([, pointer]) => pointer)
+}
+
+function validShare(share: PublicShareV1): boolean {
+  return share.version === 1 && (share.source === true || !!share.receivers?.length) &&
+    (share.receivers === undefined || (share.receivers.length >= 1 && share.receivers.length <= 8 &&
+      !duplicates(share.receivers.map(receiver => receiver.id)) && share.receivers.every(receiver =>
+        /^[a-z][a-z0-9.-]{0,63}$/u.test(receiver.id) &&
+        !['__proto__', 'prototype', 'constructor'].includes(receiver.id) &&
+        [...receiver.title].length >= 1 && [...receiver.title].length <= 80 && !/[\p{Cc}\p{Cs}]/u.test(receiver.title) &&
+        receiver.commandId === 'default' && receiver.types.length === 1 && receiver.types[0] === 'text/plain' &&
+        Number.isInteger(receiver.maxBytes) && receiver.maxBytes >= 1 && receiver.maxBytes <= 16384)))
 }
 
 function semanticValid(manifest: PublicManifestV1): boolean {
@@ -512,6 +540,7 @@ function validateParsedManifest(
   if (
     manifest.apiVersion !== 1 ||
     !minimumHost ||
+    (manifest.share !== undefined && (versionGreater(SHARE_MIN_HOST, minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || manifest.commands !== undefined || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'panel' || manifest.panel == null || !manifest.permissions.includes('ui.panel'))) ||
     (normalizedCommands(manifest).some(({ command }) => !!command.inputCapabilities?.length) && (versionGreater([0, 20, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
     (normalizedCommands(manifest).some(({ command }) => !!command.inputCapabilities?.length && command.outputMode === 'panel') && (versionGreater([0, 21, 0], minimumHost) || manifest.commands !== undefined || manifest.panel?.runtimeActions !== true || !manifest.permissions.includes('ui.panel'))) ||
     (manifest.permissions.includes('files.openText') && (versionGreater([0, 13, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.window') || !manifest.window || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'window' || manifest.commands !== undefined)) ||

@@ -22,6 +22,7 @@ export interface PluginInvocation {
     platform: 'windows' | 'macos'
     theme: 'dark' | 'light'
     invokedAt: string
+    readonly entry?: PluginShareEntry
   }
 }
 
@@ -442,6 +443,44 @@ export interface PluginPanelUpdate {
   invokedAt: string
   sessionEpoch: U64Decimal
   data: JsonValue
+  readonly entry?: PluginShareEntry
+}
+
+/** Windows Host 0.22.0+: no body is supplied during restricted preparation. */
+export interface PluginShareEntry {
+  readonly kind: 'sharePrepare'
+  readonly receiverId: string
+}
+
+export interface PluginSharePayload {
+  readonly type: 'text/plain'
+  readonly text: string
+}
+
+export interface PluginShareSourceSnapshot {
+  readonly revision: U64Decimal
+  readonly payload: PluginSharePayload
+}
+
+export interface PluginShareReceiveEvent {
+  readonly version: 1
+  readonly transferId: string
+  readonly receiverId: string
+  readonly sessionEpoch: U64Decimal
+  readonly payload: PluginSharePayload
+}
+
+export interface UiPilotPluginPanelShareApiV1 {
+  /** One synchronous provider; publish the initial revision before registration.
+   * Null means unavailable. Text is preserved and bounded to 16384 UTF-8 bytes.
+   */
+  onSource(provider: () => PluginShareSourceSnapshot | null): () => void
+  /** Session revisions start at 1 and strictly increase; carries no body. */
+  invalidateSource(revision: U64Decimal): Promise<void>
+  /** Register before first onUpdate. Synchronously accept into memory, then
+   * schedule business work separately. Promise returns are invalid.
+   */
+  onReceive(handler: (event: PluginShareReceiveEvent) => Readonly<{ accepted: boolean }>): () => void
 }
 
 export interface UiPilotPluginPanelStorageApiV1 {
@@ -557,6 +596,8 @@ export interface UiPilotPluginPanelSpeechApiV1 {
 }
 
 export interface UiPilotPluginPanelApiV1 {
+  /** Windows Host 0.22.0+: explicitly declared source/receiver capability. */
+  readonly share?: Readonly<UiPilotPluginPanelShareApiV1>
   /** Windows Host 0.21.0+ image Panel only. Register before first onUpdate.
    * Latest snapshot after Ready, then on revision changes; event <=64KiB.
    * Unsubscribe/teardown invalidates queued delivery. All fields are deeply frozen.

@@ -215,6 +215,105 @@ pub(crate) struct PublicPanelV1 {
     pub(crate) host_key_focus: Option<PanelHostKeyFocus>,
 }
 
+pub(crate) const SHARE_MIN_HOST: [u32; 3] = [0, 22, 0];
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PublicShareReceiverV1 {
+    #[schemars(regex(pattern = "^[a-z][a-z0-9.-]{0,63}$"))]
+    pub(crate) id: String,
+    #[schemars(length(min = 1, max = 80))]
+    #[schemars(regex(pattern = r"^[^\u0000-\u001f\u007f-\u009f\ud800-\udfff]*$"))]
+    pub(crate) title: String,
+    pub(crate) command_id: String,
+    pub(crate) types: Vec<String>,
+    #[schemars(range(min = 1, max = 16384))]
+    pub(crate) max_bytes: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PublicShareV1 {
+    #[schemars(range(min = 1, max = 1))]
+    pub(crate) version: u32,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_share_source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_share_source_schema")]
+    pub(crate) source: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_share_receivers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_share_receivers_schema")]
+    pub(crate) receivers: Option<Vec<PublicShareReceiverV1>>,
+}
+
+fn deserialize_present_share_source<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
+}
+
+fn present_share_source_schema(_: &mut SchemaGenerator) -> Schema {
+    serde_json::json!({"const": true}).try_into().unwrap()
+}
+
+fn deserialize_present_share_receivers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<PublicShareReceiverV1>>, D::Error> {
+    Vec::<PublicShareReceiverV1>::deserialize(deserializer).map(Some)
+}
+
+fn present_share_receivers_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Vec::<PublicShareReceiverV1>::json_schema(generator);
+    schema.insert("minItems".into(), 1.into());
+    schema.insert("maxItems".into(), 8.into());
+    schema
+}
+
+fn deserialize_present_share<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PublicShareV1>, D::Error> {
+    PublicShareV1::deserialize(deserializer).map(Some)
+}
+
+fn present_share_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<PublicShareV1>()
+}
+
+impl PublicShareV1 {
+    fn valid(&self) -> bool {
+        self.version == 1
+            && self.source.is_none_or(|source| source)
+            && (self.source == Some(true)
+                || self
+                    .receivers
+                    .as_ref()
+                    .is_some_and(|receivers| !receivers.is_empty()))
+            && self.receivers.as_ref().is_none_or(|receivers| {
+                !receivers.is_empty()
+                    && receivers.len() <= 8
+                    && !has_duplicates(receivers.iter().map(|receiver| receiver.id.as_str()))
+                    && receivers.iter().all(|receiver| {
+                        valid_setting_key(&receiver.id)
+                            && !matches!(
+                                receiver.id.as_str(),
+                                "__proto__" | "prototype" | "constructor"
+                            )
+                            && (1..=80).contains(&receiver.title.chars().count())
+                            && !receiver.title.chars().any(char::is_control)
+                            && receiver.command_id == "default"
+                            && receiver.types == ["text/plain"]
+                            && (1..=16384).contains(&receiver.max_bytes)
+                    })
+            })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicNetworkV1 {
@@ -501,6 +600,13 @@ pub(crate) struct PublicManifestV1 {
     )]
     #[schemars(schema_with = "present_network_schema")]
     pub(crate) network: Option<PublicNetworkV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_share",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(schema_with = "present_share_schema")]
+    pub(crate) share: Option<PublicShareV1>,
     pub(crate) permissions: Vec<PublicPermission>,
     #[serde(default)]
     pub(crate) settings: Vec<PublicSettingV1>,
@@ -566,6 +672,17 @@ pub(crate) fn public_manifest_v1_schema() -> schemars::Schema {
     ]));
     schema.as_object_mut().unwrap().get_mut("$defs").unwrap()["PublicNamedCommandV1"]
         ["properties"]["outputMode"] = serde_json::json!({"const": "mainResult"});
+    let defs = schema.as_object_mut().unwrap().get_mut("$defs").unwrap();
+    defs["PublicShareV1"]["anyOf"] = serde_json::json!([
+        {"required": ["source"], "properties": {"source": true}},
+        {"required": ["receivers"], "properties": {"receivers": true}}
+    ]);
+    defs["PublicShareReceiverV1"]["properties"]["id"]["not"] =
+        serde_json::json!({"enum": ["__proto__", "prototype", "constructor"]});
+    defs["PublicShareReceiverV1"]["properties"]["commandId"] =
+        serde_json::json!({"const": "default"});
+    defs["PublicShareReceiverV1"]["properties"]["types"] =
+        serde_json::json!({"const": ["text/plain"]});
     schema
 }
 
@@ -673,6 +790,7 @@ fn validate_manifest(
                     .iter()
                     .any(|host| !valid_https_host(host))
         })
+        || manifest.share.as_ref().is_some_and(|share| !share.valid())
         || has_duplicates(manifest.permissions.iter().copied())
         || manifest.settings.iter().any(|setting| !setting.validate())
         || has_duplicates(manifest.settings.iter().map(PublicSettingV1::key))
@@ -786,6 +904,18 @@ fn validate_manifest(
     }
     let minimum_host = parse_canonical_version(&manifest.minimum_host_version)
         .ok_or(PublicPackageError::InvalidPackage)?;
+    if manifest.share.is_some()
+        && (minimum_host < SHARE_MIN_HOST
+            || manifest.supported_platforms != [PublicPlatform::Windows]
+            || !manifest.legacy_command().is_some_and(|command| {
+                command.activation_mode == PublicActivationMode::Submit
+                    && command.output_mode == PublicOutputMode::Panel
+            })
+            || manifest.panel.is_none()
+            || !manifest.permissions.contains(&PublicPermission::UiPanel))
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
     if manifest
         .normalized_commands()
         .any(|(_, command)| !command.input_capabilities.is_empty())
@@ -1141,6 +1271,179 @@ mod schema_tests {
             &serde_json::to_vec(value).unwrap(),
             &PublicPluginHost::current(PublicPlatform::Windows),
         )
+    }
+
+    #[test]
+    fn share_manifest_contract() {
+        use serde_json::json;
+        let receiver = json!({"id":"translate-text", "title":"翻译文本", "commandId":"default", "types":["text/plain"], "maxBytes":8192});
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = json!("0.22.0");
+        value["command"]["outputMode"] = json!("panel");
+        value["panel"] = json!({"entry":"dist/panel.html"});
+        value["permissions"] = json!(["ui.panel"]);
+        value["share"] = json!({"version":1,"source":true,"receivers":[receiver.clone()]});
+        let host = PublicPluginHost {
+            version: [0, 22, 0],
+            ..PublicPluginHost::current(PublicPlatform::Windows)
+        };
+        let parse = |v: &Value| parse_manifest(&serde_json::to_vec(v).unwrap(), &host);
+        for share in [
+            json!({"version":1,"source":true}),
+            json!({"version":1,"receivers":[receiver.clone()]}),
+            value["share"].clone(),
+        ] {
+            let mut valid = value.clone();
+            valid["share"] = share;
+            let parsed = parse(&valid).unwrap();
+            assert_eq!(parsed.normalized_commands().next().unwrap().0, "default");
+            assert!(parsed.legacy_command().is_some());
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap()["share"],
+                valid["share"]
+            );
+        }
+        let mut boundary = value.clone();
+        boundary["share"]["receivers"] = json!((0..8)
+            .map(|i| {
+                let mut r = receiver.clone();
+                r["id"] = json!(format!("r{i}"));
+                r["title"] = json!("😀".repeat(80));
+                r["maxBytes"] = json!(if i == 0 { 1 } else { 16384 });
+                r
+            })
+            .collect::<Vec<_>>());
+        assert!(parse(&boundary).is_ok());
+        for (pointer, invalid) in [
+            ("/share", Value::Null),
+            ("/share", json!({"version":1})),
+            ("/share", json!({"source":true})),
+            ("/share", json!({"version":1,"source":true,"send":true})),
+            ("/share/version", json!(2)),
+            ("/share/version", Value::Null),
+            ("/share/source", json!(false)),
+            ("/share/source", Value::Null),
+            ("/share/receivers", Value::Null),
+            ("/share/receivers", json!([])),
+            (
+                "/share/receivers",
+                json!([receiver.clone(), receiver.clone()]),
+            ),
+            (
+                "/share/receivers",
+                json!((0..9)
+                    .map(|i| {
+                        let mut r = receiver.clone();
+                        r["id"] = json!(format!("r{i}"));
+                        r
+                    })
+                    .collect::<Vec<_>>()),
+            ),
+            ("/share/receivers/0", Value::Null),
+            (
+                "/share/receivers/0",
+                json!({"id":"r","title":"R","types":["text/plain"],"maxBytes":1}),
+            ),
+            (
+                "/share/receivers/0",
+                json!({"id":"r","title":"R","commandId":"default","types":["text/plain"],"maxBytes":1,"input":""}),
+            ),
+            ("/share/receivers/0/commandId", json!("translate")),
+            ("/minimumHostVersion", json!("0.21.0")),
+            ("/supportedPlatforms", json!(["windows", "macos"])),
+            ("/command/activationMode", json!("live")),
+            ("/panel", Value::Null),
+            ("/permissions", json!([])),
+        ] {
+            let mut invalid_value = value.clone();
+            *invalid_value.pointer_mut(pointer).unwrap() = invalid;
+            assert!(parse(&invalid_value).is_err(), "{pointer}: {invalid_value}");
+        }
+        for id in [
+            "",
+            "Upper",
+            "a/b",
+            "a_b",
+            "é",
+            &"a".repeat(65),
+            "__proto__",
+            "prototype",
+            "constructor",
+        ] {
+            let mut invalid = value.clone();
+            invalid["share"]["receivers"][0]["id"] = json!(id);
+            assert!(parse(&invalid).is_err(), "id {id}");
+        }
+        for title in [
+            "",
+            &"😀".repeat(81),
+            "a\n",
+            "a\t",
+            "a\0",
+            "a\u{7f}",
+            "a\u{85}",
+        ] {
+            let mut invalid = value.clone();
+            invalid["share"]["receivers"][0]["title"] = json!(title);
+            assert!(parse(&invalid).is_err(), "title {title:?}");
+        }
+        for types in [
+            Value::Null,
+            json!([]),
+            json!(["text/html"]),
+            json!(["text/plain", "text/plain"]),
+        ] {
+            let mut invalid = value.clone();
+            invalid["share"]["receivers"][0]["types"] = types;
+            assert!(parse(&invalid).is_err());
+        }
+        for max_bytes in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(16385),
+            json!(1.5),
+            json!("8192"),
+        ] {
+            let mut invalid = value.clone();
+            invalid["share"]["receivers"][0]["maxBytes"] = max_bytes;
+            assert!(parse(&invalid).is_err());
+        }
+        for output in ["mainResult", "window"] {
+            let mut invalid = value.clone();
+            invalid["command"]["outputMode"] = json!(output);
+            invalid.as_object_mut().unwrap().remove("panel");
+            invalid["permissions"] = json!([]);
+            if output == "window" {
+                invalid["window"] = json!({"entry":"dist/window.html"});
+                invalid["permissions"] = json!(["ui.window"]);
+            }
+            assert!(parse(&invalid).is_err());
+        }
+        let mut named = value.clone();
+        let mut command = named.as_object_mut().unwrap().remove("command").unwrap();
+        command["id"] = json!("share");
+        command["outputMode"] = json!("mainResult");
+        named["commands"] = json!([command]);
+        named.as_object_mut().unwrap().remove("panel");
+        named["permissions"] = json!([]);
+        assert!(parse(&named).is_err());
+        let old_host = PublicPluginHost {
+            version: [0, 21, 0],
+            ..host
+        };
+        assert!(parse_manifest(&serde_json::to_vec(&value).unwrap(), &old_host).is_err());
+        let raw = serde_json::to_string(&value)
+            .unwrap()
+            .replace("\"source\":true", "\"source\":true,\"source\":true");
+        assert!(parse_manifest(raw.as_bytes(), &host).is_err());
+        let raw = serde_json::to_string(&value)
+            .unwrap()
+            .replace("翻译文本", "\\ud800");
+        assert!(parse_manifest(raw.as_bytes(), &host).is_err());
+        value.as_object_mut().unwrap().remove("share");
+        value["minimumHostVersion"] = json!("0.3.0");
+        assert!(parse(&value).is_ok());
     }
 
     #[test]

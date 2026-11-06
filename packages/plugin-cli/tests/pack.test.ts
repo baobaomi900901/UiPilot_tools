@@ -160,7 +160,7 @@ describe('packPackage', () => {
 it('embeds the same per-command directory diagnostics and metadata in a production-incompatible pack', async () => {
   const request = await setup()
   const manifest = multiCommandManifest()
-  manifest.minimumHostVersion = '0.21.1'
+  manifest.minimumHostVersion = '0.22.1'
   manifest.commands[0].summary = ''
   manifest.commands[1].inputRequired = true
   await writeFile(join(request.source, 'plugin.json'), JSON.stringify(manifest))
@@ -182,7 +182,7 @@ it.each([false, true])('production Host 0.6 packs complete commands arrays (sing
   if (single) manifest.commands = manifest.commands.slice(0, 1)
   await writeFile(join(request.source, 'plugin.json'), JSON.stringify(manifest))
   const result = await packPackage(request, options)
-  expect(result).toMatchObject({ created: true, validation: { valid: true, target: { hostVersion: '0.21.0' } } })
+  expect(result).toMatchObject({ created: true, validation: { valid: true, target: { hostVersion: '0.22.0' } } })
   if (!result.created) throw new Error('Expected production pack success')
   expect(result.validation?.plugin?.commands?.map(command => command.commandId)).toEqual(manifest.commands.map(command => command.id))
   const bytes = await readFile(request.output)

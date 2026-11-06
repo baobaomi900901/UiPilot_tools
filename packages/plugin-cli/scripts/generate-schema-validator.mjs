@@ -18,7 +18,7 @@ function inlineNumericFormats(value) {
   if (!value || typeof value !== 'object') return
   if (value.format === 'uint32') {
     delete value.format
-    value.maximum = 4294967295
+    value.maximum = Math.min(value.maximum ?? 4294967295, 4294967295)
   } else if (value.format === 'double') {
     delete value.format
   }
