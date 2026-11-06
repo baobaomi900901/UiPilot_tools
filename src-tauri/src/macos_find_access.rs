@@ -30,21 +30,23 @@ pub(super) struct Access {
 
 // Serialize scope changes through completion of an old lease. A second revoke
 // cannot acknowledge while a previous change is still draining a native submit.
-struct Retiring(Option<Arc<DocumentsGrant>>);
+struct Retiring(Vec<Arc<DocumentsGrant>>);
 impl Retiring {
     fn mark(&mut self, grant: Option<Arc<DocumentsGrant>>) {
-        if let Some(grant) = &grant { grant.mark_revoked(); }
-        self.0 = grant;
+        if let Some(grant) = grant {
+            grant.mark_revoked();
+            self.0.push(grant);
+        }
     }
 }
 impl Drop for Retiring {
     fn drop(&mut self) {
-        if let Some(old) = self.0.take() { old.revoke(); }
+        for old in self.0.drain(..) { old.revoke(); }
     }
 }
 fn change<T>(host: &Host, operation: impl FnOnce(&mut Retiring) -> T) -> T {
     let _turn = host.document_changes.lock().expect("Documents transition");
-    let mut retiring = Retiring(None);
+    let mut retiring = Retiring(Vec::new());
     // operation releases controller/access/registry guards before Retiring drops.
     operation(&mut retiring)
 }
@@ -70,8 +72,12 @@ impl Access {
         self.lost = lost;
         host.files.clear();
         let invalidated = registry.invalidate_domain(QueryDomain::File);
-        self.revision = next.ok_or_else(failed)?;
-        invalidated.map_err(|_| failed())?;
+        let (Some(next), Ok(())) = (next, invalidated) else {
+            // Do not let a newly selected URL's native lease drop under host locks.
+            retiring.mark(grant);
+            return Err(failed());
+        };
+        self.revision = next;
         self.grant = grant;
         Ok(())
     }
@@ -131,23 +137,28 @@ pub(crate) async fn get_find_documents_access(window: WebviewWindow, invocation_
 pub(crate) async fn revoke_find_documents_access(window: WebviewWindow, invocation_id: String) -> Response<Value> {
     check_find(&window)?;
     let app = window.app_handle().clone();
-    let worker_app = app.clone();
-    let (owner, view) = tauri::async_runtime::spawn_blocking(move || {
-        if !window.is_visible().unwrap_or(false) { return Err(stale()); }
-        let service = host(&worker_app);
+    // Invalidate the picker owner before waiting for a binding operation already
+    // on a worker. Its late URL must never be published to this invocation.
+    let id = invocation_id.clone();
+    on_main(&app, move |app| {
+        let service = host(app);
+        if !app.get_webview_window("find").is_some_and(|w| w.is_visible().unwrap_or(false)) { return Err(stale()); }
+        let panel = service.controller.with_visible_admission(&id, || {
+            service.documents.lock().expect("Find documents").panel.take()
+        }).ok_or_else(stale)?;
+        if let Some(panel) = panel { cancel_sheet(&panel); }
+        Ok(())
+    }).await??;
+    tauri::async_runtime::spawn_blocking(move || {
+        let service = host(&app);
         change(&service, |retiring| service.controller.with_visible_admission(&invocation_id, || {
             let mut access = service.documents.lock().expect("Find documents");
-            let owner = access.panel.take();
             if access.grant.is_some() || access.lost {
-                access.replace(None, false, &service, registries(&worker_app).find(), retiring)?;
+                access.replace(None, false, &service, registries(&app).find(), retiring)?;
             }
-            Ok((owner, access.view()))
+            Ok(access.view())
         }).unwrap_or_else(|| Err(stale())))
-    }).await.map_err(|_| failed())??;
-    if let Some(owner) = owner {
-        on_main(&app, move |_| cancel_sheet(&owner)).await?;
-    }
-    Ok(view)
+    }).await.map_err(|_| failed())?
 }
 
 fn still_selecting(service: &Host, owner: &Owner) -> bool {
@@ -161,28 +172,33 @@ fn acquire_for_owner<T>(service: &Host, owner: &Owner, visible: bool, acquire: i
     acquire()
 }
 
-fn finish_selection(service: &Host, registry: &ResultRegistry, owner: &Owner, visible: bool,
-    picked: Response<Option<Arc<DocumentsGrant>>>) -> Response<Value> {
-    let mut candidate = picked;
-    let response = change(service, |retiring| service.controller.with_visible_admission(&owner.invocation, || {
-        let mut access = service.documents.lock().expect("Find documents");
-        if !visible || access.panel.as_ref() != Some(owner) { return Err(stale()); }
-        access.panel = None;
-        match &mut candidate {
-            Ok(picked) => {
-                if let Some(grant) = picked.take() { access.replace(Some(grant), false, service, registry, retiring)?; }
-                Ok(access.view())
+fn finish_selection(service: &Host, registry: &ResultRegistry, owner: &Owner, visible: impl Fn() -> bool,
+    acquire: impl FnOnce() -> Response<Option<Arc<DocumentsGrant>>>) -> Response<Value> {
+    // Keep native acquisition, commit, and discard in the same worker-side
+    // transition. A revoke acknowledgment cannot overtake an in-flight pickup.
+    change(service, |retiring| {
+        let mut candidate = acquire_for_owner(service, owner, visible(), acquire);
+        let is_visible = visible();
+        let response = service.controller.with_visible_admission(&owner.invocation, || {
+            let mut access = service.documents.lock().expect("Find documents");
+            if !is_visible || access.panel.as_ref() != Some(owner) { return Err(stale()); }
+            access.panel = None;
+            match &mut candidate {
+                Ok(picked) => {
+                    if let Some(grant) = picked.take() { access.replace(Some(grant), false, service, registry, retiring)?; }
+                    Ok(access.view())
+                }
+                Err(err) => Err(err.clone()),
             }
-            Err(err) => Err(err.clone()),
+        }).unwrap_or_else(|| Err(stale()));
+        if response.is_err() {
+            let mut access = service.documents.lock().expect("Find documents");
+            if access.panel.as_ref() == Some(owner) { access.panel = None; }
+            drop(access);
+            if let Ok(Some(discarded)) = candidate { discarded.revoke(); }
         }
-    }).unwrap_or_else(|| Err(stale())));
-    if response.is_err() {
-        let mut access = service.documents.lock().expect("Find documents");
-        if access.panel.as_ref() == Some(owner) { access.panel = None; }
-        drop(access);
-        if let Ok(Some(discarded)) = candidate { discarded.revoke(); }
-    }
-    response
+        response
+    })
 }
 
 type Selection = Response<Option<Retained<NSURL>>>;
@@ -204,27 +220,15 @@ pub(crate) async fn grant_find_documents_access(window: WebviewWindow, invocatio
         }
     }).await??;
     let selection = selected.await.unwrap_or_else(|_| Err(failed()));
-    let service = host(&app);
-    let picked = match selection {
-        Ok(Some(url)) => {
-            let owner_copy = owner.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                // The blocking worker may have queued behind newer input. Check
-                // again immediately before acquiring any native authorization.
-                acquire_for_owner(&service, &owner_copy, window.is_visible().unwrap_or(false), || {
-                    objc2::rc::autoreleasepool(|_| DocumentsGrant::from_selection(&url))
-                        .map(Some).map_err(|_| error("documentsAccessDenied"))
-                })
-            }).await.unwrap_or_else(|_| Err(failed()))
-        }
-        Ok(None) => Ok(None),
-        Err(err) => Err(err),
-    };
     let finished = owner.invocation.clone();
     let worker = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let visible = worker.get_webview_window("find").is_some_and(|w| w.is_visible().unwrap_or(false));
-        finish_selection(&host(&worker), registries(&worker).find(), &owner, visible, picked)
+        finish_selection(&host(&worker), registries(&worker).find(), &owner,
+            || window.is_visible().unwrap_or(false), || match selection? {
+                Some(url) => objc2::rc::autoreleasepool(|_| DocumentsGrant::from_selection(&url))
+                    .map(Some).map_err(|_| error("documentsAccessDenied")),
+                None => Ok(None),
+            })
     }).await.map_err(|_| failed())?;
     // AppKit may restore the parent key window after the sheet callback. If the
     // user switched apps in the meantime, this invocation now owns ordinary blur.
@@ -371,14 +375,14 @@ mod tests {
         let reserve = || service.documents.lock().unwrap().reserve("A").unwrap();
         let owner = reserve();
         assert!(sheet_owns_focus(&service, "A"));
-        assert_eq!(finish_selection(&service, registry, &owner, true, Ok(Some(grant.clone()))).unwrap(),
+        assert_eq!(finish_selection(&service, registry, &owner, || true, || Ok(Some(grant.clone()))).unwrap(),
             json!({"status":"granted","revision":"1"}));
         assert!(!registry.is_execution_ticket_current(&old));
         let owner = reserve();
-        assert_eq!(finish_selection(&service, registry, &owner, true, Ok(None)).unwrap()["revision"], "1");
+        assert_eq!(finish_selection(&service, registry, &owner, || true, || Ok(None)).unwrap()["revision"], "1");
         assert!(grant.is_active());
         let owner = reserve();
-        assert!(finish_selection(&service, registry, &owner, true, Err(error("documentsAccessDenied"))).is_err());
+        assert!(finish_selection(&service, registry, &owner, || true, || Err(error("documentsAccessDenied"))).is_err());
         assert!(grant.is_active());
         let (token, cancel) = service.files.begin(&service.controller, registry, "A", 2, false).unwrap();
         change(&service, |retiring| service.documents.lock().unwrap()
@@ -408,15 +412,19 @@ mod tests {
         let should_not_acquire = || -> Response<()> { panic!("stale chooser reached native authorization") };
         assert!(acquire_for_owner(&service, &a, true, should_not_acquire).is_err());
         assert!(acquire_for_owner(&service, &b, false, should_not_acquire).is_err());
-        let discarded = fixture.grant();
-        assert!(finish_selection(&service, registries.find(), &a, true, Ok(Some(discarded.clone()))).is_err());
-        assert!(!discarded.is_active());
+        assert!(finish_selection(&service, registries.find(), &a, || true,
+            || panic!("old panel acquired a grant")).is_err());
         assert!(still_selecting(&service, &b));
         assert_eq!(service.documents.lock().unwrap().view()["revision"], "0");
-        service.controller.shutdown();
+        let discarded = fixture.grant();
+        assert!(finish_selection(&service, registries.find(), &b, || true, || {
+            service.controller.shutdown();
+            Ok(Some(discarded.clone()))
+        }).is_err());
+        assert!(!discarded.is_active());
         let grant = detach_on_exit(&service);
         drain_on_worker(&service, grant);
         assert!(!still_selecting(&service, &b));
-        assert!(finish_selection(&service, registries.find(), &b, false, Ok(None)).is_err());
+        assert!(finish_selection(&service, registries.find(), &b, || false, || Ok(None)).is_err());
     }
 }
