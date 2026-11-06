@@ -607,7 +607,10 @@ fn valid_command(command: &PublicCommandV1) -> bool {
         && !has_duplicates(command.input_capabilities.iter().copied())
         && (command.input_capabilities.is_empty()
             || (command.activation_mode == PublicActivationMode::Submit
-                && command.output_mode == PublicOutputMode::MainResult))
+                && matches!(
+                    command.output_mode,
+                    PublicOutputMode::MainResult | PublicOutputMode::Panel
+                )))
 }
 
 fn validate_manifest(
@@ -787,6 +790,18 @@ fn validate_manifest(
         .normalized_commands()
         .any(|(_, command)| !command.input_capabilities.is_empty())
         && (minimum_host < [0, 20, 0] || manifest.supported_platforms != [PublicPlatform::Windows])
+    {
+        return Err(PublicPackageError::IncompatibleApi);
+    }
+    if manifest.normalized_commands().any(|(_, command)| {
+        !command.input_capabilities.is_empty() && command.output_mode == PublicOutputMode::Panel
+    }) && (minimum_host < [0, 21, 0]
+        || manifest.legacy_command().is_none()
+        || !manifest
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.runtime_actions)
+        || !manifest.permissions.contains(&PublicPermission::UiPanel))
     {
         return Err(PublicPackageError::IncompatibleApi);
     }
@@ -1126,6 +1141,46 @@ mod schema_tests {
             &serde_json::to_vec(value).unwrap(),
             &PublicPluginHost::current(PublicPlatform::Windows),
         )
+    }
+
+    #[test]
+    fn image_panel_capability_contract() {
+        let mut value = manifest(None);
+        value["minimumHostVersion"] = serde_json::json!("0.21.0");
+        value["command"]["inputCapabilities"] = serde_json::json!(["image.ocr"]);
+        value["command"]["outputMode"] = serde_json::json!("panel");
+        value["panel"] = serde_json::json!({"entry":"dist/panel.html", "runtimeActions":true});
+        value["permissions"] = serde_json::json!(["ui.panel"]);
+        let host = PublicPluginHost {
+            version: [0, 21, 0],
+            ..PublicPluginHost::current(PublicPlatform::Windows)
+        };
+        let parse = |v: &Value| parse_manifest(&serde_json::to_vec(v).unwrap(), &host);
+        assert!(parse(&value).is_ok());
+        for (pointer, invalid) in [
+            ("/minimumHostVersion", serde_json::json!("0.20.0")),
+            ("/panel/runtimeActions", serde_json::json!(false)),
+            ("/permissions", serde_json::json!([])),
+            ("/command/activationMode", serde_json::json!("live")),
+            (
+                "/supportedPlatforms",
+                serde_json::json!(["windows", "macos"]),
+            ),
+        ] {
+            let mut invalid_value = value.clone();
+            *invalid_value.pointer_mut(pointer).unwrap() = invalid;
+            assert!(parse(&invalid_value).is_err(), "{pointer}");
+        }
+        let mut named = value.clone();
+        let mut command = named.as_object_mut().unwrap().remove("command").unwrap();
+        command["id"] = serde_json::json!("ocr");
+        named["commands"] = serde_json::json!([command]);
+        assert!(parse(&named).is_err());
+        let old_host = PublicPluginHost {
+            version: [0, 20, 0],
+            ..host
+        };
+        assert!(parse_manifest(&serde_json::to_vec(&value).unwrap(), &old_host).is_err());
     }
 
     #[test]

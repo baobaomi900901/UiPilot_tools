@@ -286,7 +286,7 @@ function validCommand(command: PublicCommandV1): boolean {
     (!command.inputRequired || !!command.inputPlaceholder?.trim()) &&
     (command.inputPlaceholder == null || plainText(command.inputPlaceholder)) &&
     !duplicates(command.inputCapabilities ?? []) &&
-    (!(command.inputCapabilities?.length) || (command.activationMode === 'submit' && command.outputMode === 'mainResult'))
+    (!(command.inputCapabilities?.length) || (command.activationMode === 'submit' && (command.outputMode === 'mainResult' || command.outputMode === 'panel')))
 }
 
 function sharedSemanticPointers(manifest: PublicManifestV1): string[] {
@@ -415,7 +415,7 @@ function namedCommandIssues(manifest: PublicManifestV1 & { commands: PublicNamed
         /\p{Cc}/u.test(command.summary)), 'summary', 'Command summary must be nonempty, at most 512 Unicode scalars, and contain no control characters.'],
       [command.inputRequired && !command.inputPlaceholder?.trim(), 'inputPlaceholder', 'A command requiring input must have a nonempty placeholder.'],
       [command.inputPlaceholder != null && !plainText(command.inputPlaceholder), 'inputPlaceholder', 'Command inputPlaceholder must be plain text.'],
-      [duplicates(command.inputCapabilities ?? []) || (!!command.inputCapabilities?.length && (command.activationMode !== 'submit' || command.outputMode !== 'mainResult')), 'inputCapabilities', 'Image OCR requires unique capabilities and submit/mainResult output.'],
+      [duplicates(command.inputCapabilities ?? []) || (!!command.inputCapabilities?.length && (command.activationMode !== 'submit' || (command.outputMode !== 'mainResult' && command.outputMode !== 'panel'))), 'inputCapabilities', 'Image OCR requires unique capabilities and submit/mainResult output.'],
     ]
     for (const [invalid, field, message] of rules) if (invalid) issues.push({
       code: 'MANIFEST_SEMANTIC_INVALID', message,
@@ -513,6 +513,7 @@ function validateParsedManifest(
     manifest.apiVersion !== 1 ||
     !minimumHost ||
     (normalizedCommands(manifest).some(({ command }) => !!command.inputCapabilities?.length) && (versionGreater([0, 20, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||
+    (normalizedCommands(manifest).some(({ command }) => !!command.inputCapabilities?.length && command.outputMode === 'panel') && (versionGreater([0, 21, 0], minimumHost) || manifest.commands !== undefined || manifest.panel?.runtimeActions !== true || !manifest.permissions.includes('ui.panel'))) ||
     (manifest.permissions.includes('files.openText') && (versionGreater([0, 13, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.window') || !manifest.window || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'window' || manifest.commands !== undefined)) ||
     (manifest.permissions.includes('speech.speak') && (versionGreater([0, 18, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows' || !manifest.permissions.includes('ui.panel') || !manifest.panel || manifest.command?.activationMode !== 'submit' || manifest.command?.outputMode !== 'panel' || manifest.commands !== undefined)) ||
     (manifest.permissions.includes('clipboard.history.copy') && (versionGreater([0, 17, 0], minimumHost) || manifest.supportedPlatforms.length !== 1 || manifest.supportedPlatforms[0] !== 'windows')) ||

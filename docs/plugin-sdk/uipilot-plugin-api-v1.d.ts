@@ -308,8 +308,25 @@ export type PluginHandler = (
   api: Readonly<UiPilotPluginApiV1>,
 ) => Promise<PluginResponse>
 
-export interface PluginPanelRequest { action: string; payload: JsonValue }
+/** Windows Host 0.21.0+: bounded display preview; recognition uses the original snapshot. */
+export interface PanelImageSnapshot extends PluginImageInput {
+  /** PNG, longest edge <=512px, encoded bytes <=40KiB. */
+  readonly previewDataUrl: string
+}
+export interface PluginPanelImageChangedEvent {
+  readonly sessionEpoch: U64Decimal
+  readonly revision: U64Decimal
+  readonly image: Readonly<PanelImageSnapshot> | null
+}
+export interface PluginPanelRequest {
+  action: string
+  payload: JsonValue
+  /** Host 0.21.0+: current Panel image reference, at most 512 characters. */
+  imageId?: string
+}
 export interface PluginPanelActionInvocation {
+  /** Host 0.21.0+: request-bound reference, distinct from the Panel snapshot ID. */
+  readonly image?: Readonly<PluginImageInput>
   apiVersion: 1
   requestId: string
   action: string
@@ -538,6 +555,13 @@ export interface UiPilotPluginPanelSpeechApiV1 {
 }
 
 export interface UiPilotPluginPanelApiV1 {
+  /** Windows Host 0.21.0+ image Panel only. Register before first onUpdate.
+   * Latest snapshot after Ready, then on revision changes; event <=64KiB.
+   * Unsubscribe/teardown invalidates queued delivery. All fields are deeply frozen.
+   */
+  onImageChanged?(handler: (event: Readonly<PluginPanelImageChangedEvent>) => void | Promise<void>): () => void
+  /** Current session only; publishes an empty image revision. Old session: ExpiredPanelSession. */
+  readonly clearImage?: () => Promise<void>
   /** Host 0.16.0+. One synchronous provider, evaluated before the menu takes focus.
    * Up to 12 actions per group. Return null while a plugin modal owns focus.
    * Session/input updates invalidate open actions. Callbacks must also guard object identity.

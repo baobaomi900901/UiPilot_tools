@@ -68,6 +68,33 @@ describe('validateManifest', () => {
     expect(validate({ ...base, commands: [{ ...command, id: 'ocr' }] }).ok).toBe(false)
   })
 
+  function panelImageManifest(): any {
+    return { ...imageManifest(), minimumHostVersion: '0.21.0',
+      command: { ...imageManifest().command, outputMode: 'panel' },
+      panel: { entry: 'dist/panel.html', runtimeActions: true }, permissions: ['ui.panel'] }
+  }
+
+  it('accepts Windows single-command image Panel on Host 0.21.0', () => {
+    expect(validate(panelImageManifest())).toMatchObject({ ok: true })
+  })
+
+  it.each([
+    ['missing runtimeActions', (v: any) => { delete v.panel.runtimeActions }],
+    ['missing ui.panel', (v: any) => { v.permissions = [] }],
+    ['old floor', (v: any) => { v.minimumHostVersion = '0.20.0' }],
+    ['live', (v: any) => { v.command.activationMode = 'live' }],
+    ['other platform', (v: any) => { v.supportedPlatforms = ['windows', 'macos'] }],
+    ['named commands', (v: any) => { v.commands = [{ ...v.command, id: 'ocr' }]; delete v.command }],
+  ])('rejects image Panel with %s', (_label, mutate) => {
+    const value = panelImageManifest()
+    mutate(value)
+    expect(validate(value).ok).toBe(false)
+  })
+
+  it('rejects image Panel on installed Host 0.20.0', () => {
+    expect(validateManifest(Buffer.from(JSON.stringify(panelImageManifest())), 'windows', [0, 20, 0]).ok).toBe(false)
+  })
+
   it('rejects OCR packages on older installed hosts', () => {
     expect(validateManifest(Buffer.from(JSON.stringify(imageManifest())), 'windows', [0, 19, 0])).toMatchObject({ ok: false })
   })
@@ -137,7 +164,7 @@ describe('validateManifest', () => {
     })
 
     const tooNewHost = structuredClone(value)
-    tooNewHost.minimumHostVersion = '0.20.1'
+    tooNewHost.minimumHostVersion = '0.21.1'
     expect(validate(tooNewHost)).toMatchObject({
       ok: false,
       issues: [{ code: 'API_INCOMPATIBLE' }],
