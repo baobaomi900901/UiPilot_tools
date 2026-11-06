@@ -4,7 +4,7 @@
 
 **实施顺序**：1 → 2 → 3 → 4 → 5 → 6 → 7 为首版。发布后 8、10 可独立开展，两者的支持矩阵均确定后才进行 9。Task 1 的新设计在批准后成为接口、状态、失败语义的唯一合同；Tasks 8–10 各自需要后续规格。本文按该合同组织实施，不预先定义新的 IPC 字段、默认按键或授权规则。
 
-**技术边界**：0.19.0 基线，Rust 1.96.1、锁定的 Tauri 2 与 React 19；Windows 原生构建链继续回归。仅发布 aarch64-apple-darwin，不发布 Intel 或 Universal，不以 Rosetta 启动。最低版本候选 15.7.4；M1 + 精确最低系统、后续 Apple Silicon + 较新系统两行均需使用同一最终产物。macOS SIP、Gatekeeper、TCC 与 CSP 按正常设置运行。
+**技术边界**：0.19.0 基线，Rust 1.96.1、锁定的 Tauri 2 与 React 19；Windows 原生构建链继续回归。仅发布 aarch64-apple-darwin，不发布 Intel 或 Universal，不以 Rosetta 启动。最低版本候选 15.7.4；本轮验证 M1 + 精确最低系统；按用户决定跳过较新芯片和系统组合，未实测。macOS SIP、Gatekeeper、TCC 与 CSP 按正常设置运行。
 
 **执行与证据**：从仓库根目录运行命令。每项实现先令聚焦测试按预期失败，再作最小实现并复跑；每项形成独立提交，规格/质量审查通过才移交。每个编号步骤按顺序执行，在本任务记录中以同一编号关联：前置版本/环境、操作、实际结果与测试名或日志片段。Rust 过滤器用同命令追加 -- --list 核对新增用例，再运行并检查通过数量；0 tests 不算通过。前端测试文件也须有实际命中的断言。未测、阻塞和失败分开记录，不得视为通过。保存脱敏证据（commit、设备芯片及 OS/build、命令/退出码、包 SHA-256），不记录密钥和用户内容。测试用临时目录及隔离账户。改变真实前台、安装、输入控制、系统权限、登录项及正式签名分发，应先取得对应操作的明确确认。
 
@@ -104,7 +104,7 @@
 - [ ] **7.1 组合 CI。** 为 Mac/Windows 分别预检 host、工具链、缓存和外部依赖。Mac 记录 uname 与 rustc host；Windows 从 scripts/provider_build.py 实际选择的 UIPILOT_RUST_UIA_ROOT、.uipilot-local.json 或默认 D:/code/rust_uia 获取 Provider 源码，记录 revision、runner、构建清单/hash；缺失即阻塞，不能取不匹配 exe 代替。两平台执行完整本地协调器；按 manifest 分组验证正向平台与不支持平台，保留 Windows-only 示例合同。保存每阶段状态及实际验证包数。
 - [ ] **7.2 检查实际包。** CI 从干净输出生成 app/dmg 和 Windows 安装包。新增脚本只读挂载本次 DMG 并定位其中的 .app，取 Info.plist 的 CFBundleExecutable/LSMinimumSystemVersion/标识和图标；遍历全部 Mach-O，以 `lipo -archs`、`otool -l` 核对仅 arm64、部署下限不高于声明版本，并核对主程序的部署目标。注入错误 slice、较高 minos、.exe/.dll 或错误最低版本的夹具，逐个要求脚本非零。验证结束释放挂载；Windows 检查 NSIS/Helper、Provider 及 Everything 清单与产物哈希。
 - [ ] **7.3 验证公开分发。** 在获授权的发布流程中签名、公证、staple，保留工具结果；用 `codesign --verify --deep --strict --verbose=2 "$app"`、`xcrun stapler validate "$dmg"` 和 `spctl --assess --type execute "$app"` 校验（变量分别指该候选 DMG 内 .app 与 DMG）。使用真实下载、带隔离属性的候选包执行安装；确认签名身份、hardened runtime 与 Gatekeeper 验收，记录最终 DMG SHA-256。未能签名/公证时只登记内部测试包，公开发布状态为阻塞。
-- [ ] **7.4 做三行实机验收。** M1 + 精确最低 OS、后续 Apple Silicon + 较新 OS 分别下载同一哈希的包，干净安装、菜单和快捷键唤起、中英文搜索、启动/激活、Esc、睡眠恢复、重开、替换升级保留设置、正常退出和卸载应用；核对无非核心权限弹窗。Windows 在干净测试环境安装该次 NSIS，核对 apps、文件搜索、插件授权、托盘退出及原资源；填独立运行结果、视频/日志和证据位置。任一必需行缺失或失败则发布未通过。
+- [ ] **7.4 做 M1 和 Windows 实机验收。** M1 + 精确最低 OS 使用已核验哈希的包，干净安装、菜单和快捷键唤起、中英文搜索、启动/激活、Esc、睡眠恢复、重开、替换升级保留设置、正常退出和卸载应用；核对无非核心权限弹窗。Windows 在干净测试环境安装该次 NSIS，核对 apps、文件搜索、插件授权、托盘退出及原资源；填独立运行结果、视频/日志和证据位置。任一必需行缺失或失败则发布未通过。
 
 **Distinct test coverage:** 同一最终 DMG 的两种芯片行、不满足架构/最低版本的反例，以及 Windows 从安装器到启动的独立实测；编译与开发包测试不能代替这三行。
 **Verify:** 双平台 `npm run verify:local`；Mac `npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg`、`node scripts/verify-macos-bundle.mjs`；Windows `npm run tauri -- build`。验收记录包含检查的 .app 来源、最终签名后哈希、安装/升级版本和三个实际结果。至此即可判定**首版**，以下各任务单独发版。

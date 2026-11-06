@@ -18,7 +18,7 @@
 | 2 构建入口 | Mac Vite/Tauri 构建与配置测试通过。Windows x64 原生构建生成 NSIS 与 MSI，测试者确认 NSIS 安装后可正常使用 | Windows 服务专项回归 |
 | 3、6 宿主和前端 | 正式宿主与前端已合入，内部 arm64 包已生成；本地 ACL、库测试及前端测试通过 | 主题切换、中文输入法组合输入 |
 | 4、5 应用与快捷键 | `ca77db1`、`bad4cb1` 已合入；复审修正 `4354513`、`24d18aa` 进入候选 `a79f612`。候选通过集成终审和 103 项 Rust 库测试 | 休眠恢复、多显示器、快捷键冲突及改键后的持久化 |
-| 7 发布门槛 | 候选全仓九阶段验证通过，本地签名 app/DMG、真实包检查、34 个平台/示例组合已验证；M1 Pro 从 DMG 安装后启动、快捷键唤起和输入通过；Windows 实机全量本地验证退出码 0，NSIS 哈希和人工安装结果见[设备验收单](../../releases/2026-11-06-desktop-port-device-checks.md) | 同一 DMG 的较新 Apple Silicon Mac 安装验收、Windows 升级/卸载等专项及公开发布签名/公证 |
+| 7 发布门槛 | 候选全仓九阶段验证通过，本地签名 app/DMG、真实包检查、34 个平台/示例组合已验证；M1 Pro 从 DMG 安装后启动、快捷键唤起和输入通过；Windows 实机全量本地验证退出码 0，NSIS 哈希和人工安装结果见[设备验收单](../../releases/2026-11-06-desktop-port-device-checks.md) | Windows 升级/卸载等专项及公开发布签名/公证 |
 | 8–10 后续能力 | 按功能分别立项 | 依赖首版发布门槛及后续规格 |
 
 内部候选 `a79f612` 的 DMG SHA-256 为 `3c640e2b8da704d438f59afcb437cc06509273b1bcff05e792e44e04cede77a3`，主程序 SHA-256 为 `5656161a61cb60c9480023ddd4f94b28e3711785ad8e5aeaff7e5a608df02b6d`。已只读挂载 DMG 并确认其中的主程序与单独交付的 .app 一致。
@@ -36,7 +36,7 @@
 | 后续 | 文件/目录搜索与 Finder 定位、插件（含旧版及公开插件）、凭据、其他内置命令、登录时启动、双击修饰键、剪贴板历史/粘贴、选中文本、截图、通知与进程工具 | 首版仅列出核心入口；旧设置、收藏、快捷键、深链或直接 IPC 均须经过同一能力边界 |
 | Windows 专用 | Everything、SystemIndex、Provider、提升 Helper、WebView2、NSIS | 继续由 Windows 构建并回归 |
 
-- **最低版本候选为 macOS 15.7.4。** 当前原生 arm64 主机可复现该补丁版本；这是保守的首版产品选择，不代表依赖的理论下限。Task 1 核对锁文件、Xcode/SDK、WKWebView、所需 API 可用性及测试设备。发布门槛为 **M1 + 精确最低系统** 和 **后续 Apple Silicon + 较新系统** 两行通过相同发布包的启动器闭环。保留芯片、OS/build、工具链及包哈希；本机的 `uname -m` 与 `sw_vers` 不能替代这些证据。若依赖或设备无法满足，阻断发布；修改下限需更新设计、包元数据、验收行和支持说明并重验。
+- **最低版本候选为 macOS 15.7.4。** 当前原生 arm64 主机可复现该补丁版本；这是保守的首版产品选择，不代表依赖的理论下限。Task 1 核对锁文件、Xcode/SDK、WKWebView、所需 API 可用性及测试设备。本轮必测 Mac 为 **M1 + 精确最低系统**。2026-11-06 按用户决定跳过后续 Apple Silicon + 较新系统实机行；该组合未实测，不阻塞本轮验收。保留芯片、OS/build、工具链及包哈希；本机的 `uname -m` 与 `sw_vers` 不能替代这些证据。若依赖或设备无法满足，阻断发布；修改下限需更新设计、包元数据、验收行和支持说明并重验。
 - 保持 0.19.0 基线、Rust 1.96.1、锁定的 Tauri 2、React 19、TypeScript/Vite 及现有 IPC 调用者边界。按 [UI 规范](../../ui-guidelines.md) 验证明暗主题、焦点、输入法和键盘操作。沿用已有收藏协议（现有应用条目的 `favorite` 为 None）；不借移植改变 Windows 应用结果行为。
 - 首版不触发辅助功能、录屏、输入监控、完全磁盘访问或登录项授权。真实切换焦点/打开应用、安装、注册登录项、输入模拟、使用签名身份及对外发布须在对应实机阶段先取得范围明确的确认。本轮仅改计划。
 
@@ -135,7 +135,7 @@
 - [ ] 检查 .dmg 中实际交付的 .app，验证 Info.plist 的 LSMinimumSystemVersion、主程序和随附 Mach-O 的架构（lipo -archs 仅 arm64）及 LC_BUILD_VERSION/minos 与下限相容、bundle ID、图标、资源；排除 .exe/.dll 及 Windows 工具。Windows 安装包反向检查 Helper/Provider/Everything、NSIS hooks 和既有安装操作。
 - [ ] 对外分发前用授权的 Developer ID 签名、hardened runtime、公证并 staple；以 codesign、stapler、Gatekeeper 和带下载隔离属性的干净安装验收记录为凭。无身份时仅交付明确标记的本地测试包，保留公开发布阻塞项。
 
-**Distinct test coverage:** 错误 slice/最低版本、嵌套二进制要求更高系统或夹带 Windows 资源均导致包门禁失败；同一候选包在最低 OS M1 与较新系统后续芯片安装、替换升级保留设置、卸载后退出清理，二次启动恢复正常；Windows 干净安装仍能搜索并打开应用。
+**Distinct test coverage:** 错误 slice/最低版本、嵌套二进制要求更高系统或夹带 Windows 资源均导致包门禁失败；候选包在最低 OS M1 安装、替换升级保留设置、卸载后退出清理，二次启动恢复正常；Windows 干净安装仍能搜索并打开应用。
 
 **Verify:** 双平台 `npm run verify:local`；Mac `npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg`，再从仓库根目录运行新增的 `node scripts/verify-macos-bundle.mjs`（定位该次输出，校验并打印包哈希）；Windows `npm run tauri -- build`。记录两平台完整命令、状态与产物。
 

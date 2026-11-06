@@ -1,6 +1,6 @@
 # macOS Find 与 Spotlight 文件搜索设计
 
-**状态：待单独批准的 Task 8 设计输入。** 基线 `37d1bca`，适用 M1 系列及后续 Apple Silicon。当前生产 Mac 仍只开放核心启动器，`HostCapabilities.files=false`。本次只验证只读系统 API；首版 Task 7 的 Windows 原生交付、后续芯片/较新系统、公证与 Gatekeeper 等未完成行仍按各自门槛处理。Task 8 产品实现依赖 Task 7 通过与本规格获批。参见[首版支持矩阵及 Task 8](../plans/2026-11-06-macos-port.md)和[逐步验收 §8](../plans/2026-11-06-macos-port-steps.md)。
+**状态：待单独批准的 Task 8 设计输入。** 基线 `37d1bca`，适用 M1 系列及后续 Apple Silicon。当前生产 Mac 仍只开放核心启动器，`HostCapabilities.files=false`。本次只验证只读系统 API；首版 Task 7 的 Windows 原生交付进展见设备验收单；按用户决定跳过后续芯片/较新系统实机行。公开分发的公证与 Gatekeeper 验收仍单列。Task 8 产品实现依赖 Task 7 通过与本规格获批。参见[首版支持矩阵及 Task 8](../plans/2026-11-06-macos-port.md)和[逐步验收 §8](../plans/2026-11-06-macos-port-steps.md)。
 
 ## 用户可见范围与默认行为
 
