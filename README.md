@@ -32,6 +32,10 @@ npm run tauri -- build # 原生应用构建
 
 Windows 下安装 Python 3.10+ 后，在终端运行 **.\Pack.cmd**（也可双击），或直接执行 `python -X utf8 scripts/package.py`：输入 `1` 打包主程序 Setup，输入 `2` 后从列表选择一个插件打包。打包器仅使用 Python 标准库。产物固定在 `artifacts/packages/setup` 和 `artifacts/packages/plugins`，同名文件在新包成功后自动覆盖。准备条件和使用方法见[打包工具说明](docs/packaging-tool.md)。
 
+## 原生 CI 验证
+
+[Desktop port verification](.github/workflows/desktop-port.yml) 由维护者手动触发。Mac runner 需要 `self-hosted, macOS, ARM64, uipilot-build` 标签、原生 Node 22、仓库指定的 Rust 和 macOS SDK。Windows runner 需要 `self-hosted, Windows, X64, uipilot-provider` 标签、Node 22、MSVC/Rust、NSIS 与现有 Windows 构建依赖，另需备妥独立 Provider 源码（通过 `UIPILOT_RUST_UIA_ROOT` 指定，或使用既有位置）。两个 runner 均需能取得锁定依赖。工作流构建本地测试包并检查，不发布。真实安装、窗口焦点、较新芯片与最低系统的验收须在独立测试设备记录。
+
 ## 验证
 
 ```powershell

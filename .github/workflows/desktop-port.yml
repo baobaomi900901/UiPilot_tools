@@ -1,0 +1,56 @@
+name: Desktop port verification
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: [self-hosted, macOS, ARM64, uipilot-build]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify native toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
+          node -e "if(process.arch !== 'arm64' || Number(process.versions.node.split('.')[0]) < 22) process.exit(1)"
+          sw_vers
+          xcrun --show-sdk-version
+          cargo --version
+      - name: Install locked dependencies
+        run: |
+          npm ci
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+      - name: Run local checks and signed internal bundle smoke
+        run: |
+          npm run verify:local
+          node --test scripts/platform-launcher.test.mjs scripts/macos-host-acl.test.mjs scripts/verify-macos-bundle.test.mjs
+          npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg --config src-tauri/tauri.macos-internal.conf.json -- --locked
+          node scripts/verify-macos-bundle.mjs
+  windows:
+    runs-on: [self-hosted, Windows, X64, uipilot-provider]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify native toolchain and independent Provider checkout
+        run: |
+          if (-not ((rustc -vV) -contains 'host: x86_64-pc-windows-msvc')) { throw 'Native MSVC toolchain required' }
+          node -e "if(process.arch !== 'x64' || Number(process.versions.node.split('.')[0]) < 22) process.exit(1)"
+          python -c "from scripts.provider_build import source_root; import subprocess; p=source_root(); assert (p/'Cargo.toml').is_file(), p; subprocess.run(['git', '-C', str(p), 'rev-parse', 'HEAD'], check=True)"
+      - name: Install locked dependencies
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+      - name: Run local checks
+        run: npm run verify:local
+      - name: Verify platform entry and staging
+        run: |
+          node --test scripts/platform-launcher.test.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run test:managed-everything
+      - name: Build Windows installer
+        run: npm run tauri -- build -- --locked
