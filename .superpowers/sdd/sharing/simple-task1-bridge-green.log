@@ -1,0 +1,13 @@
+
+> uipilot@0.22.0 test
+> vitest run src/plugin-panel-action-bootstrap.test.ts
+
+
+ RUN  v4.1.10 D:/code/UiPilot_tools
+
+
+ Test Files  1 passed (1)
+      Tests  10 passed (10)
+   Start at  21:39:13
+   Duration  1.19s (transform 64ms, setup 0ms, import 89ms, tests 680ms, environment 0ms)
+

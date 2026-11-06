@@ -1,0 +1,2 @@
+node node_modules/typescript/bin/tsc --noEmit (final working tree)
+exit=0

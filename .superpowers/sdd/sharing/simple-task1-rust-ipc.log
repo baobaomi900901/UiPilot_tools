@@ -1,0 +1,8 @@
+
+running 3 tests
+test commands::tests::plugin_panel_focus_main_thread_effects_run_only_after_a_current_claim ... ok
+test commands::tests::plugin_panel_focus_commands_split_content_request_and_main_ack_capabilities ... ok
+test commands::tests::plugin_panel_commands_derive_identity_from_exact_caller_labels ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2021 filtered out; finished in 0.04s
+

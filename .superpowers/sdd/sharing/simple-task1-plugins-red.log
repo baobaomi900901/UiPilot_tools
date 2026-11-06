@@ -1,0 +1,197 @@
+TAP version 13
+# Subtest: receivers register before update; no autofocus; readiness and image initialize once
+ok 1 - receivers register before update; no autofocus; readiness and image initialize once
+  ---
+  duration_ms: 216.0779
+  type: 'test'
+  ...
+# Subtest: host Enter ACK is immediate, copy uses current edited value, native focus returns even when empty
+ok 2 - host Enter ACK is immediate, copy uses current edited value, native focus returns even when empty
+  ---
+  duration_ms: 29.5227
+  type: 'test'
+  ...
+# Subtest: local textarea newline, IME and repeats remain isolated; deterministic Tab spans main input and controls
+ok 3 - local textarea newline, IME and repeats remain isolated; deterministic Tab spans main input and controls
+  ---
+  duration_ms: 31.8021
+  type: 'test'
+  ...
+# Subtest: clear pending disables old copy immediately; stale copy feedback cannot restore state
+ok 4 - clear pending disables old copy immediately; stale copy feedback cannot restore state
+  ---
+  duration_ms: 21.9251
+  type: 'test'
+  ...
+# Subtest: full long text copied unchanged, oversize edit rejected; errors and no text never copy
+ok 5 - full long text copied unchanged, oversize edit rejected; errors and no text never copy
+  ---
+  duration_ms: 23.6958
+  type: 'test'
+  ...
+# Subtest: failure retries explicitly; copy error preserves text; new session hides old text and stale actions
+ok 6 - failure retries explicitly; copy error preserves text; new session hides old text and stale actions
+  ---
+  duration_ms: 27.5829
+  type: 'test'
+  ...
+# Subtest: new image arriving before deferred clear IPC revokes the old clear intent
+ok 7 - new image arriving before deferred clear IPC revokes the old clear intent
+  ---
+  duration_ms: 20.094
+  type: 'test'
+  ...
+# Subtest: share snapshots current edited multiline OCR text and rejects loading/empty/error states
+not ok 8 - share snapshots current edited multiline OCR text and rejects loading/empty/error states
+  ---
+  duration_ms: 19.2383
+  type: 'test'
+  location: 'D:\\code\\UiPilot_tools\\examples\\public-plugins\\com.uipilot.ocr\\tests\\panel.test.js:88:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + undefined
+    - null
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: ~
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///D:/code/UiPilot_tools/examples/public-plugins/com.uipilot.ocr/tests/panel.test.js:89:60)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: Host readiness precedes update registration, replaces input/theme without stealing focus, and uses current request facade
+ok 9 - Host readiness precedes update registration, replaces input/theme without stealing focus, and uses current request facade
+  ---
+  duration_ms: 321.8349
+  type: 'test'
+  ...
+# Subtest: source and detection use same searchable selector; keyboard selection restores focus; target excludes auto
+ok 10 - source and detection use same searchable selector; keyboard selection restores focus; target excludes auto
+  ---
+  duration_ms: 139.9092
+  type: 'test'
+  ...
+# Subtest: single provider opens real selector and capability controls explain unavailable status
+ok 11 - single provider opens real selector and capability controls explain unavailable status
+  ---
+  duration_ms: 25.1399
+  type: 'test'
+  ...
+# Subtest: plain Enter and IME do not submit; Ctrl+Enter submits; stale action callbacks do nothing
+ok 12 - plain Enter and IME do not submit; Ctrl+Enter submits; stale action callbacks do nothing
+  ---
+  duration_ms: 132.5852
+  type: 'test'
+  ...
+# Subtest: preferences writes serialize/coalesce and preserve captured ownership without storing text
+ok 13 - preferences writes serialize/coalesce and preserve captured ownership without storing text
+  ---
+  duration_ms: 151.2942
+  type: 'test'
+  ...
+# Subtest: unavailable readiness stays explicit and disposing removes Host callbacks/timers
+ok 14 - unavailable readiness stays explicit and disposing removes Host callbacks/timers
+  ---
+  duration_ms: 62.1865
+  type: 'test'
+  ...
+# Subtest: same-session resubmit preserves unsaved local preferences while new session uses Runtime preferences
+ok 15 - same-session resubmit preserves unsaved local preferences while new session uses Runtime preferences
+  ---
+  duration_ms: 33.4966
+  type: 'test'
+  ...
+# Subtest: uncertain save failure is reported once without automatic retry or text persistence
+ok 16 - uncertain save failure is reported once without automatic retry or text persistence
+  ---
+  duration_ms: 77.3614
+  type: 'test'
+  ...
+# Subtest: choosing manual language from detection restores visible source control and modal traps Tab
+ok 17 - choosing manual language from detection restores visible source control and modal traps Tab
+  ---
+  duration_ms: 57.0476
+  type: 'test'
+  ...
+# Subtest: refresh keys are suppressed and search shortcut stays within the open selector
+ok 18 - refresh keys are suppressed and search shortcut stays within the open selector
+  ---
+  duration_ms: 43.5079
+  type: 'test'
+  ...
+# Subtest: injected effects receive captured facades, invalidation and disposal; stale menus cannot run them
+ok 19 - injected effects receive captured facades, invalidation and disposal; stale menus cannot run them
+  ---
+  duration_ms: 60.0385
+  type: 'test'
+  ...
+# Subtest: real effect adapter uses captured facades, accessible stop labels and shared Host actions
+ok 20 - real effect adapter uses captured facades, accessible stop labels and shared Host actions
+  ---
+  duration_ms: 140.3925
+  type: 'test'
+  ...
+# Subtest: real adapter editing preserves current value and selection, clears output and stops speech through IME
+ok 21 - real adapter editing preserves current value and selection, clears output and stops speech through IME
+  ---
+  duration_ms: 110.5467
+  type: 'test'
+  ...
+# Subtest: multilingual selector exposes manual-detection guidance and both text regions support RTL
+ok 22 - multilingual selector exposes manual-detection guidance and both text regions support RTL
+  ---
+  duration_ms: 65.5416
+  type: 'test'
+  ...
+# Subtest: keyboard navigation keeps the active language visible in a long list
+ok 23 - keyboard navigation keeps the active language visible in a long list
+  ---
+  duration_ms: 50.9193
+  type: 'test'
+  ...
+# Subtest: share accepts exact text once after preferences/Ready, translates once and exposes output source
+not ok 24 - share accepts exact text once after preferences/Ready, translates once and exposes output source
+  ---
+  duration_ms: 33.6129
+  type: 'test'
+  location: 'D:\\code\\UiPilot_tools\\examples\\public-plugins\\com.uipilot.translate\\tests\\panel.test.js:278:1'
+  failureType: 'testCodeFailure'
+  error: 'receiver is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    Object.receive (file:///D:/code/UiPilot_tools/examples/public-plugins/com.uipilot.translate/tests/panel.test.js:31:35)
+    TestContext.<anonymous> (file:///D:/code/UiPilot_tools/examples/public-plugins/com.uipilot.translate/tests/panel.test.js:281:21)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: shared translation business failure keeps received original and target UI without retry
+not ok 25 - shared translation business failure keeps received original and target UI without retry
+  ---
+  duration_ms: 16.0337
+  type: 'test'
+  location: 'D:\\code\\UiPilot_tools\\examples\\public-plugins\\com.uipilot.translate\\tests\\panel.test.js:287:1'
+  failureType: 'testCodeFailure'
+  error: 'receiver is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    Object.receive (file:///D:/code/UiPilot_tools/examples/public-plugins/com.uipilot.translate/tests/panel.test.js:31:35)
+    TestContext.<anonymous> (file:///D:/code/UiPilot_tools/examples/public-plugins/com.uipilot.translate/tests/panel.test.js:289:21)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+1..25
+# tests 25
+# suites 0
+# pass 22
+# fail 3
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 3992.1348

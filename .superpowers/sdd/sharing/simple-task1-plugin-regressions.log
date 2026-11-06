@@ -1,0 +1,886 @@
+TAP version 13
+# Subtest: all declared assets, HTML references and relative module imports remain inside the strict package
+ok 1 - all declared assets, HTML references and relative module imports remain inside the strict package
+  ---
+  duration_ms: 21.5457
+  type: 'test'
+  ...
+# Subtest: actual Panel and Runtime bootstraps: ACK/Ready, request-bound image, editable copy, latest pending and clear
+ok 2 - actual Panel and Runtime bootstraps: ACK/Ready, request-bound image, editable copy, latest pending and clear
+  ---
+  duration_ms: 258.0227
+  type: 'test'
+  ...
+# Subtest: actual bootstrap empty entry zero calls, safe provider failure, explicit retry, pagehide ignores late completion
+ok 3 - actual bootstrap empty entry zero calls, safe provider failure, explicit retry, pagehide ignores late completion
+  ---
+  duration_ms: 48.044
+  type: 'test'
+  ...
+# Subtest: ACK cannot request; matching Ready starts exactly once; same source no request
+ok 4 - ACK cannot request; matching Ready starts exactly once; same source no request
+  ---
+  duration_ms: 13.8611
+  type: 'test'
+  ...
+# Subtest: one physical active request plus latest pending A B C: only C displays
+ok 5 - one physical active request plus latest pending A B C: only C displays
+  ---
+  duration_ms: 2.4676
+  type: 'test'
+  ...
+# Subtest: same-session update preserves edited text/image and cannot repeat OCR
+ok 6 - same-session update preserves edited text/image and cannot repeat OCR
+  ---
+  duration_ms: 3.6825
+  type: 'test'
+  ...
+# Subtest: clear and replacement revoke pending/results while preserving physical single flight
+ok 7 - clear and replacement revoke pending/results while preserving physical single flight
+  ---
+  duration_ms: 1.6357
+  type: 'test'
+  ...
+# Subtest: failure disables copy, explicit retry, length bounds, disposal ignores response
+ok 8 - failure disables copy, explicit retry, length bounds, disposal ignores response
+  ---
+  duration_ms: 2.9567
+  type: 'test'
+  ...
+# Subtest: same-session update between scheduled pump and request cannot lose the current image
+ok 9 - same-session update between scheduled pump and request cannot lose the current image
+  ---
+  duration_ms: 1.9259
+  type: 'test'
+  ...
+# Subtest: receivers register before update; no autofocus; readiness and image initialize once
+ok 10 - receivers register before update; no autofocus; readiness and image initialize once
+  ---
+  duration_ms: 242.6341
+  type: 'test'
+  ...
+# Subtest: host Enter ACK is immediate, copy uses current edited value, native focus returns even when empty
+ok 11 - host Enter ACK is immediate, copy uses current edited value, native focus returns even when empty
+  ---
+  duration_ms: 32.1434
+  type: 'test'
+  ...
+# Subtest: local textarea newline, IME and repeats remain isolated; deterministic Tab spans main input and controls
+ok 12 - local textarea newline, IME and repeats remain isolated; deterministic Tab spans main input and controls
+  ---
+  duration_ms: 31.9667
+  type: 'test'
+  ...
+# Subtest: clear pending disables old copy immediately; stale copy feedback cannot restore state
+ok 13 - clear pending disables old copy immediately; stale copy feedback cannot restore state
+  ---
+  duration_ms: 23.0886
+  type: 'test'
+  ...
+# Subtest: full long text copied unchanged, oversize edit rejected; errors and no text never copy
+ok 14 - full long text copied unchanged, oversize edit rejected; errors and no text never copy
+  ---
+  duration_ms: 26.5262
+  type: 'test'
+  ...
+# Subtest: failure retries explicitly; copy error preserves text; new session hides old text and stale actions
+ok 15 - failure retries explicitly; copy error preserves text; new session hides old text and stale actions
+  ---
+  duration_ms: 27.6252
+  type: 'test'
+  ...
+# Subtest: new image arriving before deferred clear IPC revokes the old clear intent
+ok 16 - new image arriving before deferred clear IPC revokes the old clear intent
+  ---
+  duration_ms: 19.7551
+  type: 'test'
+  ...
+# Subtest: share snapshots current edited multiline OCR text and rejects loading/empty/error states
+ok 17 - share snapshots current edited multiline OCR text and rejects loading/empty/error states
+  ---
+  duration_ms: 19.6079
+  type: 'test'
+  ...
+# Subtest: new identity declares minimal image Panel contract
+ok 18 - new identity declares minimal image Panel contract
+  ---
+  duration_ms: 13.4412
+  type: 'test'
+  ...
+# Subtest: onCommand only initializes; service authority belongs to onPanelAction
+ok 19 - onCommand only initializes; service authority belongs to onPanelAction
+  ---
+  duration_ms: 3.4099
+  type: 'test'
+  ...
+# Subtest: safe CredentialNotConfiguredError, no retry
+ok 20 - safe CredentialNotConfiguredError, no retry
+  ---
+  duration_ms: 0.627
+  type: 'test'
+  ...
+# Subtest: safe CredentialDisabledError, no retry
+ok 21 - safe CredentialDisabledError, no retry
+  ---
+  duration_ms: 0.2709
+  type: 'test'
+  ...
+# Subtest: safe CredentialUnavailableError, no retry
+ok 22 - safe CredentialUnavailableError, no retry
+  ---
+  duration_ms: 0.4188
+  type: 'test'
+  ...
+# Subtest: safe ServicePermissionDeniedError, no retry
+ok 23 - safe ServicePermissionDeniedError, no retry
+  ---
+  duration_ms: 0.2857
+  type: 'test'
+  ...
+# Subtest: safe PermissionDeniedError, no retry
+ok 24 - safe PermissionDeniedError, no retry
+  ---
+  duration_ms: 0.5729
+  type: 'test'
+  ...
+# Subtest: safe NetworkTargetDeniedError, no retry
+ok 25 - safe NetworkTargetDeniedError, no retry
+  ---
+  duration_ms: 0.4861
+  type: 'test'
+  ...
+# Subtest: safe ProviderAuthenticationError, no retry
+ok 26 - safe ProviderAuthenticationError, no retry
+  ---
+  duration_ms: 0.8974
+  type: 'test'
+  ...
+# Subtest: safe ProviderQuotaError, no retry
+ok 27 - safe ProviderQuotaError, no retry
+  ---
+  duration_ms: 1.1664
+  type: 'test'
+  ...
+# Subtest: safe NetworkTimeoutError, no retry
+ok 28 - safe NetworkTimeoutError, no retry
+  ---
+  duration_ms: 0.5783
+  type: 'test'
+  ...
+# Subtest: safe NetworkFailureError, no retry
+ok 29 - safe NetworkFailureError, no retry
+  ---
+  duration_ms: 0.687
+  type: 'test'
+  ...
+# Subtest: safe NetworkLimitExceededError, no retry
+ok 30 - safe NetworkLimitExceededError, no retry
+  ---
+  duration_ms: 0.2474
+  type: 'test'
+  ...
+# Subtest: safe NetworkResponseTooLargeError, no retry
+ok 31 - safe NetworkResponseTooLargeError, no retry
+  ---
+  duration_ms: 0.2222
+  type: 'test'
+  ...
+# Subtest: safe NetworkResponseInvalidError, no retry
+ok 32 - safe NetworkResponseInvalidError, no retry
+  ---
+  duration_ms: 0.2701
+  type: 'test'
+  ...
+# Subtest: safe InvalidServiceRequestError, no retry
+ok 33 - safe InvalidServiceRequestError, no retry
+  ---
+  duration_ms: 0.2162
+  type: 'test'
+  ...
+# Subtest: safe UnknownError, no retry
+ok 34 - safe UnknownError, no retry
+  ---
+  duration_ms: 0.2222
+  type: 'test'
+  ...
+# Subtest: missing authority, provider and action never call service; empty/invalid/oversize never succeeds
+ok 35 - missing authority, provider and action never call service; empty/invalid/oversize never succeeds
+  ---
+  duration_ms: 0.7926
+  type: 'test'
+  ...
+# Subtest: expired authority propagates
+ok 36 - expired authority propagates
+  ---
+  duration_ms: 1.2106
+  type: 'test'
+  ...
+# Subtest: all official language entries, detection flags and names are offered once
+ok 37 - all official language entries, detection flags and names are offered once
+  ---
+  duration_ms: 22.0323
+  type: 'test'
+  ...
+# Subtest: language search matches Chinese names, English names and provider codes
+ok 38 - language search matches Chinese names, English names and provider codes
+  ---
+  duration_ms: 1.1585
+  type: 'test'
+  ...
+# Subtest: all languages persist while auto remains source-only and bodies are excluded
+ok 39 - all languages persist while auto remains source-only and bodies are excluded
+  ---
+  duration_ms: 3.3897
+  type: 'test'
+  ...
+# Subtest: 1.5.0 keeps legacy identity and declares single-Panel text sharing
+ok 40 - 1.5.0 keeps legacy identity and declares single-Panel text sharing
+  ---
+  duration_ms: 2.4738
+  type: 'test'
+  ...
+# Subtest: package contains all declared entries and local import/assets, with only allowed asset types
+ok 41 - package contains all declared entries and local import/assets, with only allowed asset types
+  ---
+  duration_ms: 13.9526
+  type: 'test'
+  ...
+# Subtest: language menu and service registry expose only implemented Host languages and provider
+ok 42 - language menu and service registry expose only implemented Host languages and provider
+  ---
+  duration_ms: 0.4458
+  type: 'test'
+  ...
+# Subtest: fresh production CLI rejects an archive candidate missing its declared Panel entry
+ok 43 - fresh production CLI rejects an archive candidate missing its declared Panel entry
+  ---
+  duration_ms: 2090.6391
+  type: 'test'
+  ...
+# Subtest: shipped manifest and actual bootstrap mount, await settled readiness, and dispose on pagehide
+ok 44 - shipped manifest and actual bootstrap mount, await settled readiness, and dispose on pagehide
+  ---
+  duration_ms: 404.9413
+  type: 'test'
+  ...
+# Subtest: copies complete multiline text; success is guarded against revision changes
+ok 45 - copies complete multiline text; success is guarded against revision changes
+  ---
+  duration_ms: 14.6043
+  type: 'test'
+  ...
+# Subtest: clipboard failures map permissions without success or raw errors
+ok 46 - clipboard failures map permissions without success or raw errors
+  ---
+  duration_ms: 3.3375
+  type: 'test'
+  ...
+# Subtest: play toggles stop and source/target ownership ignores old terminal IDs
+ok 47 - play toggles stop and source/target ownership ignores old terminal IDs
+  ---
+  duration_ms: 2.4166
+  type: 'test'
+  ...
+# Subtest: late created obsolete playback is stopped before queued replacement starts
+ok 48 - late created obsolete playback is stopped before queued replacement starts
+  ---
+  duration_ms: 3.6655
+  type: 'test'
+  ...
+# Subtest: completion before play reply never restores playing
+ok 49 - completion before play reply never restores playing
+  ---
+  duration_ms: 2.6605
+  type: 'test'
+  ...
+# Subtest: edit while play pending stops exact late playback and never publishes
+ok 50 - edit while play pending stops exact late playback and never publishes
+  ---
+  duration_ms: 2.2526
+  type: 'test'
+  ...
+# Subtest: replace while play pending stops exact late playback and never publishes
+ok 51 - replace while play pending stops exact late playback and never publishes
+  ---
+  duration_ms: 2.89
+  type: 'test'
+  ...
+# Subtest: unknown auto source and missing voice explain unavailability; explicit source works without translation
+ok 52 - unknown auto source and missing voice explain unavailability; explicit source works without translation
+  ---
+  duration_ms: 1.9959
+  type: 'test'
+  ...
+# Subtest: no browser/private system bypasses in adapter
+ok 53 - no browser/private system bypasses in adapter
+  ---
+  duration_ms: 3.1843
+  type: 'test'
+  ...
+# Subtest: stale failed stop cannot overwrite replacement completion status
+ok 54 - stale failed stop cannot overwrite replacement completion status
+  ---
+  duration_ms: 3.2508
+  type: 'test'
+  ...
+# Subtest: permission-denied play reports fixed feedback
+ok 55 - permission-denied play reports fixed feedback
+  ---
+  duration_ms: 1.798
+  type: 'test'
+  ...
+# Subtest: speech completion error maps missing voice without exposing private payload
+ok 56 - speech completion error maps missing voice without exposing private payload
+  ---
+  duration_ms: 1.7158
+  type: 'test'
+  ...
+# Subtest: dispose after started playback stops only its owned ID and unsubscribes
+ok 57 - dispose after started playback stops only its owned ID and unsubscribes
+  ---
+  duration_ms: 1.35
+  type: 'test'
+  ...
+# Subtest: actual command, readiness, Runtime provider and DOM complete translation with real effect adapter
+ok 58 - actual command, readiness, Runtime provider and DOM complete translation with real effect adapter
+  ---
+  duration_ms: 378.6896
+  type: 'test'
+  ...
+# Subtest: ServicePermissionDeniedError traverses Runtime and renders safe failure without success
+ok 59 - ServicePermissionDeniedError traverses Runtime and renders safe failure without success
+  ---
+  duration_ms: 89.7389
+  type: 'test'
+  ...
+# Subtest: PermissionDeniedError traverses Runtime and renders safe failure without success
+ok 60 - PermissionDeniedError traverses Runtime and renders safe failure without success
+  ---
+  duration_ms: 77.6577
+  type: 'test'
+  ...
+# Subtest: replacement selection invalidates old response/audio and empty failure cannot reuse old text
+ok 61 - replacement selection invalidates old response/audio and empty failure cannot reuse old text
+  ---
+  duration_ms: 282.249
+  type: 'test'
+  ...
+# Subtest: host readiness is separate from local revision and edited text keeps debounce
+ok 62 - host readiness is separate from local revision and edited text keeps debounce
+  ---
+  duration_ms: 3.0049
+  type: 'test'
+  ...
+# Subtest: initial text waits for ready and uses business response directly
+ok 63 - initial text waits for ready and uses business response directly
+  ---
+  duration_ms: 0.7897
+  type: 'test'
+  ...
+# Subtest: single request drops A and B and dispatches only latest C
+ok 64 - single request drops A and B and dispatches only latest C
+  ---
+  duration_ms: 0.5344
+  type: 'test'
+  ...
+# Subtest: replaced session cannot receive old result or dispatch before matching ready
+ok 65 - replaced session cannot receive old result or dispatch before matching ready
+  ---
+  duration_ms: 0.6028
+  type: 'test'
+  ...
+# Subtest: composition suppresses requests and composition end debounces
+ok 66 - composition suppresses requests and composition end debounces
+  ---
+  duration_ms: 0.7622
+  type: 'test'
+  ...
+# Subtest: empty avoids requests; same language still requests authorization
+ok 67 - empty avoids requests; same language still requests authorization
+  ---
+  duration_ms: 0.5671
+  type: 'test'
+  ...
+# Subtest: UTF8 limit includes multibyte text and preserves exact input
+ok 68 - UTF8 limit includes multibyte text and preserves exact input
+  ---
+  duration_ms: 1.7729
+  type: 'test'
+  ...
+# Subtest: auto never guesses language; swap needs current detected result
+ok 69 - auto never guesses language; swap needs current detected result
+  ---
+  duration_ms: 1.0792
+  type: 'test'
+  ...
+# Subtest: edits clear results; failure does not retry; dispose invalidates callbacks
+ok 70 - edits clear results; failure does not retry; dispose invalidates callbacks
+  ---
+  duration_ms: 1.377
+  type: 'test'
+  ...
+# Subtest: latest queued edit still waits its remaining debounce after active completion
+ok 71 - latest queued edit still waits its remaining debounce after active completion
+  ---
+  duration_ms: 1.0114
+  type: 'test'
+  ...
+# Subtest: preferences initialize atomically and state snapshots do not mutate model
+ok 72 - preferences initialize atomically and state snapshots do not mutate model
+  ---
+  duration_ms: 1.5661
+  type: 'test'
+  ...
+# Subtest: same epoch update with new request supersedes prior ready identity
+ok 73 - same epoch update with new request supersedes prior ready identity
+  ---
+  duration_ms: 0.4274
+  type: 'test'
+  ...
+# Subtest: preserves bounded structured Runtime failure while bridge exceptions stay generic
+ok 74 - preserves bounded structured Runtime failure while bridge exceptions stay generic
+  ---
+  duration_ms: 0.7805
+  type: 'test'
+  ...
+# Subtest: unchanged composition after success does not request again
+ok 75 - unchanged composition after success does not request again
+  ---
+  duration_ms: 0.3883
+  type: 'test'
+  ...
+# Subtest: unchanged composition after failure does not request again
+ok 76 - unchanged composition after failure does not request again
+  ---
+  duration_ms: 0.3081
+  type: 'test'
+  ...
+# Subtest: composition resumes legitimate suspended pending text
+ok 77 - composition resumes legitimate suspended pending text
+  ---
+  duration_ms: 0.2776
+  type: 'test'
+  ...
+# Subtest: default scheduler calls receiver-sensitive global timers with their owning global
+ok 78 - default scheduler calls receiver-sensitive global timers with their owning global
+  ---
+  duration_ms: 0.4501
+  type: 'test'
+  ...
+# Subtest: detected Japanese can reverse a translation into Arabic without losing direction
+ok 79 - detected Japanese can reverse a translation into Arabic without losing direction
+  ---
+  duration_ms: 0.4083
+  type: 'test'
+  ...
+# Subtest: Host readiness precedes update registration, replaces input/theme without stealing focus, and uses current request facade
+ok 80 - Host readiness precedes update registration, replaces input/theme without stealing focus, and uses current request facade
+  ---
+  duration_ms: 337.4557
+  type: 'test'
+  ...
+# Subtest: source and detection use same searchable selector; keyboard selection restores focus; target excludes auto
+ok 81 - source and detection use same searchable selector; keyboard selection restores focus; target excludes auto
+  ---
+  duration_ms: 142.9332
+  type: 'test'
+  ...
+# Subtest: single provider opens real selector and capability controls explain unavailable status
+ok 82 - single provider opens real selector and capability controls explain unavailable status
+  ---
+  duration_ms: 27.5474
+  type: 'test'
+  ...
+# Subtest: plain Enter and IME do not submit; Ctrl+Enter submits; stale action callbacks do nothing
+ok 83 - plain Enter and IME do not submit; Ctrl+Enter submits; stale action callbacks do nothing
+  ---
+  duration_ms: 121.6823
+  type: 'test'
+  ...
+# Subtest: preferences writes serialize/coalesce and preserve captured ownership without storing text
+ok 84 - preferences writes serialize/coalesce and preserve captured ownership without storing text
+  ---
+  duration_ms: 159.3262
+  type: 'test'
+  ...
+# Subtest: unavailable readiness stays explicit and disposing removes Host callbacks/timers
+ok 85 - unavailable readiness stays explicit and disposing removes Host callbacks/timers
+  ---
+  duration_ms: 60.2576
+  type: 'test'
+  ...
+# Subtest: same-session resubmit preserves unsaved local preferences while new session uses Runtime preferences
+ok 86 - same-session resubmit preserves unsaved local preferences while new session uses Runtime preferences
+  ---
+  duration_ms: 35.6446
+  type: 'test'
+  ...
+# Subtest: uncertain save failure is reported once without automatic retry or text persistence
+ok 87 - uncertain save failure is reported once without automatic retry or text persistence
+  ---
+  duration_ms: 71.9798
+  type: 'test'
+  ...
+# Subtest: choosing manual language from detection restores visible source control and modal traps Tab
+ok 88 - choosing manual language from detection restores visible source control and modal traps Tab
+  ---
+  duration_ms: 57.0158
+  type: 'test'
+  ...
+# Subtest: refresh keys are suppressed and search shortcut stays within the open selector
+ok 89 - refresh keys are suppressed and search shortcut stays within the open selector
+  ---
+  duration_ms: 34.4621
+  type: 'test'
+  ...
+# Subtest: injected effects receive captured facades, invalidation and disposal; stale menus cannot run them
+ok 90 - injected effects receive captured facades, invalidation and disposal; stale menus cannot run them
+  ---
+  duration_ms: 50.445
+  type: 'test'
+  ...
+# Subtest: real effect adapter uses captured facades, accessible stop labels and shared Host actions
+ok 91 - real effect adapter uses captured facades, accessible stop labels and shared Host actions
+  ---
+  duration_ms: 138.8155
+  type: 'test'
+  ...
+# Subtest: real adapter editing preserves current value and selection, clears output and stops speech through IME
+ok 92 - real adapter editing preserves current value and selection, clears output and stops speech through IME
+  ---
+  duration_ms: 140.4724
+  type: 'test'
+  ...
+# Subtest: multilingual selector exposes manual-detection guidance and both text regions support RTL
+ok 93 - multilingual selector exposes manual-detection guidance and both text regions support RTL
+  ---
+  duration_ms: 69.673
+  type: 'test'
+  ...
+# Subtest: keyboard navigation keeps the active language visible in a long list
+ok 94 - keyboard navigation keeps the active language visible in a long list
+  ---
+  duration_ms: 50.6167
+  type: 'test'
+  ...
+# Subtest: share accepts exact text once after preferences/Ready, translates once and exposes output source
+ok 95 - share accepts exact text once after preferences/Ready, translates once and exposes output source
+  ---
+  duration_ms: 82.4651
+  type: 'test'
+  ...
+# Subtest: shared translation business failure keeps received original and target UI without retry
+ok 96 - shared translation business failure keeps received original and target UI without retry
+  ---
+  duration_ms: 45.7891
+  type: 'test'
+  ...
+# Subtest: new empty submission after sharing clears source while same-request theme update preserves it
+ok 97 - new empty submission after sharing clears source while same-request theme update preserves it
+  ---
+  duration_ms: 33.3497
+  type: 'test'
+  ...
+# Subtest: initialization preserves "" without translating
+ok 98 - initialization preserves "" without translating
+  ---
+  duration_ms: 3.392
+  type: 'test'
+  ...
+# Subtest: initialization preserves "  hello\\n " without translating
+ok 99 - initialization preserves "  hello\\n " without translating
+  ---
+  duration_ms: 1.6674
+  type: 'test'
+  ...
+# Subtest: unavailable or malformed stored preferences fall back safely
+ok 100 - unavailable or malformed stored preferences fall back safely
+  ---
+  duration_ms: 0.7844
+  type: 'test'
+  ...
+# Subtest: dispatches auto without changing text
+ok 101 - dispatches auto without changing text
+  ---
+  duration_ms: 1.0251
+  type: 'test'
+  ...
+# Subtest: dispatches en without changing text
+ok 102 - dispatches en without changing text
+  ---
+  duration_ms: 0.5107
+  type: 'test'
+  ...
+# Subtest: dispatches zh-CHS without changing text
+ok 103 - dispatches zh-CHS without changing text
+  ---
+  duration_ms: 0.3244
+  type: 'test'
+  ...
+# Subtest: unknown detection remains null
+ok 104 - unknown detection remains null
+  ---
+  duration_ms: 0.5789
+  type: 'test'
+  ...
+# Subtest: invalid input 0 never invokes API
+ok 105 - invalid input 0 never invokes API
+  ---
+  duration_ms: 0.4476
+  type: 'test'
+  ...
+# Subtest: invalid input 1 never invokes API
+ok 106 - invalid input 1 never invokes API
+  ---
+  duration_ms: 0.7568
+  type: 'test'
+  ...
+# Subtest: invalid input 2 never invokes API
+ok 107 - invalid input 2 never invokes API
+  ---
+  duration_ms: 0.9507
+  type: 'test'
+  ...
+# Subtest: invalid input 3 never invokes API
+ok 108 - invalid input 3 never invokes API
+  ---
+  duration_ms: 0.3707
+  type: 'test'
+  ...
+# Subtest: invalid input 4 never invokes API
+ok 109 - invalid input 4 never invokes API
+  ---
+  duration_ms: 0.1387
+  type: 'test'
+  ...
+# Subtest: invalid input 5 never invokes API
+ok 110 - invalid input 5 never invokes API
+  ---
+  duration_ms: 0.1047
+  type: 'test'
+  ...
+# Subtest: invalid input 6 never invokes API
+ok 111 - invalid input 6 never invokes API
+  ---
+  duration_ms: 0.1251
+  type: 'test'
+  ...
+# Subtest: invalid input 7 never invokes API
+ok 112 - invalid input 7 never invokes API
+  ---
+  duration_ms: 0.1496
+  type: 'test'
+  ...
+# Subtest: invalid input 8 never invokes API
+ok 113 - invalid input 8 never invokes API
+  ---
+  duration_ms: 0.2359
+  type: 'test'
+  ...
+# Subtest: invalid input 9 never invokes API
+ok 114 - invalid input 9 never invokes API
+  ---
+  duration_ms: 0.1201
+  type: 'test'
+  ...
+# Subtest: invalid input 10 never invokes API
+ok 115 - invalid input 10 never invokes API
+  ---
+  duration_ms: 0.1348
+  type: 'test'
+  ...
+# Subtest: invalid input 11 never invokes API
+ok 116 - invalid input 11 never invokes API
+  ---
+  duration_ms: 0.0833
+  type: 'test'
+  ...
+# Subtest: accessors and symbols are rejected without reading payload fields
+ok 117 - accessors and symbols are rejected without reading payload fields
+  ---
+  duration_ms: 0.3054
+  type: 'test'
+  ...
+# Subtest: unknown action is rejected before dispatch
+ok 118 - unknown action is rejected before dispatch
+  ---
+  duration_ms: 0.1643
+  type: 'test'
+  ...
+# Subtest: missing service capability has a fixed failure
+ok 119 - missing service capability has a fixed failure
+  ---
+  duration_ms: 0.2685
+  type: 'test'
+  ...
+# Subtest: safe failure ServicePermissionDeniedError
+ok 120 - safe failure ServicePermissionDeniedError
+  ---
+  duration_ms: 0.6928
+  type: 'test'
+  ...
+# Subtest: safe failure PermissionDeniedError
+ok 121 - safe failure PermissionDeniedError
+  ---
+  duration_ms: 0.2259
+  type: 'test'
+  ...
+# Subtest: safe failure CredentialNotConfiguredError
+ok 122 - safe failure CredentialNotConfiguredError
+  ---
+  duration_ms: 0.1701
+  type: 'test'
+  ...
+# Subtest: safe failure CredentialDisabledError
+ok 123 - safe failure CredentialDisabledError
+  ---
+  duration_ms: 0.245
+  type: 'test'
+  ...
+# Subtest: safe failure CredentialUnavailableError
+ok 124 - safe failure CredentialUnavailableError
+  ---
+  duration_ms: 0.1512
+  type: 'test'
+  ...
+# Subtest: safe failure ProviderAuthenticationError
+ok 125 - safe failure ProviderAuthenticationError
+  ---
+  duration_ms: 0.1245
+  type: 'test'
+  ...
+# Subtest: safe failure ProviderQuotaError
+ok 126 - safe failure ProviderQuotaError
+  ---
+  duration_ms: 0.1204
+  type: 'test'
+  ...
+# Subtest: safe failure NetworkTimeoutError
+ok 127 - safe failure NetworkTimeoutError
+  ---
+  duration_ms: 0.1517
+  type: 'test'
+  ...
+# Subtest: unrecognized error constructor
+ok 128 - unrecognized error constructor
+  ---
+  duration_ms: 1.5232
+  type: 'test'
+  ...
+# Subtest: unrecognized error __proto__
+ok 129 - unrecognized error __proto__
+  ---
+  duration_ms: 0.1595
+  type: 'test'
+  ...
+# Subtest: unrecognized error toString
+ok 130 - unrecognized error toString
+  ---
+  duration_ms: 0.1448
+  type: 'test'
+  ...
+# Subtest: unrecognized error UnknownError
+ok 131 - unrecognized error UnknownError
+  ---
+  duration_ms: 0.1285
+  type: 'test'
+  ...
+# Subtest: malformed service response null
+ok 132 - malformed service response null
+  ---
+  duration_ms: 0.3515
+  type: 'test'
+  ...
+# Subtest: malformed service response {}
+ok 133 - malformed service response {}
+  ---
+  duration_ms: 0.1543
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":[],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false}
+ok 134 - malformed service response {"translations":[],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false}
+  ---
+  duration_ms: 0.1652
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":[42],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false}
+ok 135 - malformed service response {"translations":[42],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false}
+  ---
+  duration_ms: 0.4409
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":[""],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false}
+ok 136 - malformed service response {"translations":[""],"sourceLanguage":"en","targetLanguage":"zh-CHS","unchanged":false}
+  ---
+  duration_ms: 0.1613
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":["  你好\\n ","第二行"],"sourceLanguage":"not-real","targetLanguage":"zh-CHS","unchanged":false}
+ok 137 - malformed service response {"translations":["  你好\\n ","第二行"],"sourceLanguage":"not-real","targetLanguage":"zh-CHS","unchanged":false}
+  ---
+  duration_ms: 0.1277
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":["  你好\\n ","第二行"],"targetLanguage":"zh-CHS","unchanged":false}
+ok 138 - malformed service response {"translations":["  你好\\n ","第二行"],"targetLanguage":"zh-CHS","unchanged":false}
+  ---
+  duration_ms: 0.114
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":["  你好\\n ","第二行"],"sourceLanguage":"en","targetLanguage":"en","unchanged":false}
+ok 139 - malformed service response {"translations":["  你好\\n ","第二行"],"sourceLanguage":"en","targetLanguage":"en","unchanged":false}
+  ---
+  duration_ms: 0.1115
+  type: 'test'
+  ...
+# Subtest: malformed service response {"translations":["  你好\\n ","第二行"],"sourceLanguage":"en","targetLanguage":"zh-CHS"}
+ok 140 - malformed service response {"translations":["  你好\\n ","第二行"],"sourceLanguage":"en","targetLanguage":"zh-CHS"}
+  ---
+  duration_ms: 0.109
+  type: 'test'
+  ...
+# Subtest: reverse direction and maximum text size use the Host service
+ok 141 - reverse direction and maximum text size use the Host service
+  ---
+  duration_ms: 0.3672
+  type: 'test'
+  ...
+# Subtest: same-language calls still go through Host admission
+ok 142 - same-language calls still go through Host admission
+  ---
+  duration_ms: 0.2555
+  type: 'test'
+  ...
+# Subtest: sparse translation arrays are rejected
+ok 143 - sparse translation arrays are rejected
+  ---
+  duration_ms: 0.2319
+  type: 'test'
+  ...
+# Subtest: whitespace-only explicit action never invokes the service
+ok 144 - whitespace-only explicit action never invokes the service
+  ---
+  duration_ms: 0.1801
+  type: 'test'
+  ...
+# Subtest: all published directions reach the Host and retain detected source metadata
+ok 145 - all published directions reach the Host and retain detected source metadata
+  ---
+  duration_ms: 4.4207
+  type: 'test'
+  ...
+# Subtest: unsupported provider language direction is a safe actionable error
+ok 146 - unsupported provider language direction is a safe actionable error
+  ---
+  duration_ms: 0.2744
+  type: 'test'
+  ...
+1..146
+# tests 146
+# suites 0
+# pass 146
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 3489.6046

@@ -1,0 +1,7 @@
+preexisting user patch reverse-check exit=0 (only superseded authority tests and mixed activation file excluded)
+eff33ca666df5c1b2d154b10e9ecc6313ad580e3 refs/heads/codex/sharing-full-handoff-backup-20261106
+
+FullName : D:\code\UiPilot_tools\.superpowers\sdd\sharing\pre-simplification-working.patch
+Length   : 375386
+
+11329:        assert_eq!(identity.name, "demo Window");

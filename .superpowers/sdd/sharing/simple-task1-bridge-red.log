@@ -1,0 +1,47 @@
+
+> uipilot@0.22.0 test
+> vitest run src/plugin-panel-action-bootstrap.test.ts
+
+
+ RUN  v4.1.10 D:/code/UiPilot_tools
+
+ ❯ src/plugin-panel-action-bootstrap.test.ts (10 tests | 2 failed) 623ms
+     × exposes synchronous source and receive registration without preparation APIs 15ms
+     × waits for async Ready and claims once even after duplicate notifications 5ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/plugin-panel-action-bootstrap.test.ts > single Panel share bridge > exposes synchronous source and receive registration without preparation APIs
+AssertionError: expected 'undefined' to be 'function' // Object.is equality
+
+Expected: "function"
+Received: "undefined"
+
+ ❯ src/plugin-panel-action-bootstrap.test.ts:180:42
+    178|   it('exposes synchronous source and receive registration without prep…
+    179|     const p = panel()
+    180|     expect(typeof p.api.share?.onSource).toBe('function')
+       |                                          ^
+    181|     expect(typeof p.api.share?.onReceive).toBe('function')
+    182|     expect(p.api.share?.invalidateSource).toBeUndefined()
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/plugin-panel-action-bootstrap.test.ts > single Panel share bridge > waits for async Ready and claims once even after duplicate notifications
+TypeError: Cannot read properties of undefined (reading 'onReceive')
+ ❯ src/plugin-panel-action-bootstrap.test.ts:196:17
+    194|       version: 1, transferId: '1', receiverId: 'translate', sessionEpo…
+    195|     } : undefined)
+    196|     p.api.share.onReceive(receive)
+       |                 ^
+    197|     p.api.onReady(() => new Promise<void>(resolve => { release = resol…
+    198|     p.api.onUpdate(() => undefined)
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 8 passed (10)
+   Start at  21:37:14
+   Duration  1.04s (transform 71ms, setup 0ms, import 99ms, tests 623ms, environment 0ms)
+

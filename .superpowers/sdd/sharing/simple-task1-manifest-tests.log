@@ -1,0 +1,13 @@
+
+> @uipilot/plugin-cli@0.1.0 test
+> vitest run tests/manifest-sharing.test.ts
+
+
+ RUN  v4.1.10 D:/code/UiPilot_tools/packages/plugin-cli
+
+
+ Test Files  1 passed (1)
+      Tests  59 passed (59)
+   Start at  22:11:45
+   Duration  1.07s (transform 296ms, setup 0ms, import 375ms, tests 50ms, environment 0ms)
+
