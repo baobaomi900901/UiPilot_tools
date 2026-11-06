@@ -1,7 +1,8 @@
 use super::*;
 use crate::public_plugins::share_prepare::SharePrepareError as E;
 use crate::public_plugins::{
-    runtime_label, PluginInvocationTheme, PluginRequestOwner, ScheduledPluginRequest,
+    runtime_label, PluginContextStatus, PluginInvocationTheme, PluginRequestOwner,
+    PublicPluginManagementError, ScheduledPluginRequest,
 };
 
 fn fixture(
@@ -143,41 +144,87 @@ fn share_prepare_cancel_after_sender_take_wins_and_late_completion_cannot_publis
     ));
 }
 #[test]
-fn share_prepare_drop_keeps_physical_slot_and_original_deadline() {
+fn share_prepare_drop_before_emit_aborts_slot_and_rejects_late_dispatch() {
     let (_root, service, manager, receiver) = fixture("share-prepare-drop");
     let now = Instant::now();
     let pending = service
         .begin_share_prepare(receiver.clone(), "host-transfer".into(), now)
         .unwrap();
-    let context = pending.dispatch.context.clone();
-    let deadline = pending.dispatch.deadline;
     drop(pending.registration);
     assert_eq!(pending.receiver.recv().unwrap(), Err(E::Cancelled));
-    assert_eq!(
-        service
-            .begin_share_prepare(receiver, "next".into(), now)
-            .err(),
-        Some(E::Busy)
-    );
-    assert!(manager
-        .scheduler()
-        .expire_timeouts(deadline - Duration::from_nanos(1))
-        .unwrap()
-        .is_empty());
-    let completion = completion(&pending.dispatch);
-    let outcome = manager
-        .complete(
-            &runtime_label(&context.plugin_id, context.plugin_generation).unwrap(),
-            &completion,
-            now,
-        )
+    let next = service
+        .begin_share_prepare(receiver, "next".into(), now)
         .unwrap();
-    assert!(!outcome.accepted);
+    assert_eq!(next.dispatch.deadline, pending.dispatch.deadline);
+    assert!(service
+        .emit_share_prepare_with(&pending.dispatch, || {
+            panic!("cancelled undispatched handler must never emit alongside its replacement")
+        })
+        .is_err());
     assert_eq!(
-        service.complete_share_prepare_with(&completion, &outcome, || {}),
-        None
+        manager.scheduler().context_status(&next.dispatch.context),
+        PluginContextStatus::Current
     );
     assert!(service.submissions.lock().unwrap().by_token.is_empty());
+}
+
+#[test]
+fn share_prepare_post_admission_invalidation_aborts_before_recheck_returns_error() {
+    let (_root, service, manager, receiver) = fixture("share-prepare-admission-race");
+    let now = Instant::now();
+    let plugin_id = receiver.plugin.plugin_id.clone();
+    assert_eq!(
+        service
+            .begin_share_prepare_with(receiver, "transfer".into(), now, || {
+                manager
+                    .scheduler()
+                    .retire_plugin_requests(&plugin_id)
+                    .unwrap();
+            })
+            .err(),
+        Some(E::Expired)
+    );
+    assert!(service.share_preparations.lock().unwrap().is_empty());
+    let current_receiver = manager.share_catalog().unwrap().remove(0);
+    assert!(service
+        .begin_share_prepare(current_receiver, "next".into(), now)
+        .is_ok());
+}
+
+#[test]
+fn share_prepare_emission_claim_then_cancel_keeps_physical_slot_and_original_deadline() {
+    let (_root, service, manager, receiver) = fixture("share-prepare-emission-cancel");
+    let now = Instant::now();
+    let pending = service
+        .begin_share_prepare(receiver.clone(), "transfer".into(), now)
+        .unwrap();
+    service
+        .emit_share_prepare_with(&pending.dispatch, || {
+            // The real native emitter can deliver before reporting failure. Cancel
+            // here is also the deterministic claim-vs-cancel interleaving.
+            pending.registration.cancel();
+            assert_eq!(
+                service
+                    .begin_share_prepare(receiver.clone(), "next".into(), now)
+                    .err(),
+                Some(E::Busy)
+            );
+            Err(PublicPluginManagementError::Unavailable)
+        })
+        .unwrap_err();
+    assert_eq!(pending.receiver.recv().unwrap(), Err(E::Cancelled));
+    assert_eq!(pending.dispatch.deadline, now + Duration::from_secs(30));
+    assert!(manager
+        .scheduler()
+        .expire_timeouts(pending.dispatch.deadline - Duration::from_nanos(1))
+        .unwrap()
+        .is_empty());
+    let replacements = manager
+        .scheduler()
+        .expire_timeouts(pending.dispatch.deadline)
+        .unwrap();
+    assert_eq!(replacements.len(), 1);
+    assert!(!replacements[0].counts_as_fault);
 }
 #[test]
 fn share_prepare_revalidates_receiver_identity_and_rejects_invalid_initialization() {
@@ -292,4 +339,107 @@ fn share_prepare_current_bundle_rechecked_after_sender_take_without_runtime_curr
         None
     );
     assert_eq!(pending.receiver.recv().unwrap(), Err(E::Expired));
+}
+
+#[test]
+fn share_prepare_unemitted_replacement_by_ordinary_command_settles_and_never_queues_or_emits_old_handler(
+) {
+    let (_root, service, manager, receiver) = fixture("share-prepare-command-replace");
+    let now = Instant::now();
+    let pending = service
+        .begin_share_prepare(receiver, "transfer".into(), now)
+        .unwrap();
+    let ordinary = service
+        .schedule_command(
+            manager.route("/demo ordinary").unwrap().unwrap(),
+            1,
+            "/demo ordinary".into(),
+            now,
+        )
+        .unwrap();
+    let ordinary_dispatch = ordinary
+        .dispatch
+        .expect("ordinary command must not wait behind a never-emitted handler");
+    assert_eq!(
+        pending
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        Err(E::Cancelled)
+    );
+    assert!(!pending.registration.result_is_current());
+    assert!(service
+        .emit_share_prepare_with(&pending.dispatch, || panic!("replaced handler emitted"))
+        .is_err());
+    assert_eq!(
+        manager
+            .scheduler()
+            .context_status(&ordinary_dispatch.context),
+        PluginContextStatus::Current
+    );
+    let ordinary_completion = completion(&ordinary_dispatch);
+    let outcome = manager
+        .complete(
+            &runtime_label(
+                &ordinary_dispatch.context.plugin_id,
+                ordinary_dispatch.context.plugin_generation,
+            )
+            .unwrap(),
+            &ordinary_completion,
+            now,
+        )
+        .unwrap();
+    assert!(outcome.accepted);
+    assert!(
+        outcome.next.is_none(),
+        "no orphaned waiter is left after the ordinary handler completes"
+    );
+}
+
+#[test]
+fn share_prepare_emitted_replacement_by_ordinary_command_waits_for_physical_completion() {
+    let (_root, service, manager, receiver) = fixture("share-prepare-emitted-command-replace");
+    let now = Instant::now();
+    let pending = service
+        .begin_share_prepare(receiver, "transfer".into(), now)
+        .unwrap();
+    service
+        .emit_share_prepare_with(&pending.dispatch, || Ok(()))
+        .unwrap();
+    let ordinary = service
+        .schedule_command(
+            manager.route("/demo ordinary").unwrap().unwrap(),
+            1,
+            "/demo ordinary".into(),
+            now,
+        )
+        .unwrap();
+    assert!(
+        ordinary.dispatch.is_none(),
+        "an emitted handler still owns the physical slot"
+    );
+    assert_eq!(
+        pending
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        Err(E::Cancelled)
+    );
+    let done = completion(&pending.dispatch);
+    let outcome = manager
+        .complete(
+            &runtime_label(&done.context.plugin_id, done.context.plugin_generation).unwrap(),
+            &done,
+            now,
+        )
+        .unwrap();
+    assert!(!outcome.accepted);
+    assert!(matches!(
+        outcome.completed_owner,
+        PluginRequestOwner::SharePrepare(_)
+    ));
+    assert!(matches!(
+        outcome.next.unwrap().candidate.owner,
+        PluginRequestOwner::Command(_)
+    ));
 }

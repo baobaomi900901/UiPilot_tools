@@ -219,6 +219,8 @@ struct RunningRequest {
     // Preserve logical retirement across physical completion and controller settlement.
     action_retirement: Option<super::content_action::ContentActionError>,
     notification_published: bool,
+    // Claimed under the scheduler lock immediately before the native emit.
+    share_prepare_emission_started: bool,
 }
 
 pub(crate) struct PluginCurrentRequest<'a> {
@@ -511,6 +513,21 @@ impl PluginRequestScheduler {
         {
             return Err(PluginScheduleError::GenerationMismatch);
         }
+        // A never-emitted prepare has no physical handler to wait for. A
+        // command supersedes it atomically; the service settles its channel.
+        // Once emission is claimed, retain the existing waiting/deadline path.
+        if matches!(reserved.candidate.owner, PluginRequestOwner::Command(_))
+            && queue.running.as_ref().is_some_and(|running| {
+                !running.share_prepare_emission_started
+                    && matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_))
+            })
+        {
+            if let Some(running) = queue.running.take() {
+                if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
+                    owner.lease.cancel();
+                }
+            }
+        }
         if matches!(
             reserved.candidate.owner,
             PluginRequestOwner::SharePrepare(_)
@@ -667,6 +684,7 @@ impl PluginRequestScheduler {
             current: true,
             action_retirement: None,
             notification_published: false,
+            share_prepare_emission_started: false,
         });
         Ok(request)
     }
@@ -820,6 +838,49 @@ impl PluginRequestScheduler {
         }
         let (_, reason) = queue.action_completion.take().ok_or(E::Expired)?;
         reason.map_or(Ok(()), Err)
+    }
+
+    /// Serialize emission against abort and command replacement. After this
+    /// claim, cancellation must preserve physical occupancy even if emit fails.
+    pub(crate) fn claim_share_prepare_emission(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), PluginScheduleError> {
+        let mut state = self.lock()?;
+        let running = state.by_plugin.get_mut(&context.plugin_id)
+            .and_then(|queue| queue.running.as_mut())
+            .filter(|running| {
+                running.request.context == *context
+                    && running.current
+                    && running.request.candidate.owner.live()
+                    && matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_))
+                    && !running.share_prepare_emission_started
+            })
+            .ok_or(PluginScheduleError::GenerationMismatch)?;
+        running.share_prepare_emission_started = true;
+        Ok(())
+    }
+
+    /// Called after logical retirement. Both this abort and emission claim use
+    /// the scheduler lock, so a released slot can never subsequently emit.
+    pub(crate) fn abort_unemitted_share_prepare(
+        &self,
+        context: &PluginRequestContext,
+    ) -> Result<(), PluginScheduleError> {
+        let mut state = self.lock()?;
+        if let Some(queue) = state.by_plugin.get_mut(&context.plugin_id) {
+            if queue.running.as_ref().is_some_and(|running| {
+                running.request.context == *context
+                    && !running.current
+                    && !running.share_prepare_emission_started
+                    && matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_))
+            }) {
+                // enqueue_reserved never queues behind an unclaimed prepare.
+                debug_assert!(queue.waiting.is_none());
+                queue.running = None;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn retire_context(
@@ -1205,6 +1266,7 @@ fn dispatch(
         current: true,
         action_retirement: None,
         notification_published: false,
+        share_prepare_emission_started: false,
     });
     Ok(request)
 }

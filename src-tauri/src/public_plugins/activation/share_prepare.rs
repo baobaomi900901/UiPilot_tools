@@ -90,9 +90,11 @@ impl PublicPluginManager {
     pub(crate) fn retire_share_prepare(&self, context: &PluginRequestContext) {
         if let Ok(transition) = self.network_authority.begin_transition() {
             let _ = self.scheduler.retire_context(context);
+            let _ = self.scheduler.abort_unemitted_share_prepare(context);
             transition.invalidate_context(context);
         } else {
             let _ = self.scheduler.retire_context(context);
+            let _ = self.scheduler.abort_unemitted_share_prepare(context);
         }
     }
 }

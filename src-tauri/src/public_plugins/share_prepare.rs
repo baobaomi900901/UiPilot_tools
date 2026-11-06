@@ -110,6 +110,15 @@ impl PublicPluginService {
         prepare_id: String,
         now: Instant,
     ) -> Result<SharePreparation, SharePrepareError> {
+        self.begin_share_prepare_with(receiver, prepare_id, now, || {})
+    }
+    pub(super) fn begin_share_prepare_with(
+        self: &Arc<Self>,
+        receiver: Receiver,
+        prepare_id: String,
+        now: Instant,
+        after_admission: impl FnOnce(),
+    ) -> Result<SharePreparation, SharePrepareError> {
         let owner = SharePrepareOwner {
             receiver,
             prepare_id,
@@ -117,6 +126,7 @@ impl PublicPluginService {
         };
         let manager = self.manager().map_err(|_| SharePrepareError::Unavailable)?;
         let dispatch = manager.admit_share_prepare(&owner, now)?;
+        after_admission();
         let (sender, receiver) = mpsc::channel();
         let registration = SharePrepareRegistration {
             context: dispatch.context.clone(),
@@ -147,6 +157,17 @@ impl PublicPluginService {
             registration,
             receiver,
         })
+    }
+    pub(super) fn emit_share_prepare_with(
+        &self,
+        request: &ScheduledPluginRequest,
+        emit: impl FnOnce() -> Result<(), PublicPluginManagementError>,
+    ) -> Result<(), PublicPluginManagementError> {
+        self.manager()?
+            .scheduler()
+            .claim_share_prepare_emission(&request.context)
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        emit()
     }
     pub(crate) fn retire_share_prepare(&self, context: &PluginRequestContext) {
         if let Ok(manager) = self.manager() {

@@ -696,6 +696,7 @@ impl PublicPluginService {
                 return Err(PublicPluginManagementError::Unavailable);
             }
         };
+        self.retire_share_preparations(Some(&route.plugin_id), Some(route.generation));
         after_enqueue();
         let result_context = self.result_action.lock().ok().and_then(|slot| {
             slot.as_ref()
@@ -1390,10 +1391,14 @@ impl PublicPluginService {
         let label = runtime_label(&request.context.plugin_id, request.context.plugin_generation)
             .ok_or(PublicPluginManagementError::Unavailable)?;
         let window = app.get_webview_window(&label).ok_or(PublicPluginManagementError::Unavailable)?;
-        window.emit("uipilot-public-plugin-command", PluginCommandDispatch {
+        let emit = || window.emit("uipilot-public-plugin-command", PluginCommandDispatch {
             context: request.context.clone(), kind: kind.into(), invocation,
-        }).map_err(|_| PublicPluginManagementError::Unavailable)?;
-        Ok(())
+        }).map_err(|_| PublicPluginManagementError::Unavailable);
+        if matches!(request.candidate.owner, PluginRequestOwner::SharePrepare(_)) {
+            self.emit_share_prepare_with(request, emit)
+        } else {
+            emit()
+        }
     }
 
     pub(crate) fn dispatch_invocation(&self, request: &ScheduledPluginRequest, theme: PluginInvocationTheme, invoked_at: String) -> Result<(&'static str, serde_json::Value), PublicPluginManagementError> {
