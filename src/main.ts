@@ -240,9 +240,11 @@ export const pluginWindowClient: PluginWindowClient = {
   setPinned: (input) => invoke('set_plugin_window_pinned', input),
   close: () => invoke<void>('close_plugin_window'),
 }
+const findForwardEvent = 'find://forwarded'
+const findThemeEvent = 'find://theme-changed'
 export const findClient: FindClient = {
-  listenForward: (handler) => listen('find://forwarded', (event) => handler(event.payload)),
-  listenThemeChanged: (handler) => listen('find://theme-changed', (event) => handler(event.payload)),
+  listenForward: (handler) => listen(findForwardEvent, (event) => handler(event.payload)),
+  listenThemeChanged: (handler) => listen(findThemeEvent, (event) => handler(event.payload)),
   prepareInitialization: () => invoke<FindReadyOutcome>('prepare_find_initialization'),
   commitReady: (input) => invoke<FindReadyOutcome>('commit_find_ready', { input }),
   getReadyStatus: (input) => invoke<FindReadyOutcome>('get_find_ready_status', { input }),
@@ -400,6 +402,40 @@ function bootstrapMain(host: HTMLElement): void {
   void load()
 }
 
+function mountFind(host: HTMLElement): void {
+  const scope = (window as Window & { __UIPILOT_MACOS_FIND__?: unknown }).__UIPILOT_MACOS_FIND__
+  if (scope !== undefined && scope !== 'public-preview' && scope !== 'indexed-local-qa') {
+    host.textContent = '文件搜索范围不可用。'
+    return
+  }
+  const core = createFindCore(scope ? {
+    ...findClient,
+    listenForward: (handler) => listen(findForwardEvent, event => handler(event.payload), { target: 'find' }),
+    listenThemeChanged: (handler) => listen(findThemeEvent, event => handler(event.payload), { target: 'find' }),
+    macos: {
+      scope,
+      cancelQuery: (input) => invoke<void>('cancel_find_query', input),
+      openDocument: (input) => invoke<ExecuteOutcome>('open_find_document', input),
+    },
+  } : findClient)
+  const root = createRoot(host, {
+    onUncaughtError: () => {
+      core.destroy()
+      host.textContent = '文件搜索暂不可用。'
+    },
+  })
+  let tornDown = false
+  const teardown = () => {
+    if (tornDown) return
+    tornDown = true
+    window.removeEventListener('pagehide', teardown)
+    core.destroy()
+    root.unmount()
+  }
+  window.addEventListener('pagehide', teardown)
+  root.render(createElement(FindView, { core }))
+}
+
 const label = currentWindowLabel()
 if (label === 'main') {
   bootstrapMain(host)
@@ -432,23 +468,7 @@ if (label === 'main') {
   root.render(createElement(PluginWindowView, { core }))
   void core.start()
 } else if (label === 'find') {
-  const core = createFindCore(findClient)
-  const root = createRoot(host, {
-    onUncaughtError: () => {
-      core.destroy()
-      host.textContent = '文件搜索暂不可用。'
-    },
-  })
-  let tornDown = false
-  const teardown = () => {
-    if (tornDown) return
-    tornDown = true
-    window.removeEventListener('pagehide', teardown)
-    core.destroy()
-    root.unmount()
-  }
-  window.addEventListener('pagehide', teardown)
-  root.render(createElement(FindView, { core }))
+  mountFind(host)
 } else {
   throw new Error(`Unknown Tauri window label: ${label}`)
 }

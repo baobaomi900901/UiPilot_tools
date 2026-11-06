@@ -13,6 +13,7 @@ import {
   type FileResultView,
   type FileSort,
   type FindClient,
+  type MacFindScope,
   type FindForwardPayload,
   type ThemePreference,
   type U64Decimal,
@@ -46,6 +47,8 @@ export interface FindSnapshot {
 }
 
 export interface FindCore {
+  readonly macosScope?: MacFindScope
+  openDocument(): void
   getSnapshot(): FindSnapshot
   subscribe(listener: () => void): () => void
   start(): Promise<void>
@@ -108,13 +111,17 @@ const PREVIEW_ERROR = '无法保存文件预览设置。'
 const READY_ERROR = '文件搜索暂不可用。'
 const PREVIEW_IMAGE_EXTENSION = /\.(?:bmp|gif|heic|jpe?g|png|svg|tiff?|webp)$/iu
 
-function errorText(value: unknown): string {
+function errorText(value: unknown, macos = false): string {
   if (typeof value !== 'object' || value === null) return FALLBACK_ERROR
   const code = (value as { code?: unknown }).code
+  if (macos && code === 'fileOpenFailed') return '无法打开此项目，请重新搜索。'
+  if (macos && code === 'fileActionUnconfirmed') return '已向 macOS 提交请求，请检查结果后再重新搜索。'
   return typeof code === 'string' ? ERROR_TEXT[code as CommandErrorCode] ?? FALLBACK_ERROR : FALLBACK_ERROR
 }
 
-function statusText(status: FileIndexStatus, hasResults: boolean): string {
+function statusText(status: FileIndexStatus, hasResults: boolean, macos: boolean): string {
+  if (macos && status === 'partial') return '仅显示部分结果。'
+  if (macos && !hasResults && status === 'ready') return '当前范围内没有匹配的 Spotlight 结果。'
   if (status === 'building') return '正在索引。'
   if (status === 'partial') return '部分位置无法访问。'
   if (status === 'rebuilding') return '索引正在重建。'
@@ -212,7 +219,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const requestId = model.requestId
     const selected = model.results[model.selectedIndex]
     if (
-      !model.previewEnabled || !model.ready || !invocationId || !requestId || !selected ||
+      client.macos || !model.previewEnabled || !model.ready || !invocationId || !requestId || !selected ||
       selected.view.kind !== 'file' || !PREVIEW_IMAGE_EXTENSION.test(selected.view.name)
     ) {
       publish()
@@ -302,6 +309,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
           resultId: item.resultId,
           view: {
             key: item.fullPath,
+            ...(client.macos && item.canOpenDocument ? { canOpenDocument: true } : {}),
             name: item.name,
             kind: item.kind,
             sizeBytes: item.sizeBytes,
@@ -310,7 +318,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
           },
         }))
         model.selectedIndex = model.results.length ? 0 : -1
-        model.status = statusText(response.status, model.results.length > 0)
+        model.status = statusText(response.status, model.results.length > 0, Boolean(client.macos))
         publish()
         beginThumbnail()
       },
@@ -319,7 +327,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
             query !== model.query || category !== model.category || sequence !== querySequence) return
         model.searchPending = false
         model.indexStatus = 'unavailable'
-        model.status = errorText(error)
+        model.status = errorText(error, Boolean(client.macos))
         publish()
       },
     )
@@ -327,12 +335,17 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
 
   function acceptForward(value: unknown): void {
     if (destroyed) return
-    const payload = parseFindForwardPayload(value)
+    const payload = parseFindForwardPayload(value, Boolean(client.macos))
     if (!payload || (lastForward && compareDecimalRevision(payload.forwardSequence, lastForward) <= 0)) return
     lastForward = payload.forwardSequence
     model.invocationId = payload.invocationId
     model.query = payload.query
     querySequence = 0
+    if (payload.pinned !== undefined) {
+      pinOwner = ++operationToken
+      model.pinPending = false
+      model.pinned = payload.pinned
+    }
     searchOwner = ++operationToken
     model.searchPending = false
     model.executePending = false
@@ -376,6 +389,11 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         return
       }
       unlistenTheme = await client.listenThemeChanged(acceptTheme)
+      if (destroyed) {
+        unlistenTheme()
+        unlistenTheme = undefined
+        return
+      }
     } catch {
       unlistenTheme?.()
       unlistenForward?.()
@@ -392,6 +410,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       } catch {
         prepared = null
       }
+      if (destroyed) return
       if (!prepared || prepared.status !== 'prepared') {
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
         continue
@@ -407,6 +426,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       } catch {
         // The commit response may be lost after the backend committed it.
       }
+      if (destroyed) return
       if (!ready) {
         try {
           const status = parseFindReadyOutcome(await client.getReadyStatus({ initializationToken }))
@@ -416,6 +436,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
           // Retry the same commit before preparing a replacement.
         }
       }
+      if (destroyed) return
       if (!ready) {
         try {
           const retried = parseFindReadyOutcome(await client.commitReady({ initializationToken }))
@@ -424,6 +445,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
           ready = false
         }
       }
+      if (destroyed) return
       if (ready) {
         model.ready = true
         model.status = ''
@@ -444,6 +466,15 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     clearResults()
     publish()
     if (query) beginSearch()
+    else if (client.macos) {
+      const invocationId = model.invocationId
+      const sequence = nextSequence()
+      if (sequence !== null) void client.macos.cancelQuery({ invocationId, querySequence: sequence }).catch((error) => {
+        if (destroyed || model.invocationId !== invocationId || querySequence !== sequence || model.query) return
+        model.status = errorText(error, true)
+        publish()
+      })
+    }
   }
 
   function submitSearch(): void {
@@ -531,7 +562,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         if (destroyed || owner !== pinOwner || invocationId !== model.invocationId) return
         model.pinPending = false
         model.pinned = previousPinned
-        model.status = errorText(error)
+        model.status = errorText(error, Boolean(client.macos))
         publish()
       },
     )
@@ -543,26 +574,44 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     beginThumbnail()
   }
 
-  function executeSelection(): void {
+  function retireMacResultSet(): void {
+    model.requestId = undefined
+    for (const row of model.results) delete row.view.canOpenDocument
+  }
+
+  function executeSelection(openDocument = false): void {
     const invocationId = model.invocationId
     const selected = model.results[model.selectedIndex]
     const requestId = model.requestId
-    if (!model.ready || !invocationId || !selected || !requestId || model.executePending) return
+    if (!model.ready || !invocationId || !selected || model.executePending) return
+    if (!requestId) {
+      model.status = '请重新搜索后再执行操作。'
+      publish()
+      return
+    }
+    if (openDocument && (!client.macos || !selected.view.canOpenDocument)) return
     const owner = ++operationToken
     executeOwner = owner
     model.executePending = true
     model.status = ''
     publish()
-    void client.executeResult({ requestId, resultId: selected.resultId }).then(
-      () => {
+    const input = { requestId, resultId: selected.resultId }
+    const pending = openDocument && client.macos ? client.macos.openDocument(input) : client.executeResult(input)
+    void pending.then(
+      (outcome) => {
         if (destroyed || owner !== executeOwner || invocationId !== model.invocationId) return
         model.executePending = false
+        if (client.macos) {
+          retireMacResultSet()
+          model.status = outcome.status === 'fileRevealRequested' ? '已请求在 Finder 中显示。' : '已提交打开请求。'
+        }
         publish()
       },
       (error: unknown) => {
         if (destroyed || owner !== executeOwner || invocationId !== model.invocationId) return
         model.executePending = false
-        model.status = errorText(error)
+        if (client.macos && (error as {code?: string} | null)?.code === 'fileActionUnconfirmed') retireMacResultSet()
+        model.status = errorText(error, Boolean(client.macos))
         publish()
       },
     )
@@ -589,7 +638,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     } catch (error) {
       if (destroyed || owner !== hideOwner || invocationId !== model.invocationId) return
       model.hidePending = false
-      model.status = errorText(error)
+      model.status = errorText(error, Boolean(client.macos))
       publish()
     }
   }
@@ -627,6 +676,8 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   }
 
   return {
+    macosScope: client.macos?.scope,
+    openDocument: () => executeSelection(true),
     getSnapshot: () => snapshot,
     subscribe(listener) {
       listeners.add(listener)

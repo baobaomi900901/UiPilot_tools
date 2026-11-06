@@ -334,6 +334,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   searchUnavailable: '文件搜索服务不可用',
   fileNotFound: '文件已不存在。',
   fileOpenFailed: '无法在资源管理器中打开。',
+  fileActionUnconfirmed: '已向 macOS 提交请求，请检查结果后再重新搜索。',
   webSearchFailed: '操作不可用，请重试。',
   clipboardWriteFailed: '无法复制到剪贴板。',
   pluginPermissionDenied: '插件所需权限不可用，请在「设置 → 权限」中检查。',

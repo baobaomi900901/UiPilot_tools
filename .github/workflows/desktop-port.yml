@@ -27,6 +27,8 @@ jobs:
       - name: Run local checks and signed internal bundle smoke
         run: |
           npm run verify:local
+          cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview
+          cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-system-qa
           node --test scripts/platform-launcher.test.mjs scripts/macos-host-acl.test.mjs scripts/verify-macos-bundle.test.mjs
           npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg --config src-tauri/tauri.macos-internal.conf.json -- --locked
           node scripts/verify-macos-bundle.mjs

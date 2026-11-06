@@ -17,13 +17,13 @@ pub(crate) struct HostCapabilities {
     double_tap: bool,
 }
 
-fn local_main(label: &str, page: &url::Url, origin: &url::Url) -> bool {
-    label == "main" && page.scheme() == origin.scheme() && page.host_str() == origin.host_str()
+fn local_webview(label: &str, expected: &str, page: &url::Url, origin: &url::Url) -> bool {
+    label == expected && page.scheme() == origin.scheme() && page.host_str() == origin.host_str()
         && page.port_or_known_default() == origin.port_or_known_default()
         && page.username().is_empty() && page.password().is_none()
 }
 
-pub(crate) fn trusted_page(label: &str, page: &url::Url, config: &tauri::Config) -> bool {
+fn trusted_caller(label: &str, expected: &str, page: &url::Url, config: &tauri::Config) -> bool {
     let production = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
     let origin = if tauri::is_dev() {
         let Some(dev_url) = config.build.dev_url.as_ref().filter(|url| {
@@ -35,17 +35,37 @@ pub(crate) fn trusted_page(label: &str, page: &url::Url, config: &tauri::Config)
     } else {
         url::Url::parse(production).expect("valid packaged origin")
     };
-    local_main(label, page, &origin)
+    local_webview(label, expected, page, &origin)
+}
+
+pub(crate) fn mac_find_enabled() -> bool {
+    cfg!(all(target_os = "macos", feature = "macos-find-preview")) &&
+        (!cfg!(feature = "macos-find-system-qa") ||
+            (std::env::var_os("UIPILOT_FIND_ISOLATED_QA").as_deref() == Some(std::ffi::OsStr::new("1")) &&
+                std::env::var_os("UIPILOT_FIND_QA_VERIFIED_ROOTS").is_some_and(|roots| !roots.is_empty())))
+}
+
+pub(crate) fn trusted_page(label: &str, page: &url::Url, config: &tauri::Config) -> bool {
+    trusted_caller(label, "main", page, config) ||
+        (mac_find_enabled() &&
+            trusted_caller(label, "find", page, config))
+}
+
+fn require(window: &WebviewWindow, expected: &str) -> Result<(), &'static str> {
+    use tauri::Manager;
+    let page = window.url().map_err(|_| "invalidCaller")?;
+    trusted_caller(window.label(), expected, &page, window.app_handle().config())
+        .then_some(()).ok_or("invalidCaller")
 }
 
 pub(crate) fn require_main(window: &WebviewWindow) -> Result<(), &'static str> {
-    use tauri::Manager;
-    let page = window.url().map_err(|_| "invalidCaller")?;
-    if trusted_page(window.label(), &page, window.app_handle().config()) {
-        Ok(())
-    } else {
-        Err("invalidCaller")
-    }
+    require(window, "main")
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+pub(crate) fn require_find(window: &WebviewWindow) -> Result<(), &'static str> {
+    if !mac_find_enabled() { return Err("invalidCaller"); }
+    require(window, "find")
 }
 
 #[tauri::command]
@@ -54,7 +74,7 @@ pub(crate) fn get_host_capabilities(window: WebviewWindow) -> Result<HostCapabil
     let windows = cfg!(windows);
     Ok(HostCapabilities {
         version: 1, platform: if windows { "windows" } else { "macos" },
-        plugins: windows, files: windows, screenshot: windows, messages: windows, credentials: windows,
+        plugins: windows, files: windows || mac_find_enabled(), screenshot: windows, messages: windows, credentials: windows,
         builtin_features: windows, command_hotkeys: windows, autostart: windows, double_tap: cfg!(any(windows, target_os = "macos")),
     })
 }
@@ -66,12 +86,14 @@ mod platform_bootstrap {
     fn identity_precedes_state_and_port_is_part_of_dev_origin() {
         let url = |s| url::Url::parse(s).unwrap();
         let dev = url("http://127.0.0.1:14321");
-        assert!(local_main("main", &dev, &dev));
-        assert!(!local_main("find", &dev, &dev));
-        assert!(!local_main("main", &url("http://127.0.0.1:14328"), &dev));
+        assert!(local_webview("main", "main", &dev, &dev));
+        assert!(!local_webview("find", "main", &dev, &dev));
+        assert!(!local_webview("main", "main", &url("http://127.0.0.1:14328"), &dev));
+        assert!(!local_webview("main", "find", &dev, &dev));
+        assert!(local_webview("find", "find", &dev, &dev));
         let packaged = url("tauri://localhost");
-        assert!(local_main("main", &url("tauri://localhost/index.html"), &packaged));
-        assert!(!local_main("main", &dev, &packaged));
-        assert!(!local_main("main", &url("tauri://localhost.attacker.test"), &packaged));
+        assert!(local_webview("main", "main", &url("tauri://localhost/index.html"), &packaged));
+        assert!(!local_webview("main", "main", &dev, &packaged));
+        assert!(!local_webview("main", "main", &url("tauri://localhost.attacker.test"), &packaged));
     }
 }

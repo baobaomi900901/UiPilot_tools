@@ -1,0 +1,20 @@
+[
+  {
+    "identifier": "macos-find-preview-main",
+    "platforms": ["macOS"],
+    "webviews": ["main"],
+    "permissions": ["allow-open-find-window", "allow-set-builtin-feature-favorite"]
+  },
+  {
+    "identifier": "macos-find-preview-window",
+    "platforms": ["macOS"],
+    "webviews": ["find"],
+    "permissions": [
+      "core:event:allow-listen", "core:event:allow-unlisten",
+      "allow-prepare-find-initialization", "allow-commit-find-ready",
+      "allow-get-find-ready-status", "allow-set-find-pinned", "allow-set-find-preview-preference",
+      "allow-hide-find-window", "allow-search-files", "allow-cancel-find-query",
+      "allow-execute-result", "allow-open-find-document"
+    ]
+  }
+]

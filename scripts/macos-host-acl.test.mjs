@@ -18,6 +18,31 @@ test('Mac production enables only a local main capability and its core commands'
   assert.ok(read('capabilities/main.json').permissions.includes('allow-get-host-capabilities'));
 });
 
+test('preview grants main and Find separate local IPC routes', () => {
+  const [main, find] = read('macos-find-preview-acl.json');
+  // The preview grants these commands at runtime; build-time command pruning cannot see that ACL.
+  for (const file of ['tauri.conf.json', 'tauri.macos.conf.json', 'tauri.macos-internal.conf.json']) {
+    assert.notEqual(read(file).build?.removeUnusedCommands, true);
+  }
+  for (const acl of [main, find]) {
+    assert.deepEqual(acl.platforms, ['macOS']);
+    assert.equal(acl.remote, undefined);
+    assert.equal(acl.windows, undefined);
+  }
+  assert.deepEqual(main.webviews, ['main']);
+  assert.deepEqual(main.permissions.toSorted(), ['allow-open-find-window', 'allow-set-builtin-feature-favorite']);
+  assert.deepEqual(find.webviews, ['find']);
+  assert.deepEqual(find.permissions.toSorted(), [
+    'allow-cancel-find-query', 'allow-commit-find-ready', 'allow-execute-result', 'allow-get-find-ready-status',
+    'allow-hide-find-window', 'allow-open-find-document', 'allow-prepare-find-initialization', 'allow-search-files',
+    'allow-set-find-pinned', 'allow-set-find-preview-preference',
+    'core:event:allow-listen', 'core:event:allow-unlisten',
+  ].toSorted());
+  for (const acl of [main, find]) {
+    assert.ok(!read('tauri.macos.conf.json').app.security.capabilities.includes(acl.identifier));
+  }
+});
+
 import { waitForBootstrap } from './smoke-platform-bootstrap.mjs';
 test('smoke requires both the trusted frontend marker and a clean exit', async () => {
   const run = code => waitForBootstrap(process.execPath, ['-e', code], { log() {} });

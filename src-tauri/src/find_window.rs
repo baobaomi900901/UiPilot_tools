@@ -451,6 +451,16 @@ impl FindWindowController {
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+    pub(crate) fn transfer_source_invocation(&self, id: u64, registries: &ResultRegistries) -> Option<u64> {
+        let core = self.lock();
+        match &core.state {
+            AdmissionState::Transferring(transfer) if transfer.transaction.transfer_id == id =>
+                registries.main().current_source_invocation(&transfer.transaction.retirement),
+            _ => None,
+        }
+    }
+
     pub(crate) fn confirm_transfer_focus(
         &self,
         transfer_id: u64,
@@ -619,6 +629,21 @@ impl FindWindowController {
             core.state = AdmissionState::Hidden;
         }
         true
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+    pub(crate) fn finish_native_close(&self, registries: &ResultRegistries) {
+        let mut core = self.lock();
+        if let Some(queued) = core.queued.take() {
+            Self::complete(queued, OpenFindCompletion::Superseded);
+        }
+        if core.committed_token.is_some() {
+            if let AdmissionState::Transferring(transfer) = mem::replace(&mut core.state, AdmissionState::Hidden) {
+                Self::complete(transfer.transaction, OpenFindCompletion::Superseded);
+            }
+        }
+        core.pinned = false;
+        registries.find().hide_and_clear();
     }
 
     pub(crate) fn pinned(&self) -> bool {
@@ -811,8 +836,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        file_index::{IndexedKind, OpenIndexedPath, VolumeIdentity},
-        file_search::FileExecutionAction,
         result_registry::{ExecutionTicket, QueryDomain, ResultAction, ResultRegistries},
     };
 
@@ -864,14 +887,8 @@ mod tests {
         let token = find
             .begin_query(QueryDomain::File, invocation_id, 1)
             .unwrap();
-        let action =
-            ResultAction::OpenFile(FileExecutionAction::Indexed(OpenIndexedPath::for_test(
-                0,
-                1,
-                VolumeIdentity::for_test(r"\\?\Volume{FIND}\", 1, "ntfs"),
-                "file.txt",
-                IndexedKind::File,
-            )));
+        // This fixture exercises ticket ownership, independent of the native file operation.
+        let action = ResultAction::CopyBuiltInText { text: "test".into() };
         let (request_id, result_id) = find
             .publish_if_latest(
                 token,

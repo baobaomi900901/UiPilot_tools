@@ -282,6 +282,22 @@ pub(crate) struct ResultItem {
     pub(crate) has_default_action: bool,
 }
 
+pub(crate) fn find_item(query: String, subtitle: String, favorite: bool) -> ResultItem {
+    ResultItem {
+        result_actions: None,
+        result_id: String::new(),
+        activation: LauncherResultActivation::OpenFind { query },
+        title: "/find".into(),
+        subtitle: Some(subtitle),
+        icon: None,
+        plugin_icon_url: None,
+        icon_kind: Some(ResultIconKind::Find),
+        detail: None,
+        favorite: Some(ResultFavorite::builtin(BuiltinFeature::Find, favorite)),
+        has_default_action: false,
+    }
+}
+
 pub(crate) fn search_response(
     request_id: String,
     items: Vec<(String, crate::model::ResultItem)>,

@@ -5726,22 +5726,7 @@ fn find_result(
     subtitle: String,
     favorite: bool,
 ) -> (crate::model::ResultItem, Option<ResultAction>) {
-    (
-        crate::model::ResultItem {
-            result_actions: None,
-            result_id: String::new(),
-            activation: LauncherResultActivation::OpenFind { query },
-            title: "/find".into(),
-            subtitle: Some(subtitle),
-            icon: None,
-            plugin_icon_url: None,
-            icon_kind: Some(ResultIconKind::Find),
-            detail: None,
-            favorite: Some(ResultFavorite::builtin(BuiltinFeature::Find, favorite)),
-            has_default_action: false,
-        },
-        None,
-    )
+    (crate::model::find_item(query, subtitle, favorite), None)
 }
 
 fn web_search_result(

@@ -9231,6 +9231,95 @@ describe('real adapter and startup', () => {
     }
   })
 
+  it('does not start Find when its Mac scope marker is unknown', async () => {
+    resetAdapterDocument()
+    windowCapture.label = 'find'
+    Object.defineProperty(window, '__UIPILOT_MACOS_FIND__', { configurable: true, value: 'unknown' })
+    try {
+      await act(async () => { await import('./main') })
+      expect(document.body.textContent).toContain('文件搜索范围不可用')
+      expect(tauriCapture.invoke).not.toHaveBeenCalled()
+      expect(tauriCapture.listen).not.toHaveBeenCalled()
+    } finally {
+      Reflect.deleteProperty(window, '__UIPILOT_MACOS_FIND__')
+      windowCapture.label = 'main'
+    }
+  })
+
+  it.each([
+    ['public-preview', '本机公共字体与共享目录'],
+    ['indexed-local-qa', '本地 Spotlight 索引（隔离验收）'],
+  ])('boots the %s Mac Find adapter, forwards the query and reveals only the selected handle', async (scope, description) => {
+    resetAdapterDocument()
+    windowCapture.label = 'find'
+    Object.defineProperty(window, '__UIPILOT_MACOS_FIND__', { configurable: true, value: scope })
+    let forward: ((event: { payload: unknown }) => void) | undefined
+    tauriCapture.listen.mockImplementation(async (event, handler) => {
+      if (event === 'find://forwarded') forward = handler
+      return vi.fn()
+    })
+    tauriCapture.invoke.mockImplementation(async command => {
+      if (command === 'prepare_find_initialization') return {
+        status: 'prepared', initialization: {
+          initializationToken: 'init', themeRevision: '1', theme: 'system',
+          filePreviewRevision: '1', filePreviewEnabled: true, pinned: false,
+        },
+      }
+      if (command === 'commit_find_ready') return {status: 'ready', initializationToken: 'init'}
+      if (command === 'search_files') return fileResponse('1', [{
+        ...fileItem(), fullPath: '/Users/Shared/example.png', name: 'example.png', canOpenDocument: true,
+      }])
+      if (command === 'execute_result') return {status: 'fileRevealRequested'}
+      throw new Error(command)
+    })
+    try {
+      await act(async () => { await import('./main') })
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('commit_find_ready', {input: {initializationToken: 'init'}}))
+      await act(async () => forward!({payload: {invocationId: 'find-1', forwardSequence: '1', query: 'example'}}))
+      expect(tauriCapture.invoke).toHaveBeenCalledWith('search_files', {
+        query: 'example', category: 'all', sort: 'modifiedDesc', invocationId: 'find-1', querySequence: 1,
+      })
+      const row = document.querySelector<HTMLElement>('[role=option]')!
+      expect(row.textContent).toContain('example.png')
+      expect(document.body.textContent).toContain(description)
+      await act(async () => { row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
+      expect(tauriCapture.invoke).toHaveBeenCalledWith('execute_result', {requestId: 'file-request-1', resultId: 'file-result-1'})
+      expect(tauriCapture.invoke.mock.calls.some(([command]) => command === 'load_find_thumbnail')).toBe(false)
+      expect(tauriCapture.capabilities).not.toHaveBeenCalled()
+    } finally {
+      await pagehide()
+      Reflect.deleteProperty(window, '__UIPILOT_MACOS_FIND__')
+      windowCapture.label = 'main'
+    }
+  })
+
+  it('enables only Find when a Mac preview reports files without other builtins', async () => {
+    const { client, emit } = fakeClient()
+    let favorite = false
+    vi.mocked(client.setBuiltinFeatureFavorite).mockImplementation(async () => { favorite = true })
+    vi.mocked(client.searchApps).mockImplementation(async ({ query }) => ({
+      requestId: 'preview-find',
+      items: [{
+        ...findLauncherItem(query), favorite: { target: { kind: 'builtin', feature: 'find' }, favorite },
+      }, { resultId: 'screenshot', title: 'Screenshot', iconKind: 'screenshot', activation: { kind: 'openScreenshot' } }],
+    }))
+    const core = createLauncherCore(client, undefined, { ...hostSnapshot('macos'), files: true })
+    await core.start()
+    try {
+      emit(shown('mac-find'))
+      await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+      core.openPluginContextMenu(0)
+      core.setPluginFavorite(0, true)
+      core.closePluginContextMenu()
+      await vi.waitFor(() => expect(core.getSnapshot().results[0].favorite?.favorite).toBe(true))
+      expect(client.setBuiltinFeatureFavorite).toHaveBeenCalledExactlyOnceWith({ feature: 'find', favorite: true })
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/find 字体', inputType: 'insertText' })
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(client.openFind).toHaveBeenCalledWith({ query: '字体', invocationId: 'mac-find', querySequence: 3 }))
+      expect(client.startScreenshot).not.toHaveBeenCalled()
+    } finally { core.destroy() }
+  })
+
   it('routes Mac text and slash queries through application search only', async () => {
     const { client, emit } = fakeClient()
     client.cancelTranslationSelection = vi.fn(async () => {})
@@ -9903,6 +9992,8 @@ describe('file protocol', () => {
       { ...valid, total: '-1' },
       { ...valid, status: 'unknown' },
       { ...valid, items: [{ ...valid.items[0], sizeBytes: '01' }] },
+      { ...valid, items: [{ ...valid.items[0], canOpenDocument: 'yes' }] },
+      { ...valid, items: [{ ...valid.items[0], canOpenDocument: true, kind: 'folder', sizeBytes: null }] },
       { ...valid, items: [{ ...valid.items[0], kind: 'directory' }] },
       { ...valid, items: [{ ...valid.items[0], modifiedUtc: '2026-07-22' }] },
       Object.assign(Object.create({ inherited: true }), valid),

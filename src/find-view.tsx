@@ -6,7 +6,6 @@ import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
 import type { FileCategory, FileResultKind } from './protocol'
 import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
 import { createContextActionsMenu, type ContextActionsMenu } from './context-actions-ui'
-import { isWindowPinShortcut } from './window-pin-shortcut'
 
 const CATEGORY_LABELS: Record<FileCategory, string> = {
   all: '全部', folder: '文件夹', excel: 'Excel', word: 'Word', ppt: 'PPT',
@@ -52,6 +51,11 @@ export interface FindViewProps {
 }
 
 export function FindView({ core }: FindViewProps): React.JSX.Element {
+  const macos = core.macosScope !== undefined
+  const primary = macos ? '⌘' : 'Ctrl'
+  const scopeText = core.macosScope === 'indexed-local-qa'
+    ? '本地 Spotlight 索引（隔离验收）'
+    : '预览范围：本机公共字体与共享目录（仅限 Spotlight 已索引项目）'
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
   const [media] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(media.matches)
@@ -111,10 +115,15 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         disabledReason: busy ?? (owner.searchPending ? '正在搜索' : !owner.query ? '请输入搜索内容' : undefined),
         run() { if (current()) { inputRef.current?.focus(); core.submitSearch() } },
       }] : [{
-        id: 'find-reveal', title: '打开所在的文件夹', shortcut: 'Enter', icon: 'arrow',
+        id: 'find-reveal', title: macos
+          ? item?.kind === 'folder' ? '在 Finder 中打开文件夹' : '在 Finder 中显示'
+          : '打开所在的文件夹', shortcut: 'Enter', icon: 'arrow',
         disabledReason: busy ?? (owner.searchPending ? '正在搜索' : !item ? '没有选中的文件' : undefined),
         run() { if (current() && item) core.keyDown('Enter', false) },
-      }],
+      }, ...(macos && item?.canOpenDocument ? [{
+        id: 'find-open-document', title: '打开文件', icon: 'arrow' as const, disabledReason: busy,
+        run() { if (current()) core.openDocument() },
+      }] : [])],
       global: [
         { id: 'find-category', title: '下一分类', shortcut: 'Tab', icon: 'arrow-right-to-line',
           disabledReason: busy,
@@ -122,18 +131,18 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         { id: 'find-previous-category', title: '上一分类', shortcut: 'Shift+Tab', icon: 'arrow-left-to-line',
           disabledReason: busy,
           run() { if (current()) cycleCategory('previous') } },
-        { id: 'find-pin', title: owner.pinned ? '取消固定窗口' : '固定窗口', shortcut: 'Ctrl+T', icon: 'pin',
+        { id: 'find-pin', title: owner.pinned ? '取消固定窗口' : '固定窗口', shortcut: `${primary}+T`, icon: 'pin',
           disabledReason: busy ?? (owner.pinPending ? '正在更新固定状态' : undefined),
           run() { if (current()) core.setPinned(!owner.pinned) } },
         { id: 'find-preview', title: owner.previewEnabled ? '关闭预览' : '打开预览', icon: 'eye',
           disabledReason: busy ?? (owner.previewPending ? '正在更新预览状态' : undefined),
           run() { if (current()) core.setPreviewEnabled(!owner.previewEnabled) } },
-        { id: 'find-input', title: '返回搜索框', shortcut: 'Ctrl+F', icon: 'search',
+        { id: 'find-input', title: '返回搜索框', shortcut: `${primary}+F`, icon: 'search',
           run() { if (current()) inputRef.current?.focus() } },
       ],
     }, { origin, bottom: 42, onClose: () => setActionsOpen(false) })
     setActionsOpen(menu.isOpen)
-  }, [core, cycleCategory])
+  }, [core, cycleCategory, macos, primary])
 
   useEffect(() => {
     const menu = createContextActionsMenu(document)
@@ -184,14 +193,24 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
-      const menuShortcut = event.key.toLowerCase() === 'k' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey
+      if (macos && event.keyCode === 229) return
+      const primaryPressed = (event.ctrlKey && !event.metaKey) || (macos && event.metaKey && !event.ctrlKey)
+      const shortcut = primaryPressed && !event.altKey && !event.shiftKey
+      const menuShortcut = event.key.toLowerCase() === 'k' && shortcut
       if (menuShortcut && (event.repeat || event.isComposing)) {
         event.preventDefault()
         event.stopPropagation()
         return
       }
       // Shared menu must receive arrows/Escape before the background Find list.
-      if (menuRef.current?.isOpen) return
+      if (menuRef.current?.isOpen) {
+        if (macos && menuShortcut && event.metaKey) {
+          event.preventDefault()
+          event.stopPropagation()
+          menuRef.current.close()
+        }
+        return
+      }
       if (event.defaultPrevented) return
       if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
         event.preventDefault()
@@ -206,13 +225,13 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         if (!event.repeat) openActions()
         return
       }
-      if (isWindowPinShortcut(event)) {
+      if (shortcut && event.key.toLowerCase() === 't' && !event.isComposing) {
         event.preventDefault()
         event.stopPropagation()
         if (!event.repeat) core.setPinned(!core.getSnapshot().pinned)
         return
       }
-      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f' && (!macos || !event.isComposing)) {
         event.preventDefault()
         event.stopPropagation()
         inputRef.current?.focus()
@@ -227,7 +246,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
     }
     window.addEventListener('keydown', onWindowKeyDown, true)
     return () => window.removeEventListener('keydown', onWindowKeyDown, true)
-  }, [core, openActions, cycleCategory])
+  }, [core, openActions, cycleCategory, macos])
 
   useLayoutEffect(() => {
     const option = snapshot.selectedIndex >= 0 ? optionRefs.current.get(snapshot.selectedIndex) : undefined
@@ -235,7 +254,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   }, [snapshot.selectedIndex])
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (!['Enter', 'Escape'].includes(event.key) || event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
+    if (!['Enter', 'Escape'].includes(event.key) || event.nativeEvent.isComposing || (macos && event.nativeEvent.keyCode === 229) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
     event.preventDefault()
     if (event.repeat) return
     if (event.key === 'Enter') core.submitSearch()
@@ -269,7 +288,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               onChange={(event) => core.setQuery(event.currentTarget.value)}
               onKeyDown={onKeyDown}
             />
-            <Tooltip title={`${snapshot.pinned ? '取消固定' : '固定窗口'} (Ctrl+T)`}>
+            <Tooltip title={`${snapshot.pinned ? '取消固定' : '固定窗口'} (${primary}+T)`}>
               <Button
                 className={snapshot.pinned ? 'find-icon-button is-selected' : 'find-icon-button'}
                 type="text"
@@ -283,7 +302,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                 )}
                 aria-label={snapshot.pinned ? '取消固定' : '固定窗口'}
                 aria-pressed={snapshot.pinned}
-                aria-keyshortcuts="Control+t"
+                aria-keyshortcuts={macos ? 'Meta+t' : 'Control+t'}
                 tabIndex={-1}
                 disabled={disabled || snapshot.pinPending || !snapshot.invocationId}
                 onClick={() => core.setPinned(!snapshot.pinned)}
@@ -317,7 +336,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                   disabled={disabled || !snapshot.invocationId}
                   onClick={() => core.setCategory(category)}
                   onKeyDown={(event) => {
-                    if (event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
+                    if (event.nativeEvent.isComposing || (macos && event.nativeEvent.keyCode === 229) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
                     if (event.key === 'Enter' || event.key === 'Escape') {
                       event.preventDefault()
                       event.stopPropagation()
@@ -342,7 +361,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                     role="option"
                     tabIndex={-1}
                     onKeyDown={(event) => {
-                      if (event.nativeEvent.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+                      if (event.nativeEvent.isComposing || (macos && event.nativeEvent.keyCode === 229) || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
                       if (event.key !== 'Enter' && event.key !== 'Escape') return
                       event.preventDefault()
                       event.stopPropagation()
@@ -387,7 +406,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             >
               {selected ? <>
                 <Tooltip title={selected.name}><h2>{selected.name}</h2></Tooltip>
-                <div className="find-preview-media">
+                {!macos && <div className="find-preview-media">
                   {snapshot.thumbnailPending ? <Spin size="small" /> : null}
                   {!snapshot.thumbnailPending && showThumbnail ? (
                     <img
@@ -404,7 +423,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                       <span>无预览图片</span>
                     </div>
                   ) : null}
-                </div>
+                </div>}
                 <dl>
                   <dt>类型</dt><dd>{fileType(selected.kind, selected.name)}</dd>
                   <dt>大小</dt><dd>{fileSize(selected.kind, selected.sizeBytes)}</dd>
@@ -423,13 +442,13 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
           <div className="find-region find-footer-region">
             <footer className="find-footer file-toolbar">
-              <span>{snapshot.indexStatus === 'building' ? `正在索引，已有 ${snapshot.total} 条结果` : `共 ${snapshot.total} 条结果`}</span>
+              <span title={macos ? scopeText : undefined}>{macos ? `${snapshot.total} 条结果 · ${scopeText}` : snapshot.indexStatus === 'building' ? `正在索引，已有 ${snapshot.total} 条结果` : `共 ${snapshot.total} 条结果`}</span>
               <div className="status-region" role="status" aria-live="polite" aria-atomic="true">{snapshot.status}</div>
-              <button type="button" className="launcher-operations-trigger" tabIndex={-1} aria-label="操作 Ctrl+K"
-                aria-haspopup="dialog" aria-expanded={actionsOpen} aria-keyshortcuts="Control+k"
+              <button type="button" className="launcher-operations-trigger" tabIndex={-1} aria-label={`操作 ${primary}+K`}
+                aria-haspopup="dialog" aria-expanded={actionsOpen} aria-keyshortcuts={macos ? 'Meta+k' : 'Control+k'}
                 disabled={!snapshot.ready || !snapshot.invocationId || snapshot.hidePending}
                 onMouseDown={(event) => event.preventDefault()} onClick={openActions}>
-                操作 <kbd>Ctrl+K</kbd>
+                操作 <kbd>{primary}+K</kbd>
               </button>
             </footer>
           </div>

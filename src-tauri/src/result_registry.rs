@@ -16,6 +16,8 @@ pub(crate) enum ResultAction {
         app_id: String,
         target: ApplicationLaunchTarget,
     },
+    #[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+    MacFindRow(usize),
     #[cfg(windows)]
     OpenFile(crate::file_search::FileExecutionAction),
     CopyBuiltInText {
@@ -221,11 +223,6 @@ impl Default for ResultRegistry {
 }
 
 impl ResultRegistry {
-    #[cfg(target_os = "macos")]
-    pub(crate) fn for_main() -> Self {
-        Self::scoped(WindowScope::Main, Arc::new(OpaqueIdAllocator::default()))
-    }
-
     fn scoped(scope: WindowScope, allocator: Arc<OpaqueIdAllocator>) -> Self {
         Self::new(scope, allocator, true)
     }
@@ -504,6 +501,13 @@ impl ResultRegistry {
             expected_domain_epoch,
             next_domain_epoch,
         }))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+    pub(crate) fn current_source_invocation(&self, lease: &PreparedApplicationQueryRetirement) -> Option<u64> {
+        let current = self.prepare_application_query_retirement(&lease.invocation_id, lease.query_sequence)
+            .ok().flatten()?;
+        (current == *lease).then(|| lease.invocation_id.parse().ok()).flatten()
     }
 
     pub(crate) fn retire_application_query_if_current(

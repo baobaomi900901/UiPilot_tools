@@ -131,6 +131,11 @@ fn fit_axis(current: i32, size: u32, start: i32, extent: u32) -> i32 {
     else { (i64::from(start) + spare / 2).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 }
 }
 
+#[cfg(feature = "macos-find-preview")]
+pub(crate) fn main_invocation_current(app: &AppHandle, id: u64) -> bool {
+    app.state::<Mutex<Presentation>>().lock().expect("presentation state").owns(id)
+}
+
 // A queued blur or application completion can only hide its own presentation.
 pub(crate) fn hide_if_current(app: &AppHandle, id: u64) -> Result<(), ()> {
     let state = app.state::<Mutex<Presentation>>();
@@ -153,8 +158,12 @@ fn recheck_focus(app: &AppHandle, id: u64, delay: Duration) {
             let Some(window) = handle.get_webview_window("main") else { return; };
             if window.is_focused().unwrap_or(false) {
                 state.lock().expect("presentation state").observe_focus();
-            } else if hide_if_current(&handle, id).is_err() {
-                eprintln!("UiPilot: could not hide unfocused invocation {id}");
+            } else {
+                #[cfg(feature = "macos-find-preview")]
+                if crate::macos_find_host::owns_main_blur(&handle) { return; }
+                if hide_if_current(&handle, id).is_err() {
+                    eprintln!("UiPilot: could not hide unfocused invocation {id}");
+                }
             }
         });
     });
@@ -214,8 +223,14 @@ struct ThemeUpdate { theme: ThemePreference }
 #[tauri::command]
 fn set_theme_preference(window: WebviewWindow, preference: ThemeUpdate) -> Result<(), &'static str> {
     require_main(&window)?;
-    window.app_handle().state::<SettingsStore>().set_theme_preference_with_revision(preference.theme)
-        .map(|_| ()).map_err(|_| "settingsFailed")
+    let revision = window.app_handle().state::<SettingsStore>().set_theme_preference_with_revision(preference.theme)
+        .map_err(|_| "settingsFailed")?;
+    if let Some(find) = window.app_handle().get_webview_window("find") {
+        find.emit_to("find", "find://theme-changed", serde_json::json!({
+            "themeRevision": revision.to_string(), "theme": preference.theme
+        })).map_err(|_| "windowFailed")?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -230,11 +245,27 @@ async fn hide_launcher(window: WebviewWindow, invocation_id: String) -> Result<(
     receive.await.map_err(|_| "windowFailed")?.map_err(|_| "windowFailed")
 }
 
+#[cfg(feature = "macos-find-preview")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FavoriteInput { feature: crate::settings::BuiltinFeature, favorite: bool }
+
+#[cfg(feature = "macos-find-preview")]
+#[tauri::command]
+fn set_builtin_feature_favorite(window: WebviewWindow, input: FavoriteInput) -> Result<(), &'static str> {
+    require_main(&window)?;
+    if !crate::host_capabilities::mac_find_enabled() || input.feature != crate::settings::BuiltinFeature::Find { return Err("invalidCaller"); }
+    window.state::<SettingsStore>().set_builtin_feature_favorite(input.feature, input.favorite)
+        .map_err(|_| "settingsFailed")
+}
+
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     let settings = SettingsStore::load(&app.path().app_data_dir()?)?;
     app.manage(settings);
     crate::macos_apps::setup(app);
+    #[cfg(feature = "macos-find-preview")]
+    if crate::host_capabilities::mac_find_enabled() { crate::macos_find_host::setup(app)?; }
     let open = MenuItem::with_id(app, "show", "显示 UiPilot", true, None::<&str>)?;
     app.manage(hotkey::ShowMenu(open.clone()));
     if let Err(error) = app.handle().plugin(ShortcutBuilder::new().with_handler(|app, shortcut, event| {
@@ -272,8 +303,25 @@ pub fn run() {
             .build())
         .manage(hotkey::LauncherHotkey::default())
         .manage(Mutex::new(Presentation::default()))
-        .invoke_handler(tauri::generate_handler![crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference, hide_launcher, hotkey::save_hotkey, hotkey::set_hotkey_recording, crate::macos_apps::search_apps, crate::macos_apps::execute_result])
+        .invoke_handler(tauri::generate_handler![
+            crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
+            hide_launcher, hotkey::save_hotkey, hotkey::set_hotkey_recording,
+            crate::macos_apps::search_apps, crate::macos_apps::execute_result,
+            #[cfg(feature = "macos-find-preview")] set_builtin_feature_favorite,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_window,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::prepare_find_initialization,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::commit_find_ready,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::get_find_ready_status,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::set_find_pinned,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::set_find_preview_preference,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::hide_find_window,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::search_files,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::cancel_find_query,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_document,
+        ])
         .on_window_event(|window, event| {
+            #[cfg(feature = "macos-find-preview")]
+            if crate::macos_find_host::on_window_event(window, event) { return; }
             if window.label() != "main" { return; }
             let state = window.state::<Mutex<Presentation>>();
             match event {
@@ -303,6 +351,8 @@ pub fn run() {
                 tauri::RunEvent::Reopen { .. } => show(app),
                 tauri::RunEvent::ExitRequested { .. } => {
                     app.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting = true;
+                    #[cfg(feature = "macos-find-preview")]
+                    crate::macos_find_host::shutdown(app);
                     hotkey::stop(app);
                     app.remove_tray_by_id("launcher");
                 }

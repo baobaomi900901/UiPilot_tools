@@ -36,6 +36,8 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "get_host_capabilities",
             "open_find_window",
+            "cancel_find_query",
+            "open_find_document",
             "prepare_find_initialization",
             "commit_find_ready",
             "get_find_ready_status",

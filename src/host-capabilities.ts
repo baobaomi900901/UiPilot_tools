@@ -36,7 +36,10 @@ export function settingsTabAvailable(host: HostCapabilities, tab: string): boole
 
 export function resultAvailable(host: HostCapabilities, activation: LauncherResultActivation, item: ResultItem): boolean {
   if (!host.plugins && (item.actions || item.pluginIconUrl || item.favorite?.target?.kind === 'publicPlugin')) return false
-  if (!host.builtinFeatures && (item.iconKind || item.favorite?.target?.kind === 'builtin')) return false
+  if (!host.builtinFeatures && (item.iconKind || item.favorite?.target?.kind === 'builtin')) {
+    if (activation.kind !== 'openFind' || !host.files || item.iconKind !== 'find' ||
+        (item.favorite && (item.favorite.target?.kind !== 'builtin' || item.favorite.target.feature !== 'find'))) return false
+  }
   switch (activation.kind) {
     case 'openFind': return host.files
     case 'openScreenshot': return host.screenshot

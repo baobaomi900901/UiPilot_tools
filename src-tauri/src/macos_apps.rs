@@ -8,7 +8,7 @@ use crate::{
     apps::{self, macos_backend::{self, BundleTarget, OpenAttempt, OpenOutcome}, AppCache, ApplicationLaunchTarget},
     host_capabilities::require_main,
     model::{search_response, SearchResponse},
-    result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
+    result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
     settings::SettingsStore,
 };
 
@@ -28,10 +28,10 @@ struct Scan {
 }
 
 impl MacApplications {
-    fn new(cache: AppCache) -> Self {
+    fn new(cache: AppCache, registry: ResultRegistry) -> Self {
         Self {
             cache: Arc::new(cache),
-            registry: ResultRegistry::for_main(),
+            registry,
             ready: watch::channel(None).0,
             scan: Mutex::new(Scan::default()),
             execute: Mutex::new(()),
@@ -58,7 +58,9 @@ impl MacApplications {
 }
 
 pub(crate) fn setup(app: &mut tauri::App) {
-    let service = Arc::new(MacApplications::new(AppCache::new()));
+    let registries = Arc::new(ResultRegistries::default());
+    let service = Arc::new(MacApplications::new(AppCache::new(), registries.main().clone()));
+    app.manage(registries);
     app.manage(Arc::clone(&service));
     service.refresh();
 }
@@ -109,6 +111,10 @@ pub(crate) async fn search_apps(
     let Some(token) = service.registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence) else {
         return Ok(None);
     };
+    #[cfg(feature = "macos-find-preview")]
+    if crate::host_capabilities::mac_find_enabled() && (query.trim().is_empty() || query.trim().starts_with('/')) {
+        return Ok(publish(&service, app.state::<SettingsStore>().inner(), token, &query));
+    }
     let retrying = *service.ready.borrow() == Some(false);
     if retrying { service.refresh(); }
     let mut ready = service.ready.subscribe();
@@ -120,10 +126,33 @@ pub(crate) async fn search_apps(
 }
 
 fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str) -> Option<SearchResponse> {
-    let mut applications = service.cache.snapshot();
-    settings.decorate_applications(&mut applications);
-    let entries = apps::rank(&applications, query.trim()).iter().map(apps::registry_entry).collect();
-    service.registry.publish_if_latest(token, entries, || true, search_response)
+    let query = query.trim();
+    let preview = crate::host_capabilities::mac_find_enabled();
+    let command = preview && (query.starts_with('/') || query.is_empty());
+    let mut entries = Vec::new();
+    if !command {
+        let mut applications = service.cache.snapshot();
+        settings.decorate_applications(&mut applications);
+        entries.extend(apps::rank(&applications, query).iter().map(|app| {
+            let (item, action) = apps::registry_entry(app);
+            (item, Some(action))
+        }));
+    }
+    if preview {
+        let arg = if !command { Some(query) }
+            else if query.is_empty() || "/find".starts_with(query) { Some("") }
+            else { query.strip_prefix("/find ").map(str::trim) };
+        if let Some(argument) = arg {
+            let favorite = settings.snapshot().favorite_builtin_features.contains(&crate::settings::BuiltinFeature::Find);
+            let subtitle = if argument.is_empty() { "搜索文件".into() } else { format!("搜索文件：{argument}") };
+            entries.push((crate::model::find_item(argument.into(), subtitle, favorite), None));
+        }
+    }
+    service.registry.publish_if_latest(token, entries, || true, |id, items| {
+        let mut response = search_response(id, items);
+        response.replace_local_results = command;
+        response
+    })
 }
 
 fn execute_registered(
@@ -157,7 +186,16 @@ fn execute_registered(
 }
 
 #[tauri::command]
-pub(crate) async fn execute_result(window: WebviewWindow, request_id: String, result_id: String) -> Result<OpenOutcome, Error> {
+pub(crate) async fn execute_result(window: WebviewWindow, request_id: String, result_id: String) -> Result<serde_json::Value, serde_json::Value> {
+    #[cfg(feature = "macos-find-preview")]
+    if window.label() == "find" {
+        return crate::macos_find_host::execute_file(window, request_id, result_id, false).await;
+    }
+    execute_app(window, request_id, result_id).await.map(|outcome| serde_json::json!(outcome))
+        .map_err(|error| serde_json::json!(error))
+}
+
+async fn execute_app(window: WebviewWindow, request_id: String, result_id: String) -> Result<OpenOutcome, Error> {
     require_main(&window).map_err(|_| Error::caller())?;
     let app = window.app_handle().clone();
     let service = Arc::clone(app.state::<Arc<MacApplications>>().inner());
@@ -184,10 +222,32 @@ mod platform_app_commands {
         let f = Fixture::new();
         let path = f.bundle("中文 App.app", "com.fixture.registry", "中文 App");
         let app = macos_backend::application(&f.0, &path).unwrap();
-        let service = MacApplications::new(AppCache::from_apps(vec![app]));
+        let service = MacApplications::new(AppCache::from_apps(vec![app]), ResultRegistries::default().main().clone());
         let settings = SettingsStore::load(&f.0.join("settings")).unwrap();
         service.registry.on_show("1".into());
         (f, service, settings)
+    }
+
+    #[test]
+    fn find_results_follow_the_build_gate_and_use_the_persisted_favorite() {
+        let (_f, service, settings) = fixture();
+        settings.set_builtin_feature_favorite(crate::settings::BuiltinFeature::Find, true).unwrap();
+        for (index, (query, argument)) in [
+            ("/fi", Some("")), ("/find", Some("")), ("/find 会议", Some("会议")),
+            ("会议", Some("会议")), ("/invalid", None),
+        ].into_iter().enumerate() {
+            let token = service.registry.begin_query(QueryDomain::Application, "1", index as u64 + 1).unwrap();
+            let response = publish(&service, &settings, token, query).unwrap();
+            let item = response.items.iter().find(|row| matches!(row.icon_kind, Some(crate::model::ResultIconKind::Find)));
+            if crate::host_capabilities::mac_find_enabled() && argument.is_some() {
+                let row = item.unwrap();
+                assert!(matches!(&row.activation, crate::model::LauncherResultActivation::OpenFind { query } if Some(query.as_str()) == argument));
+                assert_eq!(row.favorite, Some(crate::model::ResultFavorite::builtin(crate::settings::BuiltinFeature::Find, true)));
+                assert_eq!(service.registry.resolve(&response.request_id, &row.result_id), Err(RegistryError::UnknownResult));
+            } else {
+                assert!(item.is_none());
+            }
+        }
     }
 
     #[test]

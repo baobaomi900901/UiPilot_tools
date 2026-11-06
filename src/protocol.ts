@@ -367,6 +367,7 @@ export type ExecuteOutcome =
   | { status: 'activationRefusedLaunchRequested'; message: string }
   | { status: 'textCopied' }
   | { status: 'fileRevealRequested' }
+  | { status: 'fileOpenRequested' }
   | { status: 'folderOpenRequested' }
 
 export type CommandErrorCode =
@@ -393,6 +394,7 @@ export type CommandErrorCode =
   | 'dataCleanupPending'
   | 'fileNotFound'
   | 'fileOpenFailed'
+  | 'fileActionUnconfirmed'
   | 'webSearchFailed'
 
 export interface CommandError {
@@ -573,7 +575,7 @@ export type PluginTimerErrorName =
   | 'TimerInputNotAllowed'
   | 'MessageStoreUnavailable'
   | 'TimerUnavailable'
-export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string }
+export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string; pinned?: boolean }
 export type OpenFindOutcome = { status: 'forwarded' } | { status: 'superseded' }
 export interface OpenFindInput { query: string; invocationId: string; querySequence: number }
 export interface FindInitializationPrepared {
@@ -590,7 +592,13 @@ export type FindReadyOutcome =
   | { status: 'superseded' }
 export interface FindPreviewPreferenceResult { filePreviewRevision: U64Decimal; filePreviewEnabled: boolean }
 export interface FindThemeChanged { themeRevision: U64Decimal; theme: ThemePreference }
+export type MacFindScope = 'public-preview' | 'indexed-local-qa'
 export interface FindClient {
+  macos?: {
+    scope: MacFindScope
+    cancelQuery(input: { invocationId: string; querySequence: number }): Promise<void>
+    openDocument(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
+  }
   listenForward(handler: (payload: unknown) => void): Promise<() => void>
   listenThemeChanged(handler: (payload: unknown) => void): Promise<() => void>
   prepareInitialization(): Promise<unknown>
@@ -731,6 +739,7 @@ export type FileIndexStatus = 'building' | 'ready' | 'partial' | 'rebuilding' | 
 export type FileResultKind = 'file' | 'folder'
 
 export interface FileResultItem {
+  canOpenDocument?: boolean
   resultId: string
   name: string
   kind: FileResultKind
@@ -749,6 +758,7 @@ export interface FileSearchResponse {
 
 
 export interface FileResultView {
+  canOpenDocument?: boolean
   key: string
   name: string
   kind: FileResultKind
@@ -1545,13 +1555,16 @@ export function parseMessageHostCommandError(value: unknown): MessageHostCommand
   return null
 }
 
-export function parseFindForwardPayload(value: unknown): FindForwardPayload | null {
+export function parseFindForwardPayload(value: unknown, macos = false): FindForwardPayload | null {
   const payload = plainRecord(value)
-  const forwardSequence = payload ? parseU64Decimal(payload.forwardSequence) : null
-  if (!payload || !exactKeys(payload, ['forwardSequence', 'invocationId', 'query']) ||
-      typeof payload.invocationId !== 'string' || payload.invocationId.length === 0 ||
-      typeof payload.query !== 'string' || !forwardSequence) return null
-  return { invocationId: payload.invocationId, forwardSequence, query: payload.query }
+  if (!payload) return null
+  const hasPin = macos && Object.prototype.hasOwnProperty.call(payload, 'pinned')
+  const keys = hasPin ? ['forwardSequence', 'invocationId', 'pinned', 'query'] : ['forwardSequence', 'invocationId', 'query']
+  const forwardSequence = parseU64Decimal(payload.forwardSequence)
+  if (!exactKeys(payload, keys) || typeof payload.invocationId !== 'string' || payload.invocationId.length === 0 ||
+      typeof payload.query !== 'string' || !forwardSequence || (hasPin && typeof payload.pinned !== 'boolean')) return null
+  return { invocationId: payload.invocationId, forwardSequence, query: payload.query,
+    ...(hasPin ? { pinned: payload.pinned as boolean } : {}) }
 }
 
 const FIND_THUMBNAIL_PREFIX = 'data:image/png;base64,'
@@ -1633,7 +1646,13 @@ export function parseRefreshAtUtc(value: unknown): string | null {
 
 function parseFileResultItem(value: unknown): FileResultItem | null {
   const item = plainRecord(value)
-  if (!item || !exactKeys(item, ['fullPath', 'kind', 'modifiedUtc', 'name', 'resultId', 'sizeBytes'])) return null
+  if (!item) return null
+  const keys = ['fullPath', 'kind', 'modifiedUtc', 'name', 'resultId', 'sizeBytes']
+  if (Object.prototype.hasOwnProperty.call(item, 'canOpenDocument')) {
+    if (typeof item.canOpenDocument !== 'boolean' || (item.canOpenDocument && item.kind !== 'file')) return null
+    keys.unshift('canOpenDocument')
+  }
+  if (!exactKeys(item, keys)) return null
   if (
     typeof item.resultId !== 'string' ||
     typeof item.name !== 'string' ||

@@ -47,6 +47,10 @@ mod macos_find_identity;
 #[allow(dead_code)] // Private worker bridge, pending Find controller and scope integration.
 mod macos_find_query;
 
+#[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+mod find_window;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // Neither the default host nor plugin windows register file search IPC.
 mod macos_find_results;
+#[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
+mod macos_find_host;
