@@ -43,6 +43,7 @@ pub(crate) struct PluginSubmissionOwner {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PluginRequestOwner {
     Command(PluginSubmissionOwner),
+    SharePrepare(super::share_prepare::SharePrepareOwner),
     ResultAction(super::result_action::ResultActionOrigin),
     WindowAction {
         identity: crate::plugin_window::WindowActionIdentity,
@@ -57,6 +58,7 @@ pub(crate) enum PluginRequestOwner {
 impl PluginRequestOwner {
     pub(crate) fn live(&self) -> bool {
         match self {
+            Self::SharePrepare(owner) => owner.lease.live(),
             Self::ResultAction(origin) => {
                 origin.lease.live()
                     && origin
@@ -100,6 +102,7 @@ impl PluginRequestCandidate {
             && self.input.len() <= 64 * 1024
             && !self.input.contains('\0')
             && match &self.owner {
+                PluginRequestOwner::SharePrepare(owner) => owner.valid_for(self),
                 PluginRequestOwner::Command(owner) => {
                     owner.ui_intent_epoch != 0 && !owner.submission_token.is_empty()
                 }
@@ -178,6 +181,7 @@ pub(crate) enum PluginScheduleOutcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginCompletionOutcome {
+    pub(crate) completed_owner: PluginRequestOwner,
     pub(crate) credential_publication: Option<(u64, super::result_action::ResultActionLease)>,
     pub(crate) accepted: bool,
     pub(crate) next: Option<ScheduledPluginRequest>,
@@ -219,6 +223,7 @@ struct RunningRequest {
 
 pub(crate) struct PluginCurrentRequest<'a> {
     panel_action: bool,
+    effects_allowed: bool,
     plugin_generation: u64,
     activation_id: u64,
     admission_epoch: u64,
@@ -226,6 +231,10 @@ pub(crate) struct PluginCurrentRequest<'a> {
 }
 
 impl PluginCurrentRequest<'_> {
+    pub(crate) fn effects_allowed(&self) -> bool {
+        self.effects_allowed
+    }
+
     pub(crate) fn is_panel_action(&self) -> bool {
         self.panel_action
     }
@@ -504,7 +513,8 @@ impl PluginRequestScheduler {
         }
         if matches!(
             reserved.candidate.owner,
-            PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::SharePrepare(_)
+                | PluginRequestOwner::PanelAction { .. }
                 | PluginRequestOwner::WindowAction { .. }
                 | PluginRequestOwner::ResultAction(_)
         ) && (queue.rebuilding || queue.running.is_some() || queue.waiting.is_some())
@@ -521,7 +531,8 @@ impl PluginRequestScheduler {
                     *reason = Some(super::content_action::ContentActionError::Cancelled);
                 }
             }
-            PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::SharePrepare(_)
+            | PluginRequestOwner::PanelAction { .. }
             | PluginRequestOwner::WindowAction { .. }
             | PluginRequestOwner::ResultAction(_) => {
                 if queue
@@ -561,7 +572,8 @@ impl PluginRequestScheduler {
             if running.current
                 && matches!(
                     running.request.candidate.owner,
-                    PluginRequestOwner::PanelAction { .. }
+                    PluginRequestOwner::SharePrepare(_)
+                        | PluginRequestOwner::PanelAction { .. }
                         | PluginRequestOwner::WindowAction { .. }
                         | PluginRequestOwner::ResultAction(_)
                 )
@@ -570,6 +582,9 @@ impl PluginRequestScheduler {
                     Some(super::content_action::ContentActionError::Cancelled);
             }
             running.current = false;
+            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
+                owner.lease.cancel();
+            }
             let expired = running.request.context.clone();
             let replaced_submission_token =
                 queue.waiting.replace(reserved.clone()).map(|request| {
@@ -709,7 +724,8 @@ impl PluginRequestScheduler {
         let accepted = running.current && running.request.candidate.owner.live();
         if matches!(
             running.request.candidate.owner,
-            PluginRequestOwner::PanelAction { .. }
+            PluginRequestOwner::SharePrepare(_)
+                | PluginRequestOwner::PanelAction { .. }
                 | PluginRequestOwner::WindowAction { .. }
                 | PluginRequestOwner::ResultAction(_)
         ) {
@@ -730,6 +746,7 @@ impl PluginRequestScheduler {
             None
         };
         Ok(PluginCompletionOutcome {
+            completed_owner: running.request.candidate.owner.clone(),
             credential_publication: None,
             accepted,
             next,
@@ -824,6 +841,9 @@ impl PluginRequestScheduler {
                 .filter(|r| r.request.context == *context)
             {
                 running.current = false;
+                if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
+                    owner.lease.cancel();
+                }
                 running.action_retirement =
                     Some(super::content_action::ContentActionError::Expired);
             }
@@ -847,10 +867,13 @@ impl PluginRequestScheduler {
             running.request.context == *context
                 && matches!(
                     running.request.candidate.owner,
-                    PluginRequestOwner::ResultAction(_)
+                    PluginRequestOwner::ResultAction(_) | PluginRequestOwner::SharePrepare(_)
                 )
         }) {
             running.current = false;
+            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
+                owner.lease.cancel();
+            }
             running.action_retirement = Some(super::content_action::ContentActionError::Cancelled);
             return Ok(None);
         }
@@ -907,6 +930,7 @@ impl PluginRequestScheduler {
                 .as_mut()
                 .ok_or(PluginContextAccessError::Unavailable)?;
             Ok(operation(&mut PluginCurrentRequest {
+                effects_allowed: !matches!(running.request.candidate.owner, PluginRequestOwner::SharePrepare(_)),
                 panel_action: matches!(
                     running.request.candidate.owner,
                     PluginRequestOwner::PanelAction { .. }
@@ -1017,6 +1041,9 @@ impl PluginRequestScheduler {
             .filter(|r| r.request.context == *context)
         {
             running.current = false;
+            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
+                owner.lease.cancel();
+            }
             running.action_retirement = Some(super::content_action::ContentActionError::Expired);
             changed = true;
         }
@@ -1068,6 +1095,9 @@ impl PluginRequestScheduler {
         }
         if let Some(running) = queue.running.as_mut() {
             running.current = false;
+            if let PluginRequestOwner::SharePrepare(owner) = &running.request.candidate.owner {
+                owner.lease.cancel();
+            }
             running.action_retirement = Some(super::content_action::ContentActionError::Expired);
             retired.push((
                 running.request.context.clone(),
@@ -1191,7 +1221,7 @@ mod tests {
         }
     }
 
-    fn candidate(
+    pub(super) fn candidate(
         value: &str,
         generation: u64,
         mode: PublicActivationMode,
@@ -1903,3 +1933,6 @@ mod tests {
         assert!(!token.live());
     }
 }
+
+#[cfg(test)]
+mod share_prepare_tests;

@@ -1,4 +1,5 @@
 mod share_catalog;
+mod share_prepare;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -756,6 +757,10 @@ impl PublicPluginManager {
                 || caller.generation != input.context.plugin_generation
             {
                 return Err("expiredRequest");
+            }
+            if !self.scheduler.with_current(&input.context, |request| request.effects_allowed())
+                .map_err(|_| "expiredRequest")? {
+                return Err("servicePermissionDenied");
             }
             let bundle = self
                 .bundles
@@ -5284,6 +5289,10 @@ impl PublicPluginManager {
                 || caller.generation != input.context.plugin_generation
             {
                 return Err("expiredRequest");
+            }
+            if !self.scheduler.with_current(&input.context, |request| request.effects_allowed())
+                .map_err(|_| "expiredRequest")? {
+                return Err("servicePermissionDenied");
             }
             let bundle = self
                 .bundles
@@ -16773,4 +16782,6 @@ mod tests {
             .unwrap();
         assert_eq!(manager.selection_translation_authority(), None);
     }
+    include!("activation/share_prepare_tests.rs");
+
 }

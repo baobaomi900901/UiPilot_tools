@@ -40,6 +40,25 @@ const context = { pluginId: 'com.example.panel', pluginGeneration: 1, requestId:
 const invocation = { apiVersion: 1, requestId: context.requestId, action: 'preview', payload: { body: 'Hi', values: [1, 2] }, context: { platform: 'windows', theme: 'dark', invokedAt: '2026-10-24T00:00:00Z' } }
 
 describe('panel action executable bridges', () => {
+  it('dispatches body-free share preparation through onCommand and preserves optional entry', async () => {
+    const handler = vi.fn(async (next: any) => {
+      expect(next.input).toBe('')
+      expect(next.image).toBeUndefined()
+      expect(next.context.entry).toEqual({ kind: 'sharePrepare', receiverId: 'receive' })
+      expect(Object.isFrozen(next.context.entry)).toBe(true)
+      return { requestId: next.requestId, data: { initialized: true } }
+    })
+    const r = await runtime({ onCommand: handler }, false)
+    const prepare = { apiVersion: 1, requestId: context.requestId, input: '', context: {
+      platform: 'windows', theme: 'dark', invokedAt: 'now', entry: { kind: 'sharePrepare', receiverId: 'receive' },
+    } }
+    await r.callback({ payload: { context, kind: 'command', invocation: prepare } })
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(r.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: {
+      context, response: { requestId: context.requestId, data: { initialized: true } },
+    } })
+  })
+
   it('delivers the host request-scoped image as a frozen Panel action descriptor', async () => {
     const descriptor = { id: 'request-image', mimeType: 'image/png', width: 10, height: 20, byteLength: 80 }
     const handler = vi.fn(async (next: any) => {

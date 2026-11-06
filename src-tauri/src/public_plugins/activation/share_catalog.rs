@@ -3,7 +3,7 @@
 use super::*;
 use crate::plugin_share::{catalog::Receiver, types::PluginIdentity};
 
-fn eligible(manifest: &PublicManifestV1, config: &EffectivePluginConfig) -> bool {
+pub(super) fn eligible(manifest: &PublicManifestV1, config: &EffectivePluginConfig) -> bool {
     config.installed
         && config.enabled
         && config.fault.is_none()
@@ -19,7 +19,7 @@ fn eligible(manifest: &PublicManifestV1, config: &EffectivePluginConfig) -> bool
             .contains(&PublicPermission::UiPanel)
 }
 
-fn identity(bundle: &super::super::activation_bundle::ActivationBundle) -> PluginIdentity {
+pub(super) fn identity(bundle: &super::super::activation_bundle::ActivationBundle) -> PluginIdentity {
     PluginIdentity {
         plugin_id: bundle.config.plugin_id.clone(),
         generation: bundle.config.active_generation,

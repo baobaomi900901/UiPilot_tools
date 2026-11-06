@@ -4420,3 +4420,6 @@ fn current_host_still_rejects_packages_requiring_a_future_release() {
         PublicPackageError::IncompatibleApi,
     );
 }
+
+#[path = "share_prepare_tests.rs"]
+mod share_prepare_tests;
