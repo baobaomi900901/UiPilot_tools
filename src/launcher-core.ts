@@ -2683,7 +2683,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         (event.builtinEntry && (!capabilities.commandHotkeys || !capabilities.builtinFeatures))) return
     if (event.selectionTranslation && consumedSelectionIds.has(event.selectionTranslation.id)) return
     if (event.selectionTranslation) consumedSelectionIds.add(event.selectionTranslation.id)
-    if (event.target === 'launcher' && (hotkeyRecording || (model.view === 'settings' && Date.now() <= hotkeyShowGraceUntil)) && consumeHotkeyRecording(event.commandEntry)) {
+    if (capabilities.platform === 'windows' && event.target === 'launcher' && (hotkeyRecording || (model.view === 'settings' && Date.now() <= hotkeyShowGraceUntil)) && consumeHotkeyRecording(event.commandEntry)) {
       commandEntryToken++
       stableCommandTarget = undefined
     stableBuiltinTarget = undefined
@@ -3231,10 +3231,21 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   let recordingQueue: Promise<void> = Promise.resolve()
+  let recordingInvocationId: string | undefined
   function setHotkeyRecordingPhase(phase: HotkeyRecordingPhase): Promise<void> {
     // Arm the host before the shared recorder accepts input. Sequential IPC also
     // prevents a late start response from undoing a subsequent cancellation.
-    recordingQueue = recordingQueue.catch(() => {}).then(() => client.setHotkeyRecording({ recording: phase === 'recording' }))
+    const recording = phase === 'recording'
+    const request: { recording: boolean; invocationId?: string } = { recording }
+    if (capabilities.platform === 'macos') {
+      // A view can change before the queued IPC runs. An old recorder's
+      // release must carry its original owner, even after a new menu show.
+      if (recording) recordingInvocationId = model.invocationId
+      if (!recordingInvocationId) return recording ? Promise.reject(new Error('missing recording owner')) : Promise.resolve()
+      request.invocationId = recordingInvocationId
+      if (!recording) recordingInvocationId = undefined
+    }
+    recordingQueue = recordingQueue.catch(() => {}).then(() => client.setHotkeyRecording(request))
     const armed = phase === 'recording' ? recordingQueue : recordingQueue.catch(() => {})
     if (destroyed) return armed
     if (phase === 'recording' && model.view === 'settings') {

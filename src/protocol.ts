@@ -526,7 +526,7 @@ export interface LauncherClient {
   selectScreenshotSaveDirectory(): Promise<ScreenshotSaveDirectoryView | null>
   setScreenshotSaveDirectory(input: { input: { directory: string | null } }): Promise<ScreenshotSaveDirectoryView>
   setScreenshotHotkey(input: { input: { hotkey: string | null } }): Promise<void>
-  setHotkeyRecording(input: { recording: boolean }): Promise<void>
+  setHotkeyRecording(input: { recording: boolean; invocationId?: string }): Promise<void>
   setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
   setWebSearchEngine(input: { preference: { engine: WebSearchEngine } }): Promise<void>
   hideLauncher(invocationId?: string): Promise<void>

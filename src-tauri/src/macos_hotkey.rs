@@ -116,7 +116,6 @@ pub(super) struct LauncherHotkey {
     // The plugin calls our handler while holding its own registration lock.
     // Never acquire the binding transaction lock inside that callback.
     effective_id: AtomicU32,
-    recording: AtomicBool,
     stopping: AtomicBool,
 }
 pub(super) struct ShowMenu(pub(super) MenuItem<Wry>);
@@ -132,15 +131,15 @@ pub(super) fn initialize(app: &AppHandle) {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum KeyAction { Show, Record }
+enum KeyAction { Show, Record(u64) }
 
 impl LauncherHotkey {
-    fn action(&self, id: u32, event: ShortcutState) -> Option<KeyAction> {
+    fn action(&self, id: u32, event: ShortcutState, recording: Option<u64>) -> Option<KeyAction> {
         if event != ShortcutState::Pressed || self.stopping.load(Ordering::Acquire)
             || self.effective_id.load(Ordering::Acquire) != id {
             return None;
         }
-        Some(if self.recording.load(Ordering::Acquire) { KeyAction::Record } else { KeyAction::Show })
+        Some(recording.map_or(KeyAction::Show, KeyAction::Record))
     }
 
     fn stop_once(&self) -> bool {
@@ -152,10 +151,11 @@ impl LauncherHotkey {
 
 pub(super) fn on_pressed(app: &AppHandle, shortcut: &Shortcut, event: ShortcutState) {
     let Some(state) = app.try_state::<LauncherHotkey>() else { return; };
-    match state.action(shortcut.id(), event) {
-        Some(KeyAction::Record) => {
+    let owner = app.state::<Mutex<super::Presentation>>().lock().expect("presentation state").recording_owner();
+    match state.action(shortcut.id(), event, owner) {
+        Some(KeyAction::Record(id)) => {
             let text = app.state::<SettingsStore>().snapshot().hotkey;
-            let _ = app.emit_to("main", "hotkey-recording://current", text);
+            let _ = app.emit_to("main", "hotkey-recording://current", serde_json::json!({"invocationId": id.to_string(), "hotkey": text}));
         }
         Some(KeyAction::Show) => super::show(app),
         None => {}
@@ -172,14 +172,13 @@ pub(super) fn stop(app: &AppHandle) {
 }
 
 #[tauri::command]
-pub(super) fn set_hotkey_recording(window: WebviewWindow, recording: bool) -> Result<(), HotkeyError> {
+pub(super) fn set_hotkey_recording(window: WebviewWindow, recording: bool, invocation_id: String) -> Result<(), HotkeyError> {
     require_main(&window).map_err(|code| HotkeyError { code })?;
-    window.state::<LauncherHotkey>().recording.store(recording, Ordering::Release);
+    let stale = || HotkeyError { code: "staleRequest" };
+    let id = invocation_id.parse().map_err(|_| stale())?;
+    let state = window.state::<Mutex<super::Presentation>>();
+    if !state.lock().expect("presentation state").set_recording(id, recording) { return Err(stale()); }
     Ok(())
-}
-
-pub(super) fn end_recording(app: &AppHandle) {
-    app.state::<LauncherHotkey>().recording.store(false, Ordering::Release);
 }
 
 #[tauri::command]
@@ -272,14 +271,13 @@ mod tests {
     fn recording_stale_events_and_duplicate_quit_never_open_the_launcher() {
         let state = LauncherHotkey::default();
         state.effective_id.store(42, Ordering::Release);
-        assert_eq!(state.action(42, ShortcutState::Pressed), Some(KeyAction::Show));
-        state.recording.store(true, Ordering::Release);
-        assert_eq!(state.action(42, ShortcutState::Pressed), Some(KeyAction::Record));
-        assert_eq!(state.action(42, ShortcutState::Released), None);
-        assert_eq!(state.action(41, ShortcutState::Pressed), None);
+        assert_eq!(state.action(42, ShortcutState::Pressed, None), Some(KeyAction::Show));
+        assert_eq!(state.action(42, ShortcutState::Pressed, Some(1)), Some(KeyAction::Record(1)));
+        assert_eq!(state.action(42, ShortcutState::Released, Some(1)), None);
+        assert_eq!(state.action(41, ShortcutState::Pressed, Some(1)), None);
         assert!(state.stop_once());
         assert!(!state.stop_once());
-        assert_eq!(state.action(42, ShortcutState::Pressed), None);
+        assert_eq!(state.action(42, ShortcutState::Pressed, Some(1)), None);
     }
 
     #[test]

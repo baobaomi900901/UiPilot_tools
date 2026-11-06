@@ -22,6 +22,7 @@ struct Presentation {
     invocation: u64,
     visible: Option<u64>,
     focused: Option<u64>,
+    recording: Option<u64>,
 }
 
 impl Presentation {
@@ -44,11 +45,22 @@ impl Presentation {
         if self.quitting || self.invocation != id { return false; }
         self.visible = Some(id);
         self.focused = None;
+        self.recording = None;
         true
     }
 
     fn owns(&self, id: u64) -> bool {
         !self.quitting && self.visible == Some(id) && self.invocation == id
+    }
+
+    fn set_recording(&mut self, id: u64, armed: bool) -> bool {
+        if !self.owns(id) { return false; }
+        self.recording = armed.then_some(id);
+        true
+    }
+
+    fn recording_owner(&self) -> Option<u64> {
+        self.recording.filter(|id| self.owns(*id))
     }
 
     fn observe_focus(&mut self) {
@@ -61,6 +73,7 @@ impl Presentation {
         if self.visible == Some(id) {
             self.visible = None;
             self.focused = None;
+            self.recording = None;
         }
     }
 
@@ -125,7 +138,6 @@ pub(crate) fn hide_if_current(app: &AppHandle, id: u64) -> Result<(), ()> {
     let window = app.get_webview_window("main").ok_or(())?;
     window.hide().map_err(|_| ())?;
     state.lock().expect("presentation state").retire(id);
-    hotkey::end_recording(app);
     window.emit("launcher://hidden", ()).map_err(|_| ())
 }
 
@@ -352,6 +364,24 @@ mod lifecycle_tests {
         state.quitting = true;
         assert!(!state.owns(retry));
         assert_eq!(state.request_show(), None);
+    }
+    #[test]
+    fn old_recording_arm_and_release_cannot_modify_a_later_session() {
+        let mut state = Presentation { ready: true, ..Presentation::default() };
+        let a = state.request_show().unwrap();
+        assert!(state.begin_present(a));
+        assert!(state.set_recording(a, true));
+        state.retire(a);
+        assert!(!state.set_recording(a, true));
+        let b = state.request_show().unwrap();
+        assert!(state.begin_present(b));
+        assert!(!state.set_recording(a, true));
+        assert_eq!(state.recording_owner(), None);
+        assert!(state.set_recording(b, true));
+        assert!(!state.set_recording(a, false));
+        assert_eq!(state.recording_owner(), Some(b));
+        state.quitting = true;
+        assert_eq!(state.recording_owner(), None);
     }
     #[test]
     fn active_monitor_placement_handles_removed_displays_and_negative_origins() {

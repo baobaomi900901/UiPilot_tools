@@ -348,7 +348,13 @@ function mountMain(host: HTMLElement, capabilities: HostCapabilities) {
     if (tornDown) return
     try {
       const recordingUnlisten = await listen('hotkey-recording://current', (event) => {
-        window.dispatchEvent(new CustomEvent(HOTKEY_RECORDING_CURRENT_DOM_EVENT, { detail: event.payload }))
+        let detail = event.payload
+        if (capabilities.platform === 'macos') {
+          const value = detail as { invocationId?: unknown; hotkey?: unknown } | null
+          if (!value || typeof value.hotkey !== 'string' || value.invocationId !== core.getSnapshot().invocationId) return
+          detail = value.hotkey
+        }
+        window.dispatchEvent(new CustomEvent(HOTKEY_RECORDING_CURRENT_DOM_EVENT, { detail }))
       })
       let entryUnlisten: (() => void) | undefined
       try { if (capabilities.commandHotkeys) entryUnlisten = await listen('command-hotkey://entry', (event) => core.commandHotkeyEntry(event.payload)) }
