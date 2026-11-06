@@ -361,6 +361,11 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
       }
     } });
     reflectDeleteProperty(window, '__TAURI_INTERNALS__');
+    // WebView2 injects this bootstrap before the Runtime HTML has been parsed.
+    // IPC readiness alone does not mean the entry attribute exists yet.
+    if (document.readyState === 'loading') {
+      await new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+    }
     const entry = document.documentElement.dataset.runtimeEntry;
     const module = entry ? await import(entry) : null;
     if (!module || typeof module.onCommand !== 'function') throw new TypeError('onCommand export required');
