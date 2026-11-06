@@ -92,8 +92,9 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, pl
     }
   }, [releaseRecording, ownerId, onCommit, allowDoubleTap, allowSameValue, value, updateRecorderState])
 
-  const display =
-    recording ? '按下快捷键…' : value ? formatHotkeyDisplay(value, platform) : ''
+  const recordingPrompt = platform === 'macos' && !allowDoubleTap
+    ? '按下组合键，如 ⌥ + 空格' : '按下快捷键…'
+  const display = recording ? recordingPrompt : value ? formatHotkeyDisplay(value, platform) : ''
 
   useLayoutEffect(() => {
     if (recording) {
