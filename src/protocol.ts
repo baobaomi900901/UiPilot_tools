@@ -376,6 +376,7 @@ export type CommandErrorCode =
   | 'applicationEntryUnavailable'
   | 'settingsFailed'
   | 'hotkeyConflict'
+  | 'invalidHotkey'
   | 'windowFailed'
   | 'invalidFileQuery'
   | 'fileSearchWorkerFailed'
@@ -528,7 +529,7 @@ export interface LauncherClient {
   setHotkeyRecording(input: { recording: boolean }): Promise<void>
   setThemePreference(input: { preference: { theme: ThemePreference } }): Promise<void>
   setWebSearchEngine(input: { preference: { engine: WebSearchEngine } }): Promise<void>
-  hideLauncher(): Promise<void>
+  hideLauncher(invocationId?: string): Promise<void>
 }
 
 export interface PluginWindowClient {

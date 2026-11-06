@@ -9201,6 +9201,8 @@ describe('real adapter and startup', () => {
       core.keyDown('Enter', false)
       expect(client.openFind).not.toHaveBeenCalled()
       expect(client.cancelTranslationSelection).not.toHaveBeenCalled()
+      await core.requestHide()
+      expect(client.hideLauncher).toHaveBeenCalledWith('mac-typing')
     } finally { core.destroy() }
   })
 

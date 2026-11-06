@@ -225,7 +225,7 @@ export const client: LauncherClient = {
       'set_web_search_engine',
       Object.freeze({ preference: Object.freeze({ engine: input.preference.engine }) }),
     ),
-  hideLauncher: () => invoke<void>('hide_launcher'),
+  hideLauncher: (invocationId) => invoke<void>('hide_launcher', ...(invocationId === undefined ? [] : [{ invocationId }])),
   validateYoudaoTranslation: (input) => invoke('validate_youdao_translation', { input }),
   credentials: createCredentialClient(invoke),
 }

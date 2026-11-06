@@ -15,6 +15,8 @@
     "allow-get-host-capabilities",
     "allow-load-settings",
     "allow-set-theme-preference",
-    "allow-hide-launcher"
+    "allow-hide-launcher",
+    "allow-save-hotkey",
+    "allow-set-hotkey-recording"
   ]
 }

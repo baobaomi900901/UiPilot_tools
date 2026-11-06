@@ -324,6 +324,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   applicationEntryUnavailable: '应用入口不可用，请重新扫描。',
   settingsFailed: '设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。',
   hotkeyConflict: '快捷键已被命令占用，请选择其他快捷键。',
+  invalidHotkey: '请选择带修饰键的普通组合键。',
   windowFailed: '窗口操作失败。',
   invalidFileQuery: '查询无效。',
   fileSearchWorkerFailed: '搜索暂不可用。',
@@ -2999,11 +3000,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
   function finishSettingsMutation(operation: SettingsOperation, failed: boolean, error?: unknown): void {
     if (!ownsSettingsOperation(operation)) return
-    const conflict = failed && typeof error === 'object' && error !== null &&
-      Object.prototype.hasOwnProperty.call(error, 'code') && (error as { code?: unknown }).code === 'hotkeyConflict'
+    const code = failed && typeof error === 'object' && error !== null &&
+      Object.prototype.hasOwnProperty.call(error, 'code') ? (error as { code?: unknown }).code : undefined
+    const rejection = code === 'hotkeyConflict' || code === 'invalidHotkey' ? code : undefined
     const current = ownsSettingsView(operation)
-    if (failed && !conflict) model.settingsUncertain = true
-    if (conflict && current && operation.previous && model.settings) {
+    if (failed && !rejection) model.settingsUncertain = true
+    if (rejection && current && operation.previous && model.settings) {
       const previous = operation.previous
       setControlDraft(model.settings.hotkey.key, previous.hotkey)
       model.settings.hotkey.value = previous.hotkey
@@ -3015,8 +3017,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     releaseSettingsOperation(operation)
     if (model.view === 'settings') {
       void requestSettingsLoad()
-      if (conflict && current && model.viewEpoch === viewEpoch) {
-        model.status = ERROR_TEXT.hotkeyConflict
+      if (rejection && current && model.viewEpoch === viewEpoch) {
+        model.status = rejection === 'hotkeyConflict' && capabilities.platform === 'macos'
+          ? '快捷键已被占用，请选择其他组合键。' : ERROR_TEXT[rejection]
         publish(true)
       }
     } else {
@@ -4063,7 +4066,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     commandEntryToken++
     stableCommandTarget = undefined
     stableBuiltinTarget = undefined
-    if (destroyed || model.hidePending) return
+    if (destroyed || model.hidePending || (capabilities.platform === 'macos' && !model.invocationId)) return
     retireResultActionSource()
     cancelMinuteRefresh()
     model.shownNotice = undefined
@@ -4073,11 +4076,12 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     invalidateFavoriteInteraction()
     leaveFileMode()
     discardQuicklinksUi()
-    const captured = { token: ++token, epoch: model.viewEpoch }
+    const captured = { token: ++token, epoch: model.viewEpoch, invocationId: model.invocationId }
     hideToken = captured.token
     publish(true)
     try {
-      await client.hideLauncher()
+      if (capabilities.platform === 'macos') await client.hideLauncher(captured.invocationId)
+      else await client.hideLauncher()
       if (destroyed || captured.token !== hideToken || captured.epoch !== model.viewEpoch) return
       model.hidePending = false
       discardPanelUi()
