@@ -62,7 +62,7 @@ pub(crate) use alarm_asset::AlarmAssetIdentity;
 pub(crate) use alarm_asset::{PreparedAlarmAsset, ValidatedAlarmAsset};
 pub(crate) use manifest::{
     public_manifest_v1_schema, valid_plugin_id, PanelHostKeyDeclaration, PanelHostKeyFocus,
-    PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
+    PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform, PublicPluginHost, PublicPackageError,
 };
 pub(crate) use network::{PluginNetworkErrorCode, PluginNetworkResponse};
 #[cfg(test)]
@@ -2197,39 +2197,6 @@ fn valid_json_value(value: &serde_json::Value) -> bool {
 pub(crate) enum PublicPackageSource {
     Archive(PathBuf),
     DevelopmentDirectory(PathBuf),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PublicPluginHost {
-    pub(crate) platform: PublicPlatform,
-    pub(crate) version: [u32; 3],
-    pub(crate) api_version: u32,
-}
-
-impl PublicPluginHost {
-    pub(crate) fn current(platform: PublicPlatform) -> Self {
-        // Installation compatibility must use the same release as the running
-        // application, rather than a second manually maintained version.
-        let version = [
-            env!("CARGO_PKG_VERSION_MAJOR"),
-            env!("CARGO_PKG_VERSION_MINOR"),
-            env!("CARGO_PKG_VERSION_PATCH"),
-        ]
-        .map(|part| part.parse::<u32>().expect("Cargo release version must fit u32"));
-        Self {
-            platform,
-            version,
-            api_version: 1,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PublicPackageError {
-    InvalidPackage,
-    IncompatiblePlatform,
-    IncompatibleApi,
-    UnsupportedPermission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

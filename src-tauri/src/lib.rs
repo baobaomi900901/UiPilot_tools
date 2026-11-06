@@ -1,6 +1,3 @@
-// The installer helper is a standalone binary and does not use the host library.
-#![cfg(not(feature = "installer-helper-build"))]
-
 mod dev_startup;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod translation_languages;
@@ -522,6 +519,7 @@ pub fn run() {
         .manage(Arc::clone(&main_window_transfers))
         .manage(Arc::new(screenshot::window::ScreenshotHost::default()))
         .invoke_handler(tauri::generate_handler![
+            host_capabilities::get_host_capabilities,
             screenshot::commands::start_screenshot,
             screenshot::commands::get_screenshot_state,
             screenshot::commands::read_screenshot_image,
@@ -956,6 +954,7 @@ mod tests {
             .filter(|command| !command.is_empty())
             .collect::<Vec<_>>();
         let mut expected = vec![
+            "host_capabilities::get_host_capabilities",
             "commands::open_find_window",
             "commands::prepare_find_initialization",
             "commands::commit_find_ready",

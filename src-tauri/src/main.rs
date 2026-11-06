@@ -7,6 +7,7 @@ fn main() {
         "[UiPilot dev] 主程序进程已启动（PID {}），正在初始化…",
         std::process::id()
     );
+    #[cfg(windows)]
     uipilot_lib::prepare_windows_identity();
     uipilot_lib::run();
 }

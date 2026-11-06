@@ -6672,6 +6672,8 @@ pub(crate) fn load_settings(
         .screenshot_save_directory
         .clone()
         .or_else(|| app.path().desktop_dir().ok());
+    static READY_MARKER: std::sync::Once = std::sync::Once::new();
+    READY_MARKER.call_once(|| eprintln!("[UiPilot] main frontend ready"));
     #[cfg(debug_assertions)]
     {
         static READY_LOG: std::sync::Once = std::sync::Once::new();

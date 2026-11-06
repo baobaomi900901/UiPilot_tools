@@ -13,7 +13,12 @@
         "maximizable": false,
         "fullscreen": false
       }
-    ]
+    ],
+    "security": {
+      "capabilities": [
+        "macos-main"
+      ]
+    }
   },
   "bundle": {
     "targets": [
