@@ -1,6 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "build": {
+    "features": ["schema-generator"],
     "beforeBuildCommand": "python scripts/provider_build.py prepare && npm run build && npm run build:managed-everything",
     "beforeBundleCommand": "python scripts/provider_build.py validate && npm run stage:managed-everything:production"
   },

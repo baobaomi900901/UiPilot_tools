@@ -597,10 +597,15 @@ export type FindDocumentsOperation = 'get' | 'grant' | 'revoke'
 export type FindDocumentsAccess = Readonly<{
   status: 'notGranted' | 'granted' | 'needsReauthorization'
   revision: U64Decimal
+  persistence: 'none' | 'session' | 'remembered'
 }>
 export interface FindClient {
   macos?: {
-    documents?: Record<FindDocumentsOperation, (input: { invocationId: string }) => Promise<unknown>>
+    documents?: {
+      get(input: { invocationId: string }): Promise<unknown>
+      grant(input: { invocationId: string; remember: boolean }): Promise<unknown>
+      revoke(input: { invocationId: string }): Promise<unknown>
+    }
     scope: MacFindScope
     cancelQuery(input: { invocationId: string; querySequence: number }): Promise<void>
     openDocument(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
@@ -1563,11 +1568,16 @@ export function parseMessageHostCommandError(value: unknown): MessageHostCommand
 
 export function parseFindDocumentsAccess(value: unknown): FindDocumentsAccess | null {
   const record = plainRecord(value)
-  if (!record || !exactKeys(record, ['revision', 'status'])) return null
+  if (!record || !exactKeys(record, ['persistence', 'revision', 'status'])) return null
   const revision = parseU64Decimal(record.revision)
   const status = record.status
   if (!revision || (status !== 'granted' && status !== 'notGranted' && status !== 'needsReauthorization')) return null
-  return Object.freeze({ revision, status })
+  const persistence = record.persistence
+  if (persistence !== 'none' && persistence !== 'session' && persistence !== 'remembered') return null
+  if (status === 'granted' && persistence === 'none') return null
+  if (status === 'notGranted' && persistence !== 'none') return null
+  if (status === 'needsReauthorization' && persistence === 'session') return null
+  return Object.freeze({ revision, status, persistence })
 }
 
 export function parseFindForwardPayload(value: unknown, macos = false): FindForwardPayload | null {

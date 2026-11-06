@@ -17,11 +17,16 @@ node scripts/verify-macos-bundle.mjs
 
 ### 文件搜索预览
 
-内部 Apple Silicon 文件搜索预览包可在主窗口输入 `/find 文件名` 并回车。默认搜索公共字体目录和本机共享目录 `/Users/Shared` 中已被 Spotlight 索引且允许读取的项目。要搜索本地「文稿」，点击 Find 里的「允许本次搜索文稿」，在系统窗口选中当前账户的「文稿」文件夹并确认。Find 会用原关键词重新搜索，包括文稿的子目录。点击「停止搜索文稿」可随时移出该范围，退出 UiPilot 后授权结束。
+内部 Apple Silicon 文件搜索预览包可在主窗口输入 `/find 文件名` 并回车。默认搜索公共字体目录和本机共享目录 `/Users/Shared` 中已被 Spotlight 索引且允许读取的项目。要搜索本地「文稿」，点击「授权并记住文稿」，在系统窗口选中当前账户的「文稿」文件夹并确认。Find 会用原关键词重新搜索，包括子目录。显示「停止并忘记文稿」即表示授权已保存；退出并重新打开同一个安装包，首次搜索会自动恢复。点击该按钮可移除保存的授权。若只需本次使用，在 ⌘K 操作菜单中选择「仅本次搜索文稿」。
 
 选中文件行后按回车可在 Finder 中定位文件，选中文件夹则会打开它。支持的普通文档另有「打开文件」操作。正式目标是免配置搜索系统已索引、UiPilot 可访问的本地文件。全系统范围仍待签名身份与系统隐私授权验收，常规构建继续关闭 Find。
 
-如需构建受限范围的预览包，使用上方内部打包命令，在 `build` 后添加 `--features macos-find-preview`。发布状态与测试边界见[文件搜索设计](docs/superpowers/specs/2026-11-06-macos-file-search-design.md)。
+使用以下命令构建并验证支持记住文稿的内部包。只有主程序携带应用专属书签权限。更换签名或安装新版本后可能需要重新授权。发布状态与测试边界见[文件搜索设计](docs/superpowers/specs/2026-11-06-macos-file-search-design.md)。
+
+```sh
+npm run tauri -- build --features macos-find-preview --target aarch64-apple-darwin --bundles app,dmg --config src-tauri/tauri.macos-internal.conf.json --config src-tauri/tauri.macos-find-documents.conf.json -- --locked --no-default-features
+node scripts/verify-macos-bundle.mjs --documents
+```
 
 ## 工具链与开发
 

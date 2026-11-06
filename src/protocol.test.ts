@@ -12,13 +12,21 @@ import {
   parsePublicPluginPrepareSummary,
 } from './protocol'
 
-it('accepts only the Documents access status and its decimal revision', () => {
-  for (const status of ['notGranted', 'granted', 'needsReauthorization']) {
-    expect(parseFindDocumentsAccess({ status, revision: '0' })).toEqual({ status, revision: '0' })
+it('distinguishes an active saved grant, a session grant, and a bookmark that needs consent again', () => {
+  for (const [status, persistence] of [
+    ['notGranted', 'none'], ['granted', 'session'], ['granted', 'remembered'],
+    ['needsReauthorization', 'none'], ['needsReauthorization', 'remembered'],
+  ]) {
+    const reply = { status, persistence, revision: '0' }
+    expect(parseFindDocumentsAccess(reply)).toEqual(reply)
   }
   for (const invalid of [
-    { status: 'granted', revision: '01' }, { status: 'unknown', revision: '1' },
-    { status: 'granted', revision: '1', path: '/private' }, { revision: '1' }, null,
+    { status: 'granted', persistence: 'remembered', revision: '01' },
+    { status: 'granted', persistence: 'none', revision: '0' },
+    { status: 'notGranted', persistence: 'remembered', revision: '0' },
+    { status: 'needsReauthorization', persistence: 'session', revision: '0' },
+    { status: 'granted', persistence: 'remembered', revision: '1', path: '/private' },
+    { status: 'granted', revision: '0' }, null,
   ]) expect(parseFindDocumentsAccess(invalid)).toBeNull()
 })
 

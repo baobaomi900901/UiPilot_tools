@@ -109,12 +109,21 @@ pub(crate) async fn search_files(window: WebviewWindow, query: String, category:
     if !window.is_visible().unwrap_or(false) { return Ok(None); }
     let service = host(window.app_handle());
     let registries = registries(window.app_handle());
-    let Some((token, cancel)) = service.files.begin(&service.controller, registries.find(), &invocation_id, query_sequence, false)
-        else { return Ok(None); };
-    if query.trim().is_empty() || query.len() > 1024 || query.chars().count() > 255 || query.contains('\0')
+    if invocation_id.is_empty() || query_sequence == 0 || query.trim().is_empty() || query.len() > 1024 || query.chars().count() > 255 || query.contains('\0')
         || sort != "modifiedDesc" || !matches!(category.as_str(), "all"|"folder"|"excel"|"word"|"ppt"|"pdf"|"image"|"video"|"audio"|"archive") {
         return Err(error("invalidFileQuery"));
     }
+    // A lazy grant restoration changes the file domain epoch. Resolve it before
+    // reserving the first query so a concurrently mounting Find keeps its search.
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    {
+        let app = window.app_handle().clone();
+        let id = invocation_id.clone();
+        tauri::async_runtime::spawn_blocking(move || super::documents::snapshot(&app, &id))
+            .await.map_err(|_| error("fileSearchWorkerFailed"))??;
+    }
+    let Some((token, cancel)) = service.files.begin(&service.controller, registries.find(), &invocation_id, query_sequence, false)
+        else { return Ok(None); };
     let serial = service.files.serial_search.clone().lock_owned().await;
     if !service.files.rows.lock().expect("Find rows").owns(&invocation_id, query_sequence) { return Ok(None); }
     #[cfg(not(feature = "macos-find-system-qa"))]

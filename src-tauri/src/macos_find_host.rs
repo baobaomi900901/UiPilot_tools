@@ -46,6 +46,8 @@ struct Host {
     #[cfg(not(feature = "macos-find-system-qa"))]
     document_changes: Mutex<()>,
     #[cfg(not(feature = "macos-find-system-qa"))]
+    bookmark_store: documents::Storage,
+    #[cfg(not(feature = "macos-find-system-qa"))]
     exit_drain: Mutex<ExitDrain>,
     transfer: Mutex<Option<Transfer>>,
     driving: AtomicBool,
@@ -59,7 +61,11 @@ pub(crate) fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     app.add_capability(include_str!("../macos-find-preview-acl.json"))?;
     #[cfg(not(feature = "macos-find-system-qa"))]
     app.add_capability(include_str!("../macos-find-documents-acl.json"))?;
-    app.manage(Arc::new(Host::default()));
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    let state = Host { bookmark_store: documents::Storage::new(app.path().app_data_dir()?), ..Host::default() };
+    #[cfg(feature = "macos-find-system-qa")]
+    let state = Host::default();
+    app.manage(Arc::new(state));
     let scope_marker = if cfg!(feature = "macos-find-system-qa") {
         "Object.defineProperty(window,'__UIPILOT_MACOS_FIND__',{value:'indexed-local-qa'});"
     } else {

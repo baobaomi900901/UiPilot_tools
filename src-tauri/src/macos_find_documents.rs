@@ -1,5 +1,8 @@
-//! A session grant owns the exact URL selected in the native panel. It cannot be
-//! reconstructed from a path, a saved preference, or a previous process's grant.
+//! A Documents grant originates in a native panel selection or in a validated app-scoped
+//! bookmark created from that selection. A stored path cannot reconstruct a grant.
+
+#[path = "macos_find_bookmark.rs"]
+mod bookmark;
 
 use super::*;
 use objc2::Message;
@@ -66,6 +69,7 @@ pub(crate) struct DocumentsGrant {
     identity: FindPathIdentity,
     reference: Retained<NSURL>,
     require_system_location: bool,
+    selected_in_panel: bool,
     revoked: AtomicBool,
     lease: Mutex<Option<PanelAccess>>,
 }
@@ -83,6 +87,10 @@ impl DocumentsGrant {
     }
 
     fn bind_selected(expected: &Path, selected: &NSURL, require_system_location: bool) -> Result<Arc<Self>, FindError> {
+        Self::bind_url(expected, selected, require_system_location, false)
+    }
+
+    fn bind_url(expected: &Path, selected: &NSURL, require_system_location: bool, require_scoped_lease: bool) -> Result<Arc<Self>, FindError> {
         let components: PathBuf = expected.components().collect();
         if !expected.is_absolute() || components.as_os_str() != expected.as_os_str()
             || expected.components().any(|part| part == Component::ParentDir)
@@ -92,6 +100,7 @@ impl DocumentsGrant {
         }
         if !Mounts::current()?.allows_root(expected) { return Err(FindError::Denied); }
         let lease = PanelAccess::new(selected);
+        if require_scoped_lease && !lease.started { return Err(FindError::Denied); }
         let anchor_path = expected.parent().and_then(Path::parent).ok_or(FindError::Denied)?;
         let anchor_fd = open_directory(anchor_path)?;
         ensure_local_fd(&anchor_fd)?;
@@ -108,7 +117,7 @@ impl DocumentsGrant {
                 anchor: None,
             }),
             anchor_path: anchor_path.to_owned(), anchor_fd, identity, reference,
-            require_system_location, revoked: AtomicBool::new(false), lease: Mutex::new(Some(lease)),
+            require_system_location, selected_in_panel: !require_scoped_lease, revoked: AtomicBool::new(false), lease: Mutex::new(Some(lease)),
         });
         grant.revalidate()?;
         Ok(grant)

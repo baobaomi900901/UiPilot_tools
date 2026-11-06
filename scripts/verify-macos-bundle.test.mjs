@@ -3,7 +3,16 @@ import test from 'node:test'
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { checkBinary, checkResourceName, checkSharedResources } from './verify-macos-bundle.mjs'
+import { checkBinary, checkResourceName, checkSharedResources, checkDocumentsEntitlements } from './verify-macos-bundle.mjs'
+
+test('Documents preview signing grants only the main executable the app-scoped bookmark entitlement', () => {
+  const entitlement = { 'com.apple.security.files.bookmarks.app-scope': true }
+  checkDocumentsEntitlements(entitlement, true)
+  checkDocumentsEntitlements({}, false)
+  assert.throws(() => checkDocumentsEntitlements({}, true))
+  assert.throws(() => checkDocumentsEntitlements(entitlement, false))
+  assert.throws(() => checkDocumentsEntitlements({...entitlement, 'com.apple.security.files.user-selected.read-write': true}, true))
+})
 
 const macho = minos => 'Load command 9\n  cmd LC_BUILD_VERSION\n  platform 1\n  minos ' + minos + '\n'
 test('only the main executable must match the exact minimum', () => {

@@ -17,6 +17,8 @@ name = "uipilot_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
+default = ["schema-generator"]
+schema-generator = []
 custom-protocol = ["tauri/custom-protocol"]
 test-instrumentation = []
 macos-find-preview = [
@@ -27,6 +29,11 @@ macos-find-preview = [
 macos-find-system-qa = ["macos-find-preview"]
 fault-injection = []
 installer-helper-build = []
+
+[[bin]]
+name = "generate_public_plugin_schema"
+path = "src/bin/generate_public_plugin_schema.rs"
+required-features = ["schema-generator"]
 
 [[bin]]
 name = "uipilot-everything-installer"

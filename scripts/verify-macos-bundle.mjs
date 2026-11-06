@@ -51,7 +51,23 @@ export async function checkSharedResources(resources, bundleRoot, projectRoot) {
     }
   }
 }
-async function inspectApp(app) {
+const bookmarkEntitlement = 'com.apple.security.files.bookmarks.app-scope'
+export function checkDocumentsEntitlements(entitlements, main) {
+  const keys = Object.keys(entitlements)
+  if (main ? keys.length !== 1 || entitlements[bookmarkEntitlement] !== true : keys.length !== 0) {
+    throw new Error('Unexpected Documents preview signing entitlements')
+  }
+}
+
+function signedEntitlements(file) {
+  const plist = execFileSync('codesign', ['--display', '--xml', '--entitlements', '-', file],
+    {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']}).trim()
+  if (!plist) return {}
+  return JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', '--', '-'],
+    {input: plist, encoding: 'utf8'}))
+}
+
+async function inspectApp(app, documents) {
   app = realpathSync(app)
   const info = JSON.parse(run('plutil', '-convert','json','-o','-',path.join(app,'Contents/Info.plist')))
   const base = json(path.join(root,'src-tauri/tauri.conf.json'))
@@ -63,6 +79,7 @@ async function inspectApp(app) {
   if (path.basename(info.CFBundleIconFile) !== info.CFBundleIconFile ||
       !existsSync(path.join(app,'Contents/Resources',info.CFBundleIconFile))) throw new Error('Missing application icon')
   const main = path.join(app,'Contents/MacOS',base.mainBinaryName)
+  if (documents && !info.NSDocumentsFolderUsageDescription?.trim()) throw new Error('Missing Documents usage description')
   if (!lstatSync(main).isFile() || !isMachO(main)) throw new Error('Expected a regular Mach-O executable: ' + main)
   function visit(dir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -73,6 +90,7 @@ async function inspectApp(app) {
       } else if (entry.isDirectory()) visit(file)
       else if (entry.isFile() && isMachO(file)) {
         checkBinary(run('lipo','-archs',file), run('otool','-l',file), minimum, file === main)
+        if (documents) checkDocumentsEntitlements(signedEntitlements(file), file === main)
       } else if (!entry.isFile()) throw new Error('Unexpected bundle entry: ' + file)
     }
   }
@@ -81,9 +99,9 @@ async function inspectApp(app) {
   run('codesign','--verify','--deep','--strict',app)
   console.log('Verified signed arm64 app; minimum', minimum, 'executable SHA-256', await digest(main))
 }
-async function verify(input) {
+async function verify(input, documents) {
   if (process.platform !== 'darwin') throw new Error('Run on macOS')
-  if (input.endsWith('.app')) return inspectApp(input)
+  if (input.endsWith('.app')) return inspectApp(input, documents)
   if (!input.endsWith('.dmg') || !lstatSync(input).isFile()) throw new Error('Expected a regular .dmg file or an .app')
   const mount = mkdtempSync(path.join(realpathSync(tmpdir()),'uipilot-dmg-'))
   let attached = false
@@ -92,7 +110,7 @@ async function verify(input) {
     attached = true
     const apps = readdirSync(mount,{withFileTypes:true}).filter(entry => entry.isDirectory() && entry.name.endsWith('.app'))
     if (apps.length !== 1) throw new Error('Expected one top-level app in DMG')
-    await inspectApp(path.join(mount,apps[0].name))
+    await inspectApp(path.join(mount,apps[0].name), documents)
   } finally {
     if (attached) run('hdiutil','detach',mount)
     if (existsSync(mount)) rmdirSync(mount)
@@ -101,14 +119,17 @@ async function verify(input) {
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    let input = process.argv[2]
-    if (process.argv.length > 3) throw new Error('Usage: node scripts/verify-macos-bundle.mjs [artifact]')
+    const args = process.argv.slice(2)
+    const documents = args[0] === '--documents'
+    if (documents) args.shift()
+    if (args.length > 1) throw new Error('Usage: node scripts/verify-macos-bundle.mjs [--documents] [artifact]')
+    let input = args[0]
     if (!input) {
       const dir = path.join(process.env.CARGO_TARGET_DIR ?? path.join(root,'src-tauri/target'),'aarch64-apple-darwin/release/bundle/dmg')
       const files = readdirSync(dir).filter(name => name.endsWith('.dmg'))
       if (files.length !== 1) throw new Error('Provide the exact DMG path for this build')
       input = path.join(dir,files[0])
     }
-    await verify(path.resolve(input))
+    await verify(path.resolve(input), documents)
   } catch (error) { console.error(error.message); process.exitCode = 1 }
 }

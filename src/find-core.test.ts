@@ -470,13 +470,13 @@ describe('Mac Spotlight execution', () => {
   })
 })
 
-describe('session Documents access in the Mac public preview', () => {
+describe('Documents access in the Mac public preview', () => {
   function setup() {
     const fake = fakeClient()
     const docs = {
-      get: vi.fn(async () => ({ status: 'notGranted', revision: '0' })),
-      grant: vi.fn(async () => ({ status: 'granted', revision: '1' })),
-      revoke: vi.fn(async () => ({ status: 'notGranted', revision: '2' })),
+      get: vi.fn(async () => ({ status: 'notGranted', persistence: 'none', revision: '0' })),
+      grant: vi.fn(async () => ({ status: 'granted', persistence: 'remembered', revision: '1' })),
+      revoke: vi.fn(async () => ({ status: 'notGranted', persistence: 'none', revision: '2' })),
     }
     const core = createFindCore({ ...fake.client, macos: {
       scope: 'public-preview', documents: docs, cancelQuery: vi.fn(), openDocument: vi.fn(),
@@ -494,20 +494,20 @@ describe('session Documents access in the Mac public preview', () => {
     await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('public.ttf'))
     expect(docs.get).toHaveBeenCalledExactlyOnceWith({ invocationId: 'find' })
     expect(docs.grant).not.toHaveBeenCalled()
-    docs.grant.mockResolvedValueOnce({ status: 'notGranted', revision: '0' })
+    docs.grant.mockResolvedValueOnce({ status: 'notGranted', persistence: 'none', revision: '0' })
     await core.updateDocuments('grant')
     expect(client.searchFiles).toHaveBeenCalledOnce()
     expect(core.getSnapshot().documents?.notice).toContain('未更改')
     await core.updateDocuments('grant')
     await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('document.pdf'))
-    const pending = deferred<{status: string; revision: string}>()
+    const pending = deferred<{status: string; revision: string; persistence: string}>()
     docs.revoke.mockReturnValueOnce(pending.promise)
     const revoking = core.updateDocuments('revoke')
     expect(core.getSnapshot().results).toEqual([])
     core.submitSearch()
     await core.updateDocuments('revoke')
     expect(docs.revoke).toHaveBeenCalledExactlyOnceWith({ invocationId: 'find' })
-    pending.resolve({ status: 'notGranted', revision: '2' })
+    pending.resolve({ status: 'notGranted', persistence: 'none', revision: '2' })
     await revoking
     await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('public.ttf'))
     expect(client.searchFiles).toHaveBeenCalledTimes(3)
@@ -524,11 +524,11 @@ describe('session Documents access in the Mac public preview', () => {
     expect(core.getSnapshot().documents).toMatchObject({ access: { status: 'notGranted' } })
     expect(core.getSnapshot().documents?.notice).toContain('系统选择框')
     expect(JSON.stringify(core.getSnapshot())).not.toContain('/private/path')
-    const pending = deferred<{status: string; revision: string}>()
+    const pending = deferred<{status: string; revision: string; persistence: string}>()
     docs.grant.mockReturnValueOnce(pending.promise)
     const old = core.updateDocuments('grant')
     emitForward({ invocationId: 'b', forwardSequence: '2', query: 'new' })
-    pending.resolve({ status: 'granted', revision: '1' })
+    pending.resolve({ status: 'granted', persistence: 'remembered', revision: '1' })
     await old
     await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.status).toBe('notGranted'))
     expect(client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ invocationId: 'b', querySequence: 1 }))
@@ -537,7 +537,7 @@ describe('session Documents access in the Mac public preview', () => {
 
   it('restores results once when a previously granted scope is readable after a failed status check', async () => {
     const { core, client, docs, emitForward } = setup()
-    const allowed = { status: 'granted', revision: '1' }
+    const allowed = { status: 'granted', persistence: 'remembered', revision: '1' }
     docs.get.mockResolvedValueOnce(allowed).mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce(allowed)
     vi.mocked(client.searchFiles).mockResolvedValue(fileResponse('document.pdf'))
     await core.start()
@@ -550,6 +550,64 @@ describe('session Documents access in the Mac public preview', () => {
     await core.updateDocuments('get')
     await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('document.pdf'))
     expect(client.searchFiles).toHaveBeenCalledTimes(2)
+    core.destroy()
+  })
+
+  it('restores remembered access before the first search and uses the latest typed query', async () => {
+    const { core, client, docs, emitForward } = setup()
+    const restored = deferred<{ status: string; revision: string; persistence: string }>()
+    docs.get.mockReturnValueOnce(restored.promise)
+    vi.mocked(client.searchFiles).mockResolvedValue(fileResponse('插画.png'))
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: '插' })
+    core.setQuery('插画')
+    expect(client.searchFiles).not.toHaveBeenCalled()
+    restored.resolve({ status: 'granted', persistence: 'remembered', revision: '1' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('插画.png'))
+    expect(client.searchFiles).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({query: '插画'}))
+    expect(docs.grant).not.toHaveBeenCalled()
+    core.destroy()
+  })
+
+  it('reports session-only fallback after consent and preserves a deliberate session choice', async () => {
+    for (const remember of [true, false]) {
+      const { core, docs, emitForward } = setup()
+      await core.start()
+      emitForward({ invocationId: 'find', forwardSequence: '1', query: '' })
+      await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.status).toBe('notGranted'))
+      docs.grant.mockResolvedValueOnce({ status: 'granted', persistence: 'session', revision: '1' })
+      await core.updateDocuments('grant', remember)
+      expect(docs.grant).toHaveBeenCalledExactlyOnceWith({ invocationId: 'find', remember })
+      expect(core.getSnapshot().documents?.notice).toContain(remember ? '下次启动需重新授权' : '本次搜索已包含文稿')
+      core.destroy()
+    }
+  })
+
+  it('allows forgetting a record even when its storage cannot be read', async () => {
+    const { core, docs, emitForward } = setup()
+    docs.get.mockRejectedValueOnce({ code: 'documentsAccessStorageFailed' })
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: '' })
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.storageError).toBe(true))
+    await core.updateDocuments('revoke')
+    expect(docs.revoke).toHaveBeenCalledExactlyOnceWith({ invocationId: 'find' })
+    expect(core.getSnapshot().documents?.notice).toBe('已停止搜索文稿并忘记授权。')
+    core.destroy()
+  })
+
+  it('keeps forget retryable when the host cannot confirm a durable removal', async () => {
+    const { core, docs, emitForward } = setup()
+    docs.get.mockResolvedValueOnce({ status: 'granted', persistence: 'remembered', revision: '1' })
+      .mockResolvedValueOnce({ status: 'needsReauthorization', persistence: 'remembered', revision: '2' })
+    docs.revoke.mockRejectedValueOnce({ code: 'documentsAccessStorageFailed' })
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: '' })
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.persistence).toBe('remembered'))
+    await core.updateDocuments('revoke')
+    expect(core.getSnapshot().documents?.notice).toContain('未能确认已忘记')
+    await core.updateDocuments('revoke')
+    expect(docs.revoke).toHaveBeenCalledTimes(2)
+    expect(core.getSnapshot().documents?.access?.status).toBe('notGranted')
     core.destroy()
   })
 
@@ -568,8 +626,8 @@ describe('session Documents access in the Mac public preview', () => {
 
   it('rechecks a granted scope if the host retires the current search without a response', async () => {
     const { core, client, docs, emitForward } = setup()
-    docs.get.mockResolvedValueOnce({status: 'granted', revision: '1'})
-      .mockResolvedValueOnce({status: 'needsReauthorization', revision: '2'})
+    docs.get.mockResolvedValueOnce({status: 'granted', persistence: 'remembered', revision: '1'})
+      .mockResolvedValueOnce({status: 'needsReauthorization', persistence: 'none', revision: '2'})
     vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('private.pdf'))
       .mockResolvedValueOnce(null).mockResolvedValueOnce(fileResponse('public.ttf'))
     await core.start()
@@ -584,8 +642,8 @@ describe('session Documents access in the Mac public preview', () => {
 
   it('refreshes access after a stale result and clears documents that need reauthorization', async () => {
     const { core, client, docs, emitForward } = setup()
-    docs.get.mockResolvedValueOnce({ status: 'granted', revision: '1' })
-      .mockResolvedValueOnce({ status: 'needsReauthorization', revision: '2' })
+    docs.get.mockResolvedValueOnce({ status: 'granted', persistence: 'remembered', revision: '1' })
+      .mockResolvedValueOnce({ status: 'needsReauthorization', persistence: 'none', revision: '2' })
     vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('private.pdf'))
       .mockResolvedValueOnce(fileResponse('public.ttf'))
     vi.mocked(client.executeResult).mockRejectedValueOnce({ code: 'staleRequest' })

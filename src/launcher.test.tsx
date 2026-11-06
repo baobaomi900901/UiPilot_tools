@@ -9270,9 +9270,9 @@ describe('real adapter and startup', () => {
         ...fileItem(), fullPath: '/Users/Shared/example.png', name: 'example.png', canOpenDocument: true,
       }])
       if (command === 'execute_result') return {status: 'fileRevealRequested'}
-      if (command === 'get_find_documents_access') return {status: 'notGranted', revision: '0'}
-      if (command === 'grant_find_documents_access') return {status: 'granted', revision: '1'}
-      if (command === 'revoke_find_documents_access') return {status: 'notGranted', revision: '2'}
+      if (command === 'get_find_documents_access') return {status: 'notGranted', persistence: 'none', revision: '0'}
+      if (command === 'grant_find_documents_access') return {status: 'granted', persistence: 'remembered', revision: '1'}
+      if (command === 'revoke_find_documents_access') return {status: 'notGranted', persistence: 'none', revision: '2'}
       throw new Error(command)
     })
     try {
@@ -9289,7 +9289,7 @@ describe('real adapter and startup', () => {
       if (scope === 'public-preview') {
         expect(tauriCapture.invoke).toHaveBeenCalledWith('get_find_documents_access', { invocationId: 'find-1' })
         await act(async () => documents!.click())
-        expect(tauriCapture.invoke).toHaveBeenCalledWith('grant_find_documents_access', { invocationId: 'find-1' })
+        expect(tauriCapture.invoke).toHaveBeenCalledWith('grant_find_documents_access', { invocationId: 'find-1', remember: true })
         await act(async () => documents!.click())
         expect(tauriCapture.invoke).toHaveBeenCalledWith('revoke_find_documents_access', { invocationId: 'find-1' })
       } else {

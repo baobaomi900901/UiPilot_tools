@@ -30,6 +30,7 @@ interface DocumentsControl {
   access?: FindDocumentsAccess
   pending?: FindDocumentsOperation
   notice?: string
+  storageError?: boolean
 }
 
 export interface FindSnapshot {
@@ -58,7 +59,7 @@ export interface FindSnapshot {
 
 export interface FindCore {
   readonly macosScope?: MacFindScope
-  updateDocuments(operation: FindDocumentsOperation): Promise<void>
+  updateDocuments(operation: FindDocumentsOperation, remember?: boolean): Promise<void>
   openDocument(): void
   getSnapshot(): FindSnapshot
   subscribe(listener: () => void): () => void
@@ -292,6 +293,9 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   function beginSearch(): void {
     const invocationId = model.invocationId
     if (!model.ready || !invocationId || !model.query || model.executePending || model.documents?.pending === 'revoke') return
+    // On first use the host may restore a bookmark and retire the old scope.
+    // Keep typing responsive and issue the latest query once restoration finishes.
+    if (model.documents?.pending === 'get' && !model.documents.access) return
     const sequence = nextSequence()
     if (sequence === null) return
     const owner = ++operationToken
@@ -360,13 +364,13 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     else publish()
   }
 
-  async function updateDocuments(operation: FindDocumentsOperation): Promise<void> {
+  async function updateDocuments(operation: FindDocumentsOperation, remember = true): Promise<void> {
     const invocationId = model.invocationId
     const control = model.documents
     if (!documents || !control || !invocationId || !model.ready || destroyed ||
         control.pending || model.hidePending || model.executePending) return
     if (operation === 'grant' && (!control.access || control.access.status === 'granted')) return
-    if (operation === 'revoke' && (!control.access || control.access.status === 'notGranted')) return
+    if (operation === 'revoke' && !control.storageError && (!control.access || control.access.status === 'notGranted')) return
     const owner = ++documentsOwner
     const current = () => !destroyed && model.invocationId === invocationId && owner === documentsOwner
     model.documents = { access: control.access, pending: operation }
@@ -378,7 +382,9 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     publish()
 
     const read = async (action: FindDocumentsOperation): Promise<FindDocumentsAccess> => {
-      const next = parseFindDocumentsAccess(await documents[action]({ invocationId }))
+      const reply = action === 'grant' ? await documents.grant({ invocationId, remember })
+        : await documents[action]({ invocationId })
+      const next = parseFindDocumentsAccess(reply)
       if (!next || (control.access && compareDecimalRevision(next.revision, control.access.revision) < 0)) {
         throw new Error('Invalid Documents access revision')
       }
@@ -387,20 +393,25 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
 
     let next: FindDocumentsAccess
     let notice: string | undefined
-    let refresh = operation === 'revoke' || documentsReadFailed
+    const firstRead = operation === 'get' && !control.access && !documentsReadFailed
+    let refresh = operation === 'revoke' || documentsReadFailed || firstRead
     try {
       next = await read(operation)
     } catch (error) {
       if (!current()) return
       if (operation === 'get') {
         documentsReadFailed = true
-        model.documents = { notice: '无法读取文稿授权，可重试。' }
+        model.documents = {
+          storageError: (error as {code?: unknown} | null)?.code === 'documentsAccessStorageFailed',
+          notice: '无法读取文稿授权，可重试。',
+        }
         if (control.access?.status === 'granted') {
           searchOwner = ++operationToken
           clearResults()
           model.searchPending = false
         }
         publish()
+        if (firstRead && model.query) beginSearch()
         return
       }
       // A lost mutation reply may follow a successful native change. Retire old
@@ -410,14 +421,22 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       model.searchPending = false
       model.documents = { pending: 'get' }
       publish()
-      notice = (error as { code?: unknown } | null)?.code === 'documentsAccessDenied'
+      const code = (error as { code?: unknown } | null)?.code
+      if (code === 'documentsAccessStorageFailed') notice = operation === 'revoke'
+        ? '未能确认已忘记文稿授权，请重试。' : '无法保存文稿授权，请重试。'
+      else if (code === 'documentsRememberedAccessExists') notice = '已保留原文稿授权。如要改为仅本次搜索，请先忘记旧授权。'
+      else notice = code === 'documentsAccessDenied'
         ? '无法授权文稿。请在系统选择框选择当前用户的“文稿”文件夹。' : '未能确认文稿授权，请检查后重试。'
       try {
         next = await read('get')
-      } catch {
+      } catch (readError) {
         if (!current()) return
         documentsReadFailed = true
-        model.documents = { notice: '无法读取文稿授权，可重试。' }
+        model.documents = {
+          storageError: code === 'documentsAccessStorageFailed' ||
+            (readError as {code?: unknown} | null)?.code === 'documentsAccessStorageFailed',
+          notice,
+        }
         publish()
         return
       }
@@ -427,10 +446,12 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const changed = control.access && (next.revision !== control.access.revision || next.status !== control.access.status)
     if (!notice && operation === 'grant') {
       if (!changed) notice = '已取消选择，搜索范围未更改。'
-      else if (next.status === 'granted') notice = '本次搜索已包含文稿。'
+      else if (next.persistence === 'remembered') notice = '已记住文稿授权，下次启动会自动恢复。'
+      else if (next.status === 'granted') notice = remember
+        ? '文稿仅限本次搜索，下次启动需重新授权。' : '本次搜索已包含文稿。'
     }
     if (!notice && operation === 'revoke') notice = next.status === 'notGranted'
-      ? '已停止搜索文稿。' : '文稿搜索范围未更改。'
+      ? '已停止搜索文稿并忘记授权。' : '文稿搜索范围未更改。'
     documentsReadFailed = false
     model.documents = { access: next, notice }
     if (refresh || changed) refreshSearchScope()

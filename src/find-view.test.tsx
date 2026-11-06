@@ -959,35 +959,37 @@ it('exposes Mac preview scope, Finder actions and metadata without requesting a 
   expect(core.getSnapshot().results).toEqual([])
 })
 
-it('opens and removes session Documents access from the header and keyboard Actions menu', async () => {
+it('remembers and forgets Documents access from the header and keyboard Actions menu', async () => {
   const fake = fakeClient()
-  const get = vi.fn(async () => ({ status: 'notGranted', revision: '0' }))
-  const grant = vi.fn(async () => ({ status: 'granted', revision: '1' }))
-  const revoke = vi.fn(async () => ({ status: 'notGranted', revision: '2' }))
+  const get = vi.fn(async () => ({ status: 'notGranted', persistence: 'none', revision: '0' }))
+  const grant = vi.fn(async () => ({ status: 'granted', persistence: 'remembered', revision: '1' }))
+  const revoke = vi.fn(async () => ({ status: 'notGranted', persistence: 'none', revision: '2' }))
   const core = createFindCore({ ...fake.client, macos: {
     scope: 'public-preview', documents: { get, grant, revoke }, openDocument: vi.fn(), cancelQuery: vi.fn(),
   } })
   const host = await mount(core)
   await act(async () => fake.emitForward())
   const header = host.querySelector<HTMLButtonElement>('.find-documents-button')!
-  expect(header.textContent).toBe('允许本次搜索文稿')
+  expect(header.textContent).toBe('授权并记住文稿')
   expect(grant).not.toHaveBeenCalled()
   await act(async () => header.click())
-  expect(grant).toHaveBeenCalledExactlyOnceWith({ invocationId: 'inv-1' })
-  expect(header.textContent).toBe('停止搜索文稿')
-  expect(host.textContent).toContain('共享目录与本次允许的文稿')
+  expect(grant).toHaveBeenCalledExactlyOnceWith({ invocationId: 'inv-1', remember: true })
+  expect(header.textContent).toBe('停止并忘记文稿')
+  expect(host.textContent).toContain('共享目录与已记住授权的文稿')
   const input = host.querySelector<HTMLInputElement>('[role=combobox]')!
   input.focus()
   await pressFind(input, 'k', { metaKey: true })
   const stop = [...document.querySelectorAll<HTMLButtonElement>('.uipilot-context-action')]
-    .find(button => button.textContent === '停止搜索文稿')!
+    .find(button => button.textContent === '停止并忘记文稿')!
   await pressFind(document.activeElement!, 'ArrowDown')
   expect(document.activeElement).toBe(stop)
   await pressFind(stop, 'Enter')
   expect(revoke).toHaveBeenCalledExactlyOnceWith({ invocationId: 'inv-1' })
-  expect(header.textContent).toBe('允许本次搜索文稿')
-  get.mockResolvedValueOnce({ status: 'needsReauthorization', revision: '3' })
+  expect(header.textContent).toBe('授权并记住文稿')
+  get.mockResolvedValueOnce({ status: 'needsReauthorization', persistence: 'remembered', revision: '3' })
   await act(async () => { window.dispatchEvent(new Event('focus')) })
   expect(host.textContent).toContain('文稿需重新授权')
+  await pressFind(input, 'k', { metaKey: true })
+  expect(document.querySelector('.uipilot-context-actions')?.textContent).toContain('忘记文稿授权')
   expect(grant).toHaveBeenCalledOnce()
 })

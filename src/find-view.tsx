@@ -48,8 +48,8 @@ function modified(value: string): string {
 
 function documentsButton(access?: FindDocumentsAccess): { action: FindDocumentsOperation; title: string } {
   if (!access) return { action: 'get', title: '读取文稿授权' }
-  if (access.status === 'granted') return { action: 'revoke', title: '停止搜索文稿' }
-  return { action: 'grant', title: '允许本次搜索文稿' }
+  if (access.status === 'granted') return { action: 'revoke', title: access.persistence === 'remembered' ? '停止并忘记文稿' : '停止搜索文稿' }
+  return { action: 'grant', title: '授权并记住文稿' }
 }
 
 export interface FindViewProps {
@@ -64,7 +64,9 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   const documentsAction = documentsButton(documents?.access)
   let scopeText = '预览范围：本机公共字体与共享目录（仅限 Spotlight 已索引项目）'
   if (core.macosScope === 'indexed-local-qa') scopeText = '本地 Spotlight 索引（隔离验收）'
-  else if (documents?.access?.status === 'granted') scopeText = '预览范围：本机公共字体、共享目录与本次允许的文稿（仅限 Spotlight 已索引项目）'
+  else if (documents?.access?.status === 'granted') scopeText = documents.access.persistence === 'remembered'
+    ? '预览范围：本机公共字体、共享目录与已记住授权的文稿（仅限 Spotlight 已索引项目）'
+    : '预览范围：本机公共字体、共享目录与本次允许的文稿（仅限 Spotlight 已索引项目）'
   else if (documents?.access?.status === 'needsReauthorization') scopeText = `文稿需重新授权 · ${scopeText}`
   else if (documents && !documents.access) scopeText = `文稿授权待确认 · ${scopeText}`
   const [media] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
@@ -139,8 +141,12 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
           id: 'find-documents-access', title: documentsButton(owner.documents.access).title, icon: 'settings' as const,
           disabledReason: busy ?? (owner.documents.pending ? '正在确认文稿授权' : undefined),
           run() { if (current()) void core.updateDocuments(documentsButton(owner.documents?.access).action) },
-        }, ...(owner.documents.access?.status === 'needsReauthorization' ? [{
-          id: 'find-stop-documents', title: '停止搜索文稿', icon: 'close' as const,
+        }, ...(owner.documents.access && owner.documents.access.status !== 'granted' ? [{
+          id: 'find-session-documents', title: '仅本次搜索文稿', icon: 'search' as const,
+          disabledReason: busy ?? (owner.documents.pending ? '正在确认文稿授权' : undefined),
+          run() { if (current()) void core.updateDocuments('grant', false) },
+        }] : []), ...(owner.documents.access?.status === 'needsReauthorization' || owner.documents.storageError ? [{
+          id: 'find-stop-documents', title: '忘记文稿授权', icon: 'close' as const,
           disabledReason: busy ?? (owner.documents.pending ? '正在确认文稿授权' : undefined),
           run() { if (current()) void core.updateDocuments('revoke') },
         }] : [])] : []),
@@ -171,7 +177,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
       return JSON.stringify([state.ready, state.invocationId, state.query, state.category,
         state.results[state.selectedIndex]?.key, state.searchPending, state.executePending,
         state.hidePending, state.pinned, state.pinPending, state.previewEnabled, state.previewPending,
-        state.documents?.access?.revision, state.documents?.access?.status, state.documents?.pending])
+        state.documents?.access?.revision, state.documents?.access?.status, state.documents?.pending, state.documents?.storageError])
     }
     let previous = stamp()
     const unsubscribe = core.subscribe(() => {
@@ -315,7 +321,9 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               onChange={(event) => core.setQuery(event.currentTarget.value)}
               onKeyDown={onKeyDown}
             />
-            {documents && <Tooltip title="只搜索 Spotlight 已索引的系统文稿文件夹。退出 UiPilot 后，本次授权结束。">
+            {documents && <Tooltip title={documentsAction.action === 'revoke'
+              ? '将文稿移出搜索范围，并移除已保存的授权。'
+              : '选择本地文稿后，UiPilot 会尝试记住授权，供下次启动时搜索。'}>
               <Button className="find-documents-button" size="small" aria-busy={Boolean(documents.pending)}
                 disabled={disabled || !snapshot.invocationId || snapshot.hidePending || Boolean(documents.pending)}
                 onClick={() => void core.updateDocuments(documentsAction.action)}>

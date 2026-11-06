@@ -24,28 +24,33 @@ pub(crate) struct AtomicPaths {
     backup: PathBuf,
 }
 
+pub(crate) fn open_data_directory(directory: &Path, create: bool) -> io::Result<OwnedFd> {
+    if !directory.is_absolute() { return Err(io::Error::other("expected absolute settings directory")); }
+    let mut parent = open("/", DIRECTORY, Mode::empty())?;
+    for component in directory.components() {
+        let child = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => name,
+            _ => return Err(io::Error::other("invalid settings directory")),
+        };
+        parent = match openat(&parent, child, DIRECTORY, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) if create => {
+                match mkdirat(&parent, child, Mode::RWXU) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                openat(&parent, child, DIRECTORY, Mode::empty())?
+            }
+            Err(error) => return Err(error.into()),
+        };
+    }
+    Ok(parent)
+}
+
 impl AtomicPaths {
     pub(crate) fn open(directory: &Path, name: &str) -> io::Result<Self> {
-        if !directory.is_absolute() { return Err(io::Error::other("expected absolute settings directory")); }
-        let mut parent = open("/", DIRECTORY, Mode::empty())?;
-        for component in directory.components() {
-            let child = match component {
-                Component::RootDir => continue,
-                Component::Normal(name) => name,
-                _ => return Err(io::Error::other("invalid settings directory")),
-            };
-            parent = match openat(&parent, child, DIRECTORY, Mode::empty()) {
-                Ok(fd) => fd,
-                Err(Errno::NOENT) => {
-                    match mkdirat(&parent, child, Mode::RWXU) {
-                        Ok(()) | Err(Errno::EXIST) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    openat(&parent, child, DIRECTORY, Mode::empty())?
-                }
-                Err(error) => return Err(error.into()),
-            };
-        }
+        let parent = open_data_directory(directory, true)?;
         Ok(Self { directory: parent, current: PathBuf::from(name), backup: PathBuf::from(format!("{name}.backup")) })
     }
 

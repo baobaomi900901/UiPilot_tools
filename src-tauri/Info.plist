@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>允许后，UiPilot 可以搜索「文稿」中已被 Spotlight 索引的本地文件，并在 Finder 中定位你选中的项目。</string>
+    <string>UiPilot 用此权限搜索「文稿」中已被 Spotlight 索引的本地文件。选择记住授权后，下次打开文件搜索时会恢复访问。</string>
 </dict>
 </plist>
