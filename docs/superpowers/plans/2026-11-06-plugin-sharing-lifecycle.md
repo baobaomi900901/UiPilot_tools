@@ -1,3 +1,5 @@
+> SUPERSEDED 2026-11-06: user confirmed target-side errors with no return to OCR. Do not execute this lifecycle subplan; use 2026-11-06-plugin-sharing.md.
+
 # Plugin sharing: Panel lifecycle subplan
 
 Implement OCR edited text → Ctrl+K → Share → selected receiving Panel, with translation receiving into its editor and starting translation once. The host discovers declared receivers; plugins own business processing. The governing contract is [the approved sharing design](../specs/2026-11-06-plugin-sharing-design.md), sections 3–8 and its acceptance matrix in section 10.
