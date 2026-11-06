@@ -34,6 +34,7 @@ fn main() {
     }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "get_host_capabilities",
             "open_find_window",
             "prepare_find_initialization",
             "commit_find_ready",

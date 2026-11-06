@@ -5,7 +5,38 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Number, Value};
 use unicode_normalization::UnicodeNormalization;
 
-use super::{PublicPackageError, PublicPluginHost};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublicPluginHost {
+    pub(crate) platform: PublicPlatform,
+    pub(crate) version: [u32; 3],
+    pub(crate) api_version: u32,
+}
+
+impl PublicPluginHost {
+    pub(crate) fn current(platform: PublicPlatform) -> Self {
+        // Installation compatibility must use the same release as the running
+        // application, rather than a second manually maintained version.
+        let version = [
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+        ]
+        .map(|part| part.parse::<u32>().expect("Cargo release version must fit u32"));
+        Self {
+            platform,
+            version,
+            api_version: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicPackageError {
+    InvalidPackage,
+    IncompatiblePlatform,
+    IncompatibleApi,
+    UnsupportedPermission,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

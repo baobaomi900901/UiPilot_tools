@@ -7,12 +7,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    apps::{AppCache, Application},
-    atomic_file::{
-        commit_with_backup, quarantine_invalid, read_optional, AtomicFileError, AtomicPaths,
-    },
-};
+#[cfg(windows)]
+use crate::{apps::{AppCache, Application}, atomic_file::{quarantine_invalid, read_optional}};
+use crate::atomic_file::{commit_with_backup, AtomicFileError, AtomicPaths};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +84,9 @@ impl ManagedBuiltinFeature {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
+    #[cfg(target_os = "macos")]
+    #[serde(flatten)]
+    additional: BTreeMap<String, serde_json::Value>,
     pub(crate) hotkey: String,
     #[serde(default)]
     pub(crate) screenshot_hotkey: Option<String>,
@@ -161,7 +161,9 @@ pub(crate) enum SettingsError {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey: "Shift+Space".into(),
+            #[cfg(target_os = "macos")]
+            additional: BTreeMap::new(),
+            hotkey: if cfg!(target_os = "macos") { "Alt+Space" } else { "Shift+Space" }.into(),
             screenshot_hotkey: None,
             translation_selection_hotkey: default_translation_selection_hotkey(),
             builtin_hotkeys: BTreeMap::new(),
@@ -236,10 +238,15 @@ impl From<AtomicFileError> for SettingsError {
 
 impl SettingsStore {
     pub(crate) fn load(app_data_dir: &Path) -> Result<Self, SettingsError> {
-        fs::create_dir_all(app_data_dir).map_err(|_| SettingsError::Storage)?;
-        let paths = Arc::new(AtomicPaths::new(app_data_dir, "settings.json"));
+        #[cfg(windows)]
+        let paths = {
+            fs::create_dir_all(app_data_dir).map_err(|_| SettingsError::Storage)?;
+            Arc::new(AtomicPaths::new(app_data_dir, "settings.json"))
+        };
+        #[cfg(target_os = "macos")]
+        let paths = Arc::new(AtomicPaths::open(app_data_dir, "settings.json")?);
 
-        if let Some(value) = load_candidate(paths.current())? {
+        if let Some(value) = load_candidate(&paths, paths.current())? {
             return Ok(Self {
                 paths,
                 state: Arc::new(Mutex::new(SettingsState {
@@ -250,7 +257,7 @@ impl SettingsStore {
                 })),
             });
         }
-        if let Some(value) = load_candidate(paths.backup())? {
+        if let Some(value) = load_candidate(&paths, paths.backup())? {
             return Ok(Self {
                 paths,
                 state: Arc::new(Mutex::new(SettingsState {
@@ -273,6 +280,7 @@ impl SettingsStore {
         })
     }
 
+    #[cfg(windows)]
     pub(crate) fn decorate_applications(&self, applications: &mut [Application]) {
         let state = self.state.lock().expect("settings lock poisoned");
         for application in applications {
@@ -500,6 +508,7 @@ impl SettingsStore {
         self.persist(&mut state, candidate)
     }
 
+    #[cfg(windows)]
     pub(crate) fn increment_use_count(
         &self,
         app_id: &str,
@@ -686,13 +695,29 @@ impl SettingsStore {
     }
 }
 
-fn load_candidate(path: &Path) -> Result<Option<Settings>, SettingsError> {
-    let Some(bytes) = read_optional(path)? else {
+fn load_candidate(_paths: &AtomicPaths, path: &Path) -> Result<Option<Settings>, SettingsError> {
+    #[cfg(target_os = "macos")]
+    let source = _paths.read_optional(path)?;
+    #[cfg(windows)]
+    let source = read_optional(path)?;
+    let Some(bytes) = source else {
         return Ok(None);
     };
     match serde_json::from_slice::<Settings>(&bytes) {
-        Ok(settings) if valid_settings(&settings) => Ok(Some(settings)),
+        Ok(settings) if valid_settings(&settings) => {
+            #[cfg(target_os = "macos")]
+            let settings = {
+                let mut settings = settings;
+                settings.additional.remove("researchId");
+                settings.additional.remove("aliases");
+                settings
+            };
+            Ok(Some(settings))
+        },
         _ => {
+            #[cfg(target_os = "macos")]
+            _paths.quarantine_invalid(path)?;
+            #[cfg(windows)]
             quarantine_invalid(path)?;
             Ok(None)
         }
@@ -763,6 +788,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(windows)]
     fn screenshot_admission_and_disable_have_one_order_and_keep_existing_session() {
         use crate::screenshot::{
             model::ScreenshotMode,
@@ -963,17 +989,17 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
-        sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc, Barrier,
-        },
-        thread,
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::*;
+    #[cfg(windows)]
+    use std::{sync::{Arc, Barrier}, thread};
+    #[cfg(windows)]
     use crate::apps::{AppCache, Application, ApplicationLaunchTarget};
 
     const APP_A: &str = "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(windows)]
     const APP_B: &str = "app-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const APP_ABSENT: &str = "app-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -988,7 +1014,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
 
         fn path(&self) -> &Path {
@@ -1012,6 +1038,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn application(app_id: &str, display_name: &str) -> Application {
         Application {
             app_id: app_id.into(),
@@ -1025,6 +1052,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn cache(apps: &[(&str, &str)]) -> AppCache {
         AppCache::from_apps(
             apps.iter()
@@ -1050,6 +1078,7 @@ mod tests {
         serde_json::from_slice(&fs::read(dir.current()).unwrap()).unwrap()
     }
 
+    #[cfg(windows)]
     fn read_backup(dir: &TestDir) -> Settings {
         serde_json::from_slice(&fs::read(dir.backup()).unwrap()).unwrap()
     }
@@ -1129,6 +1158,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn default_hotkey_is_shift_space() {
         assert_eq!(Settings::default().hotkey, "Shift+Space");
     }
@@ -1596,6 +1626,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn unknown_increment_and_overflow_leave_memory_and_disk_unchanged() {
         let dir = TestDir::new("bad-increment");
         let persisted = Settings {
@@ -1620,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn decoration_uses_stable_id_when_display_names_are_duplicates() {
         let dir = TestDir::new("decorate");
         let persisted = Settings {
@@ -1661,6 +1693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn concurrent_increments_are_serialized_in_memory_and_on_disk() {
         let dir = TestDir::new("concurrent-increments");
         let store = Arc::new(SettingsStore::load(dir.path()).unwrap());
@@ -1687,6 +1720,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn second_save_after_defaults_creates_backup_from_first_save() {
         let dir = TestDir::new("defaults-then-two-saves");
         let store = SettingsStore::load(dir.path()).unwrap();
@@ -1701,6 +1735,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn second_save_after_backup_recovery_backs_up_first_new_current() {
         let dir = TestDir::new("backup-then-two-saves");
         let recovered = Settings {
@@ -1761,6 +1796,8 @@ mod tests {
     fn file_preview_preference_updates_only_that_field() {
         let dir = TestDir::new("file-preview-only-field");
         let persisted = Settings {
+            #[cfg(target_os = "macos")]
+            additional: BTreeMap::new(),
             screenshot_hotkey: None,
             translation_selection_hotkey: default_translation_selection_hotkey(),
             builtin_hotkeys: BTreeMap::new(),
