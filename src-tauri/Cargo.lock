@@ -5229,6 +5229,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "icu_casemap",
+ "libc",
  "native-tls",
  "objc2",
  "objc2-app-kit",

@@ -2,6 +2,7 @@
 //! and a fresh cancellation token per request. Only the Find controller may authorize or publish
 //! these paths, after rechecking visibility, scope revision, query ownership and file identity.
 
+use crate::macos_find_results::IndexedLocalScope;
 use block2::RcBlock;
 use objc2::{
     rc::{autoreleasepool, Retained},
@@ -10,7 +11,7 @@ use objc2::{
 use objc2_foundation::{
     NSArray, NSDate, NSDefaultRunLoopMode, NSMetadataItemFSContentChangeDateKey,
     NSMetadataItem, NSMetadataItemFSNameKey, NSMetadataItemPathKey, NSMetadataQuery,
-    NSMetadataQueryDidFinishGatheringNotification, NSMetadataQueryIndexedLocalComputerScope,
+    NSMetadataQueryDidFinishGatheringNotification,
     NSNotification, NSNotificationCenter, NSPredicate, NSRunLoop, NSSortDescriptor, NSString,
     NSThread, NSURL,
 };
@@ -30,8 +31,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const SNAPSHOT_RESERVE: Duration = Duration::from_millis(50);
 const RUN_LOOP_STEP: Duration = Duration::from_millis(15);
 
+#[derive(Clone, Copy)]
 pub(crate) enum ApprovedScope<'a> {
-    IndexedLocal,
+    IndexedLocal(&'a IndexedLocalScope),
     Directory(&'a Path),
 }
 
@@ -43,7 +45,7 @@ impl QueryCancellation {
         self.0.store(true, Ordering::Release);
     }
 
-    fn check(&self) -> Result<(), GatherError> {
+    pub(crate) fn check(&self) -> Result<(), GatherError> {
         if self.0.load(Ordering::Acquire) {
             Err(GatherError::Cancelled)
         } else {
@@ -88,28 +90,39 @@ struct NativeQuery {
     center: Retained<NSNotificationCenter>,
     observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     finished: Arc<AtomicBool>,
+    approved_paths: Vec<PathBuf>,
 }
 
 impl NativeQuery {
     fn new(scope: ApprovedScope<'_>, text: &str) -> Result<Self, GatherError> {
         let predicate = filename_predicate(text)?;
-        let scopes = match scope {
-            ApprovedScope::IndexedLocal => {
-                // SAFETY: Foundation exports an immortal NSString scope constant.
-                NSArray::<AnyObject>::from_slice(&[unsafe { NSMetadataQueryIndexedLocalComputerScope }])
-            }
-            ApprovedScope::Directory(path) => {
-                if !path.is_absolute() {
-                    return Err(GatherError::InvalidInput);
-                }
-                let url = NSURL::from_directory_path(path).ok_or(GatherError::InvalidInput)?;
-                NSArray::<AnyObject>::from_slice(&[&url])
-            }
+        // Host-owned scopes are installed before startQuery. kMDItemPath is returned as
+        // metadata but adding BEGINSWITH to the Spotlight predicate drops real font hits.
+        #[cfg(feature = "macos-find-system-qa")]
+        let system_query = matches!(&scope, ApprovedScope::IndexedLocal(scope) if scope.uses_system_query());
+        #[cfg(not(feature = "macos-find-system-qa"))]
+        let system_query = false;
+        let approved_paths: Vec<PathBuf> = match scope {
+            ApprovedScope::IndexedLocal(scope) => scope.query_paths().map_err(|_| GatherError::ServiceUnavailable)?,
+            ApprovedScope::Directory(path) => vec![path.to_owned()],
+        };
+        if approved_paths.is_empty() || approved_paths.iter().any(|path| !path.is_absolute()) {
+            return Err(GatherError::InvalidInput);
+        }
+        let scopes = if system_query {
+            // SAFETY: this Apple scope constant is immutable. Only isolated QA scopes
+            // that passed account-home and mount preflight may select it.
+            NSArray::<AnyObject>::from_slice(&[unsafe { objc2_foundation::NSMetadataQueryIndexedLocalComputerScope }])
+        } else {
+            let urls = approved_paths.iter().map(|path| NSURL::from_directory_path(path)
+                .ok_or(GatherError::InvalidInput)).collect::<Result<Vec<_>, _>>()?;
+            let objects: Vec<&AnyObject> = urls.iter().map(|url| &***url as &AnyObject).collect();
+            NSArray::<AnyObject>::from_slice(&objects)
         };
 
         let query = NSMetadataQuery::new();
         query.setPredicate(Some(&predicate));
-        // SAFETY: the host supplied exactly one supported scope (Foundation constant or file URL).
+        // SAFETY: all scopes are host-owned file URLs or the verified Foundation QA scope.
         unsafe { query.setSearchScopes(&scopes) };
         // SAFETY: Foundation exports an immortal NSString attribute key.
         let date_key = unsafe { NSMetadataItemFSContentChangeDateKey };
@@ -130,7 +143,7 @@ impl NativeQuery {
                 &block,
             )
         };
-        Ok(Self { query, center, observer, finished })
+        Ok(Self { query, center, observer, finished, approved_paths })
     }
 
     fn gather(&self, cancel: &QueryCancellation, deadline: Instant) -> Result<Candidates, GatherError> {
@@ -166,7 +179,7 @@ impl NativeQuery {
                         // SAFETY: Foundation exports an immortal NSString attribute key.
                         let value = item.valueForAttribute(unsafe { NSMetadataItemPathKey })?;
                         let path = PathBuf::from(value.downcast::<NSString>().ok()?.to_string());
-                        path.is_absolute().then_some(path)
+                        self.approved_paths.iter().any(|root| path.starts_with(root)).then_some(path)
                     },
                 );
             }
@@ -236,7 +249,17 @@ pub(crate) fn gather_on_worker(
         return Err(GatherError::ServiceUnavailable);
     }
     let deadline = Instant::now() + QUERY_TIMEOUT;
-    autoreleasepool(|_| NativeQuery::new(scope, text)?.gather(cancel, deadline))
+    autoreleasepool(|_| {
+        let query = NativeQuery::new(scope, text)?;
+        #[cfg(feature = "macos-find-system-qa")]
+        if let ApprovedScope::IndexedLocal(scope) = scope {
+            if scope.uses_system_query() {
+                // Recheck immediately before starting the system-wide native request.
+                scope.query_paths().map_err(|_| GatherError::ServiceUnavailable)?;
+            }
+        }
+        query.gather(cancel, deadline)
+    })
 }
 
 #[cfg(test)]

@@ -821,18 +821,7 @@ mod category_tests {
 }
 
 pub(crate) fn category_predicate(category: FileCategory) -> &'static str {
-    match category {
-        FileCategory::All => "",
-        FileCategory::Folder => "folder:",
-        FileCategory::Excel => "file: ext:xls;xlsx;xlsm;xlsb;csv",
-        FileCategory::Word => "file: ext:doc;docx;docm;rtf",
-        FileCategory::Ppt => "file: ext:ppt;pptx;pptm",
-        FileCategory::Pdf => "file: ext:pdf",
-        FileCategory::Image => "file: ext:bmp;gif;heic;jpeg;jpg;png;svg;tif;tiff;webp",
-        FileCategory::Video => "file: ext:avi;m4v;mkv;mov;mp4;webm;wmv",
-        FileCategory::Audio => "file: ext:aac;flac;m4a;mp3;ogg;wav;wma",
-        FileCategory::Archive => "file: ext:7z;bz2;gz;rar;tar;tgz;zip",
-    }
+    category.everything_predicate()
 }
 
 pub(crate) fn category_search_query(query: &str, category: FileCategory) -> Vec<u16> {

@@ -5,13 +5,16 @@
 //! The scope provider must check local-volume eligibility, packages, aliases, effective
 //! access, scope revision and the native file-reference URL separately.
 
-use rustix::fs::{fstat, openat, statat, AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::fs::{accessat, fstat, openat, statat, Access, AtFlags, FileType, Mode, OFlags, Stat};
 use std::{
     ffi::OsStr,
     fs::File,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
+
+// Darwin <sys/stat.h>. Dataless provider objects must never be opened or hydrated by Find.
+const SF_DATALESS: u32 = 0x4000_0000;
 
 #[derive(Debug, Eq, PartialEq)]
 struct ObjectId {
@@ -39,6 +42,9 @@ pub(crate) struct FindPathIdentity {
     chain: Vec<ObjectId>,
     kind: FileType,
     changed: (i64, i64),
+    pub(crate) modified: (i64, i64),
+    pub(crate) size: i64,
+    pub(crate) mode: u16,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -80,7 +86,7 @@ impl FindPathIdentity {
                 Mode::empty(),
             )?;
             let stat = fstat(&directory)?;
-            if stat.st_dev != root_stat.st_dev {
+            if stat.st_dev != root_stat.st_dev || stat.st_flags & SF_DATALESS != 0 {
                 return Err(IdentityError::Ineligible);
             }
             chain.push(ObjectId::from(&stat));
@@ -89,18 +95,43 @@ impl FindPathIdentity {
         // Metadata only. Opening even a regular candidate for reading can hydrate a placeholder.
         let stat = statat(&directory, leaf, AtFlags::SYMLINK_NOFOLLOW)?;
         let kind = FileType::from_raw_mode(stat.st_mode);
-        if stat.st_dev != root_stat.st_dev
+        if stat.st_dev != root_stat.st_dev || stat.st_flags & SF_DATALESS != 0
             || !matches!(kind, FileType::Directory | FileType::RegularFile)
         {
             return Err(IdentityError::Ineligible);
         }
+        let mut required = Access::READ_OK;
+        if kind == FileType::Directory {
+            required |= Access::EXEC_OK;
+        }
+        accessat(&directory, leaf, required, AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW)?;
         chain.push(ObjectId::from(&stat));
         Ok(Self {
             relative: relative.to_owned(),
             chain,
             kind,
             changed: (stat.st_ctime, stat.st_ctime_nsec),
+            modified: (stat.st_mtime, stat.st_mtime_nsec),
+            size: stat.st_size,
+            mode: stat.st_mode,
         })
+    }
+
+    #[cfg(feature = "macos-find-system-qa")]
+    pub(crate) fn same_location(&self, other: &Self) -> bool {
+        self.chain == other.chain && self.kind == other.kind
+    }
+
+    pub(crate) fn inode_at_depth(&self, depth: usize) -> Option<u64> {
+        self.chain.get(depth).map(|object| object.inode)
+    }
+
+    pub(crate) fn leaf_inode(&self) -> u64 {
+        self.chain.last().expect("capture always records root and leaf").inode
+    }
+
+    pub(crate) fn is_directory(&self) -> bool {
+        self.kind == FileType::Directory
     }
 
     pub(crate) fn revalidate(&self, current_root: &File) -> Result<(), IdentityError> {
