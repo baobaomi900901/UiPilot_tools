@@ -930,6 +930,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       ].filter(({ results }) => results.length > 0)
 
   const queryKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Backspace' && snapshot.image && !snapshot.queryControlValue && !composing(event)) {
+      event.preventDefault()
+      core.removeImage()
+      return
+    }
     if (
       event.key === 'Tab' &&
       snapshot.file &&
@@ -1024,7 +1029,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     }
     if (event.key !== 'Enter' && event.key !== 'Escape') return
     if (!isComposing) event.preventDefault()
-    core.keyDown(event.key, isComposing)
+    core.keyDown(event.key, isComposing, event.repeat)
   }
   const quicklinksKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const isComposing = composing(event)
@@ -1681,6 +1686,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             name={`launcher-panel-suffix-${panel.suffixControl}`}
             aria-label={`${panel.commandLabel} argument`}
             placeholder={panel.inputPlaceholder}
+            imagePaste={panel.inputCapabilities?.includes('image.ocr') === true}
             autoComplete="off"
             spellCheck={false}
             disabled={!snapshot.invocationId || panel.closePending}

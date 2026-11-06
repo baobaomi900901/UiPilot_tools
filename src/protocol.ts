@@ -85,6 +85,7 @@ export interface LauncherImage {
 export type LauncherImageState = LauncherImage & { readonly phase: 'list' | 'recognizing' | 'result' | 'error' }
 export interface ImportLauncherImageInput {
   importSequence: number
+  panel?: Readonly<{ sessionEpoch: U64Decimal }>
   bytes?: number[]
   mimeType?: string
   clipboardSequence?: number
@@ -500,7 +501,7 @@ export interface LauncherClient {
   executeResult(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
   executeResultAction(input: { requestId: string; resultId: string; actionId: string }): Promise<unknown>
   retireResultActions(input: { requestId: string }): Promise<void>
-  openPluginPanel(input: { pluginId: string; commandId: string; argument: string; stableCommandTarget?: CommandHotkeyEntry }): Promise<PluginPanelCommandResult>
+  openPluginPanel(input: { pluginId: string; commandId: string; argument: string; imageId?: string; stableCommandTarget?: CommandHotkeyEntry }): Promise<PluginPanelCommandResult>
   submitPluginPanel(input: {
     sessionEpoch: U64Decimal
     argument: string
@@ -649,6 +650,7 @@ export interface PluginPanelCommandResult {
   pluginId: string
   commandLabel: string
   inputPlaceholder?: string
+  inputCapabilities?: readonly ('image.ocr')[]
   hostKeys: readonly PanelHostKeyDeclaration[]
 }
 
@@ -692,6 +694,7 @@ export interface PluginPanelSnapshot {
   pluginId: string
   commandLabel: string
   inputPlaceholder?: string
+  inputCapabilities?: readonly ('image.ocr')[]
   sessionEpoch: U64Decimal
   hostKeys: readonly PanelHostKeyDeclaration[]
   suffixControl: ControlKey
@@ -1308,7 +1311,11 @@ export function parsePluginPanelCommandResult(value: unknown): PluginPanelComman
   const keys = record.inputPlaceholder === undefined
     ? ['commandLabel', 'hostKeys', 'pluginId', 'sessionEpoch']
     : ['commandLabel', 'hostKeys', 'inputPlaceholder', 'pluginId', 'sessionEpoch']
-  if (!exactKeys(record, keys)) return null
+  if (Object.prototype.hasOwnProperty.call(record, 'inputCapabilities')) keys.push('inputCapabilities')
+  if (!exactKeys(record, keys.sort())) return null
+  if (Object.prototype.hasOwnProperty.call(record, 'inputCapabilities') &&
+      (!Array.isArray(record.inputCapabilities) || !exactDenseArray(record.inputCapabilities) ||
+       record.inputCapabilities.length > 1 || record.inputCapabilities.some((value) => value !== 'image.ocr'))) return null
   const sessionEpoch = parseU64Decimal(record.sessionEpoch)
   if (!Array.isArray(record.hostKeys) || !exactDenseArray(record.hostKeys)) return null
   const order: Readonly<Record<PanelHostKeyDeclaration, number>> = {
@@ -1345,6 +1352,7 @@ export function parsePluginPanelCommandResult(value: unknown): PluginPanelComman
     pluginId: record.pluginId,
     commandLabel: record.commandLabel,
     ...(record.inputPlaceholder === undefined ? {} : { inputPlaceholder: record.inputPlaceholder }),
+    ...(record.inputCapabilities === undefined ? {} : { inputCapabilities: Object.freeze([...(record.inputCapabilities as ('image.ocr')[])]) }),
     hostKeys,
   }
 }

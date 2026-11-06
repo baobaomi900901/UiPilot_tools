@@ -9242,6 +9242,7 @@ describe('real adapter and startup', () => {
       if (command === 'list_plugins') return Promise.resolve(pluginInventory([installedPlugin()]))
       if (command === 'open_plugin_panel' || command === 'submit_plugin_panel') return Promise.resolve({
         sessionEpoch: '7', pluginId: 'com.uipilot.demo-panel', commandLabel: 'demo-panel', hostKeys: [],
+        inputCapabilities: ['image.ocr'],
       })
       if (command === 'plugin_panel_host_key_enqueue') return Promise.resolve({ outcome: 'droppedQueueFull' })
       if (command === 'install_plugin' || command === 'reload_plugin' || command === 'delete_plugin') {
@@ -9266,6 +9267,8 @@ describe('real adapter and startup', () => {
     await main.client.setPublicPluginEffectiveName({ pluginId: 'com.example.multi', commandId: 'constructor', nameOverride: null })
     await main.client.setBuiltinFeatureFavorite({ feature: 'find', favorite: true })
     await main.client.openPluginPanel({ commandId: 'default', pluginId: 'com.uipilot.demo-panel', argument: 'hello' })
+    expect(await main.client.openPluginPanel({ commandId: 'scan', pluginId: 'com.example.ocr', argument: '', imageId: 'opaque-launcher-image' })).toMatchObject({ inputCapabilities: ['image.ocr'] })
+    await main.client.importLauncherImage!({ importSequence: 8, bytes: [1, 2], mimeType: 'image/png', panel: { sessionEpoch: u64('7') } })
     await main.client.submitPluginPanel({ sessionEpoch: u64('7'), argument: 'hello', uiIntentEpoch: 1 })
     await main.client.enqueuePluginPanelHostKey({
       sessionEpoch: u64('7'), clientSequence: u64('1'), declaration: 'ArrowDown', key: 'ArrowDown',
@@ -9301,6 +9304,8 @@ describe('real adapter and startup', () => {
       ['set_plugin_effective_name', [{ pluginId: 'com.example.multi', commandId: 'constructor', nameOverride: null }]],
       ['set_builtin_feature_favorite', [{ input: { feature: 'find', favorite: true } }]],
       ['open_plugin_panel', [{ input: { commandId: 'default', pluginId: 'com.uipilot.demo-panel', argument: 'hello' } }]],
+      ['open_plugin_panel', [{ input: { commandId: 'scan', pluginId: 'com.example.ocr', argument: '', imageId: 'opaque-launcher-image' } }]],
+      ['import_launcher_image', [{ input: { importSequence: 8, bytes: [1, 2], mimeType: 'image/png', panel: { sessionEpoch: '7' } } }]],
       ['submit_plugin_panel', [{ input: { sessionEpoch: '7', argument: 'hello', uiIntentEpoch: 1 } }]],
       ['plugin_panel_host_key_enqueue', [{ input: {
         sessionEpoch: '7', clientSequence: '1', declaration: 'ArrowDown', key: 'ArrowDown',
@@ -11233,6 +11238,258 @@ describe('builtin settings query preservation', () => {
       expect(core.getSnapshot().results).toEqual([])
       await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
     } finally { core.destroy() }
+  })
+})
+
+describe('image-capable launcher panels', () => {
+  const image = { id: 'launcher-image-a', mimeType: 'image/png', width: 12, height: 8, byteLength: 32, previewDataUrl: 'data:image/png;base64,AA==' }
+  const identity = { sessionEpoch: u64('81'), pluginId: 'com.example.image-panel', commandLabel: 'ocr', inputPlaceholder: '粘贴图片', hostKeys: ['Tab', 'Shift+Tab', 'Enter'] as const, inputCapabilities: ['image.ocr'] as const }
+  const item = (pluginId = identity.pluginId) => ({ resultId: pluginId, title: pluginId, activation: { kind: 'panelActivation' as const, pluginId, commandId: 'scan', initialArgument: '', favorite: false } })
+  async function setup(withImage = false) {
+    const fake = fakeClient()
+    const importing = vi.fn(async () => image)
+    const clear = vi.fn(async () => {})
+    Object.assign(fake.client, { importLauncherImage: importing, clearLauncherImage: clear, getLauncherClipboardSequence: vi.fn(async () => 73) })
+    vi.mocked(fake.client.openPluginPanel).mockResolvedValue(identity)
+    vi.mocked(fake.client.submitPluginPanel).mockResolvedValue(identity)
+    vi.mocked(fake.client.searchApps).mockImplementation(async () => ({ requestId: 'panel-list', items: [item(), item('com.example.second-ocr')] }))
+    const core = createLauncherCore(fake.client)
+    await core.start()
+    fake.emit(shown('image-panel-entry'))
+    if (withImage) await core.importImage(new Blob(['a'], { type: 'image/png' }))
+    else core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/ocr', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    return { ...fake, core, importing, clear }
+  }
+  it('parses optional image capabilities while accepting legacy panel identities', () => {
+    expect(parsePluginPanelCommandResult(identity)).toEqual(identity)
+    const { inputCapabilities: _, ...legacy } = identity
+    expect(parsePluginPanelCommandResult(legacy)).toEqual(legacy)
+    for (const inputCapabilities of ['image.ocr', ['other'], ['image.ocr', 'image.ocr'], null, [, 'image.ocr']]) {
+      expect(parsePluginPanelCommandResult({ ...identity, inputCapabilities })).toBeNull()
+    }
+  })
+  it.each([false, true])('opens the same focused command tag from image=%s', async (withImage) => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client, clear } = await setup(withImage)
+    const mounted = await mountLauncherView(core)
+    try {
+      await act(async () => core.keyDown('Enter', false))
+      await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+      expect(client.openPluginPanel).toHaveBeenCalledExactlyOnceWith({ pluginId: identity.pluginId, commandId: 'scan', argument: '', ...(withImage ? { imageId: image.id } : {}) })
+      expect(core.getSnapshot().panel).toMatchObject({ commandLabel: 'ocr', inputCapabilities: ['image.ocr'], suffix: '' })
+      expect(core.getSnapshot().image).toBeUndefined()
+      expect(mounted.host.querySelector('img[alt="已粘贴的图片"]')).toBeNull()
+      expect(mounted.host.querySelector('[aria-label="退出 ocr 面板"]')).not.toBeNull()
+      expect(document.activeElement).toBe(mounted.host.querySelector('input.panel-suffix-input'))
+      expect(clear).toHaveBeenCalledTimes(withImage ? 1 : 0)
+      if (withImage) expect(vi.mocked(client.openPluginPanel).mock.invocationCallOrder[0]).toBeLessThan(clear.mock.invocationCallOrder[0])
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+  it('hands the image to the selected plugin without assuming a plugin id', async () => {
+    const { core, client } = await setup(true)
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce({ ...identity, pluginId: 'com.example.second-ocr' })
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce({ ...identity, pluginId: 'com.example.second-ocr' })
+    core.activateResult(1)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.pluginId).toBe('com.example.second-ocr'))
+    expect(client.openPluginPanel).toHaveBeenCalledWith({ pluginId: 'com.example.second-ocr', commandId: 'scan', argument: '', imageId: image.id })
+    core.destroy()
+  })
+  it('keeps the original image throughout opening and after an open failure', async () => {
+    const { core, client, clear } = await setup(true)
+    const pending = deferred<PluginPanelCommandResult>()
+    vi.mocked(client.openPluginPanel).mockReturnValueOnce(pending.promise)
+    core.keyDown('Enter', false)
+    expect(core.getSnapshot().image?.id).toBe(image.id)
+    expect(clear).not.toHaveBeenCalled()
+    pending.reject(new Error('open failed'))
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot().image?.id).toBe(image.id)
+    expect(core.getSnapshot().panel).toBeUndefined()
+    expect(clear).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it.each(['remove', 'new paste'] as const)('rejects a late open after %s invalidates its image, including pending decode', async (change) => {
+    const { core, client, importing } = await setup(true)
+    const pending = deferred<PluginPanelCommandResult>()
+    vi.mocked(client.openPluginPanel).mockReturnValueOnce(pending.promise)
+    core.keyDown('Enter', false)
+    const replacement = deferred<ArrayBuffer>()
+    let importingB: Promise<void> | undefined
+    if (change === 'remove') core.removeImage()
+    else {
+      const blob = new Blob(['b'], { type: 'image/png' })
+      Object.defineProperty(blob, 'arrayBuffer', { value: () => replacement.promise })
+      importing.mockResolvedValueOnce({ ...image, id: 'launcher-image-b' })
+      importingB = core.importImage(blob)
+    }
+    pending.resolve(identity)
+    await vi.waitFor(() => expect(client.closePluginPanel).toHaveBeenCalledWith({ sessionEpoch: identity.sessionEpoch }))
+    expect(core.getSnapshot().panel).toBeUndefined()
+    expect(client.submitPluginPanel).not.toHaveBeenCalled()
+    if (importingB) {
+      core.keyDown('Enter', false)
+      expect(client.openPluginPanel).toHaveBeenCalledOnce()
+      replacement.resolve(new Uint8Array([2]).buffer)
+      await importingB
+      expect(core.getSnapshot().image?.id).toBe('launcher-image-b')
+    }
+    core.destroy()
+  })
+  it('imports repeated panel pastes into its session without a launcher thumbnail or focus change', async () => {
+    installMatchMedia(false)
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    const { core, client, importing } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    const spy = vi.spyOn(HTMLInputElement.prototype, 'addEventListener')
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input.panel-suffix-input')!
+      const index = spy.mock.calls.findIndex(([type], i) => type === 'paste' && spy.mock.contexts[i] === input)
+      expect(index).toBeGreaterThanOrEqual(0)
+      const listener = spy.mock.calls[index][1] as EventListener
+      const text = { isTrusted: true, target: input, preventDefault: vi.fn(), clipboardData: { items: [], getData: () => 'plain text' } }
+      listener(text as unknown as Event)
+      expect(text.preventDefault).not.toHaveBeenCalled()
+      expect(importing).not.toHaveBeenCalled()
+      for (let n = 0; n < 2; n++) {
+        const file = new File(['bitmap'], 'image.png', { type: 'image/png' })
+        const paste = { isTrusted: true, target: input, preventDefault: vi.fn(), clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }], getData: () => '' } }
+        await act(async () => listener(paste as unknown as Event))
+        await vi.waitFor(() => expect(importing).toHaveBeenCalledTimes(n + 1))
+        expect(importing).toHaveBeenLastCalledWith(expect.objectContaining({ panel: { sessionEpoch: identity.sessionEpoch }, mimeType: 'image/png' }))
+        expect(paste.preventDefault).toHaveBeenCalledOnce()
+        expect(core.getSnapshot().image).toBeUndefined()
+        expect(mounted.host.querySelector('input.panel-suffix-input')).toBe(input)
+        expect(document.activeElement).toBe(input)
+      }
+      expect(client.openPluginPanel).toHaveBeenCalledOnce()
+      expect(client.submitPluginPanel).toHaveBeenCalledOnce()
+    } finally { spy.mockRestore(); await mounted.unmount(); core.destroy() }
+  })
+  it('does not read clipboard images for a panel without the capability', async () => {
+    const { core, client, importing } = await setup()
+    const { inputCapabilities: _, ...legacy } = identity
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce(legacy)
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce(legacy)
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    await core.importImage()
+    expect(client.getLauncherClipboardSequence).not.toHaveBeenCalled()
+    expect(importing).not.toHaveBeenCalled()
+    core.destroy()
+  })
+  it('keeps the latest panel import feedback when an older import finishes last', async () => {
+    const { core, importing } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    const response = deferred<typeof image>()
+    importing.mockReturnValueOnce(response.promise)
+    const first = core.importImage(new Blob(['a'], { type: 'image/png' }))
+    await vi.waitFor(() => expect(importing).toHaveBeenCalledOnce())
+    importing.mockRejectedValueOnce({ code: 'invalidImage' })
+    await core.importImage(new Blob(['b'], { type: 'image/png' }))
+    expect(core.getSnapshot().status).toBe('图片格式无效或无法解码')
+    response.resolve(image)
+    await first
+    expect(core.getSnapshot().status).toBe('图片格式无效或无法解码')
+    expect(core.getSnapshot().image).toBeUndefined()
+    expect(core.getSnapshot().panel?.sessionEpoch).toBe(identity.sessionEpoch)
+    core.destroy()
+  })
+  it('discards an old panel import before native decode when the panel changes', async () => {
+    const { core, client, importing } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    const bytes = deferred<ArrayBuffer>()
+    const blob = new Blob(['old'])
+    Object.defineProperty(blob, 'arrayBuffer', { value: () => bytes.promise })
+    const pending = core.importImage(blob)
+    await core.closePanel()
+    bytes.resolve(new Uint8Array([1]).buffer)
+    await pending
+    expect(importing).not.toHaveBeenCalled()
+    expect(core.getSnapshot().image).toBeUndefined()
+    core.destroy()
+  })
+  it('ignores an old native panel import response after leaving and opening a new session', async () => {
+    const { core, client, importing } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    const response = deferred<typeof image>()
+    importing.mockReturnValueOnce(response.promise)
+    const pending = core.importImage(new Blob(['old'], { type: 'image/png' }))
+    await vi.waitFor(() => expect(importing).toHaveBeenCalledOnce())
+    expect(importing).toHaveBeenCalledWith(expect.objectContaining({ panel: { sessionEpoch: identity.sessionEpoch } }))
+    await core.closePanel()
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(2))
+    const next = { ...identity, sessionEpoch: u64('82') }
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce(next)
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce(next)
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.sessionEpoch).toBe('82'))
+    response.resolve({ ...image, id: 'expired-native-response' })
+    await pending
+    expect(core.getSnapshot().panel?.sessionEpoch).toBe('82')
+    expect(core.getSnapshot().image).toBeUndefined()
+    expect(core.getSnapshot().status).toBe('')
+    core.destroy()
+  })
+  it('routes only a fresh empty-input Enter to an image panel; preserves text, IME and Tab', async () => {
+    installMatchMedia(false)
+    const { core, client } = await setup()
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    vi.mocked(client.submitPluginPanel).mockClear()
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input.panel-suffix-input')!
+      const key = async (name: string, extra = {}) => {
+        const event = new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra })
+        await act(async () => { input.dispatchEvent(event) })
+        return event
+      }
+      expect((await key('Enter')).defaultPrevented).toBe(true)
+      await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledOnce())
+      expect((await key('Enter', { repeat: true })).defaultPrevented).toBe(true)
+      expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledOnce()
+      expect(client.submitPluginPanel).not.toHaveBeenCalled()
+      await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().panel!.suffixControl, value: 'text', inputType: 'insertText' }))
+      await key('Enter')
+      expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledOnce()
+      expect(client.submitPluginPanel).toHaveBeenCalledOnce()
+      expect((await key('Enter', { isComposing: true })).defaultPrevented).toBe(false)
+      expect((await key('Backspace', { isComposing: true })).defaultPrevented).toBe(false)
+      await key('Tab')
+      await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledTimes(2))
+      expect(client.closePluginPanel).not.toHaveBeenCalled()
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+  it('removes an ordinary launcher image with empty-input Backspace while keeping focus', async () => {
+    installMatchMedia(false)
+    const { core } = await setup(true)
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input[role="combobox"]')!
+      input.focus()
+      await act(async () => { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true })) })
+      expect(core.getSnapshot().image).toBeUndefined()
+      expect(document.activeElement).toBe(input)
+    } finally { await mounted.unmount(); core.destroy() }
+  })
+  it('preserves declared Enter routing for ordinary panels with text and repeat', async () => {
+    const { core, client } = await setup()
+    const { inputCapabilities: _, ...legacy } = identity
+    vi.mocked(client.openPluginPanel).mockResolvedValueOnce(legacy)
+    vi.mocked(client.submitPluginPanel).mockResolvedValueOnce(legacy)
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().panel?.submitPending).toBe(false))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().panel!.suffixControl, value: 'text', inputType: 'insertText' })
+    expect(core.routePanelHostKey({ key: 'Enter', repeat: true, isComposing: false, ctrlKey: false, metaKey: false, shiftKey: false, altKey: false, platform: 'windows' })).toBe(true)
+    await vi.waitFor(() => expect(client.enqueuePluginPanelHostKey).toHaveBeenCalledOnce())
+    core.destroy()
   })
 })
 

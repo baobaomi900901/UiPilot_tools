@@ -176,6 +176,7 @@ interface PrivatePanelState {
   pluginId: string
   commandLabel: string
   inputPlaceholder?: string
+  inputCapabilities?: readonly ('image.ocr')[]
   sessionEpoch: U64Decimal
   hostKeys: readonly PanelHostKeyDeclaration[]
   suffix: TextControl
@@ -833,6 +834,7 @@ function projectSnapshot(model: Model): LauncherSnapshot {
         ...(model.panel.feedback ? { feedback: model.panel.feedback } : {}),
         commandLabel: model.panel.commandLabel,
         ...(model.panel.inputPlaceholder === undefined ? {} : { inputPlaceholder: model.panel.inputPlaceholder }),
+        ...(model.panel.inputCapabilities === undefined ? {} : { inputCapabilities: Object.freeze([...model.panel.inputCapabilities]) }),
         sessionEpoch: model.panel.sessionEpoch,
         hostKeys: Object.freeze([...model.panel.hostKeys]),
         suffixControl: model.panel.suffix.key,
@@ -2012,10 +2014,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
   }
 
   async function importImage(file?: Blob): Promise<void> {
-    if (destroyed || model.view !== 'launcher' || model.launcherMode !== 'applications' || !model.invocationId || !client.importLauncherImage) return
+    if (destroyed || model.view !== 'launcher' || model.hidePending || !model.invocationId || !client.importLauncherImage) return
+    const panel = model.launcherMode === 'panel' ? model.panel : undefined
+    if (model.launcherMode !== 'applications' && !panel) return
+    if (panel && (panel.closePending || !panel.inputCapabilities?.includes('image.ocr'))) return
     imageImportPending = true
-    const owner = { sequence: ++imageImportSequence, epoch: model.viewEpoch, invocationId: model.invocationId }
-    const owns = () => !destroyed && owner.sequence === imageImportSequence && owner.epoch === model.viewEpoch && owner.invocationId === model.invocationId && !model.hidePending
+    const owner = { sequence: ++imageImportSequence, epoch: model.viewEpoch, invocationId: model.invocationId, panelEpoch: panel?.sessionEpoch }
+    const owns = () => !destroyed && owner.sequence === imageImportSequence && owner.epoch === model.viewEpoch && owner.invocationId === model.invocationId && !model.hidePending &&
+      (owner.panelEpoch === undefined
+        ? model.launcherMode === 'applications'
+        : model.launcherMode === 'panel' && model.panel?.sessionEpoch === owner.panelEpoch && !model.panel.closePending && model.panel.inputCapabilities?.includes('image.ocr'))
     try {
       // Start the native clipboard-version read synchronously in the paste callback.
       const clipboardSequence = file ? undefined : client.getLauncherClipboardSequence?.()
@@ -2032,9 +2040,15 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       await imageAuthorityRegistration
       if (!owns()) return
       if (!file && source.clipboardSequence === undefined) { imageImportPending = false; return }
-      const image = await client.importLauncherImage({ importSequence: owner.sequence, ...source })
+      const image = await client.importLauncherImage({ importSequence: owner.sequence, ...source,
+        ...(owner.panelEpoch === undefined ? {} : { panel: { sessionEpoch: owner.panelEpoch } }) })
       if (!owns()) return
       imageImportPending = false
+      if (owner.panelEpoch !== undefined) {
+        model.status = ''
+        publish(true)
+        return
+      }
       invalidateImageWork()
       if (model.mainResultCommand) {
         model.query = model.mainResultCommand.suffix.draft
@@ -3274,6 +3288,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     nextPanelHostKeyClientSequence = 1n
     panelHostKeyEnqueueTail = Promise.resolve()
     if (!model.panel) return false
+    imageImportSequence += 1
+    imageImportPending = false
     const panelTarget = model.panel.commandHotkeyTarget
     if (panelTarget && stableCommandOutputMode === 'panel' && (!stableCommandTarget || stableCommandTarget === panelTarget)) {
       stableCommandTarget = undefined
@@ -3514,6 +3530,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       model.view !== 'launcher' ||
       model.launcherMode !== 'applications' ||
       model.executePending ||
+      imageImportPending ||
       result.activation.kind !== 'panelActivation' ||
       !model.invocationId
     ) return
@@ -3526,6 +3543,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       querySequence: model.querySequence,
       query: model.query,
       resultKey: result.key,
+      imageId: model.image?.id,
+      imageImportSequence,
       pluginId: result.activation.pluginId,
       commandId: result.activation.commandId,
       argument: result.activation.initialArgument,
@@ -3535,13 +3554,16 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     publish(true)
     let pending: ReturnType<LauncherClient['openPluginPanel']>
     try {
-      pending = client.openPluginPanel({ pluginId: owner.pluginId, commandId: owner.commandId, argument: owner.argument, ...(stableCommandTarget ? { stableCommandTarget: { ...stableCommandTarget } } : {}) })
+      pending = client.openPluginPanel({ pluginId: owner.pluginId, commandId: owner.commandId, argument: owner.argument,
+        ...(owner.imageId === undefined ? {} : { imageId: owner.imageId }),
+        ...(stableCommandTarget ? { stableCommandTarget: { ...stableCommandTarget } } : {}) })
     } catch (error) {
       pending = Promise.reject(error)
     }
     const ownsAction = () => !destroyed && owner.token === panelActionToken &&
       owner.viewEpoch === model.viewEpoch && owner.invocationId === model.invocationId
     const ownsQuery = () => ownsAction() && owner.control === model.queryControl &&
+      owner.imageId === model.image?.id && owner.imageImportSequence === imageImportSequence &&
       owner.querySequence === model.querySequence && owner.query === model.query &&
       owner.query === model.queryControlValue && model.results.some(({ key }) => key === owner.resultKey)
     const releaseFailedHotkeyOpen = () => {
@@ -3575,6 +3597,9 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           void client.closePluginPanel({ sessionEpoch: identity.sessionEpoch }).catch(() => undefined)
           return
         }
+        // The backend now owns an independent Panel snapshot. Retire only the
+        // launcher image after the handoff succeeds, never while open is pending.
+        discardImage()
         searchToken = ++token
         model.searchPending = false
         model.executePending = false
@@ -3592,6 +3617,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
           pluginId: identity.pluginId,
           commandLabel: identity.commandLabel,
           ...(identity.inputPlaceholder === undefined ? {} : { inputPlaceholder: identity.inputPlaceholder }),
+          ...(identity.inputCapabilities === undefined ? {} : { inputCapabilities: Object.freeze([...identity.inputCapabilities]) }),
           sessionEpoch: identity.sessionEpoch,
           hostKeys: Object.freeze([...identity.hostKeys]),
           suffix: newTextControl(owner.argument),
@@ -4234,6 +4260,10 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       key = 'n'
     }
     if (!declaration || !key || !panel.hostKeys.includes(declaration)) return false
+    if (declaration === 'Enter' && panel.inputCapabilities?.includes('image.ocr')) {
+      if (input.repeat) return true
+      if (panel.suffix.draft !== '') return false
+    }
 
     const maxU64 = (1n << 64n) - 1n
     if (nextPanelHostKeyClientSequence > maxU64) {
@@ -4295,6 +4325,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
 
       if (model.view === 'launcher' && model.launcherMode === 'panel') {
         const panel = model.panel
+        if (repeat && panel?.inputCapabilities?.includes('image.ocr')) return
         if (panel) submitPanel(panel.suffix.value)
         return
       }
