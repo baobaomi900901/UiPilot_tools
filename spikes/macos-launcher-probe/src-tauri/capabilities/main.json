@@ -1,0 +1,10 @@
+{
+  "identifier": "local-probe",
+  "description": "Only the local probe window may request the marker.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-check-origin"
+  ]
+}
