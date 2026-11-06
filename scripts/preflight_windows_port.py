@@ -20,6 +20,7 @@ sys.dont_write_bytecode = True
 CANDIDATE = "a79f612f99c31b4bb081fbdb04eb71ac92b7c761"
 SOURCE_ZIP_SHA256 = "47970c7579ee4c381afc90092d620122f84d67760eaead827ebe19b7d75ff673"
 HOST = "x86_64-pc-windows-msvc"
+EVERYTHING_LICENSES = ("src-tauri/resources/everything/LICENSE.txt", "third-party/everything/LICENSE.txt")
 
 
 def sha256(path):
@@ -72,8 +73,14 @@ def matches_archive(root, archive):
                 if relative == ".uipilot-local.json":
                     continue
                 item = expected.get(relative)
-                if item is None or path.stat().st_size != item.file_size or path.read_bytes() != source.read(item):
+                if item is None:
                     return False
+                expected_bytes = source.read(item)
+                actual = path.read_bytes()
+                if actual != expected_bytes:
+                    # The pinned archive stored these two upstream CRLF files as LF.
+                    if relative not in EVERYTHING_LICENSES or actual != expected_bytes.replace(b"\n", b"\r\n"):
+                        return False
                 found.add(relative)
         return found == expected.keys()
 
@@ -193,10 +200,8 @@ def check_resources(root, report):
     lock = json.loads((folder / "everything.lock.json").read_text(encoding="utf-8"))
     report.check("Everything.exe", sha256(folder / "Everything.exe") == lock["everythingExeSha256"],
                  f"x64 {lock['version']} SHA-256 匹配", "从完整候选源码恢复 Everything.exe。")
-    # The lock describes upstream CRLF license bytes; Git can check out LF.
-    license_bytes = (folder / "LICENSE.txt").read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-    report.check("Everything 许可证", hashlib.sha256(license_bytes).hexdigest() == lock["licenseSha256"],
-                 "许可证文本匹配", "从候选源码恢复许可证。")
+    report.check("Everything 许可证", all(sha256(root / path) == lock["licenseSha256"] for path in EVERYTHING_LICENSES),
+                 "两份许可证的 SHA-256 均与锁文件匹配", "恢复两份许可证的原始 CRLF 字节后再打包。")
     config = json.loads((root / "src-tauri/tauri.windows.conf.json").read_text(encoding="utf-8"))
     nsis = config["bundle"]["windows"]["nsis"]
     paths = [name for name in config["bundle"]["resources"] if not name.startswith("resources/provider/")]

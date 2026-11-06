@@ -1,6 +1,8 @@
 """Portable fixture checks; the real Windows tools must still run on Windows."""
 import contextlib
+import hashlib
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +13,29 @@ import preflight_windows_port as preflight
 
 
 class PreflightTests(unittest.TestCase):
+    def test_license_line_endings_must_match_packaging_lock_for_both_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative in preflight.EVERYTHING_LICENSES:
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"license\n")
+            folder = root / "src-tauri/resources/everything"
+            (folder / "Everything.exe").write_bytes(b"exe")
+            (folder / "everything.lock.json").write_text(json.dumps({
+                "version": "fixture", "licenseSha256": hashlib.sha256(b"license\r\n").hexdigest(),
+                "everythingExeSha256": preflight.sha256(folder / "Everything.exe")
+            }))
+            (root / "src-tauri/tauri.windows.conf.json").write_text(
+                '{"bundle":{"resources":[],"windows":{"nsis":{"installerHooks":"tauri.windows.conf.json","template":"tauri.windows.conf.json"}}}}')
+            for fixed, expected_failures in [(0, 1), (1, 1), (2, 0)]:
+                if fixed:
+                    (root / preflight.EVERYTHING_LICENSES[fixed - 1]).write_bytes(b"license\r\n")
+                report = preflight.Report()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    preflight.check_resources(root, report)
+                self.assertEqual(report.failures, expected_failures)
+
     def test_archive_identity_covers_extracted_bytes_extra_files_and_archive_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "source"

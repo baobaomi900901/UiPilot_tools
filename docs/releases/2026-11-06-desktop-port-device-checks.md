@@ -32,6 +32,12 @@
 
 仅做安装实测时，直接使用 Windows 构建者交付的 NSIS 与哈希，从第 4 步开始；测试机无需安装 Rust、Node 或独立 Provider 源码。
 
+第二次实机构建已完成 Provider 准备和前端构建，随后因 `Resource License does not match the reviewed lock` 停止。旧交接包预检仅比对规范化后的文本，误报通过。固定源码 ZIP 中两份 Everything 许可证均为 LF（2,648 字节）；原始 CRLF 文件为 2,699 字节。使用此归档时，在源码目录运行以下命令，仅在两份转换结果都匹配审核锁时恢复它们。保留原 ZIP 和锁文件，验收时记录这次换行修复。随后使用前述受管构建命令重试。
+
+```cmd
+python -I -c "from pathlib import Path; import hashlib; files=[Path('third-party/everything/LICENSE.txt'),Path('src-tauri/resources/everything/LICENSE.txt')]; data=[p.read_bytes().replace(b'\r\n',b'\n').replace(b'\n',b'\r\n') for p in files]; assert all(hashlib.sha256(b).hexdigest()=='c13d19adcbfd5d07e9512de9df99956a3423399ed1fadc5fd33186697ad8df2f' for b in data), 'License content mismatch'; [p.write_bytes(b) for p,b in zip(files,data)]; print('License SHA-256 OK')"
+```
+
 **交接工具与候选源码分开存放**。从工具目录取 `scripts/preflight_windows_port.py`，该文件可在仓库外单独运行。维护者提供独立 Provider 源码；如有批准的 Provider commit，可加 `--provider-commit <完整 SHA>`。
 
 1. 在 VS 的 **x64 Native Tools / Developer PowerShell** 中准备 Windows PowerShell 5.1、原生 Python 3.10+、Git、x64 Node 22.13+（22.x）或 24+、Rust 1.96.1 MSVC x64、C++ 工具和 Windows SDK。将 `$env:UIPILOT_RUST_UIA_ROOT` 设为本机独立 Provider checkout。预检沿用产品的路径优先级，不打印路径或环境变量。使用独立测试机/账户，不用个人凭据测试插件。
