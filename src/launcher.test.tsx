@@ -9206,6 +9206,21 @@ describe('real adapter and startup', () => {
     } finally { core.destroy() }
   })
 
+  it('releases only the Mac recording owner after a new invocation', async () => {
+    const { client, emit } = fakeClient()
+    const core = createLauncherCore(client, undefined, hostSnapshot('macos'))
+    await core.start()
+    try {
+      emit(shown('A', 'settings'))
+      await core.setHotkeyRecordingPhase('recording')
+      emit(shown('B', 'launcher'))
+      expect(core.getSnapshot().view).toBe('launcher')
+      await core.setHotkeyRecordingPhase('idle')
+      expect(client.setHotkeyRecording).toHaveBeenNthCalledWith(1, { recording: true, invocationId: 'A' })
+      expect(client.setHotkeyRecording).toHaveBeenNthCalledWith(2, { recording: false, invocationId: 'A' })
+    } finally { core.destroy() }
+  })
+
   it('drops a pending capability snapshot when its window unloads', async () => {
     resetAdapterDocument()
     const result = deferred<ReturnType<typeof hostSnapshot>>()
