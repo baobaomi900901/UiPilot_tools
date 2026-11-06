@@ -1,18 +1,18 @@
 # macOS Find 与 Spotlight 文件搜索设计
 
-**状态：待单独批准的 Task 8 设计输入。** 基线 `37d1bca`，适用 M1 系列及后续 Apple Silicon。当前生产 Mac 仍只开放核心启动器，`HostCapabilities.files=false`。已接入宿主私有的 Spotlight 候选查询和文件身份复验模块，尚未向 WebView 提供文件搜索 IPC；首版 Task 7 的 Windows 原生交付进展见设备验收单；按用户决定跳过后续芯片/较新系统实机行。公开分发的公证与 Gatekeeper 验收仍单列。按本轮决定先做不依赖范围选择的查询、取消和身份校验，非阻塞人工测试后补。开放产品入口仍需完成范围选择及相应的授权边界验证。参见[首版支持矩阵及 Task 8](../plans/2026-11-06-macos-port.md)和[逐步验收 §8](../plans/2026-11-06-macos-port-steps.md)。
+**状态：2026-11-07 已选定方案 A，Task 8 正在实施。** 基线 `37d1bca`，适用 M1 系列及后续 Apple Silicon。普通构建保持 `HostCapabilities.files=false`。显式预览构建已接通主窗口 `/find`、Find 专用 IPC、Spotlight 查询、对象身份复验和 Finder 动作。首版 Task 7 的 Windows 原生交付进展见设备验收单；按用户决定跳过后续芯片/较新系统实机行。公开分发的公证与 Gatekeeper 验收仍单列。按本轮决定先做不依赖范围选择的查询、取消和身份校验，非阻塞人工测试后补。默认范围已选定；正式开放产品入口仍需验证范围授权边界。参见[首版支持矩阵及 Task 8](../plans/2026-11-06-macos-port.md)和[逐步验收 §8](../plans/2026-11-06-macos-port-steps.md)。
 
 ## 用户可见范围与默认行为
 
-用户在主启动器输入 `/find 会议`，按 Enter 打开一个独立的 Find 窗口。Find 保留现有搜索框、分类和列表；主窗口只在所属提交成功时清空输入。**默认检索范围尚待产品选择**。Spotlight 同时支持系统定义的范围和显式目录 URL；每次启动手选一个目录不是 API 限制。本机显式目录查询已正向命中。系统级 scope 加严格公开路径谓词的实验完成但返回 0 行；它没有验证 A 的真实覆盖，不构成选择 B 的依据。
+用户在主启动器输入 `/find 会议`，按 Enter 打开一个独立的 Find 窗口。Find 保留现有搜索框、分类和列表；主窗口只在所属提交成功时清空输入。**默认检索范围为方案 A：系统已索引、UiPilot 可访问的本地文件**。Spotlight 同时支持系统定义的范围和显式目录 URL；每次启动手选一个目录不是 API 限制。本机显式目录查询已正向命中。系统级 scope 加严格公开路径谓词的实验完成但返回 0 行；它没有验证 A 的真实覆盖，不构成选择 B 的依据。
 
-| 待批准策略 | 用户体验 | 权限、失效与验证成本 |
+| 范围策略 | 用户体验 | 权限、失效与验证成本 |
 | --- | --- | --- |
-| A：搜索系统已许可的 Spotlight 本地范围 | 输入文件名即可检索，更贴近启动器。应明确提示只覆盖 Spotlight 已收录且当前进程可访问的本地对象 | 采用系统 indexed local scope 或等价本地卷范围。SDK 对 IndexedLocalComputerScope 的定义还包含可能位于远端的 home，须校验结果实际挂载类型并排除网络。不能把结果可见当作文件授权，也不能把整个卷都视为已授权。需在普通账户、正式签名身份上实测 TCC 拒绝/撤销是否无意弹窗或泄漏名称；不能证明边界时继续关闭该策略 |
-| B：缩小到用户明确选取的目录，允许记住上次选择 | 首次选一次，此后直接检索旧范围，适合只搜项目/工作资料。可替换或清除范围；取消选择保留原设置 | 仅保存用户选取的本地根及校验身份。持久 bookmark 只用于定位，不能替代重新鉴权；需要 security-scoped access 时须验证签名/沙箱/entitlement 条件，并平衡 start/stop。重启重新解析，检查卷、根身份、是否移动/替换、权限。stale、不可达、身份变化或撤权则显示「重新选择目录」，旧票据失效；不得自动切到更广范围 |
+| A（已选）：搜索系统已许可的 Spotlight 本地范围 | 输入文件名即可检索，更贴近启动器。应明确提示只覆盖 Spotlight 已收录且当前进程可访问的本地对象 | 采用系统 indexed local scope 或等价本地卷范围。SDK 对 IndexedLocalComputerScope 的定义还包含可能位于远端的 home，须校验结果实际挂载类型并排除网络。不能把结果可见当作文件授权，也不能把整个卷都视为已授权。需在普通账户、正式签名身份上实测 TCC 拒绝/撤销是否无意弹窗或泄漏名称；不能证明边界时继续关闭该策略 |
+| B（未选）：缩小到用户明确选取的目录，允许记住上次选择 | 首次选一次，此后直接检索旧范围，适合只搜项目/工作资料。可替换或清除范围；取消选择保留原设置 | 仅保存用户选取的本地根及校验身份。持久 bookmark 只用于定位，不能替代重新鉴权；需要 security-scoped access 时须验证签名/沙箱/entitlement 条件，并平衡 start/stop。重启重新解析，检查卷、根身份、是否移动/替换、权限。stale、不可达、身份变化或撤权则显示「重新选择目录」，旧票据失效；不得自动切到更广范围 |
 | B 的可选隐私模式：仅本次会话 | 用户主动选择「仅本次」时不记住路径，退出释放。每次启动重新选择的交互成本仅由该模式承担 | 隐藏/重开保留进程内选择；退出释放。适用与持久目录相同的身份/本地卷检查 |
 
-推荐先验证 A 的免配置体验，B 可作为更窄的可选范围或 A 不能可靠满足权限边界时的候选默认。评审需决定批准 A、B 或两者，以及是否允许「记住目录」和默认值。未选定或没有相应实机证据前，任何方案均不得开启生产能力。其余章节中的「有效范围」表示经批准策略解析出的范围，不预设单目录为全局默认。
+已选定 A 作为产品默认范围。内部预览先限定到已验证的本地公开目录，不要求用户选择目录；这只验证入口与系统操作，不代表用户目录的覆盖或正式发布验收。B 仅留作备选，本轮不提供目录选择或持久书签。
 
 两种策略都排除网络卷、跨挂载逃逸、别名/符号链接与包内部条目；B 不接受整个卷或包目录作根。Spotlight 元数据中的路径只提供候选，不授予文件访问权限。不读取 iCloud 占位文件内容、不触发下载，不申请完全磁盘访问。受拒项目不得展示其路径；系统能证明拒绝时提示范围限制。Windows 保持原有搜索范围与 Everything/SystemIndex 行为。
 
@@ -32,8 +32,14 @@
 - 启动阶段沿用共享 React/IPC 和 `FindWindowController`。Mac 有能力时才创建隐藏的单个 `find`，允许生产 `tauri://localhost` 或已配置的开发回环来源。现有 `host_capabilities::require_main`、Mac 的 local-navigation 插件均仅允许 main；应新增显式的 find 身份检查、分别限定导航和 ACL，并分别验证 main/find WebView label、窗口与来源。拒绝任意其他窗口、外部页和 WebView 后才读取设置、范围、registry 或原生操作状态。
 - main 可展示/收藏和转发 Find。单独开放 `files`，保持 `plugins`、`builtinFeatures` 等其他能力关闭。目前 `src/host-capabilities.ts` 会在 `builtinFeatures=false` 时过滤含 iconKind 或内置收藏的结果；要为 **Find 自身** 放行 existing Find 图标、`ResultFavorite::builtin(BuiltinFeature::Find,…)` 和 `favoriteMatchesResult`，并回归上下文菜单。宿主的收藏操作也只能修改已启用的 Find。Mac `search_apps` 需实现 `/find` 补全和 `OpenFind`，而非打开所有内置命令。
 - main 的 `open_find_window` 校验当前 main invocation/query，成功转发使用既有前端提交所有权。find 的 `prepare_find_initialization`、`commit_find_ready`、状态读取、pin/hide、`search_files` 及 Find 执行只接受当前合法 Find。作用域由宿主选择。Mac `execute_result` 今天只允许 main 应用结果，将按受信 label 路由到 main 应用或独立 find 文件 registry；同一 ID 不跨域。额外的 `open_find_document(requestId,resultId)` 仅允许 find，宿主持有动作与目标，客户端不得提供路径、根、命令、程序或 URL。
-- 提供 find-only 的 `get_find_scope`，返回十进制字符串 `revision`、获批的模式及状态 `ready|needsSelection|unavailable`；只有 B 已建立可用范围时才返回其显示路径。若批准 B，再开放 `select_find_scope`、`clear_find_scope`；若 A/B 均获批，可显式切换模式。变更接受当前 Find invocation；选择 API 不接受客户端目录字符串，原生选择对话框属于 Find 的内部焦点转移，不触发 unpinned 自动隐藏。过期会话/过期选择操作的结果直接释放，不覆盖更新选择。成功变更增加 revision、撤销旧查询/结果，当前文本重新查询。浏览器不接触 bookmark、内部卷 ID 或句柄；既有初始化 DTO 的 exact-key 校验不变。
+- 本轮 A 模式按宿主固定构建范围展示提示，前端无传入搜索根或切换范围的 IPC。查询和动作分别复核当前允许的本地挂载、根身份及授权；若未来提供 B 或引入动态范围，再增加范围 revision、撤销旧票据及独立选择流程。
 - Find 私有目录/结果权限与公开插件的 `files.index.readAll`、`files.openText` 相互独立。本次不扩大 SDK 权限。独立 ACL 仅在实际后端、原生窗口、负面测试都通过后才启用。
+
+## 范围验收与发布条件
+
+- 普通构建不开启 Find。内部 `macos-find-preview` 构建将本地公共字体目录和 `/Users/Shared` 的目录 URL 传给 Spotlight，且逐对象复验。该构建可用于验收查询、收藏、窗口转发、Finder 定位以及打开文档。
+- `macos-find-system-qa` 仅为受控签名身份和隔离测试账户准备；它使用系统 `NSMetadataQueryIndexedLocalComputerScope`。只有 QA 构建、宿主环境显式设置 `UIPILOT_FIND_ISOLATED_QA=1` 且 `UIPILOT_FIND_QA_VERIFIED_ROOTS` 有值时才启用入口。后者是本次已独立核验权限的目录，以冒号分隔；只接受小范围规范本地根，不接受整个用户主目录、上级、重叠根或跨卷逃逸。该证据限 QA 流程，不是最终用户的搜索偏好。该模式不分发给普通用户。
+- 系统 QA 验收需分别覆盖已允许、未授权、明确拒绝、撤权与对象替换，确认没有意外隐私弹窗、受拒行或错误系统动作，才能扩大公开支持范围。Apple 说明在缺少明确或隐含授权时首次访问桌面可能触发系统询问。[Apple 桌面目录访问说明](https://developer.apple.com/documentation/bundleresources/information-property-list/nsdesktopfolderusagedescription)
 
 ## 生命周期与并发顺序
 
@@ -71,7 +77,7 @@ Finder 定位使用 `NSWorkspace.activateFileViewerSelectingURLs`，它没有成
 
 `207d590` 的查询桥在后台 run loop 运行 NSMetadataQuery，保留独立观察者和取消标记；按同一截止时间限制收集及复制。文件名作为字面参数，最多复制 400 条内部候选。已通过 8 个确定性查询测试，并在指定的系统字体目录中命中 `Andale Mono.ttf`。文件身份模块从已验证的根目录描述符逐组件拒绝符号链接和跨挂载，在重新鉴别时检查父目录、叶子和身份是否变化；6 项测试通过。
 
-以上实现尚未注册 Find IPC。默认范围授权、本地卷/包/别名识别、有效访问校验、结果发布、执行前复验和 Finder 操作仍未完成。非阻塞设备交互按本轮安排后补。
+以上是 `207d590` 的基线。随后已在显式预览构建中接入窗口和命令白名单、结果发布、挂载/包/别名排除、有效读取检查、原生文件引用及执行前复验。默认构建不注册 Find IPC。真实 Finder 选择与焦点、正式签名身份的受保护路径拒绝或撤权仍待单独验收。
 
 ## 本次只读证据
 

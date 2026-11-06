@@ -113,7 +113,7 @@
 ### Task 8: 文件搜索与 Finder 操作
 
 **Files:** `src-tauri/src/{file_search/mod.rs,file_search/macos.rs,file_index/mod.rs,commands.rs,find_window.rs,result_registry.rs}`、`src-tauri/capabilities/find.json`、`src/{find-core.ts,find-view.tsx,find-core.test.ts,find-view.test.tsx}`。
-**Dependencies:** Task 7；单独批准 Spotlight 索引范围、Find 初始化/固定、对象身份授权及错误展示规格；准备已索引与明确排除的临时目录。
+**Dependencies:** Task 7；2026-11-07 已选系统已索引、UiPilot 可访问的本地文件作为默认范围（方案 A）。Find 的初始化、对象身份与授权见[专项设计](../specs/2026-11-06-macos-file-search-design.md)。普通范围预览、隔离系统 QA 和正式发布分别记录。
 
 - [ ] **8.1 建立查询后端。** 增加有取消能力的 macOS 查询，查询长度/批次/上限依批准规格执行；禁止调用 Windows Everything。用 fake provider 返回成功、空、明确排除、拒绝和服务错误，检查各自可呈现的状态。真实系统无法判别「未索引」与「无匹配」时按规格提示范围限制，不能杜撰索引状态或全盘补扫。
 - [ ] **8.2 绑定 Find 请求和生命周期。** 测试 A 开始、B 发布、A 迟到，最终仅 B 可见；关闭 Find 后 A 再回调，不向已关闭窗口推送。验证准备初始化不会消费排队转发，commit ready 后仅现 owner 消费；固定状态在文件打开等待期间改变时，晚到 completion 按新状态决定隐藏。

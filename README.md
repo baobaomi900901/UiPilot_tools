@@ -15,6 +15,12 @@ node scripts/verify-macos-bundle.mjs
 
 校验脚本只读挂载本次 DMG，检查签名、arm64 架构、最低系统版本及资源，并输出 SHA-256。内部包用于本机测试；公开发布另需 Developer ID 签名与公证。前端预览不覆盖原生快捷键、窗口焦点或 IPC。
 
+### 文件搜索预览
+
+内部 Apple Silicon 预览包可在主窗口输入 `/find 文件名` 并回车。文件行默认在 Finder 中选中，文件夹在 Finder 中打开；支持的普通文档另有「打开文件」。当前预览只显示公共字体目录和本机共享目录 `/Users/Shared` 中已被 Spotlight 索引且能复核访问权限的项目。正式目标是免配置搜索系统已索引、UiPilot 可访问的本地文件。该全系统范围仍待签名身份与系统隐私授权验收，常规构建继续关闭 Find。
+
+如需构建受限范围的预览包，使用上方内部打包命令，在 `build` 后添加 `--features macos-find-preview`。发布状态与测试边界见[文件搜索设计](docs/superpowers/specs/2026-11-06-macos-file-search-design.md)。
+
 ## 工具链与开发
 
 安装 Node.js 22 LTS（CLI 最低要求 Node 20）、npm、Rust stable / Cargo、Windows MSVC C++ 构建工具与 WebView2。首次准备依赖运行 `npm ci`；Rust 离线验证需要本地已有 Cargo 依赖缓存。验证不会下载依赖或修复生成文件。
