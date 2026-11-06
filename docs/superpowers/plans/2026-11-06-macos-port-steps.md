@@ -99,15 +99,15 @@
 ### Task 7: 双平台发布门禁
 
 **Files:** `scripts/{verify-local-foundation.mjs,verify-local-foundation.test.mjs,verify-macos-bundle.mjs}`（最后一个新增），新增 CI 工作流，`README.md`、`docs/releases/`。
-**Dependencies:** Tasks 1–6 完成，设计「分发与验收」；Mac 原生 arm64 runner、两行 Mac 实机、Windows 原生 runner 及匹配的独立 Provider 源码。公开发布另需可用的 Developer ID 与公证授权。
+**Dependencies:** Tasks 1–6 完成，设计「分发与验收」；Mac 原生 arm64 runner、M1 系列最低系统实机、Windows 原生 runner 及匹配的独立 Provider 源码。公开发布另需可用的 Developer ID 与公证授权。
 
 - [ ] **7.1 组合 CI。** 为 Mac/Windows 分别预检 host、工具链、缓存和外部依赖。Mac 记录 uname 与 rustc host；Windows 从 scripts/provider_build.py 实际选择的 UIPILOT_RUST_UIA_ROOT、.uipilot-local.json 或默认 D:/code/rust_uia 获取 Provider 源码，记录 revision、runner、构建清单/hash；缺失即阻塞，不能取不匹配 exe 代替。两平台执行完整本地协调器；按 manifest 分组验证正向平台与不支持平台，保留 Windows-only 示例合同。保存每阶段状态及实际验证包数。
 - [ ] **7.2 检查实际包。** CI 从干净输出生成 app/dmg 和 Windows 安装包。新增脚本只读挂载本次 DMG 并定位其中的 .app，取 Info.plist 的 CFBundleExecutable/LSMinimumSystemVersion/标识和图标；遍历全部 Mach-O，以 `lipo -archs`、`otool -l` 核对仅 arm64、部署下限不高于声明版本，并核对主程序的部署目标。注入错误 slice、较高 minos、.exe/.dll 或错误最低版本的夹具，逐个要求脚本非零。验证结束释放挂载；Windows 检查 NSIS/Helper、Provider 及 Everything 清单与产物哈希。
 - [ ] **7.3 验证公开分发。** 在获授权的发布流程中签名、公证、staple，保留工具结果；用 `codesign --verify --deep --strict --verbose=2 "$app"`、`xcrun stapler validate "$dmg"` 和 `spctl --assess --type execute "$app"` 校验（变量分别指该候选 DMG 内 .app 与 DMG）。使用真实下载、带隔离属性的候选包执行安装；确认签名身份、hardened runtime 与 Gatekeeper 验收，记录最终 DMG SHA-256。未能签名/公证时只登记内部测试包，公开发布状态为阻塞。
 - [ ] **7.4 做 M1 和 Windows 实机验收。** M1 + 精确最低 OS 使用已核验哈希的包，干净安装、菜单和快捷键唤起、中英文搜索、启动/激活、Esc、睡眠恢复、重开、替换升级保留设置、正常退出和卸载应用；核对无非核心权限弹窗。Windows 在干净测试环境安装该次 NSIS，核对 apps、文件搜索、插件授权、托盘退出及原资源；填独立运行结果、视频/日志和证据位置。任一必需行缺失或失败则发布未通过。
 
-**Distinct test coverage:** 同一最终 DMG 的两种芯片行、不满足架构/最低版本的反例，以及 Windows 从安装器到启动的独立实测；编译与开发包测试不能代替这三行。
-**Verify:** 双平台 `npm run verify:local`；Mac `npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg`、`node scripts/verify-macos-bundle.mjs`；Windows `npm run tauri -- build`。验收记录包含检查的 .app 来源、最终签名后哈希、安装/升级版本和三个实际结果。至此即可判定**首版**，以下各任务单独发版。
+**Distinct test coverage:** M1 最低系统设备上的最终 DMG 安装、不满足架构或最低版本要求的反例，以及 Windows 从安装器到启动的独立实测。
+**Verify:** 双平台 `npm run verify:local`；Mac `npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg`、`node scripts/verify-macos-bundle.mjs`；Windows `npm run tauri -- build`。验收记录包含检查的 .app 来源、最终签名后哈希、安装/升级版本和本轮 M1、Windows 实测结果。至此即可判定**首版**，以下各任务单独发版。
 
 <a id="step-8"></a>
 ### Task 8: 文件搜索与 Finder 操作
