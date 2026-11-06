@@ -321,6 +321,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   invalidCaller: '操作不可用，请重试。',
   staleRequest: '搜索结果已过期，请重新搜索。',
   unknownResult: '搜索结果已过期，请重新搜索。',
+  applicationLaunchUnconfirmed: '已向 macOS 提交打开请求，尚未确认是否启动。请先检查应用，再重新搜索。',
   applicationEntryUnavailable: '应用入口不可用，请重新扫描。',
   settingsFailed: '设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。',
   hotkeyConflict: '快捷键已被命令占用，请选择其他快捷键。',

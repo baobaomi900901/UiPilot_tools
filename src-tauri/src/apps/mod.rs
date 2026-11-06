@@ -146,6 +146,8 @@ impl Application {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DiscoveryDiagnostics {
+    #[cfg(target_os = "macos")]
+    pub(crate) limited_directories: u64,
     pub(crate) missing_roots: u64,
     pub(crate) inaccessible_entries: u64,
     pub(crate) reparse_entries: u64,

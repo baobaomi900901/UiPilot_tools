@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager, WebviewWindow};
 use tokio::sync::watch;
 
 use crate::{
-    apps::{self, macos_backend::{self, BundleTarget, OpenOutcome}, AppCache, ApplicationLaunchTarget},
+    apps::{self, macos_backend::{self, BundleTarget, OpenAttempt, OpenOutcome}, AppCache, ApplicationLaunchTarget},
     host_capabilities::require_main,
     model::{search_response, SearchResponse},
     result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
@@ -130,7 +130,7 @@ fn execute_registered(
     service: &MacApplications,
     request_id: &str,
     result_id: &str,
-    open: impl FnOnce(&BundleTarget, &dyn Fn() -> io::Result<()>) -> io::Result<OpenOutcome>,
+    open: impl FnOnce(&BundleTarget, &dyn Fn() -> io::Result<()>) -> io::Result<OpenAttempt>,
 ) -> Result<(OpenOutcome, String, Option<u64>), Error> {
     let _guard = service.execute.lock().expect("application execution");
     let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
@@ -141,13 +141,19 @@ fn execute_registered(
         if service.registry.is_execution_ticket_current(&ticket) { Ok(()) }
         else { Err(io::Error::from(io::ErrorKind::Interrupted)) }
     };
-    let outcome = open(&bundle, &check_current).map_err(|error| {
+    let attempt = open(&bundle, &check_current).map_err(|error| {
         if error.kind() == io::ErrorKind::Interrupted { Error::stale() } else { Error::unavailable() }
     })?;
     let hide_owner = if service.registry.retire_result_set_if_current(&ticket) {
         ticket.invocation_id().parse().ok()
     } else { None };
-    Ok((outcome, app_id, hide_owner))
+    match attempt {
+        OpenAttempt::Confirmed(outcome) => Ok((outcome, app_id, hide_owner)),
+        OpenAttempt::SubmittedUnconfirmed => Err(Error {
+            code: "applicationLaunchUnconfirmed",
+            message: "打开请求已提交，macOS 尚未确认启动结果",
+        }),
+    }
 }
 
 #[tauri::command]
@@ -210,9 +216,24 @@ mod platform_app_commands {
         let id = &r.items[0].result_id;
         let failed = execute_registered(&service, &r.request_id, id, |_, _| Err(io::Error::other("missing")));
         assert_eq!(failed.unwrap_err().code, "applicationEntryUnavailable");
-        let accepted = execute_registered(&service, &r.request_id, id, |_, _| Ok(OpenOutcome::LaunchRequested)).unwrap();
+        let accepted = execute_registered(&service, &r.request_id, id, |_, _| Ok(OpenAttempt::Confirmed(OpenOutcome::LaunchRequested))).unwrap();
         assert_eq!(accepted.2, Some(1));
         assert!(execute_registered(&service, &r.request_id, id, |_, _| panic!("duplicate open")).is_err());
+    }
+
+    #[test]
+    fn an_unconfirmed_dispatch_consumes_its_ticket_and_does_not_hide() {
+        let (_f, service, settings) = fixture();
+        let query = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        let r = publish(&service, &settings, query, "App").unwrap();
+        let id = &r.items[0].result_id;
+        let pending = execute_registered(&service, &r.request_id, id, |_, check| {
+            check()?;
+            Ok(OpenAttempt::SubmittedUnconfirmed)
+        });
+        assert_eq!(pending.unwrap_err().code, "applicationLaunchUnconfirmed");
+        let retry = execute_registered(&service, &r.request_id, id, |_, _| panic!("must not resubmit"));
+        assert_eq!(retry.unwrap_err().code, "staleRequest");
     }
 
     #[test]
@@ -236,7 +257,7 @@ mod platform_app_commands {
         let accepted = execute_registered(&service, &r.request_id, &r.items[0].result_id, |_, check| {
             check()?;
             service.registry.on_show("2".into());
-            Ok(OpenOutcome::ActivationRequested)
+            Ok(OpenAttempt::Confirmed(OpenOutcome::ActivationRequested))
         }).unwrap();
         assert_eq!(accepted.2, None);
         assert!(service.registry.begin_query(QueryDomain::Application, "2", 1).is_some());
