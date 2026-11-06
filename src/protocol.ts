@@ -377,6 +377,7 @@ export type CommandErrorCode =
   | 'applicationLaunchUnconfirmed'
   | 'settingsFailed'
   | 'hotkeyConflict'
+  | 'hotkeyPermissionRequired'
   | 'invalidHotkey'
   | 'windowFailed'
   | 'invalidFileQuery'

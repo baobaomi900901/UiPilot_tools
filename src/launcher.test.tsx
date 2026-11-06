@@ -9187,6 +9187,50 @@ describe('real adapter and startup', () => {
     for (const { stop } of subscriptions.values()) expect(stop).toHaveBeenCalledOnce()
   })
 
+  it('records DoubleMeta on the second release, cancels on blur and recovers the previous setting on permission denial', async () => {
+    installMatchMedia(false)
+    const { client, emit } = fakeClient()
+    vi.mocked(client.loadSettings).mockResolvedValue(settingsFixture)
+    vi.mocked(client.saveHotkey).mockRejectedValueOnce({ code: 'hotkeyPermissionRequired' })
+    const core = createLauncherCore(client, undefined, { ...hostSnapshot('macos'), doubleTap: true })
+    await core.start()
+    emit(shown('mac-recording', 'settings'))
+    await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
+    const mounted = await mountLauncherView(core)
+    try {
+      const input = mounted.host.querySelector<HTMLInputElement>('input[name^="settings-hotkey-"]')!
+      const button = mounted.host.querySelector<HTMLButtonElement>('button[aria-label="录制快捷键"]')!
+      const press = (type: 'keydown' | 'keyup') => input.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Meta', code: 'MetaLeft', metaKey: type === 'keydown', bubbles: true, cancelable: true,
+      }))
+      await act(async () => button.click())
+      expect(input.value).toContain('双击')
+      expect(mounted.host.textContent).toContain('仅启用此手势时需要「输入监控」权限')
+      await act(async () => { press('keydown'); press('keyup'); window.dispatchEvent(new Event('blur')) })
+      expect(client.saveHotkey).not.toHaveBeenCalled()
+      expect(input.disabled).toBe(true)
+      await act(async () => button.click())
+      const pointer = (type: string) => input.dispatchEvent(new PointerEvent(type, { pointerId: 1, bubbles: true }))
+      await act(async () => {
+        press('keydown'); press('keyup'); pointer('pointerdown')
+        press('keydown'); press('keyup'); pointer('pointerup')
+      })
+      expect(client.saveHotkey).not.toHaveBeenCalled()
+      expect(input.disabled).toBe(false)
+      await act(async () => { press('keydown'); press('keyup'); press('keydown') })
+      expect(client.saveHotkey).not.toHaveBeenCalled()
+      await act(async () => { press('keyup') })
+      expect(client.saveHotkey).toHaveBeenCalledExactlyOnceWith({ hotkey: { hotkey: 'DoubleMeta' } })
+      await vi.waitFor(() => expect(core.getSnapshot().settings).toMatchObject({ readOnly: false, needsReload: false, loadStatus: 'ready' }))
+      expect(input.value).toBe('Option + Space')
+      expect(core.getSnapshot().status).toContain('输入监控')
+      expect(core.getSnapshot().status).toContain('已保留原快捷键')
+    } finally {
+      await mounted.unmount()
+      core.destroy()
+    }
+  })
+
   it('routes Mac text and slash queries through application search only', async () => {
     const { client, emit } = fakeClient()
     client.cancelTranslationSelection = vi.fn(async () => {})

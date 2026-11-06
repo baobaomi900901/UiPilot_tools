@@ -1,10 +1,11 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use tauri::{menu::MenuItem, AppHandle, Emitter, Manager, WebviewWindow, Wry};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcut, Shortcut, ShortcutState};
 
+use crate::macos_command_tap::{CommandTap, StartError};
 use crate::{host_capabilities::require_main, settings::SettingsStore};
 
 #[derive(Debug, Eq, PartialEq, serde::Serialize)]
@@ -19,7 +20,13 @@ const FAILED: HotkeyError = HotkeyError { code: "settingsFailed" };
 #[serde(deny_unknown_fields)]
 pub(super) struct HotkeyValue { hotkey: String }
 
-fn chord(text: &str) -> Result<Shortcut, HotkeyError> {
+const DOUBLE_COMMAND: &str = "DoubleMeta";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gesture { Chord(Shortcut), DoubleCommand }
+
+fn gesture(text: &str) -> Result<Gesture, HotkeyError> {
+    if text == DOUBLE_COMMAND { return Ok(Gesture::DoubleCommand); }
     if text.len() > 96 { return Err(INVALID); }
     // Recorder uses DOM's Meta; the native parser calls it Super/Command.
     let native = text.split('+').map(|part| if part.eq_ignore_ascii_case("Meta") {
@@ -33,25 +40,26 @@ fn chord(text: &str) -> Result<Shortcut, HotkeyError> {
         Code::MediaTrackNext | Code::MediaTrackPrevious | Code::MediaFastForward |
         Code::MediaRewind | Code::AudioVolumeUp | Code::AudioVolumeDown | Code::AudioVolumeMute
     ) { return Err(INVALID); }
-    Ok(shortcut)
+    Ok(Gesture::Chord(shortcut))
 }
 
 trait Port {
-    fn register(&mut self, key: Shortcut) -> Result<(), HotkeyError>;
-    fn unregister(&mut self, key: Shortcut) -> Result<(), HotkeyError>;
+    fn register(&mut self, key: Gesture) -> Result<(), HotkeyError>;
+    fn unregister(&mut self, key: Gesture) -> Result<(), HotkeyError>;
     fn save(&mut self, text: &str) -> Result<(), HotkeyError>;
+    fn ensure_active(&mut self, _key: Gesture) -> Result<(), HotkeyError> { Ok(()) }
 }
 
 #[derive(Default)]
 struct Bindings {
-    active: Option<Shortcut>,
+    active: Option<Gesture>,
     // If native cleanup fails the stale registration is inert. Retry it before
     // admitting another change rather than accumulating system reservations.
-    stale: Option<Shortcut>,
+    stale: Option<Gesture>,
 }
 impl Bindings {
-    fn initialize(&mut self, text: &str, port: &mut impl Port) -> Result<Shortcut, HotkeyError> {
-        let key = chord(text)?;
+    fn initialize(&mut self, text: &str, port: &mut impl Port) -> Result<Gesture, HotkeyError> {
+        let key = gesture(text)?;
         port.register(key)?;
         self.active = Some(key);
         Ok(key)
@@ -66,9 +74,10 @@ impl Bindings {
     }
 
     fn rebind(&mut self, text: &str, previous: &str, port: &mut impl Port) -> Result<(), HotkeyError> {
-        let key = chord(text)?;
+        let key = gesture(text)?;
         self.clear_stale(port)?;
         if self.active == Some(key) {
+            port.ensure_active(key)?;
             return if text == previous { Ok(()) } else { port.save(text) };
         }
         port.register(key)?;
@@ -97,22 +106,75 @@ impl Bindings {
     }
 }
 
-struct Native<'a>(&'a AppHandle);
-impl Port for Native<'_> {
-    fn register(&mut self, key: Shortcut) -> Result<(), HotkeyError> {
-        self.0.try_state::<GlobalShortcut<Wry>>().ok_or(FAILED)?.register(key).map_err(|_| CONFLICT)
+struct TapRegistration {
+    tap: CommandTap,
+    enabled: Arc<AtomicBool>,
+}
+
+struct Native<'a> { app: &'a AppHandle, request_permission: bool }
+
+impl Native<'_> {
+    fn start_tap(&self) -> Result<(), HotkeyError> {
+        let app = self.app.clone();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let gate = enabled.clone();
+        let tap = CommandTap::start(self.request_permission, move || {
+            if !gate.load(Ordering::Acquire) || recording(&app).is_some() { return; }
+            let gate = gate.clone();
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if handle.state::<LauncherHotkey>().may_show_tap(&gate) && recording(&handle).is_none() {
+                    super::show(&handle);
+                }
+            });
+        }).map_err(|error| match error {
+            StartError::InputMonitoringRequired => HotkeyError { code: "hotkeyPermissionRequired" },
+            StartError::Unavailable => FAILED,
+        })?;
+        let state = self.app.state::<LauncherHotkey>();
+        let mut slot = state.tap.lock().expect("command tap");
+        if let Some(old) = slot.as_ref() { old.enabled.store(false, Ordering::Release); }
+        *slot = Some(TapRegistration { tap, enabled });
+        Ok(())
     }
-    fn unregister(&mut self, key: Shortcut) -> Result<(), HotkeyError> {
-        self.0.try_state::<GlobalShortcut<Wry>>().ok_or(FAILED)?.unregister(key).map_err(|_| FAILED)
+}
+
+fn recording(app: &AppHandle) -> Option<u64> {
+    app.state::<Mutex<super::Presentation>>().lock().expect("presentation state").recording_owner()
+}
+
+impl Port for Native<'_> {
+    fn register(&mut self, key: Gesture) -> Result<(), HotkeyError> {
+        match key {
+            Gesture::Chord(key) => self.app.try_state::<GlobalShortcut<Wry>>().ok_or(FAILED)?
+                .register(key).map_err(|_| CONFLICT),
+            Gesture::DoubleCommand => self.start_tap(),
+        }
+    }
+    fn ensure_active(&mut self, key: Gesture) -> Result<(), HotkeyError> {
+        if key == Gesture::DoubleCommand &&
+            !self.app.state::<LauncherHotkey>().tap.lock().expect("command tap")
+                .as_ref().is_some_and(|registration| registration.tap.is_active()) {
+            self.start_tap()?;
+        }
+        Ok(())
+    }
+    fn unregister(&mut self, key: Gesture) -> Result<(), HotkeyError> {
+        match key {
+            Gesture::Chord(key) => self.app.try_state::<GlobalShortcut<Wry>>().ok_or(FAILED)?
+                .unregister(key).map_err(|_| FAILED),
+            Gesture::DoubleCommand => { self.app.state::<LauncherHotkey>().release_tap(); Ok(()) }
+        }
     }
     fn save(&mut self, text: &str) -> Result<(), HotkeyError> {
-        self.0.state::<SettingsStore>().update_hotkey(text.to_owned()).map_err(|_| FAILED)
+        self.app.state::<SettingsStore>().update_hotkey(text.to_owned()).map_err(|_| FAILED)
     }
 }
 
 #[derive(Default)]
 pub(super) struct LauncherHotkey {
     bindings: Mutex<Bindings>,
+    tap: Mutex<Option<TapRegistration>>,
     // The plugin calls our handler while holding its own registration lock.
     // Never acquire the binding transaction lock inside that callback.
     effective_id: AtomicU32,
@@ -124,16 +186,40 @@ pub(super) fn initialize(app: &AppHandle) {
     let text = app.state::<SettingsStore>().snapshot().hotkey;
     let state = app.state::<LauncherHotkey>();
     let mut bindings = state.bindings.lock().expect("hotkey bindings");
-    match bindings.initialize(&text, &mut Native(app)) {
-        Ok(key) => state.effective_id.store(key.id(), Ordering::Release),
-        Err(_) => { let _ = app.state::<ShowMenu>().0.set_text("显示 UiPilot（快捷键不可用，请在设置中重新录制）"); }
+    let mut port = Native { app, request_permission: false };
+    if bindings.initialize(&text, &mut port).is_err() {
+        let fallback = text == DOUBLE_COMMAND && bindings.initialize("Alt+Space", &mut port).is_ok();
+        let hint = if fallback { "显示 UiPilot（双击 ⌘ 不可用，暂用 Option + 空格）" }
+            else { "显示 UiPilot（快捷键不可用，请在设置中重新录制）" };
+        let _ = app.state::<ShowMenu>().0.set_text(hint);
     }
+    state.publish_binding(bindings.active);
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum KeyAction { Show, Record(u64) }
 
 impl LauncherHotkey {
+    fn may_show_tap(&self, gate: &Arc<AtomicBool>) -> bool {
+        !self.stopping.load(Ordering::Acquire) && gate.load(Ordering::Acquire) &&
+            self.tap.lock().expect("command tap").as_ref().is_some_and(|tap|
+                Arc::ptr_eq(gate, &tap.enabled) && tap.tap.is_active())
+    }
+
+    fn publish_binding(&self, active: Option<Gesture>) {
+        let chord_id = match active { Some(Gesture::Chord(key)) => key.id(), _ => 0 };
+        self.effective_id.store(chord_id, Ordering::Release);
+        if let Some(registration) = self.tap.lock().expect("command tap").as_ref() {
+            registration.enabled.store(active == Some(Gesture::DoubleCommand), Ordering::Release);
+        }
+    }
+
+    fn release_tap(&self) {
+        if let Some(old) = self.tap.lock().expect("command tap").take() {
+            old.enabled.store(false, Ordering::Release);
+        }
+    }
+
     fn action(&self, id: u32, event: ShortcutState, recording: Option<u64>) -> Option<KeyAction> {
         if event != ShortcutState::Pressed || self.stopping.load(Ordering::Acquire)
             || self.effective_id.load(Ordering::Acquire) != id {
@@ -154,7 +240,8 @@ pub(super) fn on_pressed(app: &AppHandle, shortcut: &Shortcut, event: ShortcutSt
     let owner = app.state::<Mutex<super::Presentation>>().lock().expect("presentation state").recording_owner();
     match state.action(shortcut.id(), event, owner) {
         Some(KeyAction::Record(id)) => {
-            let text = app.state::<SettingsStore>().snapshot().hotkey;
+            let mut text = app.state::<SettingsStore>().snapshot().hotkey;
+            if text == DOUBLE_COMMAND { text = "Alt+Space".into(); }
             let _ = app.emit_to("main", "hotkey-recording://current", serde_json::json!({"invocationId": id.to_string(), "hotkey": text}));
         }
         Some(KeyAction::Show) => super::show(app),
@@ -165,6 +252,7 @@ pub(super) fn on_pressed(app: &AppHandle, shortcut: &Shortcut, event: ShortcutSt
 pub(super) fn stop(app: &AppHandle) {
     let Some(state) = app.try_state::<LauncherHotkey>() else { return; };
     if !state.stop_once() { return; }
+    state.release_tap();
     let Some(port) = app.try_state::<GlobalShortcut<Wry>>() else { return; };
     if let Err(error) = port.unregister_all() {
         eprintln!("UiPilot: quit could not release shortcut: {error}");
@@ -193,8 +281,8 @@ pub(super) async fn save_hotkey(window: WebviewWindow, hotkey: HotkeyValue) -> R
         } else {
             let previous = app.state::<SettingsStore>().snapshot().hotkey;
             let mut bindings = state.bindings.lock().expect("hotkey bindings");
-            let result = bindings.rebind(&hotkey.hotkey, &previous, &mut Native(&app));
-            state.effective_id.store(bindings.active.map_or(0, |key| key.id()), Ordering::Release);
+            let result = bindings.rebind(&hotkey.hotkey, &previous, &mut Native { app: &app, request_permission: true });
+            state.publish_binding(bindings.active);
             if result.is_ok() { let _ = app.state::<ShowMenu>().0.set_text("显示 UiPilot"); }
             result.map(|_| hotkey)
         };
@@ -208,18 +296,22 @@ mod tests {
     use super::*;
     #[derive(Default)]
     struct TestPort {
-        keys: Vec<Shortcut>,
+        keys: Vec<Gesture>,
         disk: String,
         store: Option<SettingsStore>,
+        deny_tap: bool,
         fail_save: bool,
-        fail_remove: Option<Shortcut>,
+        fail_remove: Option<Gesture>,
     }
     impl Port for TestPort {
-        fn register(&mut self, key: Shortcut) -> Result<(), HotkeyError> {
+        fn register(&mut self, key: Gesture) -> Result<(), HotkeyError> {
+            if key == Gesture::DoubleCommand && self.deny_tap {
+                return Err(HotkeyError { code: "hotkeyPermissionRequired" });
+            }
             if self.keys.contains(&key) { return Err(CONFLICT); }
             self.keys.push(key); Ok(())
         }
-        fn unregister(&mut self, key: Shortcut) -> Result<(), HotkeyError> {
+        fn unregister(&mut self, key: Gesture) -> Result<(), HotkeyError> {
             if self.fail_remove == Some(key) { return Err(FAILED); }
             self.keys.retain(|&item| item != key); Ok(())
         }
@@ -244,7 +336,7 @@ mod tests {
         settings.update_hotkey("Alt+Space".into()).unwrap();
         settings.set_theme_preference_with_revision(ThemePreference::Dark).unwrap();
 
-        let candidate = chord("Meta+K").unwrap();
+        let candidate = gesture("Meta+K").unwrap();
         let mut port = TestPort { store: Some(settings), keys: vec![candidate], ..Default::default() };
         let mut bindings = Bindings::default();
         let original = bindings.initialize("Alt+Space", &mut port).unwrap();
@@ -273,7 +365,7 @@ mod tests {
         let mut state = Bindings::default();
         let mut port = TestPort::default();
         state.rebind("Alt+Space", "", &mut port).unwrap();
-        let old = chord("Alt+Space").unwrap();
+        let old = gesture("Alt+Space").unwrap();
         port.fail_save = true;
         assert_eq!(state.rebind("Meta+K", "Alt+Space", &mut port), Err(FAILED));
         assert_eq!(port.keys, [old]);
@@ -284,8 +376,8 @@ mod tests {
     fn conflict_or_native_retirement_failure_preserves_old_binding_and_permits_retry() {
         let mut state = Bindings::default();
         let mut port = TestPort::default();
-        let old = chord("Alt+Space").unwrap();
-        let new = chord("Meta+K").unwrap();
+        let old = gesture("Alt+Space").unwrap();
+        let new = gesture("Meta+K").unwrap();
         state.rebind("Alt+Space", "", &mut port).unwrap();
         port.keys.push(new); // Another application has claimed this key.
         assert_eq!(state.rebind("Meta+K", "Alt+Space", &mut port), Err(CONFLICT));
@@ -302,7 +394,7 @@ mod tests {
     }
     #[test]
     fn startup_conflict_leaves_no_active_binding_and_retry_only_writes_the_requested_key() {
-        let key = chord("Alt+Space").unwrap();
+        let key = gesture("Alt+Space").unwrap();
         let mut port = TestPort { keys: vec![key], disk: "Alt+Space".into(), ..Default::default() };
         let mut state = Bindings::default();
         assert_eq!(state.initialize("Alt+Space", &mut port), Err(CONFLICT));
@@ -327,8 +419,31 @@ mod tests {
     }
 
     #[test]
-    fn standalone_keys_double_taps_and_malformed_chords_are_rejected() {
-        for value in ["Space", "DoubleCtrl", "DoubleAlt", "Ctrl+Shift+", "Alt+MediaPlayPause", "Alt+VolumeUp", ""] { assert_eq!(chord(value), Err(INVALID)); }
-        assert_eq!(chord("Meta+K"), chord("Command+K"));
+    fn double_command_requires_successful_admission_and_save_before_retiring_old_key() {
+        let mut port = TestPort::default();
+        let mut bindings = Bindings::default();
+        let old = gesture("Alt+Space").unwrap();
+        bindings.rebind("Alt+Space", "", &mut port).unwrap();
+        port.deny_tap = true;
+        assert_eq!(bindings.rebind(DOUBLE_COMMAND, "Alt+Space", &mut port),
+            Err(HotkeyError { code: "hotkeyPermissionRequired" }));
+        assert_eq!(port.keys, [old]);
+        assert_eq!(port.disk, "Alt+Space");
+        port.deny_tap = false;
+        port.fail_save = true;
+        assert_eq!(bindings.rebind(DOUBLE_COMMAND, "Alt+Space", &mut port), Err(FAILED));
+        assert_eq!(port.keys, [old]);
+        port.fail_save = false;
+        bindings.rebind(DOUBLE_COMMAND, "Alt+Space", &mut port).unwrap();
+        assert_eq!(port.keys, [Gesture::DoubleCommand]);
+        assert_eq!(port.disk, DOUBLE_COMMAND);
+        bindings.rebind("Alt+Space", DOUBLE_COMMAND, &mut port).unwrap();
+        assert_eq!(port.keys, [old]);
+    }
+
+    #[test]
+    fn unsupported_double_taps_and_malformed_chords_are_rejected() {
+        for value in ["Space", "DoubleCtrl", "DoubleAlt", "Ctrl+Shift+", "Alt+MediaPlayPause", "Alt+VolumeUp", ""] { assert_eq!(gesture(value), Err(INVALID)); }
+        assert_eq!(gesture("Meta+K"), gesture("Command+K"));
     }
 }

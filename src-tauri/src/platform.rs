@@ -22,6 +22,8 @@ mod model;
 #[cfg(target_os = "macos")]
 mod macos_apps;
 #[cfg(target_os = "macos")]
+mod macos_command_tap;
+#[cfg(target_os = "macos")]
 mod macos_host;
 #[cfg(target_os = "macos")]
 pub use macos_host::run;

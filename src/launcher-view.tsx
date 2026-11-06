@@ -2036,7 +2036,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           </div>
         ) : (
           <Form component="div" layout="vertical" className="settings-basic-form">
-            <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
+            <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}
+              help={core.capabilities.platform === 'macos' && core.capabilities.doubleTap
+                ? '双击同一侧 Command 可唤起 UiPilot。仅启用此手势时需要「输入监控」权限，普通组合键可直接使用。' : undefined}>
               <HotkeyRecorderInput
                 allowSameValue={core.capabilities.platform === 'macos'}
                 allowDoubleTap={core.capabilities.doubleTap}

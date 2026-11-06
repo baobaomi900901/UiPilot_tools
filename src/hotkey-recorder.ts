@@ -4,24 +4,32 @@ export type RecorderState = {
   status: RecorderStatus
   baseline: string
   pendingTap?: { modifier: 'Ctrl' | 'Alt'; atMs: number }
+  command?: {
+    held: string[]
+    down?: { code: string; atMs: number }
+    firstTap?: { code: string; atMs: number }
+  }
+}
+
+type RecorderKeyEvent = {
+  type: 'keydown' | 'keyup'
+  key: string
+  code: string
+  ctrl: boolean
+  alt: boolean
+  shift: boolean
+  meta: boolean
+  repeat: boolean
+  allowDoubleTap?: boolean
+  platform?: 'windows' | 'macos'
+  nowMs: number
 }
 
 export type RecorderEvent =
   | { type: 'start'; baseline: string }
-  | { type: 'blur' }
-  | {
-      type: 'keydown'
-      key: string
-      code: string
-      ctrl: boolean
-      alt: boolean
-      shift: boolean
-      meta: boolean
-      repeat: boolean
-      allowDoubleTap?: boolean
-      nowMs: number
-    }
-  | { type: 'cancel' }
+  | { type: 'blur' | 'cancel' }
+  | { type: 'pointer'; id: number; down: boolean }
+  | RecorderKeyEvent
 
 export type RecorderResult = {
   state: RecorderState
@@ -33,9 +41,8 @@ export const DOUBLE_TAP_WINDOW_MS = 400
 
 const RECORDING_DISPLAY = '按下快捷键…'
 
-type KeydownEvent = Extract<RecorderEvent, { type: 'keydown' }>
-
 export function formatHotkeyDisplay(canonical: string, platform: 'windows' | 'macos' = 'windows'): string {
+  if (canonical === 'DoubleMeta' && platform === 'macos') return '双击 Command'
   if (canonical === 'DoubleCtrl') return '双击 Ctrl'
   if (canonical === 'DoubleAlt') return '双击 Alt'
   if (canonical.includes('+')) {
@@ -48,7 +55,7 @@ export function formatHotkeyDisplay(canonical: string, platform: 'windows' | 'ma
   return canonical
 }
 
-function isCtrlKey(event: KeydownEvent): boolean {
+function isCtrlKey(event: RecorderKeyEvent): boolean {
   return (
     event.key === 'Control' ||
     event.code === 'ControlLeft' ||
@@ -56,13 +63,13 @@ function isCtrlKey(event: KeydownEvent): boolean {
   )
 }
 
-function isAltKey(event: KeydownEvent): boolean {
+function isAltKey(event: RecorderKeyEvent): boolean {
   return (
     event.key === 'Alt' || event.code === 'AltLeft' || event.code === 'AltRight'
   )
 }
 
-function isModifierOnlyKey(event: KeydownEvent): boolean {
+function isModifierOnlyKey(event: RecorderKeyEvent): boolean {
   return (
     isCtrlKey(event) ||
     isAltKey(event) ||
@@ -81,7 +88,7 @@ function buildMainKey(key: string, code: string): string {
   return code
 }
 
-function buildChordCanonical(event: KeydownEvent): string | undefined {
+function buildChordCanonical(event: RecorderKeyEvent): string | undefined {
   if (isModifierOnlyKey(event)) return undefined
 
   const modifiers: string[] = []
@@ -97,7 +104,7 @@ function buildChordCanonical(event: KeydownEvent): string | undefined {
 
 function idleResult(state: RecorderState): RecorderResult {
   return {
-    state: { ...state, status: 'idle', pendingTap: undefined },
+    state: { status: 'idle', baseline: state.baseline },
     display: formatHotkeyDisplay(state.baseline),
   }
 }
@@ -133,16 +140,16 @@ function handleDoubleTap(
   })
 }
 
-function handleKeydown(state: RecorderState, event: KeydownEvent): RecorderResult {
+function handleKeydown(state: RecorderState, event: RecorderKeyEvent): RecorderResult {
   if (event.repeat) {
     return recordingResult(state)
   }
 
-  if (isCtrlKey(event) && event.allowDoubleTap !== false) {
+  if (event.platform !== 'macos' && isCtrlKey(event) && event.allowDoubleTap !== false) {
     return handleDoubleTap(state, 'Ctrl', event.nowMs)
   }
 
-  if (isAltKey(event) && event.allowDoubleTap !== false) {
+  if (event.platform !== 'macos' && isAltKey(event) && event.allowDoubleTap !== false) {
     return handleDoubleTap(state, 'Alt', event.nowMs)
   }
 
@@ -164,6 +171,33 @@ function handleKeydown(state: RecorderState, event: KeydownEvent): RecorderResul
   }
 }
 
+function recordMacKey(state: RecorderState, event: RecorderKeyEvent): RecorderResult {
+  const previous = state.command ?? { held: [] }
+  const code = event.code || event.key
+  const held = previous.held.filter(key => key !== code)
+  const command: NonNullable<RecorderState['command']> = { held }
+  const standaloneCommand = (code === 'MetaLeft' || code === 'MetaRight') &&
+    !event.ctrl && !event.alt && !event.shift
+
+  if (event.type === 'keydown') {
+    held.push(code)
+    if (standaloneCommand && previous.held.length === 0 && !event.repeat) {
+      command.down = { code, atMs: event.nowMs }
+      command.firstTap = previous.firstTap
+    }
+    return handleKeydown({ ...state, command }, event)
+  }
+
+  if (standaloneCommand && !event.meta && held.length === 0 && previous.down?.code === code &&
+      event.nowMs - previous.down.atMs <= DOUBLE_TAP_WINDOW_MS) {
+    if (previous.firstTap?.code === code && event.nowMs - previous.firstTap.atMs <= DOUBLE_TAP_WINDOW_MS) {
+      return { state: { status: 'idle', baseline: 'DoubleMeta' }, commit: 'DoubleMeta', display: '双击 Command' }
+    }
+    command.firstTap = previous.down
+  }
+  return recordingResult({ ...state, command })
+}
+
 export function reduceHotkeyRecorder(
   state: RecorderState,
   event: RecorderEvent,
@@ -178,13 +212,22 @@ export function reduceHotkeyRecorder(
     case 'blur':
     case 'cancel':
       return idleResult(state)
+    case 'pointer': {
+      if (state.status !== 'recording') return idleResult(state)
+      const id = `pointer-${event.id}`
+      const held = (state.command?.held ?? []).filter(key => key !== id)
+      if (event.down) held.push(id)
+      return recordingResult({ ...state, command: { held } })
+    }
     case 'keydown':
+    case 'keyup':
       if (state.status !== 'recording') {
         return {
           state,
           display: formatHotkeyDisplay(state.baseline),
         }
       }
-      return handleKeydown(state, event)
+      if (event.platform === 'macos' && event.allowDoubleTap !== false) return recordMacKey(state, event)
+      return event.type === 'keydown' ? handleKeydown(state, event) : recordingResult(state)
   }
 }

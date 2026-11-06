@@ -172,3 +172,44 @@ describe('reduceHotkeyRecorder', () => {
     expect(r.state.status).toBe('recording')
   })
 })
+
+describe('macOS launcher Command taps', () => {
+  function key(type: 'keydown' | 'keyup', nowMs: number, code = 'MetaLeft', repeat = false) {
+    return { type, key: code.startsWith('Meta') ? 'Meta' : code, code,
+      platform: 'macos' as const, meta: type === 'keydown' && code.startsWith('Meta'),
+      repeat, ctrl: false, alt: false, shift: false, nowMs }
+  }
+  const start: RecorderState = { status: 'recording', baseline: 'Alt+Space' }
+  const down = (time: number, code?: string) => key('keydown', time, code)
+  const up = (time: number, code?: string) => key('keyup', time, code)
+  function commits(events: Array<ReturnType<typeof key>>) {
+    let state = start
+    return events.map(event => {
+      const result = reduceHotkeyRecorder(state, event)
+      state = result.state
+      return result.commit
+    }).filter(Boolean)
+  }
+  it.each(['MetaLeft', 'MetaRight'])('requires the final release of two standalone %s presses', code => {
+    const three = [down(0, code), up(30, code), down(200, code)]
+    expect(commits(three)).toEqual([])
+    expect(commits([...three, up(400, code)])).toEqual(['DoubleMeta'])
+    expect(formatHotkeyDisplay('DoubleMeta', 'macos')).toBe('双击 Command')
+  })
+  it.each([
+    ['timeout', [down(0), up(100), down(200), up(401)]],
+    ['long hold', [down(0), up(500), down(600), up(650)]],
+    ['mixed sides', [down(0), up(20), down(80, 'MetaRight'), up(100, 'MetaRight')]],
+    ['overlap', [down(0), down(10, 'MetaRight'), up(20), up(30, 'MetaRight'), down(40), up(50)]],
+    ['repeat', [down(0), key('keydown', 10, 'MetaLeft', true), up(20), down(40), up(50)]],
+    ['intervening key', [down(0), up(20), down(30, 'x'), up(40, 'x'), down(50), up(60)]],
+    ['held letter', [down(0, 'x'), down(10), up(20), down(30), up(40)]],
+    ['Ctrl', [down(0, 'ControlLeft'), up(10, 'ControlLeft'), down(15, 'ControlLeft'), up(20, 'ControlLeft')]],
+    ['Alt', [down(0, 'AltLeft'), up(10, 'AltLeft'), down(15, 'AltLeft'), up(20, 'AltLeft')]],
+  ] as const)('rejects %s', (_name, events) => {
+    expect(commits([...events])).toEqual([])
+  })
+  it('keeps ordinary Command chords available during recording', () => {
+    expect(commits([down(0), { ...down(10, 'c'), meta: true }])).toEqual(['Meta+C'])
+  })
+})

@@ -325,6 +325,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   applicationEntryUnavailable: '应用入口不可用，请重新扫描。',
   settingsFailed: '设置未能确认完成；若快捷键或开机启动行为异常，请重启 UiPilot 后检查设置。',
   hotkeyConflict: '快捷键已被命令占用，请选择其他快捷键。',
+  hotkeyPermissionRequired: '已保留原快捷键。请在「系统设置 → 隐私与安全性 → 输入监控」中允许 UiPilot，再重新录制。',
   invalidHotkey: '请选择带修饰键的普通组合键。',
   windowFailed: '窗口操作失败。',
   invalidFileQuery: '查询无效。',
@@ -3003,7 +3004,8 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
     if (!ownsSettingsOperation(operation)) return
     const code = failed && typeof error === 'object' && error !== null &&
       Object.prototype.hasOwnProperty.call(error, 'code') ? (error as { code?: unknown }).code : undefined
-    const rejection = code === 'hotkeyConflict' || code === 'invalidHotkey' ? code : undefined
+    const rejection = code === 'hotkeyConflict' || code === 'invalidHotkey' ||
+      (capabilities.platform === 'macos' && code === 'hotkeyPermissionRequired') ? code : undefined
     const current = ownsSettingsView(operation)
     if (failed && !rejection) model.settingsUncertain = true
     if (rejection && current && operation.previous && model.settings) {

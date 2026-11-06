@@ -55,7 +55,7 @@ pub(crate) fn get_host_capabilities(window: WebviewWindow) -> Result<HostCapabil
     Ok(HostCapabilities {
         version: 1, platform: if windows { "windows" } else { "macos" },
         plugins: windows, files: windows, screenshot: windows, messages: windows, credentials: windows,
-        builtin_features: windows, command_hotkeys: windows, autostart: windows, double_tap: windows,
+        builtin_features: windows, command_hotkeys: windows, autostart: windows, double_tap: cfg!(any(windows, target_os = "macos")),
     })
 }
 

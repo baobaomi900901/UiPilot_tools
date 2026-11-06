@@ -72,7 +72,8 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, pl
   useEffect(() => {
     const completeCurrentHotkeyRecording = (event: Event) => {
       const canonical = (event as CustomEvent<unknown>).detail
-      if (typeof canonical === 'string' && (!allowDoubleTap && canonical.startsWith('Double'))) return
+      if (typeof canonical === 'string' && canonical.startsWith('Double') &&
+          (!allowDoubleTap || (platform === 'macos' ? canonical !== 'DoubleMeta' : canonical === 'DoubleMeta'))) return
       if (recorderStateRef.current.status !== 'recording' || recordingOwner?.id !== ownerId || recordingOwner.releasing) return
       pendingCommit.current = undefined
       returnFocusToAction.current = true
@@ -90,10 +91,38 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, pl
     return () => {
       window.removeEventListener(HOTKEY_RECORDING_CURRENT_DOM_EVENT, completeCurrentHotkeyRecording)
     }
-  }, [releaseRecording, ownerId, onCommit, allowDoubleTap, allowSameValue, value, updateRecorderState])
+  }, [releaseRecording, ownerId, onCommit, allowDoubleTap, allowSameValue, platform, value, updateRecorderState])
 
-  const recordingPrompt = platform === 'macos' && !allowDoubleTap
-    ? '按下组合键，如 ⌥ + 空格' : '按下快捷键…'
+  useEffect(() => {
+    if (platform !== 'macos' || !allowDoubleTap) return
+    const cancelOnWindowBlur = () => {
+      if (recordingOwner?.id !== ownerId || recordingOwner.releasing) return
+      armRevision.current += 1
+      setArming(false)
+      pendingCommit.current = undefined
+      releaseRecording('idle')
+      updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, { type: 'blur' }).state)
+    }
+    const onPointer = (event: PointerEvent) => {
+      if (recorderStateRef.current.status !== 'recording') return
+      updateRecorderState(reduceHotkeyRecorder(recorderStateRef.current, {
+        type: 'pointer', id: event.pointerId, down: event.type === 'pointerdown',
+      }).state)
+    }
+    window.addEventListener('blur', cancelOnWindowBlur)
+    window.addEventListener('pointerdown', onPointer, true)
+    window.addEventListener('pointerup', onPointer, true)
+    window.addEventListener('pointercancel', onPointer, true)
+    return () => {
+      window.removeEventListener('blur', cancelOnWindowBlur)
+      window.removeEventListener('pointerdown', onPointer, true)
+      window.removeEventListener('pointerup', onPointer, true)
+      window.removeEventListener('pointercancel', onPointer, true)
+    }
+  }, [platform, allowDoubleTap, ownerId, releaseRecording, updateRecorderState])
+
+  const recordingPrompt = platform !== 'macos' ? '按下快捷键…'
+    : allowDoubleTap ? '按下组合键，或双击同一侧 Command' : '按下组合键，如 ⌥ + 空格'
   const display = recording ? recordingPrompt : value ? formatHotkeyDisplay(value, platform) : ''
 
   useLayoutEffect(() => {
@@ -137,6 +166,13 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, pl
     ).state)
   }, [onRecordingPhase, releaseRecording, ownerId, disabled, recording, updateRecorderState, value])
 
+  const recordKey = (event: ReactKeyboardEvent<HTMLInputElement>, type: 'keydown' | 'keyup') =>
+    reduceHotkeyRecorder(recorderStateRef.current, {
+      type, key: event.key, code: event.code, ctrl: event.ctrlKey, alt: event.altKey,
+      shift: event.shiftKey, meta: event.metaKey, repeat: event.repeat,
+      nowMs: platform === 'macos' ? event.timeStamp : Date.now(), platform, allowDoubleTap,
+    })
+
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Tab') {
       pendingCommit.current = undefined
@@ -155,18 +191,7 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, pl
       return
     }
     if (pendingCommit.current || recorderStateRef.current.status !== 'recording') return
-    const result = reduceHotkeyRecorder(recorderStateRef.current, {
-      type: 'keydown',
-      key: event.key,
-      code: event.code,
-      ctrl: event.ctrlKey,
-      alt: event.altKey,
-      shift: event.shiftKey,
-      meta: event.metaKey,
-      repeat: event.repeat,
-      nowMs: Date.now(),
-      allowDoubleTap,
-    })
+    const result = recordKey(event, 'keydown')
     if (result.commit) {
       if (result.commit === value && !allowSameValue) {
         returnFocusToAction.current = true
@@ -184,13 +209,21 @@ export function HotkeyRecorderInput({ onCommit, onRecordingPhase = noopPhase, pl
   const handleKeyUp = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     event.preventDefault()
     event.stopPropagation()
-    const pending = pendingCommit.current
-    if (!pending) return
+    let pending = pendingCommit.current
+    if (!pending) {
+      if (platform !== 'macos' || !allowDoubleTap || recorderStateRef.current.status !== 'recording') return
+      const result = recordKey(event, 'keyup')
+      if (!result.commit) {
+        updateRecorderState(result.state)
+        return
+      }
+      pending = { canonical: result.commit, finalState: result.state }
+    }
     pendingCommit.current = undefined
     returnFocusToAction.current = true
     releaseRecording('completed')
     updateRecorderState(pending.finalState)
-    void onCommit(pending.canonical)
+    if (pending.canonical !== value || allowSameValue) void onCommit(pending.canonical)
   }
 
   return (
