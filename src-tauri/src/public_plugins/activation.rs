@@ -1,3 +1,5 @@
+mod share_catalog;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt, fs,

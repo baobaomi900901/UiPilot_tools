@@ -116,6 +116,7 @@ mod file_search;
 
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod plugin_panel;
+mod plugin_share;
 #[cfg(any(test, not(feature = "test-instrumentation")))]
 mod panel_effects;
 mod panel_status;
