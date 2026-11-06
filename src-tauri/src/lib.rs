@@ -605,6 +605,7 @@ pub fn run() {
             commands::plugin_window_open_text,
             commands::plugin_window_request,
             commands::plugin_panel_request,
+            commands::plugin_panel_clear_image,
             commands::plugin_panel_storage_get,
             commands::plugin_panel_storage_set,
             commands::plugin_panel_storage_remove,
@@ -1024,6 +1025,7 @@ mod tests {
             "commands::plugin_panel_request_hide_admit_observed",
             "commands::plugin_panel_request_hide_commit",
             "commands::plugin_panel_request",
+            "commands::plugin_panel_clear_image",
             "commands::plugin_window_open_text",
             "commands::plugin_window_request",
             "commands::plugin_panel_storage_get",
@@ -1349,6 +1351,7 @@ mod tests {
             "plugin_panel_request_hide_admit_observed",
             "plugin_panel_request_hide_commit",
             "plugin_panel_request",
+            "plugin_panel_clear_image",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -2241,3 +2244,4 @@ mod lib {
     }
 }
 mod launcher_image;
+mod panel_image;

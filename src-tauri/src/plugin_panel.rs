@@ -371,6 +371,8 @@ struct PanelHideTicket {
 }
 
 struct LiveSession {
+    images: Option<Arc<crate::panel_image::PanelImages>>,
+    delivered_image_revision: Option<String>,
     speech_lease: crate::panel_effects::EffectLease,
     identity: PanelSessionIdentity,
     show_generation: u64,
@@ -386,8 +388,12 @@ struct LiveSession {
     runtime_request: Option<crate::public_plugins::PanelActionRegistration>,
 }
 
+mod image_session;
+pub(crate) use image_session::deliver_image_change;
+
 fn invalidate_session_locked(core: &mut ControllerCore) -> Option<LiveSession> {
     let mut session = core.session.take()?;
+    session.images.take();
     session.speech_lease.revoke();
     session.runtime_request.take();
     Some(session)
@@ -442,8 +448,10 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
 (() => {
   'use strict';
   __PANEL_JSON__
+  __PANEL_IMAGE_BRIDGE__
   __CONTEXT_ACTIONS_UI__
   const runtimeActions = __RUNTIME_ACTIONS__;
+  const imagesEnabled = __IMAGES_ENABLED__;
   let handler = null;
   let updateRegistered = false;
   let readyReceiver = null;
@@ -457,6 +465,10 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   let storageSession = null;
   let clipboardHistorySession = null;
   let liveSessionEpoch = '__SESSION_EPOCH__';
+  const imageBridge = createPanelImageBridge({ enabled: imagesEnabled, epoch: () => liveSessionEpoch,
+    active: () => documentActive, registered: () => updateRegistered,
+    invoke: (...args) => invoke(...args), json: panelJson });
+  window.addEventListener?.('uipilot-plugin-panel-image-changed', event => imageBridge.receive(event.detail));
   const contextActions = installPanelContextActions({ document, window, createMenu: createContextActionsMenu,
     getEpoch: () => liveSessionEpoch, invoke: (...args) => invoke(...args) });
   const deepFreeze = (value, seen = new WeakSet()) => {
@@ -838,24 +850,31 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
   };
   if (__CLIPBOARD_ENABLED__) Object.defineProperty(apiShape, 'clipboard', { enumerable: true, get: panelEffects.clipboard });
   if (__SPEECH_ENABLED__) Object.defineProperty(apiShape, 'speech', { enumerable: true, get: panelEffects.speech });
+  if (imagesEnabled) {
+    apiShape.onImageChanged = next => imageBridge.register(next);
+    Object.defineProperty(apiShape, 'clearImage', { enumerable: true, get: () => imageBridge.clear() });
+  }
   if (runtimeActions) {
     let pending = false;
     const makeRequest = (epoch) => async function(input) {
-      if (epoch !== liveSessionEpoch || !invoke) throw panelJson.error('ExpiredPanelSession');
+      if (!documentActive || epoch !== liveSessionEpoch || !invoke) throw panelJson.error('ExpiredPanelSession');
       let request;
       try {
         if (arguments.length !== 1) throw new Error();
-        request = panelJson.snapshot(input, ['action', 'payload']);
+        request = panelJson.snapshot(input, ['action', 'payload'], true, imagesEnabled ? ['imageId'] : []);
         if (!panelJson.validAction(request.action)) throw panelJson.error('InvalidPanelRequestError');
+        if (request.imageId !== undefined && !panelJson.validImageId(request.imageId)) {
+          throw panelJson.error('InvalidPanelRequestError');
+        }
       } catch (_) { throw panelJson.error('InvalidPanelRequestError'); }
       if (pending) throw panelJson.error('PanelRequestBusyError');
       pending = true;
       try {
         const data = await invoke('plugin_panel_request', { sessionEpoch: epoch, request });
-        if (epoch !== liveSessionEpoch) throw panelJson.error('ExpiredPanelSession');
+        if (!documentActive || epoch !== liveSessionEpoch) throw panelJson.error('ExpiredPanelSession');
         return panelJson.reply(data);
       } catch (error) {
-        if (epoch !== liveSessionEpoch) throw panelJson.error('ExpiredPanelSession');
+        if (!documentActive || epoch !== liveSessionEpoch) throw panelJson.error('ExpiredPanelSession');
         throw panelJson.error(panelJson.errorName(error));
       } finally { pending = false; }
     };
@@ -874,6 +893,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
       if (clipboardHistorySession && clipboardHistorySession.sessionEpoch !== sessionEpoch) clipboardHistorySession.close();
       readyGeneration++;
       readyUpdate = null;
+      imageBridge.prepare(sessionEpoch);
       liveSessionEpoch = sessionEpoch;
       panelEffects.reset(sessionEpoch);
       if (!storageSession || storageSession.sessionEpoch !== sessionEpoch) {
@@ -914,12 +934,12 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
           notice.requestId !== current.requestId) return;
       current.notified = true;
       const receiver = readyReceiver;
-      if (!receiver) return;
       const event = deepFreeze({ sessionEpoch: current.sessionEpoch, requestId: current.requestId });
-      queueMicrotask(() => {
+      if (receiver) queueMicrotask(() => {
         if (!documentActive || readyUpdate !== current || current.generation !== readyGeneration || readyReceiver !== receiver) return;
         try { Promise.resolve(receiver.handler(event)).catch(() => undefined); } catch (_) {}
       });
+      imageBridge.markReady();
     },
   });
   window.addEventListener?.('pagehide', () => {
@@ -927,6 +947,7 @@ pub(crate) const PUBLIC_PANEL_BOOTSTRAP_TEMPLATE: &str = r#"
     readyGeneration++;
     readyUpdate = null;
     readyReceiver = null;
+    imageBridge.close();
   });
   Object.defineProperty(window, '__UIPILOT_PLUGIN_PANEL_HOST_KEY__', {
     configurable: false,
@@ -978,7 +999,7 @@ fn panel_bootstrap_with_actions(
     host_keys: &[PanelHostKeyDeclaration],
     actions: bool,
 ) -> String {
-    panel_bootstrap_with_effects(session_epoch, host_keys, actions, false, false)
+    panel_bootstrap_with_effects(session_epoch, host_keys, actions, false, false, false)
 }
 fn panel_bootstrap_with_effects(
     session_epoch: u64,
@@ -986,8 +1007,11 @@ fn panel_bootstrap_with_effects(
     actions: bool,
     clipboard: bool,
     speech: bool,
+    images: bool,
 ) -> String {
     PUBLIC_PANEL_BOOTSTRAP_TEMPLATE
+        .replace("__PANEL_IMAGE_BRIDGE__", include_str!("panel_image_bridge.js"))
+        .replace("__IMAGES_ENABLED__", if images { "true" } else { "false" })
         .replace("__PANEL_EFFECTS__", include_str!("panel_effects.js"))
         .replace("__CLIPBOARD_ENABLED__", if clipboard { "true" } else { "false" })
         .replace("__SPEECH_ENABLED__", if speech { "true" } else { "false" })
@@ -1203,6 +1227,8 @@ impl PluginPanelController {
         let show_generation = core.show_generation;
         invalidate_session_locked(&mut core);
         core.session = Some(LiveSession {
+            images: None,
+            delivered_image_revision: None,
             speech_lease: crate::panel_effects::EffectLease::new(),
             identity: identity.clone(),
             show_generation,
@@ -2566,7 +2592,7 @@ impl PluginPanelController {
         }
         session.runtime_request.take();
         let (dispatch, registration, receiver) =
-            service.prepare_panel_action(self, &session.identity, request)?;
+            service.prepare_panel_action(self, &session.identity, request, session.images.as_ref())?;
         session.runtime_request = Some(registration);
         Ok((dispatch, receiver))
     }
@@ -3113,11 +3139,15 @@ pub(crate) fn mount(
     controller: Arc<PluginPanelController>,
     owner: PanelOwner,
     panel_entry: &str,
+    image: Option<Option<crate::launcher_image::LauncherImage>>,
 ) -> Result<PanelSessionIdentity, PublicPluginManagementError> {
     teardown(app, controller.as_ref(), None);
     let identity = controller
         .open_session(owner)
         .ok_or(PublicPluginManagementError::Unavailable)?;
+    if let Some(image) = image {
+        controller.configure_images(identity.session_epoch, image).map_err(|_| PublicPluginManagementError::Unavailable)?;
+    }
     trace_panel_focus(app, controller.as_ref(), "session-open", || {
         format!("sessionEpoch={}", identity.session_epoch)
     });
@@ -3241,6 +3271,7 @@ fn mount_webview(
                 .panel_actions_enabled(identity),
             app.state::<Arc<PublicPluginService>>().manager()?.panel_effect_declared(identity, crate::public_plugins::PublicPermission::ClipboardWrite),
             app.state::<Arc<PublicPluginService>>().manager()?.panel_effect_declared(identity, crate::public_plugins::PublicPermission::SpeechSpeak),
+            app.state::<Arc<PublicPluginService>>().manager()?.panel_images_enabled(identity),
         ),
         content_url,
         on_unmuted,
@@ -3509,6 +3540,7 @@ fn deliver_update(
             ))
             .map_err(|_| ())
     })?;
+    deliver_image_change(app, controller, identity.session_epoch)?;
     Ok(())
 }
 
@@ -5565,6 +5597,30 @@ mod tests {
         assert!(!controller
             .publish_settled_ready(&identity, &ticket, publish)
             .unwrap());
+    }
+
+    #[test]
+    fn panel_images_only_publish_latest_after_settled_ready_and_never_duplicate() {
+        let controller = PluginPanelController::default();
+        let identity = content_ready_session(&controller);
+        controller.configure_images(identity.session_epoch, None).unwrap();
+        let image = crate::launcher_image::normalize_rgba(1,1,&[1,2,3,255]).unwrap();
+        {
+            let core = controller.core.lock().unwrap();
+            let images = core.session.as_ref().unwrap().images.as_ref().unwrap();
+            images.replace(Some(image.clone())).unwrap();
+            images.replace(Some(image)).unwrap();
+        }
+        assert!(!controller.publish_image_change(identity.session_epoch, |_,_| panic!("not Ready")).unwrap());
+        let ticket = claim_panel_delivery(&controller,identity.session_epoch,"a","token-a").unwrap();
+        assert!(content_ack(&controller,&identity.content_label,identity.session_epoch,"a"));
+        controller.wait_until_acked(identity.session_epoch,"a",Duration::from_secs(1)).unwrap();
+        assert!(!controller.publish_image_change(identity.session_epoch, |_,_| panic!("Ready not published")).unwrap());
+        controller.publish_settled_ready(&identity,&ticket,|| Ok(())).unwrap();
+        assert!(controller.publish_image_change(identity.session_epoch, |_,event| { assert_eq!(event.revision,"3"); assert!(event.image.is_some()); Ok(()) }).unwrap());
+        assert!(!controller.publish_image_change(identity.session_epoch, |_,_| panic!("duplicate")).unwrap());
+        controller.host_hidden();
+        assert!(!controller.publish_image_change(identity.session_epoch, |_,_| panic!("hidden")).unwrap());
     }
 
     #[test]

@@ -14,6 +14,7 @@
     "allow-plugin-panel-set-status",
     "allow-plugin-panel-actions-submit",
     "allow-plugin-panel-request",
+    "allow-plugin-panel-clear-image",
     "allow-plugin-panel-storage-get",
     "allow-plugin-panel-storage-set",
     "allow-plugin-panel-storage-remove",

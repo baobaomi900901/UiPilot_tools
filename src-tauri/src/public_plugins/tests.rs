@@ -2572,11 +2572,18 @@ fn panel_action_fixture(
     Arc<crate::plugin_panel::PluginPanelController>,
     crate::plugin_panel::PanelSessionIdentity,
 ) {
+    panel_action_fixture_with_image(name, false)
+}
+fn panel_action_fixture_with_image(name: &str, images: bool) -> (TestRoot, Arc<PublicPluginService>, Arc<PublicPluginManager>, Arc<crate::plugin_panel::PluginPanelController>, crate::plugin_panel::PanelSessionIdentity) {
     let root = TestRoot::new(name);
     let source = root.package();
     let mut value = manifest("panel");
     value["minimumHostVersion"] = json!("0.6.0");
     value["panel"]["runtimeActions"] = json!(true);
+    if images {
+        value["minimumHostVersion"] = json!("0.21.0");
+        value["command"]["inputCapabilities"] = json!(["image.ocr"]);
+    }
     value["settings"] = json!([{ "key":"synthetic", "label":"Synthetic", "type":"secret" }]);
     write_package(&source, &value);
     let app_data = root.0.join("app-data");
@@ -2630,10 +2637,16 @@ fn panel_action_fixture(
         false,
         false
     ));
+    if images { controller.configure_images(identity.session_epoch, None).unwrap(); }
     (root, service, manager, controller, identity)
 }
+
+#[path = "panel_image_service_tests.rs"]
+mod panel_image_service_tests;
+
 fn panel_action_input() -> super::panel_action::PanelActionRequest {
     super::panel_action::PanelActionRequest {
+        image_id: None,
         action: "save".into(),
         payload: json!({"title":"draft"}),
     }

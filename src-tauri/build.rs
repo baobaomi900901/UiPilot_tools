@@ -109,6 +109,7 @@ fn main() {
             "plugin_window_open_text",
             "plugin_window_request",
             "plugin_panel_request",
+            "plugin_panel_clear_image",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",

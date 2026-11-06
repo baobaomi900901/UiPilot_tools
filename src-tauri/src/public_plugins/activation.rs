@@ -569,6 +569,7 @@ pub(crate) struct ManagementEffects {
 
 pub(crate) struct PublicPluginManager {
     pub(crate) launcher_images: Arc<crate::launcher_image::LauncherImageStore>,
+    pub(crate) panel_images: Mutex<std::collections::HashMap<PluginRequestContext, Arc<crate::panel_image::PanelImageBinding>>>,
     host: PublicPluginHost,
     #[cfg(test)]
     app_data_dir: PathBuf,
@@ -708,13 +709,6 @@ impl PublicPluginManager {
             };
             result.push((suggestion, reason));
         }
-        result.sort_by_key(|(suggestion, _)| {
-            (
-                suggestion.plugin_id != "com.uipilot.baidu-ocr",
-                suggestion.display_name.clone(),
-                suggestion.command_id.clone(),
-            )
-        });
         Ok(result)
     }
     pub(crate) fn image_route(
@@ -786,9 +780,7 @@ impl PublicPluginManager {
             {
                 return Err("servicePermissionDenied");
             }
-            let image = self
-                .launcher_images
-                .claim(&input.context, &input.input.image_id)?;
+            let image = self.claim_ocr_image(&input.context, &input.input.image_id)?;
             let publication = self
                 .scheduler
                 .capture_result_publication(
@@ -843,8 +835,7 @@ impl PublicPluginManager {
             .map_err(ServiceError::from)?;
         let prepared = store
             .with_revision(revision, || {
-                self.launcher_images
-                    .bound(&input.context, Some(&input.input.image_id))?;
+                self.bound_ocr_image(&input.context, Some(&input.input.image_id))?;
                 let response = self
                     .network_authority
                     .deliver(pending, self.scheduler.as_ref())
@@ -879,8 +870,7 @@ impl PublicPluginManager {
             .map_err(ServiceError::from)?;
         store
             .with_revision(revision, || {
-                self.launcher_images
-                    .bound(&input.context, Some(&input.input.image_id))?;
+                self.bound_ocr_image(&input.context, Some(&input.input.image_id))?;
                 let response = self
                     .network_authority
                     .deliver(pending, self.scheduler.as_ref())
@@ -1088,6 +1078,7 @@ impl PublicPluginManager {
         }
         let manager = Self {
             launcher_images: Arc::new(crate::launcher_image::LauncherImageStore::default()),
+            panel_images: Mutex::new(std::collections::HashMap::new()),
             host,
             #[cfg(test)]
             app_data_dir: app_data_dir.to_path_buf(),
@@ -5647,6 +5638,11 @@ impl PublicPluginManager {
             })
     }
 
+    pub(crate) fn panel_images_enabled(&self, identity: &crate::plugin_panel::PanelSessionIdentity) -> bool {
+        self.panel_actions_enabled(identity)
+            && self.command_uses_image(&identity.plugin_id, "default").unwrap_or(false)
+    }
+
     pub(crate) fn admit_panel_action(
         &self,
         identity: &crate::plugin_panel::PanelSessionIdentity,
@@ -5701,6 +5697,9 @@ impl PublicPluginManager {
             return Err(E::ExpiredPanelSession);
         }
         request.validate()?;
+        if request.image_id.is_some() && !command.input_capabilities.contains(&super::manifest::PublicInputCapability::ImageOcr) {
+            return Err(E::InvalidPanelRequestError);
+        }
         let reserved = self
             .scheduler
             .reserve(super::PluginRequestCandidate {
@@ -5767,6 +5766,7 @@ impl PublicPluginManager {
     }
 
     pub(crate) fn retire_panel_action(&self, context: &PluginRequestContext) {
+        if let Ok(mut bindings) = self.panel_images.lock() { bindings.remove(context); }
         if let Ok(transition) = self.network_authority.begin_transition() {
             let _ = self.scheduler.retire_context(context);
             transition.invalidate_context(context);
@@ -15885,6 +15885,8 @@ mod tests {
     ) -> super::super::baidu_ocr::BaiduCommandInput {
         serde_json::from_value(json!({"context":context,"input":{"imageId":id}})).unwrap()
     }
+    include!("panel_image_tests.rs");
+
     #[test]
     fn baidu_ocr_completed_result_can_return_to_list_and_run_again() {
         let dir = TestDir::new("baidu-rerun");
@@ -16571,6 +16573,7 @@ mod tests {
                 .admit_panel_action(
                     &identity,
                     super::super::panel_action::PanelActionRequest {
+                        image_id: None,
                         action: "translate".into(),
                         payload: Value::Null,
                     },
@@ -16617,6 +16620,7 @@ mod tests {
             .admit_panel_action(
                 &identity,
                 super::super::panel_action::PanelActionRequest {
+                    image_id: None,
                     action: "translate".into(),
                     payload: Value::Null,
                 },
@@ -16689,6 +16693,7 @@ mod tests {
             .admit_panel_action(
                 &identity,
                 super::super::panel_action::PanelActionRequest {
+                    image_id: None,
                     action: "translate".into(),
                     payload: Value::Null,
                 },

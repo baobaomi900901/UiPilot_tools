@@ -16,6 +16,7 @@ const panel = (actions = true, result: () => Promise<unknown> = async () => ({ o
   const source = template('src-tauri/src/plugin_panel.rs', 'PUBLIC_PANEL_BOOTSTRAP_TEMPLATE')
     .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
     .replace('__PANEL_EFFECTS__', readFileSync('src-tauri/src/panel_effects.js', 'utf8'))
+    .replace('__PANEL_IMAGE_BRIDGE__', readFileSync('src-tauri/src/panel_image_bridge.js', 'utf8')).replace('__IMAGES_ENABLED__', 'false')
     .replace('__CLIPBOARD_ENABLED__', 'false').replace('__SPEECH_ENABLED__', 'false')
     .replace('__PANEL_JSON__', jsonSource).replace('__RUNTIME_ACTIONS__', String(actions))
     .replaceAll('__SESSION_EPOCH__', '7').replace('__HOST_KEYS__', '[]')
@@ -39,6 +40,20 @@ const context = { pluginId: 'com.example.panel', pluginGeneration: 1, requestId:
 const invocation = { apiVersion: 1, requestId: context.requestId, action: 'preview', payload: { body: 'Hi', values: [1, 2] }, context: { platform: 'windows', theme: 'dark', invokedAt: '2026-10-24T00:00:00Z' } }
 
 describe('panel action executable bridges', () => {
+  it('delivers the host request-scoped image as a frozen Panel action descriptor', async () => {
+    const descriptor = { id: 'request-image', mimeType: 'image/png', width: 10, height: 20, byteLength: 80 }
+    const handler = vi.fn(async (next: any) => {
+      expect(next.image).toEqual(descriptor)
+      expect(Object.isFrozen(next.image)).toBe(true)
+      expect(() => { next.image.id = 'other' }).toThrow()
+      return { requestId: next.requestId, data: { ok: true } }
+    })
+    const r = await runtime({ onCommand: async () => ({}), onPanelAction: handler })
+    await r.callback({ payload: { context, kind: 'panelAction', invocation: { ...structuredClone(invocation), image: { ...descriptor } } } })
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(r.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: { context, response: { requestId: context.requestId, data: { ok: true } } } })
+  })
+
   it('can start one Runtime request from a settled-ready receiver without another ACK', async () => {
     const p = panel()
     let response: Promise<unknown> | undefined

@@ -700,6 +700,8 @@ pub(crate) struct PluginCommandCompletionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct OpenPluginPanelInput {
+    #[serde(default)]
+    image_id: Option<String>,
     plugin_id: String,
     #[serde(default)]
     command_id: Option<String>,
@@ -778,12 +780,20 @@ pub(crate) enum PanelHideAdmitResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginPanelCommandResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_capabilities: Option<Vec<&'static str>>,
     session_epoch: String,
     plugin_id: String,
     command_label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_placeholder: Option<String>,
     host_keys: Vec<crate::public_plugins::PanelHostKeyDeclaration>,
+}
+impl PluginPanelCommandResult {
+    fn with_images(mut self, enabled: bool) -> Self {
+        self.input_capabilities = enabled.then(|| vec!["image.ocr"]);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2588,10 +2598,16 @@ pub(crate) async fn plugin_baidu_ocr(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LauncherImageImportInput {
+    panel: Option<PanelImageImportTarget>,
     import_sequence: u64,
     bytes: Option<Vec<u8>>,
     mime_type: Option<String>,
     clipboard_sequence: Option<u32>,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PanelImageImportTarget {
+    session_epoch: String,
 }
 #[tauri::command]
 pub(crate) fn get_launcher_clipboard_sequence(window: WebviewWindow) -> Result<u32, CommandError> {
@@ -2613,10 +2629,13 @@ pub(crate) async fn import_launcher_image(
     let manager = service
         .manager()
         .map_err(|_| ServiceError::from("imageUnavailable"))?;
-    manager
-        .launcher_images
-        .begin_import(input.import_sequence)
-        .map_err(ServiceError::from)?;
+    let panel_epoch = input.panel.as_ref().map(|panel| crate::public_plugins::panel_action::parse_epoch(&panel.session_epoch).map_err(|_| ServiceError::from("expiredImage"))).transpose()?;
+    let controller = app.state::<Arc<PluginPanelController>>();
+    if let Some(epoch) = panel_epoch {
+        controller.begin_image_import(&manager, window.label(), epoch, input.import_sequence).map_err(ServiceError::from)?;
+    } else {
+        manager.launcher_images.begin_import(input.import_sequence).map_err(ServiceError::from)?;
+    }
     let sequence = input.import_sequence;
     let normalized = tauri::async_runtime::spawn_blocking(move || {
         match (input.bytes, input.mime_type, input.clipboard_sequence) {
@@ -2636,6 +2655,11 @@ pub(crate) async fn import_launcher_image(
     .map_err(|_| ServiceError::from("invalidImage"))?
     .map_err(ServiceError::from)?;
     // Bad decodes leave the old image and result authority untouched.
+    if let Some(epoch) = panel_epoch {
+        let image = controller.finish_image_import(&manager, window.label(), epoch, sequence, normalized).map_err(ServiceError::from)?;
+        plugin_panel::deliver_image_change(app, controller.inner(), epoch).map_err(|_| ServiceError::from("imageUnavailable"))?;
+        return Ok(image);
+    }
     let image = manager
         .launcher_images
         .finish_import_with(sequence, normalized, |contexts| {
@@ -3436,6 +3460,23 @@ pub(crate) async fn plugin_panel_request(
     })
     .await
     .map_err(|_| E::PanelRequestUnavailableError)?
+}
+
+#[tauri::command]
+pub(crate) fn plugin_panel_clear_image(
+    webview: tauri::Webview,
+    app: AppHandle,
+    controller: State<'_, Arc<PluginPanelController>>,
+    service: State<'_, Arc<PublicPluginService>>,
+    session_epoch: String,
+) -> Result<(), crate::public_plugins::panel_action::PanelActionError> {
+    use crate::public_plugins::panel_action::PanelActionError as E;
+    if plugin_panel::plugin_id_from_panel_content_label(webview.label()).is_none() { return Err(E::ExpiredPanelSession); }
+    let epoch = crate::public_plugins::panel_action::parse_epoch(&session_epoch)?;
+    let manager = service.manager().map_err(|_| E::PanelRequestUnavailableError)?;
+    controller.clear_image(&manager, webview.label(), epoch)?;
+    plugin_panel::deliver_image_change(&app, controller.inner(), epoch).map_err(|_| E::PanelRequestUnavailableError)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -4318,6 +4359,7 @@ fn panel_command_result(
     input_placeholder: Option<&str>,
 ) -> PluginPanelCommandResult {
     PluginPanelCommandResult {
+        input_capabilities: None,
         session_epoch: identity.session_epoch.to_string(),
         plugin_id: identity.plugin_id.clone(),
         command_label: identity.command_label.clone(),
@@ -4717,10 +4759,16 @@ async fn open_plugin_panel_impl(
         host_keys: route.host_keys.clone(),
         host_key_focus: route.host_key_focus,
     };
+    let images_enabled = public.manager()?.command_uses_image(&route.plugin_id, &route.command_id)?;
+    let initial_image = input.image_id.as_deref().map(|id| {
+        if !images_enabled { return Err(CommandError::plugin_query_failed()); }
+        public.manager()?.launcher_images.current(id).map_err(|_| CommandError::plugin_query_failed())
+    }).transpose()?;
+    let images = images_enabled.then_some(initial_image);
     let mount_app = app.clone();
     let mount_controller = Arc::clone(controller.inner());
     let identity = tauri::async_runtime::spawn_blocking(move || {
-        plugin_panel::mount(&mount_app, mount_controller, owner, &panel_entry)
+        plugin_panel::mount(&mount_app, mount_controller, owner, &panel_entry, images)
     })
     .await
     .map_err(|_| CommandError::plugin_query_failed())??;
@@ -4737,7 +4785,7 @@ async fn open_plugin_panel_impl(
     Ok(Some(panel_command_result(
         &identity,
         route.input_placeholder.as_deref(),
-    )))
+    ).with_images(images_enabled)))
 }
 
 async fn submit_plugin_panel_impl(
@@ -4773,7 +4821,7 @@ async fn submit_plugin_panel_impl(
             return Err(error.into());
         }
     };
-    let result = panel_command_result(&identity, input_placeholder.as_deref());
+    let result = panel_command_result(&identity, input_placeholder.as_deref()).with_images(public.manager()?.panel_images_enabled(&identity));
     spawn_panel_submission(
         app,
         Arc::clone(public.inner()),
@@ -5297,6 +5345,7 @@ pub(crate) async fn search_apps(
     };
     if let Some(route) = route {
         if image_id.is_none()
+            && route.output_mode == PublicOutputMode::MainResult
             && public
                 .manager()?
                 .command_uses_image(&route.plugin_id, &route.command_id)?
@@ -10819,6 +10868,7 @@ mod tests {
             "plugin_panel_request_hide_admit",
             "plugin_panel_request_hide_admit_observed",
             "plugin_panel_request_hide_commit",
+            "plugin_panel_clear_image",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",
@@ -10876,6 +10926,7 @@ mod tests {
             "plugin_panel_request_hide_admit",
             "plugin_panel_request_hide_admit_observed",
             "plugin_panel_request_hide_commit",
+            "plugin_panel_clear_image",
             "plugin_panel_storage_get",
             "plugin_panel_storage_set",
             "plugin_panel_storage_remove",

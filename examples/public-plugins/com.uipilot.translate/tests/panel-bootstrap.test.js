@@ -23,6 +23,7 @@ test('shipped manifest and actual bootstrap mount, await settled readiness, and 
   const source = template
     .replace('__CONTEXT_ACTIONS_UI__', (await read('src/context-actions-ui.js') + '\n' + await read('src/panel-context-actions.js')).replaceAll('export function', 'function'))
     .replace('__PANEL_EFFECTS__', await read('src-tauri/src/panel_effects.js'))
+    .replace('__PANEL_IMAGE_BRIDGE__', await read('src-tauri/src/panel_image_bridge.js')).replace('__IMAGES_ENABLED__', 'false')
     .replace('__PANEL_JSON__', await read('src-tauri/src/public_plugins/panel_action_json.js'))
     .replace('__CLIPBOARD_ENABLED__', 'true').replace('__SPEECH_ENABLED__', 'true')
     .replace('__PANEL_ACTIONS__', 'false').replace('__RUNTIME_ACTIONS__', String(manifest.panel.runtimeActions))

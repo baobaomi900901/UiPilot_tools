@@ -19,6 +19,8 @@ pub(crate) enum PanelActionError {
 pub(crate) struct PanelActionRequest {
     pub(crate) action: String,
     pub(crate) payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image_id: Option<String>,
 }
 
 pub(crate) fn parse_epoch(value: &str) -> Result<u64, PanelActionError> {
@@ -32,7 +34,7 @@ impl PanelActionRequest {
     pub(crate) fn from_value(value: Value) -> Result<Self, PanelActionError> {
         if !value
             .as_object()
-            .is_some_and(|o| o.len() == 2 && o.contains_key("action") && o.contains_key("payload"))
+            .is_some_and(|o| (o.len() == 2 || (o.len() == 3 && o.get("imageId").is_some_and(Value::is_string))) && o.contains_key("action") && o.contains_key("payload"))
         {
             return Err(PanelActionError::InvalidPanelRequestError);
         }
@@ -45,6 +47,7 @@ impl PanelActionRequest {
     pub(crate) fn validate(&self) -> Result<(), PanelActionError> {
         let bytes = self.action.as_bytes();
         if bytes.is_empty()
+            || self.image_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 512 || id.contains('\0'))
             || bytes.len() > 64
             || !bytes[0].is_ascii_lowercase()
             || !bytes
@@ -54,9 +57,7 @@ impl PanelActionRequest {
                 self.action.as_str(),
                 "__proto__" | "prototype" | "constructor"
             )
-            || !super::content_action::valid_json(
-                &serde_json::json!({"action": self.action, "payload": self.payload}),
-            )
+            || !super::content_action::valid_json(&serde_json::to_value(self).map_err(|_| PanelActionError::InvalidPanelRequestError)?)
         {
             return Err(PanelActionError::InvalidPanelRequestError);
         }
@@ -84,6 +85,13 @@ pub(crate) const JSON_BOOTSTRAP: &str = include_str!("panel_action_json.js");
 mod tests {
     use super::*;
     #[test]
+    fn panel_image_reference_is_optional_and_strictly_bounded() {
+        assert!(PanelActionRequest::from_value(serde_json::json!({"action":"recognize","payload":null,"imageId":"panel-image-1"})).is_ok());
+        for image in [serde_json::json!(null), serde_json::json!(12), serde_json::json!(""), serde_json::json!("x".repeat(513))] {
+            assert!(PanelActionRequest::from_value(serde_json::json!({"action":"recognize","payload":null,"imageId":image})).is_err());
+        }
+    }
+    #[test]
     fn panel_action_bounds_and_exact_reply() {
         assert!(PanelActionRequest::from_value(serde_json::json!(["save", null])).is_err());
         assert!(PanelActionRequest::from_value(serde_json::json!({"action":"save"})).is_err());
@@ -96,6 +104,7 @@ mod tests {
         }
         assert_eq!(parse_epoch("1"), Ok(1));
         let input = PanelActionRequest {
+            image_id: None,
             action: "save".into(),
             payload: Value::Null,
         };

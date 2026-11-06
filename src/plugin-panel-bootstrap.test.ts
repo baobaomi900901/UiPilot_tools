@@ -26,6 +26,7 @@ function panelBootstrapSource(capabilities = { clipboard: true, speech: true }):
   return template
     .replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
     .replace('__PANEL_EFFECTS__', readFileSync('src-tauri/src/panel_effects.js', 'utf8'))
+    .replace('__PANEL_IMAGE_BRIDGE__', readFileSync('src-tauri/src/panel_image_bridge.js', 'utf8')).replace('__IMAGES_ENABLED__', 'false')
     .replace('__CLIPBOARD_ENABLED__', String(capabilities.clipboard)).replace('__SPEECH_ENABLED__', String(capabilities.speech))
     .replace('__PANEL_JSON__', readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8'))
     .replace('__PANEL_ACTIONS__', 'false')

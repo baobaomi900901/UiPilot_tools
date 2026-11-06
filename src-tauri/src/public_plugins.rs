@@ -17,6 +17,7 @@ mod network;
 mod owner_cleanup;
 mod package;
 pub(crate) mod panel_action;
+mod panel_image_authority;
 pub(crate) mod result_action;
 mod runtime;
 mod scheduler;
@@ -161,6 +162,7 @@ enum ContentActionSender {
     Window(mpsc::Sender<Result<serde_json::Value, window_action::WindowActionError>>),
 }
 struct PendingContentAction {
+    image_cancelled: Arc<AtomicBool>,
     identity: ContentActionIdentity,
     active: Arc<AtomicBool>,
     sender: ContentActionSender,
@@ -169,6 +171,7 @@ pub(crate) type WindowActionRegistration = ContentActionRegistration;
 pub(crate) type PanelActionRegistration = ContentActionRegistration;
 
 pub(crate) struct ContentActionRegistration {
+    image_cancelled: Arc<AtomicBool>,
     context: PluginRequestContext,
     service: std::sync::Weak<PublicPluginService>,
     active: Arc<AtomicBool>,
@@ -182,6 +185,15 @@ impl ContentActionRegistration {
     }
     pub(crate) fn disarm(&self) {
         self.active.store(false, Ordering::Release);
+    }
+    pub(crate) fn cancel_image(&self) {
+        // Revoke service authority immediately, but let physical completion settle the
+        // promise. Otherwise the plugin pumps its newest image into a still-busy Runtime.
+        if !self.image_cancelled.swap(true, Ordering::AcqRel) && self.active() {
+            if let Some(service) = self.service.upgrade() {
+                if let Ok(manager) = service.manager() { manager.retire_panel_action(&self.context); }
+            }
+        }
     }
 }
 impl Drop for ContentActionRegistration {
@@ -1109,6 +1121,7 @@ impl PublicPluginService {
         controller: &Arc<crate::plugin_panel::PluginPanelController>,
         identity: &crate::plugin_panel::PanelSessionIdentity,
         request: panel_action::PanelActionRequest,
+        images: Option<&Arc<crate::panel_image::PanelImages>>,
     ) -> Result<
         (
             ScheduledPluginRequest,
@@ -1118,6 +1131,12 @@ impl PublicPluginService {
         panel_action::PanelActionError,
     > {
         use panel_action::PanelActionError as E;
+        // Controller holds the session gate. Validate the reference before scheduler admission.
+        let image_id = request.image_id.clone();
+        if let Some(id) = image_id.as_deref() {
+            images.ok_or(E::InvalidPanelRequestError)?.bind(id, "validate")
+                .map_err(|_| E::PanelRequestCancelledError)?;
+        }
         let mut pending = self
             .content_actions
             .lock()
@@ -1126,11 +1145,21 @@ impl PublicPluginService {
             .manager()
             .map_err(|_| E::PanelRequestUnavailableError)?
             .admit_panel_action(identity, request, Instant::now())?;
+        if let Some(id) = image_id.as_deref() {
+            let manager = self.manager().map_err(|_| E::PanelRequestUnavailableError)?;
+            let binding = images.expect("validated image session").bind(id, &request.context.request_id)
+                .map_err(|_| E::PanelRequestCancelledError)?;
+            let mut bindings = manager.panel_images.lock().map_err(|_| E::PanelRequestUnavailableError)?;
+            bindings.retain(|context, binding| context.plugin_id != identity.plugin_id && binding.image(None).is_ok());
+            bindings.insert(request.context.clone(), binding);
+        }
         let (sender, receiver) = mpsc::channel();
         let active = Arc::new(AtomicBool::new(true));
+        let image_cancelled = Arc::new(AtomicBool::new(false));
         pending.insert(
             request.context.clone(),
             PendingContentAction {
+                image_cancelled: image_cancelled.clone(),
                 identity: ContentActionIdentity::Panel(
                     identity.clone(),
                     Arc::downgrade(controller),
@@ -1140,6 +1169,7 @@ impl PublicPluginService {
             },
         );
         let registration = PanelActionRegistration {
+            image_cancelled,
             context: request.context.clone(),
             service: Arc::downgrade(self),
             active,
@@ -1171,9 +1201,11 @@ impl PublicPluginService {
             .admit_window_action(identity, request, Instant::now())?;
         let (sender, receiver) = mpsc::channel();
         let active = Arc::new(AtomicBool::new(true));
+        let image_cancelled = Arc::new(AtomicBool::new(false));
         pending.insert(
             request.context.clone(),
             PendingContentAction {
+                image_cancelled: image_cancelled.clone(),
                 identity: ContentActionIdentity::Window(
                     identity.clone(),
                     Arc::downgrade(controller),
@@ -1183,6 +1215,7 @@ impl PublicPluginService {
             },
         );
         let registration = PanelActionRegistration {
+            image_cancelled,
             context: request.context.clone(),
             service: Arc::downgrade(self),
             active,
@@ -1258,6 +1291,9 @@ impl PublicPluginService {
                 ContentActionIdentity::Panel(identity, controller) => {
                     controller.upgrade().ok_or(E::Expired).and_then(|c| {
                         c.finish_panel_action(identity, context, || {
+                            if pending.image_cancelled.load(Ordering::Acquire) {
+                                return Err(panel_action::PanelActionError::PanelRequestCancelledError);
+                            }
                             if terminal {
                                 return Ok(());
                             }
@@ -1324,6 +1360,20 @@ impl PublicPluginService {
         {
             return Err(PublicPluginManagementError::Unavailable);
         }
+        let (kind, invocation) = self.dispatch_invocation(request, theme, invoked_at)?;
+        let label = runtime_label(&request.context.plugin_id, request.context.plugin_generation)
+            .ok_or(PublicPluginManagementError::Unavailable)?;
+        let window = app.get_webview_window(&label).ok_or(PublicPluginManagementError::Unavailable)?;
+        window.emit("uipilot-public-plugin-command", PluginCommandDispatch {
+            context: request.context.clone(), kind: kind.into(), invocation,
+        }).map_err(|_| PublicPluginManagementError::Unavailable)?;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_invocation(&self, request: &ScheduledPluginRequest, theme: PluginInvocationTheme, invoked_at: String) -> Result<(&'static str, serde_json::Value), PublicPluginManagementError> {
+        if !request.candidate.owner.live() || self.manager()?.scheduler().context_status(&request.context) != PluginContextStatus::Current {
+            return Err(PublicPluginManagementError::Unavailable);
+        }
         let environment = PluginInvocationEnvironment {
             platform: PluginInvocationPlatform::Windows,
             theme,
@@ -1331,8 +1381,7 @@ impl PublicPluginService {
         };
         let image = self
             .manager()?
-            .launcher_images
-            .bound(&request.context, None)
+            .bound_ocr_image(&request.context, None)
             .ok()
             .map(|image| image.descriptor);
         if matches!(request.candidate.owner, PluginRequestOwner::Command(_))
@@ -1340,6 +1389,7 @@ impl PublicPluginService {
                 .manager()?
                 .command_uses_image(&request.context.plugin_id, &request.candidate.command_id)?
             && image.is_none()
+            && self.manager()?.panel_route(&request.context.plugin_id, "")?.is_none()
         {
             return Err(PublicPluginManagementError::Unavailable);
         }
@@ -1375,34 +1425,17 @@ impl PublicPluginService {
             ),
             PluginRequestOwner::PanelAction {
                 request: action, ..
-            } => (
-                "panelAction",
-                serde_json::json!({
+            } => {
+                if action.image_id.is_some() && image.is_none() { return Err(PublicPluginManagementError::Unavailable); }
+                let mut invocation = serde_json::json!({
                     "apiVersion": 1, "requestId": request.context.request_id, "action": action.action,
                     "payload": action.payload, "context": environment,
-                }),
-            ),
+                });
+                if let Some(image) = image { invocation["image"] = serde_json::to_value(image).map_err(|_| PublicPluginManagementError::Unavailable)?; }
+                ("panelAction", invocation)
+            },
         };
-        let label = runtime_label(
-            &request.context.plugin_id,
-            request.context.plugin_generation,
-        )
-        .ok_or(PublicPluginManagementError::Unavailable)?;
-        let window = app
-            .get_webview_window(&label)
-            .ok_or(PublicPluginManagementError::Unavailable)?;
-        window
-            .emit(
-                "uipilot-public-plugin-command",
-                PluginCommandDispatch {
-                    context: request.context.clone(),
-                    kind: kind.into(),
-                    invocation,
-                },
-            )
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
-
-        Ok(())
+        Ok((kind, invocation))
     }
 
     pub(crate) fn complete_submission(

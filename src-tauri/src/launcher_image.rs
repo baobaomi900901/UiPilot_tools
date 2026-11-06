@@ -300,30 +300,30 @@ pub(crate) fn normalize_rgba(
     if png.len() > MAX_PNG {
         return Err("imageTooLarge");
     }
-    // Preview is separately resized and never becomes provider input.
-    let ratio = (width.max(height) as f64 / 96.0).max(1.0);
-    let (pw, ph) = (
-        (width as f64 / ratio).max(1.0) as u32,
-        (height as f64 / ratio).max(1.0) as u32,
-    );
-    let mut pixels = Vec::with_capacity(pw as usize * ph as usize * 4);
-    for y in 0..ph {
-        for x in 0..pw {
-            let offset = (((y * height / ph) * width + x * width / pw) * 4) as usize;
-            pixels.extend_from_slice(&rgba[offset..offset + 4]);
+    // Derived display-only PNG: at most 512px and 40KiB; OCR keeps the original PNG.
+    let mut edge = 512u32;
+    let preview = loop {
+        let ratio = (width.max(height) as f64 / f64::from(edge)).max(1.0);
+        let (pw, ph) = ((width as f64 / ratio).max(1.0) as u32, (height as f64 / ratio).max(1.0) as u32);
+        let mut pixels = Vec::with_capacity(pw as usize * ph as usize * 4);
+        for y in 0..ph {
+            for x in 0..pw {
+                let offset = (((y * height / ph) * width + x * width / pw) * 4) as usize;
+                pixels.extend_from_slice(&rgba[offset..offset + 4]);
+            }
         }
-    }
-    let mut preview = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut preview, pw, ph);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .map_err(|_| "invalidImage")?
-            .write_image_data(&pixels)
-            .map_err(|_| "invalidImage")?;
-    }
+        let mut preview = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut preview, pw, ph);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().map_err(|_| "invalidImage")?
+                .write_image_data(&pixels).map_err(|_| "invalidImage")?;
+        }
+        if preview.len() <= 40 * 1024 { break preview; }
+        edge /= 2;
+        if edge == 0 { return Err("imageTooLarge"); }
+    };
     Ok(LauncherImage {
         descriptor: ImageDescriptor {
             id: String::new(),
@@ -448,6 +448,17 @@ fn decode_wic(bytes: &[u8]) -> Result<LauncherImage, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn panel_preview_is_bounded_and_does_not_replace_ocr_pixels() {
+        let mut seed = 13u32;
+        let pixels: Vec<u8> = (0..512*512*4).map(|_| { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 24) as u8 }).collect();
+        let image = normalize_rgba(512,512,&pixels).unwrap();
+        assert!(image.preview_data_url.len() <= 40 * 1024 * 4 / 3 + 26);
+        assert!(image.png.len() > 40 * 1024);
+        assert_eq!((image.width,image.height),(512,512));
+        let event = crate::panel_image::PanelImages::new(1,Some(image)).event();
+        assert!(serde_json::to_vec(&event).unwrap().len() <= 64 * 1024);
+    }
     #[test]
     fn late_import_and_clear_cannot_replace_newer_image() {
         let store = LauncherImageStore::default();

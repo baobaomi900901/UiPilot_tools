@@ -22,9 +22,11 @@ const panelJson = (() => {
   const setAddValue = call(WeakSet.prototype.add);
   const setDeleteValue = call(WeakSet.prototype.delete);
   const fieldsEvery = call(Array.prototype.every);
+  const fieldsSome = call(Array.prototype.some);
+  const stringIncludes = call(String.prototype.includes);
   const encode = Function.prototype.call.bind(TextEncoder.prototype.encode, new TextEncoder());
   const bad = () => { throw new ErrorValue('invalid panel JSON'); };
-  const snapshot = (input, fields, serialize = true) => {
+  const snapshot = (input, fields, serialize = true, optionalFields = []) => {
     let count = 0;
     const ancestors = new WeakSetValue();
     const copy = (value, depth) => {
@@ -59,12 +61,16 @@ const panelJson = (() => {
       } finally { setDeleteValue(ancestors, value); }
     };
     const result = copy(input, 0);
-    if (!result || isArray(result) || typeof result !== 'object' || keysOf(result).length !== fields.length || !fieldsEvery(fields, k => has(result, k))) bad();
+    if (!result || isArray(result) || typeof result !== 'object'
+      || !fieldsEvery(fields, k => has(result, k))
+      || !fieldsEvery(keysOf(result), key => fieldsSome(fields, field => field === key) || fieldsSome(optionalFields, field => field === key))) bad();
     if (serialize && encode(stringify(result)).byteLength > 65536) bad();
     return result;
   };
   const validAction = value => typeof value === 'string' && test(actionPattern, value)
     && value !== '__proto__' && value !== 'prototype' && value !== 'constructor';
+  const validImageId = value => typeof value === 'string' && value.length > 0
+    && !stringIncludes(value, '\0') && encode(value).byteLength <= 512;
   const error = name => {
     const value = new ErrorValue(name);
     define(value, 'name', { value: name });
@@ -92,5 +98,5 @@ const panelJson = (() => {
     envelope.data = data;
     return snapshot(envelope, ['requestId', 'data'], false).data;
   };
-  return freeze({ snapshot, reply, validAction, error, errorName, windowErrorName });
+  return freeze({ snapshot, reply, validAction, validImageId, error, errorName, windowErrorName });
 })();

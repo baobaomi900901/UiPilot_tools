@@ -1230,6 +1230,7 @@ mod tests {
                 content_label: "panel".into(),
                 session_epoch: 1,
                 request: PanelActionRequest {
+                    image_id: None,
                     action: "save".into(),
                     payload: serde_json::Value::Null,
                 },
