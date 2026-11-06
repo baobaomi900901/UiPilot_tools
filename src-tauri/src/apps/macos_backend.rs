@@ -9,7 +9,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use block2::RcBlock;
 use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
-use objc2_foundation::{NSBundle, NSError, NSString, NSURL};
+use objc2_foundation::{NSError, NSString, NSURL};
 use rustix::fs::{open, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
@@ -71,7 +71,7 @@ fn inspect(root: &Path, path: &Path) -> Option<(BundleTarget, plist::Dictionary)
     if !dir.is_dir() { return None; }
     let contents = path.join("Contents");
     let (bytes, info) = bounded_file(&contents.join("Info.plist"), PLIST_LIMIT)?;
-    let plist = plist::Value::from_reader(std::io::Cursor::new(bytes)).ok()?.into_dictionary()?;
+    let plist = super::macos_names::bounded_dictionary(&bytes)?;
     let identifier = plist.get("CFBundleIdentifier")?.as_string()?.trim();
     let exe = plist.get("CFBundleExecutable")?.as_string()?;
     if identifier.len() > 255 || identifier.split('.').any(|part| {
@@ -88,20 +88,6 @@ fn inspect(root: &Path, path: &Path) -> Option<(BundleTarget, plist::Dictionary)
         directory: (&dir).into(), executable: (&meta).into(), info,
     };
     Some((target, plist))
-}
-
-fn localized_name(path: &Path) -> Option<String> {
-    let url = NSURL::from_file_path(path)?;
-    let bundle = NSBundle::bundleWithURL(&url)?;
-    for key in ["CFBundleDisplayName", "CFBundleName"] {
-        if let Some(name) = bundle.objectForInfoDictionaryKey(&NSString::from_str(key))
-            .and_then(|value| value.downcast::<NSString>().ok())
-        {
-            let name = name.to_string();
-            if !name.trim().is_empty() { return Some(name); }
-        }
-    }
-    None
 }
 
 fn bundle_icon(path: &Path, plist: &plist::Dictionary) -> Option<String> {
@@ -130,13 +116,9 @@ fn bundle_icon(path: &Path, plist: &plist::Dictionary) -> Option<String> {
 
 pub(crate) fn application(root: &Path, path: &Path) -> Option<Application> {
     let (target, plist) = inspect(root, path)?;
-    let display_name = localized_name(path)
-        .or_else(|| plist.get("CFBundleDisplayName")?.as_string().map(str::to_owned))
-        .or_else(|| plist.get("CFBundleName")?.as_string().map(str::to_owned))
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| path.file_stem()?.to_str().map(str::to_owned))?;
+    let (display_name, search_aliases) = super::macos_names::read(path, &plist)?;
     let digest = Sha256::digest(format!("macos-bundle-v1\0{}", target.identifier.to_lowercase()));
-    Some(Application { app_id: format!("app-{digest:x}"), display_name,
+    Some(Application { app_id: format!("app-{digest:x}"), display_name, search_aliases,
         target: ApplicationLaunchTarget::Bundle(target), icon: bundle_icon(path, &plist), use_count: 0 })
 }
 
@@ -357,5 +339,18 @@ pub(crate) mod tests {
             if target.root == Path::new("/System/Applications"))));
         let icons = apps.iter().filter(|app| app.icon.is_some()).count();
         eprintln!("Mac application discovery returned {} unique bundles and {} icons", apps.len(), icons);
+    }
+
+    #[test]
+    #[ignore = "read-only smoke against the macOS system Calculator bundle"]
+    fn system_calculator_ranks_first_in_english_and_simplified_chinese() {
+        let apps = objc2::rc::autoreleasepool(|_| discover()).unwrap().applications;
+        let calculator = apps.iter().find(|app| matches!(&app.target, ApplicationLaunchTarget::Bundle(target)
+            if target.path == Path::new("/System/Applications/Calculator.app"))).unwrap();
+        for query in ["Calculator", "计算器"] {
+            let results = super::super::rank(&apps, query);
+            eprintln!("{query}: first={:?}, expected={:?}", results.first().map(|app| &app.display_name), calculator.display_name);
+            assert_eq!(results.first().map(|app| &app.app_id), Some(&calculator.app_id));
+        }
     }
 }

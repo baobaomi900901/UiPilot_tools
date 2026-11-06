@@ -100,6 +100,8 @@ mod tests {
     fn application(name: &str) -> Application {
         Application {
             app_id: format!("app-{name}"),
+            #[cfg(target_os = "macos")]
+            search_aliases: Vec::new(),
             display_name: name.into(),
             target: ApplicationLaunchTarget::Shortcut {
                 shortcut: PathBuf::from(format!(r"C:\Menu\{name}.lnk")),

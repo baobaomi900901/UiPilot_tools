@@ -22,6 +22,8 @@ mod discovery;
 mod icon;
 mod rank;
 #[cfg(target_os = "macos")]
+mod macos_names;
+#[cfg(target_os = "macos")]
 pub(crate) mod macos_backend;
 #[cfg(windows)]
 mod shortcut;
@@ -133,6 +135,8 @@ impl ApplicationLaunchTarget {
 pub(crate) struct Application {
     pub(crate) app_id: String,
     pub(crate) display_name: String,
+    #[cfg(target_os = "macos")]
+    pub(crate) search_aliases: Vec<String>,
     pub(crate) target: ApplicationLaunchTarget,
     pub(crate) icon: Option<String>,
     pub(crate) use_count: u64,

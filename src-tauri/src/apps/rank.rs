@@ -25,7 +25,14 @@ fn match_class(value: &str, query: &str) -> Option<u8> {
 }
 
 fn best_match(application: &Application, query: &str) -> Option<u8> {
-    match_class(&application.display_name.to_lowercase(), query)
+    let display_match = match_class(&application.display_name.to_lowercase(), query);
+    #[cfg(target_os = "macos")]
+    {
+        display_match.into_iter().chain(application.search_aliases.iter()
+            .filter_map(|alias| match_class(alias, query))).min()
+    }
+    #[cfg(not(target_os = "macos"))]
+    display_match
 }
 
 pub(crate) fn rank(applications: &[Application], query: &str) -> Vec<Application> {
@@ -90,6 +97,8 @@ mod tests {
     ) -> Application {
         Application {
             app_id: id.into(),
+            #[cfg(target_os = "macos")]
+            search_aliases: Vec::new(),
             display_name: name.into(),
             target,
             icon: None,
