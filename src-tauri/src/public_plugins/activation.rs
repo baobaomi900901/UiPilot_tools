@@ -1,3 +1,5 @@
+mod share_authority;
+pub(super) use share_authority::{AuthorityState, ShareAuthorityRegistry, ShareRevocation};
 mod share_catalog;
 mod share_prepare;
 
@@ -605,6 +607,8 @@ pub(crate) struct PublicPluginManager {
     #[cfg(test)]
     after_state_durable: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    before_state_durable: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     before_result_route_token: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     data: Mutex<ActivationData>,
     runtime_faults: Mutex<HashMap<(String, u64), RuntimeFaultWindow>>,
@@ -1115,6 +1119,8 @@ impl PublicPluginManager {
             after_uncertain_close: Mutex::new(None),
             #[cfg(test)]
             after_state_durable: Mutex::new(None),
+            #[cfg(test)]
+            before_state_durable: Mutex::new(None),
             #[cfg(test)]
             before_result_route_token: Mutex::new(None),
             data: Mutex::new(ActivationData {
@@ -2286,7 +2292,15 @@ impl PublicPluginManager {
                 self.clear_runtime_faults(&runtime.plugin_id)?;
                 let config = self.state.publish_prepared(prepared_state)?;
                 let runtime_active = config.enabled && config.fault.is_none();
+                // M still excludes manager publication/invalidation. Old N is
+                // already cleared; release N before A -> B and reinstall only
+                // the newly confirmed bundle after reacquiring N.
+                drop(network_transition);
                 reservation.publish(runtime_active.then(|| candidate.bundle(config.clone())))?;
+                let mut network_transition = self
+                    .network_authority
+                    .begin_transition()
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
                 let staged = data
                     .staged_by_label
                     .remove(&runtime.label)
@@ -2538,7 +2552,12 @@ impl PublicPluginManager {
                 let timer_effects = Vec::new();
                 self.clear_runtime_faults(plugin_id)?;
                 let config = self.state.publish_prepared(prepared_state)?;
+                drop(network_transition);
                 reservation.publish(Some(candidate.bundle(config.clone())))?;
+                let mut network_transition = self
+                    .network_authority
+                    .begin_transition()
+                    .map_err(|_| PublicPluginManagementError::Unavailable)?;
                 let authority = checked_network_authority_snapshot(
                     &self.bundles,
                     &self.state,
@@ -2650,6 +2669,7 @@ impl PublicPluginManager {
                 runtime.activation_id,
             );
             let config = self.state.publish_prepared(prepared_state)?;
+            drop(network_transition);
             reservation.publish(None)?;
             let commit = PublicEnabledCommit {
                 mutation: mutation_from_config(&config),
@@ -2735,7 +2755,12 @@ impl PublicPluginManager {
                 .set_plugin_authority(plugin_id, None)
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let config = self.state.publish_prepared(prepared_state)?;
+            drop(transition);
             reservation.publish(Some(bundle.with_config(config.clone())))?;
+            let mut transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let authority = checked_network_authority_snapshot(
                 &self.bundles,
                 &self.state,
@@ -2934,7 +2959,12 @@ impl PublicPluginManager {
             }
             let config = self.state.publish_prepared(prepared_state)?;
             let next_bundle = bundle.as_ref().map(|b| b.with_config(config.clone()));
+            drop(transition);
             reservation.publish(next_bundle.clone())?;
+            let mut transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let authority = next_bundle
                 .as_ref()
                 .map(|b| {
@@ -3046,7 +3076,12 @@ impl PublicPluginManager {
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let config = self.state.publish_prepared(prepared_state)?;
             let next_bundle = bundle.map(|bundle| bundle.with_config(config.clone()));
+            drop(network_transition);
             reservation.publish(next_bundle.clone())?;
+            let mut network_transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let authority = next_bundle
                 .as_ref()
                 .map(|bundle| {
@@ -3168,7 +3203,12 @@ impl PublicPluginManager {
                 .set_plugin_authority(plugin_id, None)
                 .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let config = self.state.publish_prepared(prepared_state)?;
+            drop(network_transition);
             reservation.publish(Some(bundle.with_config(config.clone())))?;
+            let mut network_transition = self
+                .network_authority
+                .begin_transition()
+                .map_err(|_| PublicPluginManagementError::Unavailable)?;
             let authority = checked_network_authority_snapshot(
                 &self.bundles,
                 &self.state,
@@ -3226,6 +3266,10 @@ impl PublicPluginManager {
             .map(|value| self.secrets.prepare_write(plugin_id, key, value))
             .transpose()
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        self.bundles
+            .share_authority
+            .write()
+            .block(plugin_id, ShareRevocation::Secret);
         let mut transition = self
             .network_authority
             .begin_transition()
@@ -3256,6 +3300,8 @@ impl PublicPluginManager {
         transition
             .set_plugin_authority(plugin_id, authority)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        drop(transition);
+        self.bundles.share_authority.write().available(plugin_id);
         Ok(())
     }
 
@@ -3459,6 +3505,7 @@ impl PublicPluginManager {
         self.activate_runtime_data_gate(&runtime)?;
         reservation.begin_committing()?;
         reservation.mark_durable()?;
+        drop(network_transition);
         reservation.publish(Some(candidate.bundle(config)))?;
         self.lock_data()?.active_by_plugin.remove(&plugin_id);
         Ok(Some(runtime))
@@ -4177,10 +4224,6 @@ impl PublicPluginManager {
         candidate: &PublicRuntimeCandidate,
     ) -> Result<bool, PublicPluginManagementError> {
         let _mutation = self.lock_mutation()?;
-        let mut network_transition = self
-            .network_authority
-            .begin_transition()
-            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let Some(bundle) = self.bundles.confirmed_bundle(&candidate.plugin_id)? else {
             return Ok(false);
         };
@@ -4195,12 +4238,24 @@ impl PublicPluginManager {
             return Ok(false);
         }
         let reservation = self.bundles.reserve(&candidate.plugin_id)?;
+        // Publishing the recovered bundle is not yet successful Runtime/N
+        // publication. Failure must leave this exact identity unavailable.
+        self.bundles.share_authority.write().invalidate_runtime(
+            &candidate.plugin_id,
+            candidate.generation,
+            candidate.activation_id,
+            candidate.admission_epoch,
+        );
         reservation.begin_committing()?;
         reservation.mark_durable()?;
         reservation.publish(Some(bundle.with_runtime_recovery(false)))?;
         self.lock_data()?
             .active_by_plugin
             .insert(candidate.plugin_id.clone(), Arc::clone(&bundle.runtime));
+        let mut network_transition = self
+            .network_authority
+            .begin_transition()
+            .map_err(|_| PublicPluginManagementError::Unavailable)?;
         let authority = checked_network_authority_snapshot(
             &self.bundles,
             &self.state,
@@ -4213,6 +4268,11 @@ impl PublicPluginManager {
         network_transition
             .set_plugin_authority(&candidate.plugin_id, authority)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        drop(network_transition);
+        self.bundles
+            .share_authority
+            .write()
+            .recovered(&candidate.plugin_id, candidate.generation);
         Ok(true)
     }
 
@@ -5819,12 +5879,22 @@ impl PublicPluginManager {
         &self,
         now: Instant,
     ) -> Result<Vec<PluginRuntimeReplacement>, PluginScheduleError> {
+        let _mutation = self
+            .lock_mutation()
+            .map_err(|_| PluginScheduleError::Unavailable)?;
+        let mut share_authority = self.bundles.share_authority.write();
         let mut network_transition = self
             .network_authority
             .begin_transition()
             .map_err(|_| PluginScheduleError::Unavailable)?;
         let replacements = self.scheduler.expire_timeouts(now)?;
         for replacement in &replacements {
+            share_authority.invalidate_runtime(
+                &replacement.plugin_id,
+                replacement.previous_generation,
+                replacement.previous_activation_id,
+                replacement.previous_admission_epoch,
+            );
             network_transition.invalidate_runtime(
                 &replacement.plugin_id,
                 replacement.previous_generation,
@@ -5873,10 +5943,23 @@ impl PublicPluginManager {
         network_transition
             .set_plugin_authority(plugin_id, authority)
             .map_err(|_| PublicPluginManagementError::Unavailable)?;
+        drop(network_transition);
+        self.bundles
+            .share_authority
+            .write()
+            .recovered(plugin_id, generation);
         Ok(next)
     }
 
     pub(crate) fn invalidate_runtime_generation(&self, plugin_id: &str, generation: u64) -> usize {
+        // Runtime readiness/native-loss callers hold no M. Serialize against
+        // publication's N release/reacquire so it cannot reinstall revoked N.
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut authority = self.bundles.share_authority.write();
+        authority.invalidate_generation(plugin_id, generation);
         self.network_authority
             .begin_transition()
             .map_or(0, |mut transition| {
@@ -5885,6 +5968,7 @@ impl PublicPluginManager {
     }
 
     pub(crate) fn shutdown_network(&self) -> usize {
+        self.bundles.share_authority.write().terminate();
         self.scheduler.close_result_publications();
         self.network_authority.shutdown()
     }
@@ -5978,6 +6062,12 @@ impl PublicPluginManager {
         let config = self.state.publish_prepared(prepared_state)?;
         self.activate_runtime_data_gate(&runtime)?;
         reservation.publish(Some(candidate.bundle(config)))?;
+        self.bundles.share_authority.write().invalidate_runtime(
+            plugin_id,
+            runtime.generation,
+            runtime.activation_id,
+            runtime.admission_epoch,
+        );
         self.lock_data()?
             .active_by_plugin
             .insert(plugin_id.into(), Arc::clone(&candidate.runtime));
@@ -6117,6 +6207,7 @@ impl PublicPluginManager {
         self.cancel_delayed_messages(plugin_id);
         let timer_effects = self.cancel_timer_generation(plugin_id, generation, activation_id);
         self.state.publish_prepared(prepared_state)?;
+        drop(network_transition);
         reservation.publish(None)?;
         drop(_mutation);
         self.apply_timer_post_lock_effects(timer_effects);
@@ -6231,6 +6322,10 @@ impl PublicPluginManager {
         mut effects: Option<&mut ManagementEffects>,
         observation: &mut Option<diagnostics::Attempt<'_>>,
     ) -> Result<(), PublicPluginManagementError> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_state_durable.lock().unwrap().clone() {
+            hook();
+        }
         diagnostics::phase(observation, Phase::Persistence, CommitOutcome::NotAttempted);
         reservation.begin_committing()?;
         diagnostics::phase(observation, Phase::Persistence, CommitOutcome::Unknown);
@@ -6277,6 +6372,10 @@ impl PublicPluginManager {
                 .mutation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.bundles
+                .share_authority
+                .write()
+                .block(plugin_id, ShareRevocation::Closed);
             if let Ok(mut transition) = self.network_authority.begin_transition() {
                 if let Ok(retired) = self.scheduler.retire_plugin_requests(plugin_id) {
                     effects.retired.extend(retired);
@@ -6288,7 +6387,7 @@ impl PublicPluginManager {
                 if let Ok(retired) = self.scheduler.retire_plugin_requests(plugin_id) {
                     effects.retired.extend(retired);
                 }
-                self.close_network_authority(plugin_id);
+                self.close_network_authority_locked(plugin_id);
             }
         } else {
             self.close_network_authority(plugin_id);
@@ -6300,6 +6399,18 @@ impl PublicPluginManager {
     }
 
     fn close_network_authority(&self, plugin_id: &str) {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.close_network_authority_locked(plugin_id);
+    }
+
+    fn close_network_authority_locked(&self, plugin_id: &str) {
+        self.bundles
+            .share_authority
+            .write()
+            .block(plugin_id, ShareRevocation::Closed);
         self.bundles.revoke_speech(plugin_id);
         self.network_authority.close_plugin(plugin_id);
     }
@@ -6344,10 +6455,17 @@ impl PublicPluginManager {
             .map_err(|_| PublicPluginManagementError::Unavailable)
     }
 
-    fn lock_mutation(&self) -> Result<std::sync::MutexGuard<'_, ()>, PublicPluginManagementError> {
-        self.mutation
-            .lock()
-            .map_err(|_| PublicPluginManagementError::Unavailable)
+    fn lock_mutation(
+        &self,
+    ) -> Result<share_authority::ShareMutationGuard<'_>, PublicPluginManagementError> {
+        let mutation = self.mutation.lock().map_err(|_| {
+            self.bundles.share_authority.write().terminate();
+            PublicPluginManagementError::Unavailable
+        })?;
+        Ok(share_authority::ShareMutationGuard::new(
+            mutation,
+            &self.bundles.share_authority,
+        ))
     }
 }
 
@@ -16797,5 +16915,6 @@ mod tests {
         assert_eq!(manager.selection_translation_authority(), None);
     }
     include!("activation/share_prepare_tests.rs");
+    include!("activation/share_authority_tests.rs");
 
 }

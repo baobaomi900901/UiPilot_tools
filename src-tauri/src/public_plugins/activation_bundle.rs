@@ -7,7 +7,8 @@ use std::{
 };
 
 use super::{
-    activation::RuntimeSnapshot, EffectivePluginConfig, PreparedAlarmAsset, ValidatedAlarmAsset,
+    activation::{AuthorityState, RuntimeSnapshot, ShareRevocation},
+    EffectivePluginConfig, PreparedAlarmAsset, ValidatedAlarmAsset,
 };
 
 #[derive(Clone)]
@@ -145,6 +146,7 @@ pub(super) enum ReservationError {
 }
 
 pub(super) struct ActivationReservationBook {
+    pub(super) share_authority: Arc<super::activation::ShareAuthorityRegistry>,
     terminal: AtomicBool,
     next: AtomicU64,
     state: Mutex<ActivationStoreState>,
@@ -166,6 +168,7 @@ impl Default for ActivationReservationBook {
     fn default() -> Self {
         Self {
             terminal: AtomicBool::new(false),
+            share_authority: Arc::new(super::activation::ShareAuthorityRegistry::default()),
             next: AtomicU64::new(1),
             state: Mutex::new(ActivationStoreState::default()),
         }
@@ -173,10 +176,24 @@ impl Default for ActivationReservationBook {
 }
 
 impl ActivationReservationBook {
+    // Authority mutations take A before B. Pure lookups take only B and never
+    // acquire A while retaining B.
+    fn lock_state<'a>(
+        &'a self,
+        authority: &mut AuthorityState,
+    ) -> Result<std::sync::MutexGuard<'a, ActivationStoreState>, ReservationError> {
+        self.state.lock().map_err(|_| {
+            authority.terminate();
+            self.terminal.store(true, Ordering::Release);
+            ReservationError::Unavailable
+        })
+    }
+
     pub(super) fn reserve(
         self: &Arc<Self>,
         plugin_id: &str,
     ) -> Result<ActivationReservation, ReservationError> {
+        let mut authority = self.share_authority.write();
         if self.is_terminal() {
             return Err(ReservationError::Terminal);
         }
@@ -186,10 +203,7 @@ impl ActivationReservationBook {
                 (value != 0).then_some(value)?.checked_add(1)
             })
             .map_err(|_| ReservationError::Exhausted)?;
-        let mut state = self.state.lock().map_err(|_| {
-            self.terminal.store(true, Ordering::Release);
-            ReservationError::Unavailable
-        })?;
+        let mut state = self.lock_state(&mut authority)?;
         if self.is_terminal() {
             return Err(ReservationError::Terminal);
         }
@@ -197,6 +211,7 @@ impl ActivationReservationBook {
         if slot.reservation.is_some() {
             return Err(ReservationError::Busy);
         }
+        authority.block(plugin_id, ShareRevocation::Reservation);
         if let Some(lease) = slot.speech_lease.take() { lease.revoke(); }
         let phase = Arc::new(AtomicU8::new(RESERVED));
         slot.reservation = Some((id, Arc::clone(&phase)));
@@ -247,15 +262,17 @@ impl ActivationReservationBook {
         plugin_id: &str,
         bundle: Arc<ActivationBundle>,
     ) -> Result<(), ReservationError> {
-        let mut state = self.state.lock().map_err(|_| {
-            self.terminal.store(true, Ordering::Release);
-            ReservationError::Unavailable
-        })?;
+        let mut authority = self.share_authority.write();
+        let mut state = self.lock_state(&mut authority)?;
+        if self.is_terminal() {
+            return Err(ReservationError::Terminal);
+        }
         let slot = state.slots.entry(plugin_id.to_owned()).or_default();
         if slot.reservation.is_some() || slot.bundle.is_some() {
             return Err(ReservationError::Busy);
         }
         slot.bundle = Some(bundle);
+        authority.available(plugin_id);
         Ok(())
     }
 
@@ -348,10 +365,11 @@ impl ActivationReservation {
         if self.phase.load(Ordering::Acquire) != DURABLE {
             return Err(ReservationError::Unavailable);
         }
-        let mut state = self.book.state.lock().map_err(|_| {
-            self.book.terminal.store(true, Ordering::Release);
-            ReservationError::Unavailable
-        })?;
+        let mut authority = self.book.share_authority.write();
+        let mut state = self.book.lock_state(&mut authority)?;
+        if self.book.is_terminal() {
+            return Err(ReservationError::Terminal);
+        }
         let slot = state
             .slots
             .get_mut(&self.plugin_id)
@@ -366,6 +384,7 @@ impl ActivationReservation {
         slot.bundle = bundle;
         self.phase.store(PUBLISHED, Ordering::Release);
         slot.reservation = None;
+        authority.available(&self.plugin_id);
         Ok(())
     }
 }
@@ -373,16 +392,28 @@ impl ActivationReservation {
 impl Drop for ActivationReservation {
     fn drop(&mut self) {
         let phase = self.phase.load(Ordering::Acquire);
-        if matches!(phase, COMMITTING | DURABLE) {
-            self.book.terminal.store(true, Ordering::Release);
-            self.book.revoke_speech(&self.plugin_id);
+        if phase == PUBLISHED {
             return;
         }
-        let Ok(mut state) = self.book.state.lock() else {
-            self.book.terminal.store(true, Ordering::Release);
-            self.book.revoke_speech(&self.plugin_id);
-            return;
+        let mut authority = self.book.share_authority.write();
+        let mut state = match self.book.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                authority.terminate();
+                self.book.terminal.store(true, Ordering::Release);
+                poisoned.into_inner()
+            }
         };
+        if matches!(phase, COMMITTING | DURABLE) {
+            authority.terminate();
+            self.book.terminal.store(true, Ordering::Release);
+            for slot in state.slots.values_mut() {
+                if let Some(lease) = slot.speech_lease.take() {
+                    lease.revoke();
+                }
+            }
+            return;
+        }
         if let Some(slot) = state.slots.get_mut(&self.plugin_id) {
             if slot
                 .reservation
@@ -390,8 +421,15 @@ impl Drop for ActivationReservation {
                 .is_some_and(|(id, current)| *id == self.id && Arc::ptr_eq(current, &self.phase))
             {
                 slot.reservation = None;
+                authority.available(&self.plugin_id);
             }
         }
+    }
+}
+
+impl Drop for ActivationReservationBook {
+    fn drop(&mut self) {
+        self.share_authority.write().terminate();
     }
 }
 
