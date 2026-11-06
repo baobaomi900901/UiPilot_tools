@@ -24,6 +24,21 @@
 
 用户可在「设置 → 权限」按能力分类调整插件授权（包括网络），因此插件安装成功不代表权限始终有效。调用能力时应处理权限不足；关闭权限会使相关旧请求或会话失效，重新开启后需要发起新的操作。普通重载、更新和重启会保留仍然申报的权限的关闭状态；新增权限仍需安装确认。撤销权限不会删除插件数据或已有剪贴板历史。
 
+## Windows 与 macOS 兼容性
+
+插件面向公开 SDK 编写，系统操作由宿主执行。例如结果使用 `defaultAction: { type: "copyText", text }`，宿主在用户执行结果并通过 `clipboard.write` 授权检查后复制文本。共同能力在两端应使用相同的命令、参数、结果格式、授权语义和失败行为。剪贴板实现、原生授权对话框和快捷键显示可以随系统变化。
+
+| 插件需要的能力 | Windows v1 | macOS 0.19.0 内测包 | 验收用例 |
+| --- | --- | --- | --- |
+| 主结果、普通设置、插件存储 | 已实现 | 插件宿主待开放 | `demo-settings` 改设置、升级并重启；`demo-multi` 多命令 |
+| 执行结果后复制 | 支持 `clipboard.write` | 基础声明可静态校验，实际复制待验证 | `demo-return` 允许和撤权 |
+| 内嵌 Panel、独立 Window | 基础界面及扩展受版本和权限约束 | 基础声明可静态校验，两种界面的隔离与焦点需分别实测 | Panel 用 `demo-panel`，Window 用 `note`；前者原包在 Mac 用作拒绝样例，双平台 Panel 的正向验证需要另行准备双平台开发候选 |
+| 受控 HTTPS、凭据、选区、粘贴、通知等 | 按相应能力合同和最低版本声明 | 当前 v1 实现限 Windows，逐项移植后开放 | 按各服务合同验证允许和拒绝路径 |
+
+1. 按插件的全部必需能力选择 `supportedPlatforms` 和 `minimumHostVersion`。v1 按整个包校验；使用限 Windows 的能力时，即使代码能在 Mac 上避开该调用，也应声明仅 Windows。v1 没有供插件枚举全部宿主能力的通用接口。
+2. 对目标为双平台的同一个归档，分别运行 `uipilot-plugin validate <包路径> --platform windows` 和 `uipilot-plugin validate <包路径> --platform macos`。这一步验证声明与资源。当前 Mac 内测宿主尚未执行公开插件。
+3. 开放相应能力后，在两个生产宿主内安装同一哈希的包，记录主要操作、结果与授权拒绝或撤销时的行为。API 合同以 [v1 规范](./public-plugin-v1.md)为准；实机覆盖按[移植验收计划](../superpowers/plans/2026-11-06-macos-port-steps.md#step-9)登记。
+
 ## 1. 选择插件类型
 
 | 需求 | `activationMode` | `outputMode` | 权限 | 参考 Demo |

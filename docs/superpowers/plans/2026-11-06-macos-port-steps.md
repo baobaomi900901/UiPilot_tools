@@ -129,7 +129,7 @@
 **Files:** `src-tauri/src/{public_plugins.rs,plugins.rs,plugin_panel.rs,plugin_window.rs,credentials/}`、`src-tauri/src/public_plugins/{package.rs,manifest.rs,runtime.rs,secrets.rs,webview_audio_guard.rs}`、插件 capabilities、`packages/plugin-cli/`、`docs/plugin-sdk/` 与授权示例。
 **Dependencies:** Tasks 7、8、10；核准来源、Keychain 与能力规格。参考 [开发指南 §3、4、5–7、10–12](../../plugin-sdk/public-plugin-developer-guide.md) 及 [UI 规范](../../ui-guidelines.md)；以批准的 SDK v1/schema/types 为准。
 
-- [ ] **9.1 审核装载边界。** 针对每种 manifest 权限记录 Task 8/10 真实可用性。校验安装、升级、禁用/重启恢复 与 `PublicPluginHost`、`PluginInvocationEnvironment` 的平台，未验证能力在权限读取前拒绝。旧 PluginManager 单独演练；不能证明隔离就保持关闭。升级增加权限应重新授权；安装失败保留原版本/原授权。
+- [ ] **9.1 审核装载边界。** 逐项维护[双端能力表](../../plugin-sdk/public-plugin-developer-guide.md#windows-与-macos-兼容性)。共同能力复用公开 SDK 的请求/响应、错误、权限和生命周期合同，原生实现由各端宿主负责；共用的行为用同一组输入、授权/撤权和预期结果对两端验收。 针对每种 manifest 权限记录 Task 8/10 真实可用性。校验安装、升级、禁用/重启恢复 与 `PublicPluginHost`、`PluginInvocationEnvironment` 的平台，未验证能力在权限读取前拒绝。旧 PluginManager 单独演练；不能证明隔离就保持关闭。升级增加权限应重新授权；安装失败保留原版本/原授权。
 - [ ] **9.2 先验证隐藏 runtime。** mainResult 也需惰性创建 WKWebView。安装来源、导航/下载边界 → 原生静音 → 注册 unmute → 读回静音 → 复核 generation → 导航受信包入口 → 第一条包指令。为各导航前步骤注入失败，要求零包指令、撤销 generation/拒绝 RPC、销毁实例。成功后触发 unmute，同样先撤销权限再销毁；旧回调晚于同标签新实例时只能指向旧 generation。生产 WKWebView 不能证明顺序就继续关闭 mainResult。
 - [ ] **9.3 将宿主凭据与插件秘密隔离。** 分别接入 credentials/ 与 public_plugins/secrets.rs 的 Keychain 后端，按 approved 命名与所有者检查。测试创建/读取/更新/删除、Keychain 锁定、写入失败、撤权和插件冒用 ID；验证未授权请求不触及 Keychain，失败保留旧记录、状态不报成功、日志/JSON 不含测试秘密。
 - [ ] **9.4 分别开放可见界面。** 仅在 9.2 通过后，对 Panel 和 Window 各运行生产 origin、导航/下载/音频边界、销毁重建、崩溃恢复、旧 RPC 重放与跨插件访问。新实例只接受自己的 RPC；达不到边界的 surface 继续关闭。用匹配权限的 tracked reference 验证 host/CLI/schema/types 一致（例如 demo-return 声明 clipboard.write，须先取得 Task 10 对应证据）。对 Windows-only 示例仍要求 Mac 校验拒绝。

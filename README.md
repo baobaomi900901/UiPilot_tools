@@ -4,7 +4,7 @@ Windows x64 启动器与本地公开插件宿主（当前版本 0.19.0）。宿�
 
 ## Apple Silicon 开发
 
-Mac 移植在开发中。构建入口支持原生 arm64，首版目标是通过菜单栏或全局快捷键唤起、搜索并打开应用。候选最低系统为 macOS 15.7.4，当前进度可在[逐步实施与验收](docs/superpowers/plans/2026-11-06-macos-port-steps.md)查看。
+Apple Silicon 内测包已在 M1 Pro / macOS 15.7.4 上验证从 DMG 安装、快捷键唤起与输入；核心启动器已验证应用搜索、启动和激活。按本轮安排跳过更高系统和更新芯片的实机测试。Windows 保留公开插件宿主，Mac 内测包目前只开放核心启动器。详见[设备验收记录](docs/releases/2026-11-06-desktop-port-device-checks.md)和[插件兼容性说明](docs/plugin-sdk/public-plugin-developer-guide.md#windows-与-macos-兼容性)。
 
 在 arm64 的 Node 22 环境运行 `npm ci`，再运行 `npm run dev` 预览前端，或用 `npm run build` 检查 TypeScript 并构建页面。Mac 原生入口为 `npm run tauri -- dev`，要求 aarch64-apple-darwin Rust 1.96.1 和 macOS SDK。Mac 核心宿主与前端已可一起打包。内部测试包使用本机临时签名：
 
@@ -34,7 +34,7 @@ Windows 下安装 Python 3.10+ 后，在终端运行 **.\Pack.cmd**（也可双�
 
 ## 原生 CI 验证
 
-[Desktop port verification](.github/workflows/desktop-port.yml) 由维护者手动触发。Mac runner 需要 `self-hosted, macOS, ARM64, uipilot-build` 标签、原生 Node 22、仓库指定的 Rust 和 macOS SDK。Windows runner 需要 `self-hosted, Windows, X64, uipilot-provider` 标签、Node 22、MSVC/Rust、NSIS 与现有 Windows 构建依赖，另需备妥独立 Provider 源码（通过 `UIPILOT_RUST_UIA_ROOT` 指定，或使用既有位置）。两个 runner 均需能取得锁定依赖。工作流构建本地测试包并检查，不发布。真实安装、窗口焦点、较新芯片与最低系统的验收须在独立测试设备记录。
+[Desktop port verification](.github/workflows/desktop-port.yml) 由维护者手动触发。Mac runner 需要 `self-hosted, macOS, ARM64, uipilot-build` 标签、原生 Node 22、仓库指定的 Rust 和 macOS SDK。Windows runner 需要 `self-hosted, Windows, X64, uipilot-provider` 标签、Node 22、MSVC/Rust、NSIS 与现有 Windows 构建依赖，另需备妥独立 Provider 源码（通过 `UIPILOT_RUST_UIA_ROOT` 指定，或使用既有位置）。两个 runner 均需能取得锁定依赖。工作流构建本地测试包并检查，不发布。本轮实机结果按 M1 最低系统与 Windows x64 分列记录。
 
 ## 验证
 
