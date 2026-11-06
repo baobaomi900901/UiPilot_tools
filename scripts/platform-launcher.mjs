@@ -38,6 +38,10 @@ function macTauriArguments(args, env, rustHost) {
 export function getLaunchCommand(entry, args, { platform, arch, env, rustHost }) {
   if (entry !== 'tauri' && entry !== 'dev') throw new Error('Unknown launcher entry: ' + entry);
   if (platform === 'win32') {
+    // Pass Cargo's literal "--" through to the managed build without PowerShell parameter binding.
+    if (entry === 'tauri' && ['build', 'bundle'].includes(args[0])) {
+      return { file: 'python', args: ['scripts/provider_build.py', 'build-session', '--', ...args], env };
+    }
     const script = entry === 'dev' ? 'dev-with-everything' : 'tauri';
     return { file: 'powershell.exe', args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
       'scripts/' + script + '.ps1', ...args], env };

@@ -12,6 +12,8 @@
 
 此 DMG 为内部 ad-hoc 签名候选。M1 Pro / macOS 15.7.4（24G517）已从单独的候选 .app 验过唤起、搜索、启动、激活、隐藏和退出。最低系统设备的 DMG 安装、升级等未测项目请单独补记。[已有记录](../superpowers/plans/2026-11-06-macos-port.md)
 
+2026-11-06，测试者在 M1 Pro（arm64，macOS 15.7.4，24G517）上对手动传输的候选 DMG 运行预检。SHA-256 与上表一致，脚本报告 `Preflight passed`。本次覆盖最低系统设备的包校验，从“应用程序”启动的结果待回传。
+
 ## 较新 Mac
 
 较新 Mac 实机行不需要安装 Node、Rust 或 Xcode。
@@ -23,6 +25,10 @@
 5. **覆盖升级单列。** 需要同一产品标识的、可核验的不同旧版本 .app。先记录旧包版本/哈希，设置非默认主题或组合键并退出，换入固定 DMG 内的候选，再检查数据和快捷键。若只有这一版，记录“缺旧版，升级待验”。重装同一文件仅记为同版本替换。最后退出并卸载测试副本，核对常驻进程退出、菜单图标消失、组合键释放。
 
 ## Windows x64
+
+2026-11-06，测试者在原生 Windows x64 的 VS x64 开发者环境中复检通过。候选源码、Everything 及打包输入通过，MSVC 编译器、链接器和 Windows SDK 工具均已找到。独立 Provider 为 `0bb397e0f9ea0caf1a05d25193f44a364c8de5dc`。NSIS 构建、安装实测和 WebView2 启动验证待进行。
+
+同日，固定源码包 `a79f612` 已完成 npm 安装和 Cargo 依赖下载。首次打包在 `tauri.ps1` 接收 `build` 参数时报告 `PositionalParameterNotFound`。使用该源码包时，从源码根目录运行 `python scripts/provider_build.py build-session -- build -- --locked` 执行下方第 3 步的打包命令；此入口会建立同一受管构建会话并执行原有钩子。
 
 仅做安装实测时，直接使用 Windows 构建者交付的 NSIS 与哈希，从第 4 步开始；测试机无需安装 Rust、Node 或独立 Provider 源码。
 

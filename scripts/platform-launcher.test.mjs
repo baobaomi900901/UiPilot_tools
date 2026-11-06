@@ -13,13 +13,23 @@ const target = 'aarch64-apple-darwin';
 const settings = { platform: 'darwin', arch: 'arm64', env: {}, rustHost: target };
 const run = (args, overrides) => getLaunchCommand('tauri', args, { ...settings, ...overrides });
 
-test('npm dispatch retains Windows PowerShell wrappers and literal arguments', () => {
+test('npm dispatch retains Windows PowerShell development wrappers and literal arguments', () => {
   for (const [entry, script] of [['tauri', 'tauri'], ['dev', 'dev-with-everything']]) {
     assert.match(read('package.json').scripts[entry], /platform-launcher\.mjs/);
     const command = getLaunchCommand(entry, ['dev', '--config', 'a b.json'], { platform: 'win32' });
     assert.equal(command.file, 'powershell.exe');
     assert.deepEqual(command.args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
       'scripts/' + script + '.ps1', 'dev', '--config', 'a b.json']);
+  }
+});
+
+test('Windows packaging enters the managed Provider session with literal Tauri and Cargo arguments', () => {
+  for (const verb of ['build', 'bundle']) {
+    const args = [verb, '--config', 'path with spaces.json', '--', '--locked'];
+    const command = getLaunchCommand('tauri', args, { platform: 'win32', env: process.env });
+    assert.equal(command.file, 'python');
+    assert.deepEqual(command.args, ['scripts/provider_build.py', 'build-session', '--', ...args]);
+    assert.equal(command.env, process.env);
   }
 });
 
