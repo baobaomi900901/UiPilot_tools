@@ -64,6 +64,8 @@ Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 
 
 ### Task 4: Pending Panel lifecycle and commit serialization
 
+Execute this task through the sequential [Panel lifecycle subplan](2026-11-06-plugin-sharing-lifecycle.md), with independent review after 4A, 4B and 4C, and a combined Task 4 review after 4D. The following original requirements remain the aggregate acceptance gate.
+
 **Files:** `plugin_panel.rs` and focused submodules, `plugin_share.rs`, manager/controller lifecycle authorization seams, mock native adapter tests.
 
 **Dependencies:** Task 3; design sections 6.2–6.5, 7; host integration map lock-order/lifecycle sections.
