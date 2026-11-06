@@ -1,3 +1,4 @@
+import { settingsTabAvailable } from './host-capabilities'
 import { BuiltinFeatureDetail } from './builtin-feature-panel'
 import {
   App,
@@ -377,7 +378,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     return core.setHotkeyRecordingPhase(phase)
   }, [core])
   useEffect(() => {
-    if (snapshot.view !== 'settings') return
+    if (snapshot.view !== 'settings' || core.capabilities.platform !== 'windows') return
     const onKeyDown = (event: KeyboardEvent) => {
       if (operationsMenu.current?.isOpen || hotkeyRecordingActive.current || !isWindowPinShortcut(event)) return
       event.preventDefault()
@@ -2037,6 +2038,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           <Form component="div" layout="vertical" className="settings-basic-form">
             <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
               <HotkeyRecorderInput
+                allowDoubleTap={core.capabilities.doubleTap}
+                platform={core.capabilities.platform}
                 onCommit={core.saveHotkeyCanonical}
                 onRecordingPhase={handleHotkeyRecordingPhase}
                 value={settings.hotkey.value}
@@ -2045,41 +2048,43 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 disabled={locked}
               />
             </Form.Item>
-            <Form.Item label="截图快捷键" htmlFor="settings-screenshot-hotkey" help={settings.screenshotHotkeyStatus === 'unavailable' ? '快捷键不可用，请重新录制或清除后重试。' : settings.screenshotHotkeyStatus === 'active' ? '已启用' : '未设置'}>
-              <HotkeyRecorderInput
-                label="截图快捷键"
-                id="settings-screenshot-hotkey"
-                name="settings-screenshot-hotkey"
-                allowDoubleTap={false}
-                allowSameValue={settings.screenshotHotkeyStatus === 'unavailable'}
-                value={settings.screenshotHotkey ?? ''}
-                disabled={locked}
-                onCommit={core.saveScreenshotHotkey}
-                onRecordingPhase={handleHotkeyRecordingPhase}
-              />
-              <Button aria-label="清除截图快捷键" disabled={locked || settings.screenshotHotkey === null} onClick={() => void core.saveScreenshotHotkey(null)}>清除</Button>
-            </Form.Item>
-            <Form.Item label="截图默认位置" htmlFor="settings-screenshot-save-directory">
-              <Input
-                id="settings-screenshot-save-directory"
-                aria-label="截图默认位置"
-                readOnly
-                value={settings.screenshotSaveDirectoryPath ?? ''}
-                title={settings.screenshotSaveDirectoryPath ?? undefined}
-                placeholder="保存目录不可用"
-              />
-              <div className="settings-screenshot-directory-actions">
-                <Button disabled={locked} loading={settings.operation === 'screenshotDirectory'} onClick={() => void core.selectScreenshotSaveDirectory()}>选择文件夹</Button>
-                <Button disabled={locked || settings.screenshotSaveDirectory === null} onClick={() => void core.restoreScreenshotSaveDirectory()}>恢复桌面</Button>
-              </div>
-            </Form.Item>
-            <Checkbox
+            {core.capabilities.screenshot && <>
+              <Form.Item label="截图快捷键" htmlFor="settings-screenshot-hotkey" help={settings.screenshotHotkeyStatus === 'unavailable' ? '快捷键不可用，请重新录制或清除后重试。' : settings.screenshotHotkeyStatus === 'active' ? '已启用' : '未设置'}>
+                <HotkeyRecorderInput
+                  label="截图快捷键"
+                  id="settings-screenshot-hotkey"
+                  name="settings-screenshot-hotkey"
+                  allowDoubleTap={false}
+                  allowSameValue={settings.screenshotHotkeyStatus === 'unavailable'}
+                  value={settings.screenshotHotkey ?? ''}
+                  disabled={locked}
+                  onCommit={core.saveScreenshotHotkey}
+                  onRecordingPhase={handleHotkeyRecordingPhase}
+                />
+                <Button aria-label="清除截图快捷键" disabled={locked || settings.screenshotHotkey === null} onClick={() => void core.saveScreenshotHotkey(null)}>清除</Button>
+              </Form.Item>
+              <Form.Item label="截图默认位置" htmlFor="settings-screenshot-save-directory">
+                <Input
+                  id="settings-screenshot-save-directory"
+                  aria-label="截图默认位置"
+                  readOnly
+                  value={settings.screenshotSaveDirectoryPath ?? ''}
+                  title={settings.screenshotSaveDirectoryPath ?? undefined}
+                  placeholder="保存目录不可用"
+                />
+                <div className="settings-screenshot-directory-actions">
+                  <Button disabled={locked} loading={settings.operation === 'screenshotDirectory'} onClick={() => void core.selectScreenshotSaveDirectory()}>选择文件夹</Button>
+                  <Button disabled={locked || settings.screenshotSaveDirectory === null} onClick={() => void core.restoreScreenshotSaveDirectory()}>恢复桌面</Button>
+                </div>
+              </Form.Item>
+            </>}
+            {core.capabilities.autostart && <Checkbox
               checked={settings.autostart}
               disabled={locked}
               onChange={(event) => core.setAutostart(event.target.checked)}
             >
               开机启动
-            </Checkbox>
+            </Checkbox>}
             <Form.Item label="风格">
               <Select
                 aria-label="风格"
@@ -2089,7 +2094,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 onChange={(value: ThemePreference) => core.setThemePreference(value)}
               />
             </Form.Item>
-            <Form.Item label="搜索引擎">
+            {core.capabilities.builtinFeatures && <Form.Item label="搜索引擎">
               <Select
                 aria-label="搜索引擎"
                 value={settings.webSearchEngine}
@@ -2097,9 +2102,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 options={webSearchEngineOptions}
                 onChange={(value: WebSearchEngine) => core.setWebSearchEngine(value)}
               />
-            </Form.Item>
+            </Form.Item>}
             <div className="settings-actions">
-              <Popconfirm
+              {core.capabilities.platform === 'windows' && <Popconfirm
                 title="恢复初始化设置？"
                 description="快捷键将恢复为 Shift+Space，关闭开机启动，将风格恢复为跟随系统，并将搜索引擎恢复为 Bing。"
                 okText="恢复"
@@ -2110,7 +2115,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 <Button danger disabled={locked} loading={settings.operation === 'save'}>
                   恢复初始化
                 </Button>
-              </Popconfirm>
+              </Popconfirm>}
               {settings.loadStatus === 'error' ? (
                 <Button
                   disabled={busy}
@@ -2384,7 +2389,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             </Tooltip>
             <h1>设置</h1>
           </div>
-          <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
+          {core.capabilities.platform === 'windows' && <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
             <Button
               aria-label={pinError ? '重试置顶设置' : appliedPin ? '取消置顶' : '置顶设置窗口'}
               aria-pressed={appliedPin}
@@ -2395,7 +2400,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               size="small"
               onClick={() => pinError ? setPinAttempt((attempt) => attempt + 1) : setSettingsPin((pinned) => !pinned)}
             />
-          </Tooltip>
+          </Tooltip>}
         </header>
       </div>
       <div
@@ -2448,7 +2453,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 </OverlayScrollbarsComponent>
               ),
             },
-          ]}
+          ].filter(tab => settingsTabAvailable(core.capabilities, tab.key))}
           tabPlacement="start"
           onChange={(key) => {
             if (key !== 'general' && key !== 'messages' && key !== 'plugins' && key !== 'permissions' && key !== 'credentials') return

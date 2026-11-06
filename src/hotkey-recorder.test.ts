@@ -8,6 +8,11 @@ import {
 } from './hotkey-recorder'
 
 describe('formatHotkeyDisplay', () => {
+  it('shows Mac modifier names without changing canonical settings', () => {
+    expect(formatHotkeyDisplay('Meta+Alt+Space', 'macos')).toBe('Command + Option + Space')
+    expect(formatHotkeyDisplay('Meta+Alt+Space', 'windows')).toBe('Meta + Alt + Space')
+  })
+
   it('maps double-tap canonical values', () => {
     expect(formatHotkeyDisplay('DoubleCtrl')).toBe('双击 Ctrl')
     expect(formatHotkeyDisplay('DoubleAlt')).toBe('双击 Alt')

@@ -9,6 +9,7 @@ import { createRoot } from 'react-dom/client'
 
 import { createFindCore } from './find-core'
 import { FindView } from './find-view'
+import { parseHostCapabilities, type HostCapabilities } from './host-capabilities'
 import { createLauncherCore } from './launcher-core'
 import { HOTKEY_RECORDING_CURRENT_DOM_EVENT, LauncherView } from './launcher-view'
 import { createPluginWindowCore } from './plugin-window-core'
@@ -275,94 +276,127 @@ export function currentWindowLabel(): string {
 const host = document.querySelector<HTMLElement>('#app')
 if (!host) throw new Error('Missing application root')
 
-const label = currentWindowLabel()
-if (label === 'main') {
-const core = createLauncherCore(client)
-const panelFocusListenerReady = core.preparePanelHostInputFocusListener()
-let settleReady!: (result: 'ready' | 'failed') => void
-const viewReady = new Promise<'ready' | 'failed'>((resolve) => {
-  settleReady = resolve
-})
-let readySettled = false
-const onReady = (result: 'ready' | 'failed') => {
-  if (readySettled) return
-  readySettled = true
-  settleReady(result)
-}
-let mountFailed = false
-let unlistenHotkeyRecordingCurrent: (() => void) | undefined
-const failMount = () => {
-  if (mountFailed) return
-  mountFailed = true
-  unlistenHotkeyRecordingCurrent?.()
-  unlistenHotkeyRecordingCurrent = undefined
-  onReady('failed')
-  core.failInitialization()
-  core.destroy()
-  const status = document.createElement('div')
-  status.className = 'status-region'
-  status.setAttribute('role', 'status')
-  status.setAttribute('aria-live', 'polite')
-  status.setAttribute('aria-atomic', 'true')
-  status.textContent = core.getSnapshot().status
-  host.replaceChildren(status)
-}
-const root = createRoot(host, { onUncaughtError: failMount })
-
-let tornDown = false
-const teardown = () => {
-  if (tornDown) return
-  tornDown = true
-  window.removeEventListener('pagehide', teardown)
-  unlistenHotkeyRecordingCurrent?.()
-  unlistenHotkeyRecordingCurrent = undefined
-  core.destroy()
-  root.unmount()
-}
-window.addEventListener('pagehide', teardown)
-
-try {
-  root.render(createElement(LauncherView, {
-    core, onReady,
-    setSettingsPinned: (active: boolean, pinned: boolean) => invoke<void>('set_settings_pinned', { active, pinned }),
-  }))
-} catch {
-  failMount()
-}
-
-void (async () => {
-  const result = await viewReady
-  if (tornDown) return
-  if (result === 'failed') {
+function mountMain(host: HTMLElement, capabilities: HostCapabilities) {
+  const core = createLauncherCore(client, undefined, capabilities)
+  const panelFocusListenerReady = core.preparePanelHostInputFocusListener()
+  let settleReady!: (result: 'ready' | 'failed') => void
+  const viewReady = new Promise<'ready' | 'failed'>((resolve) => {
+    settleReady = resolve
+  })
+  let readySettled = false
+  const onReady = (result: 'ready' | 'failed') => {
+    if (readySettled) return
+    readySettled = true
+    settleReady(result)
+  }
+  let mountFailed = false
+  let unlistenHotkeyRecordingCurrent: (() => void) | undefined
+  const failMount = () => {
+    if (mountFailed) return
+    mountFailed = true
+    unlistenHotkeyRecordingCurrent?.()
+    unlistenHotkeyRecordingCurrent = undefined
+    onReady('failed')
     core.failInitialization()
     core.destroy()
-    return
+    const status = document.createElement('div')
+    status.className = 'status-region'
+    status.setAttribute('role', 'status')
+    status.setAttribute('aria-live', 'polite')
+    status.setAttribute('aria-atomic', 'true')
+    status.textContent = core.getSnapshot().status
+    host.replaceChildren(status)
   }
-  if (!await panelFocusListenerReady) {
-    core.failInitialization()
+  const root = createRoot(host, { onUncaughtError: failMount })
+
+  let tornDown = false
+  const teardown = () => {
+    if (tornDown) return
+    tornDown = true
+    window.removeEventListener('pagehide', teardown)
+    unlistenHotkeyRecordingCurrent?.()
+    unlistenHotkeyRecordingCurrent = undefined
     core.destroy()
-    return
+    root.unmount()
   }
+  window.addEventListener('pagehide', teardown)
+
   try {
-    const recordingUnlisten = await listen('hotkey-recording://current', (event) => {
-      window.dispatchEvent(new CustomEvent(HOTKEY_RECORDING_CURRENT_DOM_EVENT, { detail: event.payload }))
-    })
-    let entryUnlisten: (() => void) | undefined
-    try { entryUnlisten = await listen('command-hotkey://entry', (event) => core.commandHotkeyEntry(event.payload)) }
-    catch (error) { recordingUnlisten(); throw error }
-    const unlisten = () => { recordingUnlisten(); entryUnlisten?.() }
-    if (tornDown) {
-      unlisten()
+    root.render(createElement(LauncherView, {
+      core, onReady,
+      setSettingsPinned: capabilities.platform === 'windows'
+        ? (active: boolean, pinned: boolean) => invoke<void>('set_settings_pinned', { active, pinned })
+        : undefined,
+    }))
+  } catch {
+    failMount()
+  }
+
+  void (async () => {
+    const result = await viewReady
+    if (tornDown) return
+    if (result === 'failed') {
+      core.failInitialization()
+      core.destroy()
       return
     }
-    unlistenHotkeyRecordingCurrent = unlisten
-  } catch {
-    core.failInitialization()
-    core.destroy()
-    return
+    if (!await panelFocusListenerReady) {
+      core.failInitialization()
+      core.destroy()
+      return
+    }
+    if (tornDown) return
+    try {
+      const recordingUnlisten = await listen('hotkey-recording://current', (event) => {
+        window.dispatchEvent(new CustomEvent(HOTKEY_RECORDING_CURRENT_DOM_EVENT, { detail: event.payload }))
+      })
+      let entryUnlisten: (() => void) | undefined
+      try { if (capabilities.commandHotkeys) entryUnlisten = await listen('command-hotkey://entry', (event) => core.commandHotkeyEntry(event.payload)) }
+      catch (error) { recordingUnlisten(); throw error }
+      const unlisten = () => { recordingUnlisten(); entryUnlisten?.() }
+      if (tornDown) {
+        unlisten()
+        return
+      }
+      unlistenHotkeyRecordingCurrent = unlisten
+    } catch {
+      core.failInitialization()
+      core.destroy()
+      return
+    }
+    await core.start()
+  })()
+}
+
+function bootstrapMain(host: HTMLElement): void {
+  const lifetime = new AbortController()
+  window.addEventListener('pagehide', () => lifetime.abort(), { once: true, signal: lifetime.signal })
+  const load = async () => {
+    try {
+      const capabilities = parseHostCapabilities(await invoke<unknown>('get_host_capabilities'))
+      if (!capabilities) throw new Error('Unsupported capability snapshot')
+      if (lifetime.signal.aborted) return
+      host.replaceChildren()
+      mountMain(host, capabilities)
+      lifetime.abort()
+    } catch {
+      if (lifetime.signal.aborted) return
+      const status = document.createElement('div')
+      status.setAttribute('role', 'status')
+      status.textContent = '无法读取启动器功能。'
+      const retry = document.createElement('button')
+      retry.type = 'button'
+      retry.textContent = '重试'
+      retry.addEventListener('click', () => { retry.disabled = true; void load() }, { once: true, signal: lifetime.signal })
+      host.replaceChildren(status, retry)
+    }
   }
-  await core.start()
-})()
+  void load()
+}
+
+const label = currentWindowLabel()
+if (label === 'main') {
+  bootstrapMain(host)
 } else if (label === 'screenshot') {
   void (async () => {
     const [{createScreenshotClient}, {createScreenshotCore}, {ScreenshotView}] = await Promise.all([
