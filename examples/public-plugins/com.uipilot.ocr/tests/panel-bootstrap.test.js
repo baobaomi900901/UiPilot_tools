@@ -16,10 +16,9 @@ async function setup(t) {
  const json = await read('src-tauri/src/public_plugins/panel_action_json.js')
  const contextActions = (await read('src/context-actions-ui.js') + '\n' + await read('src/panel-context-actions.js')).replaceAll('export function', 'function')
  const env = { Object, TextEncoder, Error, TypeError, Promise, Reflect, Set, WeakSet, queueMicrotask, setTimeout, setInterval, clearInterval }
- const ipc = [], services = [], copies = [], completions = new Map(); let serial = 0, runtimeCallback, imageRevision = 0
+ const ipc = [], services = [], copies = [], completions = new Map(); let serial = 0, imageRevision = 0
  const runtimeDocument = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } }
  const runtimeWindow = { testModule: plugin, __TAURI_INTERNALS__: {
-  transformCallback(fn) { runtimeCallback = fn; return 1 },
   async invoke(command, args) {
    ipc.push({ side: 'runtime', command, args })
    if (command === 'plugin_baidu_ocr') { const job = deferred(); services.push({ ...job, args }); return job.promise }
@@ -36,7 +35,7 @@ async function setup(t) {
   completions.set(requestId, job)
   const context = { pluginId: manifest.pluginId, pluginGeneration: 1, requestId }
   const invocation = { apiVersion: 1, requestId, context: { platform: 'windows', theme: 'light', invokedAt: '2026-11-06T00:00:00Z' }, ...data }
-  void runtimeCallback({ payload: { context, kind, invocation } })
+  void runtimeWindow.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__({ context, kind, invocation })
   return job.promise
  }
  const panelSource = extract(await read('src-tauri/src/plugin_panel.rs'), 'PUBLIC_PANEL_BOOTSTRAP_TEMPLATE')

@@ -9216,14 +9216,15 @@ describe('real adapter and startup', () => {
       main = (await import('./main')) as unknown as { client: LauncherClient }
     })
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://shown', expect.any(Function)))
-    expect(tauriCapture.invoke).not.toHaveBeenCalled()
+    expect(tauriCapture.invoke).toHaveBeenCalledExactlyOnceWith('plugin_share_state')
     registration.resolve(unlisten)
     await vi.waitFor(() => expect(tauriCapture.listen).toHaveBeenCalledWith('launcher://hidden', expect.any(Function)))
     await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
-    expect(order.slice(0, 13)).toEqual([
+    expect(order.slice(0, 14)).toEqual([
       'uipilot-plugin-panel-focus-host-input',
       'hotkey-recording://current',
       'command-hotkey://entry',
+      'plugin_share_state',
       'launcher://shown',
       'launcher://hidden',
       'builtin-features://changed',
@@ -9359,7 +9360,12 @@ describe('real adapter and startup', () => {
       expect(tauriCapture.listen).toHaveBeenCalledOnce()
       expect(tauriCapture.listen).toHaveBeenCalledWith('uipilot-plugin-panel-focus-host-input', expect.any(Function))
       await vi.waitFor(() => expect(focusUnlisten).toHaveBeenCalledOnce())
-      expect(tauriCapture.invoke).not.toHaveBeenCalled()
+      // The mounted view may read share state before binding failure unmounts it.
+      // No settings load or mutation may run during this failed startup.
+      expect(tauriCapture.invoke.mock.calls).toEqual(
+        expect.arrayContaining(tauriCapture.invoke.mock.calls.map(() => ['plugin_share_state'])),
+      )
+      expect(tauriCapture.invoke.mock.calls.length).toBeLessThanOrEqual(1)
     } finally {
       HTMLInputElement.prototype.addEventListener = originalAdd
       await pagehide()

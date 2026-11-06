@@ -1,4 +1,4 @@
-import type { PluginSharePayload, PluginShareReceiveEvent, UiPilotPluginPanelApiV1 } from '../../../docs/plugin-sdk/uipilot-plugin-api-v1'
+import type { PluginSharePayload, PluginShareReceiveEvent, UiPilotPluginPanelApiV1 } from '../../../docs/plugin-sdk/uipilot-plugin-api-v1.js'
 declare const panel: UiPilotPluginPanelApiV1
 const payload: PluginSharePayload = { type: 'text/plain', text: ' edited\ntext ' }
 if (panel.share) {

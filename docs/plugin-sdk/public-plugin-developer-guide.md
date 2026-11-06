@@ -1294,3 +1294,24 @@ export async function onPanelAction(invocation, api) {
 新身份 `com.uipilot.ocr@1.0.0` 安装包为 `artifacts/ocr-delivery/com.uipilot.ocr-1.0.0.uipilot-plugin`。先使用 Host 0.21.0+，按正常流程安装并确认新权限和百度主机。宿主百度配置可继续用；旧 `com.uipilot.baidu-ocr` 的授权、收藏和快捷键不迁移，也不自动卸载。若只用新版，在设置中手动停用旧版，避免图片列表出现两个条目；保留历史旧包。
 
 自动测试使用合成图片、假服务/剪贴板，覆盖真实 Runtime、模型、DOM 与实际桥脚本；同时执行 SDK 类型检查、目录与归档校验。Light/Dark、真实粘贴、跨 WebView 焦点、百度服务和系统复制仍由用户手动验收，离线通过不能替代。本次不使用 Computer Use，不自动安装、授权或调用真实服务。详细字段、错误与生命周期见 API v1 的“Host 0.21.0：图片 OCR Panel”。
+
+## Host 0.22.0：单 Panel 文本分享
+
+当前 OCR 1.1.0 与翻译 1.5.0 要求 Host 0.22.0；旧版 OCR 包保持其历史 Host 门槛。新包及校验记录见 [分享交付记录](sharing-delivery-2026-11-06.md)。Manifest `share` 声明和精确边界见 [API v1](public-plugin-v1.md#host-0220-text-sharing)。分享无需新增权限，但仍要求当前 `ui.panel` 授权；接收后的业务服务使用插件原有授权。
+
+在首次 `onUpdate` 前注册接收者；来源也应在启动时注册。两种注册均返回 unsubscribe，退出时清理。能力可选，先检测 `panel.share`：
+
+```javascript
+const offSource = panel.share?.onSource(() => ready
+  ? { type: 'text/plain', text: editor.value }
+  : null)
+const offReceive = panel.share?.onReceive(event => {
+  editor.value = event.payload.text // 先同步接纳原文，不 trim
+  queueMicrotask(() => void translateCurrentDraft()) // 由插件决定；草稿插件省略此行
+  return { accepted: true } // 不能返回 Promise
+})
+```
+
+异步处理自行检查当前插件会话/草稿是否仍有效并捕获业务错误；接收 handler 不能等待 Runtime request。翻译在接收后立即处理一次，草稿插件可以只接纳到内存。来源取当前编辑文字快照；Ctrl+K → 分享后由宿主筛选接收者，不能在插件内自动选择或串联。超限显示不可选择原因，不截断；空白/非法 Unicode/NUL 被拒绝，文字不进入主查询或历史。
+
+选择前取消保留来源；选择后普通打开目标，主输入为空。目标加载、初始化或接收错误留在目标标签下；已接纳后的翻译错误由翻译面板保留原文并提供显式重试。不会返回 OCR、自动重发或恢复来源 DOM。主题更新不重做模型初始化/接收；隐藏、导航、退出、撤权使旧工作失效。测试用假服务覆盖重复接收、异步 handler 拒绝、目标失败、旧会话及“独立草稿零业务调用”，再用生产 CLI 校验、打包、归档校验与源文件字节对照。真实 WebView、焦点、供应商及系统复制仍需手动验收。

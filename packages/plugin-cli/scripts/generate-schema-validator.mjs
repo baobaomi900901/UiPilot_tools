@@ -34,12 +34,31 @@ function inlinePanelHostKeyDeclaration(value) {
   value.$defs.PublicPanelV1.properties.hostKeys.items = structuredClone(declaration)
 }
 
+function inlineShareReceiverConstraints(value) {
+  const properties = value?.$defs?.PublicShareReceiverV1?.properties
+  const title = properties?.title
+  const types = properties?.types
+  if (title?.type !== 'string' || title.minLength !== 1 || title.maxLength !== 80 ||
+      typeof title.pattern !== 'string' || JSON.stringify(types) !== '{"const":["text/plain"]}') {
+    throw new Error('share receiver Schema shape is invalid')
+  }
+  // Ajv emits runtime helpers for Unicode length and object/array const equality.
+  // Its Unicode regexp mode counts code points, including astral pairs; the
+  // negative lookahead anchors the absolute end even for a final line break.
+  delete title.minLength
+  delete title.maxLength
+  title.allOf = [{ pattern: '^[\\s\\S]{1,80}(?![\\s\\S])' }]
+  properties.types = { type: 'array', minItems: 1, maxItems: 1, items: { const: 'text/plain' } }
+}
+
 inlineNumericFormats(schema)
 inlinePanelHostKeyDeclaration(schema)
+inlineShareReceiverConstraints(schema)
 const ajv = new Ajv2020({
   strict: true,
   allErrors: true,
   allowUnionTypes: true,
+  unicodeRegExp: true,
   code: { esm: true, source: true, lines: true },
 })
 const validate = ajv.compile(schema)

@@ -10383,7 +10383,7 @@ mod tests {
         let open = source
             .split("async fn open_plugin_panel_impl(")
             .nth(1)
-            .and_then(|tail| tail.split("async fn submit_plugin_panel_impl").next())
+            .and_then(|tail| tail.split("fn prepare_panel_submission(").next())
             .unwrap();
         let mount = open.find("plugin_panel::mount(").unwrap();
         let focus = open.find("focus_main_window_content(").unwrap();

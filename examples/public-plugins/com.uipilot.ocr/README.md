@@ -2,11 +2,11 @@
 
 在主窗口面板中预览图片、识别并编辑文字，复制当前编辑后的全文。第一版使用主程序已配置的百度 OCR，布局和交互参考翻译插件。
 
-- 插件：`com.uipilot.ocr`，版本 `1.0.0`，默认命令 `/ocr`。
-- 要求：Windows、UiPilot `0.21.0+`；API/schema v1。
+- 插件：`com.uipilot.ocr`，版本 `1.1.0`，默认命令 `/ocr`。
+- 要求：Windows、UiPilot `0.22.0+`；API/schema v1。
 - 形态：`submit + panel`，声明 `image.ocr` 输入能力和 `panel.runtimeActions`。
 - 权限：`ui.panel`、`clipboard.write`、`network.https`、`credentials.baiduOcr`；网络主机为 `aip.baidubce.com`。
-- 安装包：`com.uipilot.ocr-1.0.0.uipilot-plugin`。
+- 安装包：`com.uipilot.ocr-1.1.0.uipilot-plugin`。
 
 ## 两种入口
 
@@ -19,6 +19,8 @@
 右侧文字可以编辑。点击复制按钮，或在空的主输入框中按一次 Enter，复制当前编辑后的完整文本。文本域内 Enter 正常换行；按住 Enter 不会连续复制。
 
 ## 面板操作
+
+识别成功后，Ctrl+K → 分享可把当前编辑全文交给宿主接收者选择器。选择翻译后进入翻译标签并立即翻译；选择前取消保留 OCR，选择后目标加载或翻译失败都在目标侧报错，不返回 OCR。来源无有效文字时禁用分享；翻译目标上限为 8192 UTF-8 字节，超限显示不可选择原因，不截断。
 
 - 左侧清除按钮移除图片和识别文字，仍留在面板中，之后可继续粘贴。
 - 右侧下方可选择 OCR 源，目前只有“百度 OCR”；重复选择同一源不会重新识别。
@@ -33,7 +35,7 @@
 
 ## 从百度 OCR 旧版升级
 
-`com.uipilot.ocr` 是新的插件身份。先使用 UiPilot `0.21.0+`，再按正常安装流程安装新包并确认权限；主程序中现有的百度 OCR 配置可以继续使用。
+`com.uipilot.ocr` 是新的插件身份。先使用 UiPilot `0.22.0+`，再按正常安装流程安装新包并确认权限；主程序中现有的百度 OCR 配置可以继续使用。
 
 旧版 `com.uipilot.baidu-ocr` 的授权、收藏和快捷键不会自动迁移，已安装的旧版也不会自动卸载。若只需新版，可在设置中手动停用旧版，避免图片列表同时出现两个条目。历史旧安装包保留。
 
@@ -51,8 +53,8 @@ node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipil
 打包时输出目录须已存在，输出文件名须未占用：
 
 ```powershell
-node packages/plugin-cli/dist/cli.mjs pack examples/public-plugins/com.uipilot.ocr/package --output artifacts/ocr-delivery/com.uipilot.ocr-1.0.0.uipilot-plugin --platform windows
-node packages/plugin-cli/dist/cli.mjs validate artifacts/ocr-delivery/com.uipilot.ocr-1.0.0.uipilot-plugin --platform windows
+node packages/plugin-cli/dist/cli.mjs pack examples/public-plugins/com.uipilot.ocr/package --output artifacts/sharing-delivery/com.uipilot.ocr-1.1.0.uipilot-plugin --platform windows
+node packages/plugin-cli/dist/cli.mjs validate artifacts/sharing-delivery/com.uipilot.ocr-1.1.0.uipilot-plugin --platform windows
 ```
 
 自动测试使用合成图片、假服务和假剪贴板，覆盖 Runtime、面板状态与实际桥接代码。原生验收由用户手动进行：两种入口、真实图片粘贴、百度识别、编辑后复制、快速换图、清除、关闭重开、键盘与焦点，以及 Light/Dark 显示。离线通过不代表这些原生场景已经验收；本任务不使用 Computer Use。

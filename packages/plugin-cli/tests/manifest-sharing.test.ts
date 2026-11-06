@@ -1,4 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { readFile } from 'node:fs/promises'
+import { build } from 'esbuild'
+import { Ajv2020 } from 'ajv/dist/2020.js'
+import validateSchema from '../src/generated/manifest-validator.mjs'
 import { normalizedCommands, validateManifest } from '../src/manifest.js'
 
 function receiver() {
@@ -20,6 +24,34 @@ function validate(value: unknown, hostVersion?: readonly [number, number, number
 }
 
 describe('sharing manifest v1', () => {
+  it('bundles the standalone validator without Ajv runtime dependencies', async () => {
+    const result = await build({
+      entryPoints: ['src/generated/manifest-validator.mjs'], bundle: true,
+      platform: 'node', format: 'esm', write: false, metafile: true,
+    })
+    expect(Object.keys(result.metafile!.inputs).filter(path => /node_modules[/\\]ajv[/\\]/u.test(path))).toEqual([])
+  })
+
+  it('keeps canonical Unicode title length and exact types-array semantics', async () => {
+    const schema = JSON.parse(await readFile(new URL('../schema/uipilot-plugin-v1.schema.json', import.meta.url), 'utf8'))
+    const properties = schema.$defs.PublicShareReceiverV1.properties
+    const canonical = new Ajv2020({ strict: true }).compile({
+      type: 'object', required: ['title', 'types'],
+      properties: { title: properties.title, types: properties.types },
+    })
+    const titles = ['', 'a', '😀', '😀'.repeat(80), 'a'.repeat(79) + '😀', 'a'.repeat(80),
+      '😀'.repeat(81), 'a'.repeat(80) + '😀', 'e\u0301'.repeat(40), 'e\u0301'.repeat(40) + 'x',
+      ...['\n', '\r', '\u2028', '\u2029'].map(end => 'a'.repeat(80) + end),
+      '\ud800', '\udfff', 'a\0', '\u2028', '\u2029']
+    const typesCases = [['text/plain'], [], ['text/plain', 'text/plain'], ['text/plain', 'text/html'],
+      ['text/html', 'text/plain'], ['TEXT/PLAIN'], 'text/plain', null, {}, [null]]
+    for (const title of titles) for (const types of typesCases) {
+      const value = manifest()
+      Object.assign(value.share.receivers[0], { title, types })
+      expect(validateSchema(value), JSON.stringify({ title, types })).toBe(canonical({ title, types }))
+    }
+  })
+
   it.each(['source', 'receivers', 'both'])('accepts %s and keeps legacy routing identity internal', (kind) => {
     const value = manifest()
     if (kind === 'source') delete value.share.receivers
