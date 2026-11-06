@@ -17,7 +17,9 @@ node scripts/verify-macos-bundle.mjs
 
 ### 文件搜索预览
 
-内部 Apple Silicon 预览包可在主窗口输入 `/find 文件名` 并回车。文件行默认在 Finder 中选中，文件夹在 Finder 中打开；支持的普通文档另有「打开文件」。当前预览只显示公共字体目录和本机共享目录 `/Users/Shared` 中已被 Spotlight 索引且能复核访问权限的项目。正式目标是免配置搜索系统已索引、UiPilot 可访问的本地文件。该全系统范围仍待签名身份与系统隐私授权验收，常规构建继续关闭 Find。
+内部 Apple Silicon 文件搜索预览包可在主窗口输入 `/find 文件名` 并回车。默认搜索公共字体目录和本机共享目录 `/Users/Shared` 中已被 Spotlight 索引且允许读取的项目。要搜索本地「文稿」，点击 Find 里的「允许本次搜索文稿」，在系统窗口选中当前账户的「文稿」文件夹并确认。Find 会用原关键词重新搜索，包括文稿的子目录。点击「停止搜索文稿」可随时移出该范围，退出 UiPilot 后授权结束。
+
+选中文件行后按回车可在 Finder 中定位文件，选中文件夹则会打开它。支持的普通文档另有「打开文件」操作。正式目标是免配置搜索系统已索引、UiPilot 可访问的本地文件。全系统范围仍待签名身份与系统隐私授权验收，常规构建继续关闭 Find。
 
 如需构建受限范围的预览包，使用上方内部打包命令，在 `build` 后添加 `--features macos-find-preview`。发布状态与测试边界见[文件搜索设计](docs/superpowers/specs/2026-11-06-macos-file-search-design.md)。
 

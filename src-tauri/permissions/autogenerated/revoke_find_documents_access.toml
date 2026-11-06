@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-revoke-find-documents-access"
+description = "Enables the revoke_find_documents_access command without any pre-configured scope."
+commands.allow = ["revoke_find_documents_access"]
+
+[[permission]]
+identifier = "deny-revoke-find-documents-access"
+description = "Denies the revoke_find_documents_access command without any pre-configured scope."
+commands.deny = ["revoke_find_documents_access"]

@@ -5,6 +5,11 @@
 #[path = "file_search/extensions.rs"]
 mod extensions;
 use extensions::FileCategory;
+#[path = "macos_find_documents.rs"]
+mod documents;
+pub(crate) use documents::DocumentsGrant;
+#[cfg(all(feature = "macos-find-preview", not(feature = "macos-find-system-qa")))]
+pub(crate) use documents::documents_directory_url;
 #[cfg(feature = "macos-find-system-qa")]
 #[path = "macos_find_system_qa.rs"]
 mod system_qa;
@@ -154,6 +159,7 @@ fn check_resources(url: &NSURL) -> Result<(), FindError> {
 }
 
 pub(crate) struct IndexedLocalScope {
+    documents: Option<Arc<DocumentsGrant>>,
     roots: Vec<Arc<Root>>,
     #[cfg(feature = "macos-find-system-qa")]
     qa_home: Option<system_qa::LocalHome>,
@@ -161,16 +167,43 @@ pub(crate) struct IndexedLocalScope {
 
 impl IndexedLocalScope {
     pub(crate) fn for_host() -> Result<Self, FindError> {
+        Self::with_documents(None)
+    }
+
+    pub(crate) fn with_documents(grant: Option<Arc<DocumentsGrant>>) -> Result<Self, FindError> {
         if !cfg!(feature = "macos-find-preview") {
             return Err(FindError::Unavailable);
         }
         #[cfg(feature = "macos-find-system-qa")]
-        { system_qa::isolated_scope() }
+        {
+            let _ = grant;
+            system_qa::isolated_scope()
+        }
         #[cfg(not(feature = "macos-find-system-qa"))]
-        Self::bind(&[Path::new("/System/Library/Fonts"), Path::new("/Library/Fonts"), Path::new("/Users/Shared")])
+        Self::bind_with_documents(&[
+            Path::new("/System/Library/Fonts"), Path::new("/Library/Fonts"), Path::new("/Users/Shared"),
+        ], grant)
+    }
+
+    fn add_documents(&mut self, grant: Option<Arc<DocumentsGrant>>) {
+        if let Some(grant) = grant.filter(|grant| grant.is_active()) {
+            self.roots.push(Arc::clone(&grant.root));
+            self.documents = Some(grant);
+        }
+    }
+
+    fn recheck_documents(&self) -> Result<(), FindError> {
+        if self.documents.as_ref().is_some_and(|grant| !grant.is_active()) {
+            return Err(FindError::Stale);
+        }
+        Ok(())
     }
 
     fn bind(paths: &[&Path]) -> Result<Self, FindError> {
+        Self::bind_with_documents(paths, None)
+    }
+
+    fn bind_with_documents(paths: &[&Path], grant: Option<Arc<DocumentsGrant>>) -> Result<Self, FindError> {
         let mounts = Mounts::current()?;
         let mut roots = Vec::new();
         for &path in paths {
@@ -181,11 +214,14 @@ impl IndexedLocalScope {
                     #[cfg(feature = "macos-find-system-qa")] anchor: None }));
             }
         }
-        if roots.is_empty() { return Err(FindError::Unavailable); }
-        Ok(Self { roots, #[cfg(feature = "macos-find-system-qa")] qa_home: None })
+        let mut scope = Self { roots, documents: None, #[cfg(feature = "macos-find-system-qa")] qa_home: None };
+        scope.add_documents(grant);
+        if scope.roots.is_empty() { return Err(FindError::Unavailable); }
+        Ok(scope)
     }
 
     pub(crate) fn query_paths(&self) -> Result<Vec<PathBuf>, FindError> {
+        self.recheck_documents()?;
         let mounts = Mounts::current()?;
         let mut paths = Vec::new();
         #[cfg(feature = "macos-find-system-qa")]
@@ -231,7 +267,12 @@ impl IndexedLocalScope {
             return Err(FindError::Denied);
         }
         for root in &self.roots {
-            if path.starts_with(&root.path) { return Ok((root, path.to_owned())); }
+            if path.starts_with(&root.path) {
+                if self.documents.as_ref().is_some_and(|grant| Arc::ptr_eq(root, &grant.root) && grant.is_revoked()) {
+                    return Err(FindError::Stale);
+                }
+                return Ok((root, path.to_owned()));
+            }
             #[cfg(feature = "macos-find-system-qa")]
             if let Some(anchor) = &root.anchor {
                 if let Ok(suffix) = path.strip_prefix(&anchor.physical_root) {
@@ -387,6 +428,8 @@ fn authorize_row(scope: &IndexedLocalScope, path: PathBuf, category: FileCategor
 
 pub(crate) fn authorize_batch(scope: &IndexedLocalScope, candidates: Candidates, category: &str, cancel: &QueryCancellation) -> Result<AuthorizedBatch, FindError> {
     let category = FileCategory::parse_wire(category).ok_or(FindError::InvalidInput)?;
+    cancel.check().map_err(|_| FindError::Cancelled)?;
+    scope.recheck_documents()?;
     let mut rows = Vec::new();
     let mut partial = candidates.partial || candidates.paths.len() > 400;
     let mut seen = HashSet::new();
@@ -407,6 +450,7 @@ pub(crate) fn authorize_batch(scope: &IndexedLocalScope, candidates: Candidates,
         .then_with(|| a.full_path.cmp(&b.full_path)));
     partial |= rows.len() > 200;
     rows.truncate(200);
+    scope.recheck_documents()?;
     #[cfg(feature = "macos-find-system-qa")]
     if scope.uses_system_query() { scope.query_paths()?; }
     cancel.check().map_err(|_| FindError::Cancelled)?;
@@ -420,10 +464,11 @@ pub(crate) enum FindAction { Default, OpenDocument }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Submission { FileRevealRequested, FolderOpenRequested, FileOpenRequested, Unconfirmed }
 
-fn submit_with(
+fn submit_with<T>(
     scope: &IndexedLocalScope, target: &AuthorizedFile, action: FindAction,
-    admit: impl FnOnce() -> bool, submit: impl FnOnce(&NSURL, Submission) -> Submission,
-) -> Result<Submission, FindError> {
+    admit: impl FnOnce() -> bool, submit: impl FnOnce(&NSURL, Submission) -> T,
+) -> Result<T, FindError> {
+    scope.recheck_documents()?;
     let (root, _) = scope.routed_path(&target.path).map_err(|_| FindError::Stale)?;
     if !Arc::ptr_eq(root, &target.root) { return Err(FindError::Stale); }
     let (current, _) = root.validate(&target.path)?;
@@ -437,20 +482,48 @@ fn submit_with(
     verify_reference(&target.reference, &target.path, current.leaf_inode(), &root.fd)?;
     #[cfg(feature = "macos-find-system-qa")]
     if scope.uses_system_query() { scope.recheck_qa_evidence(&Mounts::current()?)?; }
+    scope.recheck_documents()?;
     if !admit() { return Err(FindError::Stale); }
-    Ok(submit(&target.reference, submission))
+    let dispatch = || submit(&target.reference, submission);
+    // Controller admission has finished. Only the grant's own mutex covers the native
+    // submission, so revocation can mark it stale without taking this mutex under host locks.
+    if let Some(grant) = &scope.documents {
+        grant.submit_if_active(dispatch)
+    } else {
+        Ok(dispatch())
+    }
+}
+
+enum PendingSubmission {
+    Complete(Submission),
+    Awaiting(Submission, mpsc::Receiver<bool>),
+}
+
+impl PendingSubmission {
+    fn confirmation(self) -> Submission {
+        match self {
+            Self::Complete(outcome) => outcome,
+            Self::Awaiting(outcome, callback) => {
+                if callback.recv_timeout(Duration::from_secs(2)) == Ok(true) {
+                    outcome
+                } else {
+                    Submission::Unconfirmed
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn submit_action(
     scope: &IndexedLocalScope, target: &AuthorizedFile, action: FindAction, admit: impl FnOnce() -> bool,
 ) -> Result<Submission, FindError> {
     if NSThread::isMainThread_class() { return Err(FindError::Unavailable); }
-    autoreleasepool(|_| submit_with(scope, target, action, admit, |reference, submission| {
+    let pending = autoreleasepool(|_| submit_with(scope, target, action, admit, |reference, submission| {
         let workspace = NSWorkspace::sharedWorkspace();
         let urls = NSArray::<NSURL>::from_slice(&[reference]);
         if submission == Submission::FileRevealRequested {
             workspace.activateFileViewerSelectingURLs(&urls);
-            return submission;
+            return PendingSubmission::Complete(submission);
         }
         let config = NSWorkspaceOpenConfiguration::configuration();
         let (tx, rx) = mpsc::channel();
@@ -463,8 +536,9 @@ pub(crate) fn submit_action(
         } else {
             workspace.openURL_configuration_completionHandler(reference, &config, Some(&callback));
         }
-        if rx.recv_timeout(Duration::from_secs(2)) == Ok(true) { submission } else { Submission::Unconfirmed }
-    }))
+        PendingSubmission::Awaiting(submission, rx)
+    }))?;
+    Ok(pending.confirmation())
 }
 
 #[cfg(test)]

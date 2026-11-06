@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   parseLauncherShown,
+  parseFindDocumentsAccess,
   parseBuiltinFeatures,
   parseResultActionMetadata,
   parseResultActionOutcome,
@@ -10,6 +11,16 @@ import {
   parsePublicPluginInventory,
   parsePublicPluginPrepareSummary,
 } from './protocol'
+
+it('accepts only the Documents access status and its decimal revision', () => {
+  for (const status of ['notGranted', 'granted', 'needsReauthorization']) {
+    expect(parseFindDocumentsAccess({ status, revision: '0' })).toEqual({ status, revision: '0' })
+  }
+  for (const invalid of [
+    { status: 'granted', revision: '01' }, { status: 'unknown', revision: '1' },
+    { status: 'granted', revision: '1', path: '/private' }, { revision: '1' }, null,
+  ]) expect(parseFindDocumentsAccess(invalid)).toBeNull()
+})
 
 describe('main result action protocol', () => {
   it('accepts only opaque display metadata with consistent explicit defaults', () => {

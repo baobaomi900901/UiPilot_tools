@@ -2523,6 +2523,14 @@ label,
   min-height: 0;
 }
 
+.find-header.has-documents {
+  grid-template-columns: minmax(0, 1fr) auto 32px 32px;
+}
+
+.find-documents-button.ant-btn {
+  align-self: center;
+}
+
 .find-drag-handle {
   position: absolute;
   inset: 0;

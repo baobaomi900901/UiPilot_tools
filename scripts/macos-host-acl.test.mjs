@@ -43,6 +43,21 @@ test('preview grants main and Find separate local IPC routes', () => {
   }
 });
 
+test('only the interactive public preview Find webview may request Documents access', () => {
+  const acl = read('macos-find-documents-acl.json');
+  assert.deepEqual(acl.platforms, ['macOS']);
+  assert.deepEqual(acl.webviews, ['find']);
+  assert.equal(acl.remote, undefined);
+  assert.equal(acl.windows, undefined);
+  assert.deepEqual(acl.permissions.toSorted(), [
+    'allow-get-find-documents-access', 'allow-grant-find-documents-access', 'allow-revoke-find-documents-access',
+  ]);
+  assert.ok(!read('tauri.macos.conf.json').app.security.capabilities.includes(acl.identifier));
+  for (const window of read('macos-find-preview-acl.json')) {
+    assert.ok(!window.permissions.some(permission => acl.permissions.includes(permission)));
+  }
+});
+
 import { waitForBootstrap } from './smoke-platform-bootstrap.mjs';
 test('smoke requires both the trusted frontend marker and a clean exit', async () => {
   const run = code => waitForBootstrap(process.execPath, ['-e', code], { log() {} });

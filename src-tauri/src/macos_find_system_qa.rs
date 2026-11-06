@@ -226,7 +226,7 @@ pub(super) fn isolated_scope() -> Result<IndexedLocalScope, FindError> {
         }
         roots.push(Arc::new(Root { path, fd, anchor: Some(anchor) }));
     }
-    Ok(IndexedLocalScope { roots, qa_home: Some(home) })
+    Ok(IndexedLocalScope { roots, documents: None, qa_home: Some(home) })
 }
 
 #[cfg(test)]
@@ -286,7 +286,7 @@ mod tests {
         let physical = anchor.physical_root.clone();
         let root = Arc::new(Root { path: root_path.clone(), fd, anchor: Some(anchor) });
         // No real home lookup, user-directory probe or system-wide Spotlight request.
-        let scope = IndexedLocalScope { roots: vec![root], qa_home: None };
+        let scope = IndexedLocalScope { roots: vec![root], documents: None, qa_home: None };
         let doc = root_path.join("test.pdf");
         std::fs::write(&doc, b"document").unwrap();
         let (_, logical) = scope.routed_path(&physical.join("test.pdf")).unwrap();

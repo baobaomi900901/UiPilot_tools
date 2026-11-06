@@ -24,6 +24,12 @@ use crate::{
 mod files;
 pub(crate) use files::*;
 
+#[cfg(not(feature = "macos-find-system-qa"))]
+#[path = "macos_find_access.rs"]
+mod documents;
+#[cfg(not(feature = "macos-find-system-qa"))]
+pub(crate) use documents::*;
+
 type Response<T> = Result<T, Value>;
 fn error(code: &str) -> Value { json!({ "code": code }) }
 fn stale() -> Value { error("staleRequest") }
@@ -35,6 +41,12 @@ struct Transfer { id: u64, was_visible: bool, focus_before: ForegroundWindow, de
 struct Host {
     controller: FindWindowController,
     files: files::Files,
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    documents: Mutex<documents::Access>,
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    document_changes: Mutex<()>,
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    exit_drain: Mutex<ExitDrain>,
     transfer: Mutex<Option<Transfer>>,
     driving: AtomicBool,
     stopping: AtomicBool,
@@ -45,6 +57,8 @@ struct Host {
 
 pub(crate) fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     app.add_capability(include_str!("../macos-find-preview-acl.json"))?;
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    app.add_capability(include_str!("../macos-find-documents-acl.json"))?;
     app.manage(Arc::new(Host::default()));
     let scope_marker = if cfg!(feature = "macos-find-system-qa") {
         "Object.defineProperty(window,'__UIPILOT_MACOS_FIND__',{value:'indexed-local-qa'});"
@@ -176,6 +190,8 @@ fn drive(app: &AppHandle) {
         rollback(app, transfer);
         return;
     }
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    documents::retire_panel(&service);
     *service.transfer.lock().expect("Find transfer") = Some(transfer);
     if find.unminimize().and_then(|_| find.show()).and_then(|_| find.set_focus()).is_err() {
         let failed = service.transfer.lock().expect("Find transfer").take();
@@ -199,6 +215,8 @@ pub(crate) async fn open_find_window(window: WebviewWindow, input: OpenInput) ->
     let lease = registries(app).main().prepare_application_query_retirement(&input.invocation_id, input.query_sequence)
         .ok().flatten().ok_or_else(stale)?;
     let submission = service.controller.submit_open(input.query, lease, Instant::now()).map_err(|_| failed())?;
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    on_main(app, |app| documents::retire_panel(&host(app))).await?;
     schedule(app);
     let completion = tauri::async_runtime::spawn_blocking(move || submission.completion.recv_timeout(Duration::from_secs(8)))
         .await.map_err(|_| failed())?.map_err(|_| failed())?;
@@ -289,6 +307,8 @@ fn hide(app: &AppHandle, id: &str, force: bool) -> Response<()> {
             Ok(())
         } else { Err(stale()) };
     }
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    documents::retire_panel(&service);
     let hidden = app.get_webview_window("find").is_some_and(|find| find.hide().is_ok());
     if service.controller.finish_explicit_hide(id, hidden, &registries(app)) && hidden {
         service.files.clear();
@@ -299,6 +319,28 @@ fn hide(app: &AppHandle, id: &str, force: bool) -> Response<()> {
 pub(crate) async fn hide_find_window(window: WebviewWindow, input: Hide) -> Response<()> {
     check_find(&window)?;
     on_main(window.app_handle(), move |app| hide(app, &input.invocation_id, input.force)).await?
+}
+
+fn blur_owned(host: &Host, id: &str) -> bool {
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    if documents::sheet_owns_focus(host, id) { return true; }
+    host.files.dispatching(id)
+}
+
+fn should_hide_after_blur(host: &Host, id: &str, foreground: ForegroundWindow) -> bool {
+    foreground != ForegroundWindow::Find && !blur_owned(host, id) && host.controller.request_explicit_hide(id, false)
+}
+
+fn recheck_blur(app: &AppHandle, id: String) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let _ = on_main(&handle, move |app| {
+            if should_hide_after_blur(&host(app), &id, native_snapshot(app).foreground) {
+                let _ = hide(app, &id, false);
+            }
+        }).await;
+    });
 }
 
 pub(crate) fn on_window_event(window: &Window, event: &WindowEvent) -> bool {
@@ -319,6 +361,8 @@ pub(crate) fn on_window_event(window: &Window, event: &WindowEvent) -> bool {
             api.prevent_close();
             // A native close targets the window itself, including a show/focus
             // transfer that has not yet assigned a renderer invocation.
+            #[cfg(not(feature = "macos-find-system-qa"))]
+            documents::retire_panel(&service);
             if window.hide().is_ok() {
                 service.transfer.lock().expect("Find transfer").take();
                 service.controller.finish_native_close(&registries(app));
@@ -327,17 +371,8 @@ pub(crate) fn on_window_event(window: &Window, event: &WindowEvent) -> bool {
         }
         WindowEvent::Focused(focused) => {
             if service.controller.observe_focus(WindowLabel::Find, *focused) == FocusEffect::HideFind {
-                if let Some(id) = service.controller.current_invocation().filter(|id| !service.files.dispatching(id)) {
-                    let handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(75)).await;
-                        let _ = on_main(&handle, move |app| {
-                            let service = host(app);
-                            if native_snapshot(app).foreground != ForegroundWindow::Find && !service.files.dispatching(&id) {
-                                let _ = hide(app, &id, false);
-                            }
-                        }).await;
-                    });
+                if let Some(id) = service.controller.current_invocation().filter(|id| !blur_owned(&service, id)) {
+                    recheck_blur(app, id);
                 }
             }
         }
@@ -346,18 +381,92 @@ pub(crate) fn on_window_event(window: &Window, event: &WindowEvent) -> bool {
     true
 }
 
-pub(crate) fn shutdown(app: &AppHandle) {
+#[cfg(not(feature = "macos-find-system-qa"))]
+#[derive(Default)]
+struct ExitDrain { deferred: bool, complete: bool }
+
+#[cfg(not(feature = "macos-find-system-qa"))]
+impl ExitDrain {
+    fn request(&mut self, first: bool, pending: bool, code: Option<i32>) -> bool {
+        if first {
+            self.complete = !pending;
+            self.deferred = pending && code == Some(0);
+        } else if code != Some(0) {
+            // The OS, a restart, or an abnormal exit supersedes our own Quit.
+            self.deferred = false;
+        }
+        self.deferred && !self.complete
+    }
+    fn finish(&mut self) -> bool {
+        self.complete = true;
+        std::mem::take(&mut self.deferred)
+    }
+}
+
+pub(crate) fn shutdown(app: &AppHandle, code: Option<i32>, api: &tauri::ExitRequestApi) {
     let Some(service) = app.try_state::<Arc<Host>>() else { return; };
-    service.stopping.store(true, Ordering::Release);
-    service.controller.shutdown();
-    service.files.clear();
-    registries(app).find().hide_and_clear();
+    let first = !service.stopping.swap(true, Ordering::AcqRel);
+    if first {
+        service.controller.shutdown();
+        service.files.clear();
+        registries(app).find().hide_and_clear();
+    }
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    {
+        // Stop accepting actions synchronously. Never wait on AppKit's event loop
+        // for an NSWorkspace submission that may itself need that event loop.
+        let detached = if first { documents::detach_on_exit(&service) } else { None };
+        let pending = first && (detached.is_some() || service.document_changes.try_lock().is_err());
+        if service.exit_drain.lock().expect("Find exit drain").request(first, pending, code) {
+            api.prevent_exit();
+        }
+        if pending {
+            let service = Arc::clone(service.inner());
+            let handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                documents::drain_on_worker(&service, detached);
+                if service.exit_drain.lock().expect("Find exit drain").finish() { handle.exit(0); }
+            });
+        }
+    }
+    #[cfg(feature = "macos-find-system-qa")]
+    let _ = (code, api);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::result_registry::QueryDomain;
+
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    #[test]
+    fn quit_waits_for_drain_only_for_an_explicit_normal_exit() {
+        let mut drain = ExitDrain::default();
+        assert!(drain.request(true, true, Some(0)));
+        assert!(drain.request(false, false, Some(0)));
+        assert!(drain.finish());
+        assert!(!drain.request(false, false, Some(0)));
+        for code in [None, Some(1), Some(tauri::RESTART_EXIT_CODE)] {
+            let mut drain = ExitDrain::default();
+            assert!(drain.request(true, true, Some(0)));
+            assert!(!drain.request(false, false, code));
+            assert!(!drain.finish());
+        }
+        let mut drain = ExitDrain::default();
+        assert!(!drain.request(true, false, Some(0)));
+        assert!(!drain.request(false, false, Some(0)));
+    }
+
+    #[test]
+    fn delayed_blur_respects_current_invocation_actual_focus_and_pin() {
+        let host = Host::default();
+        host.controller.set_visible_for_test("second");
+        assert!(!should_hide_after_blur(&host, "first", ForegroundWindow::Other));
+        assert!(!should_hide_after_blur(&host, "second", ForegroundWindow::Find));
+        assert!(should_hide_after_blur(&host, "second", ForegroundWindow::Other));
+        host.controller.set_pin("second", true);
+        assert!(!should_hide_after_blur(&host, "second", ForegroundWindow::Other));
+    }
 
     #[test]
     fn native_close_cancels_the_active_transfer_and_its_latest_waiter() {

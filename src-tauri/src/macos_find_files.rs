@@ -2,7 +2,7 @@ use super::{check_find, error, failed, host, on_main, registries, stale, Respons
 use crate::{
     find_window::{ExecutionHideAdmission, FindWindowController},
     macos_find_query::{gather_on_worker, ApprovedScope, GatherError, QueryCancellation},
-    macos_find_results::{authorize_batch, submit_action, AuthorizedBatch, AuthorizedFile, FindAction, FindError, IndexedLocalScope, Submission},
+    macos_find_results::{authorize_batch, submit_action, AuthorizedBatch, AuthorizedFile, FindAction, FindError, IndexedLocalScope, DocumentsGrant, Submission},
     result_registry::{ExecutionTicket, QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistry},
 };
 use serde_json::{json, Value};
@@ -68,7 +68,7 @@ impl Files {
             .is_some_and(|p| p.invocation == id && p.dispatch == Dispatch::InFlight)
     }
 
-    fn begin(&self, controller: &FindWindowController, registry: &ResultRegistry, id: &str, seq: u64,
+    pub(super) fn begin(&self, controller: &FindWindowController, registry: &ResultRegistry, id: &str, seq: u64,
         cancel_only: bool) -> Option<(QueryToken, QueryCancellation)> {
         controller.with_visible_admission(id, || {
             let mut rows = self.rows.lock().expect("Find rows");
@@ -92,8 +92,8 @@ fn query_error(error_code: FindError) -> Value {
     })
 }
 
-fn collect(query: &str, category: &str, cancel: &QueryCancellation) -> Result<(Arc<IndexedLocalScope>, AuthorizedBatch), FindError> {
-    let scope = Arc::new(IndexedLocalScope::for_host()?);
+fn collect(query: &str, category: &str, cancel: &QueryCancellation, grant: Option<Arc<DocumentsGrant>>) -> Result<(Arc<IndexedLocalScope>, AuthorizedBatch), FindError> {
+    let scope = Arc::new(IndexedLocalScope::with_documents(grant)?);
     let candidates = gather_on_worker(ApprovedScope::IndexedLocal(&scope), query, cancel)
         .map_err(|e| match e { GatherError::Cancelled => FindError::Cancelled,
             GatherError::InvalidInput => FindError::InvalidInput, GatherError::TimedOut => FindError::TimedOut,
@@ -117,16 +117,27 @@ pub(crate) async fn search_files(window: WebviewWindow, query: String, category:
     }
     let serial = service.files.serial_search.clone().lock_owned().await;
     if !service.files.rows.lock().expect("Find rows").owns(&invocation_id, query_sequence) { return Ok(None); }
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    let scope_owner = (window.app_handle().clone(), invocation_id.clone());
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let _serial = serial;
-        objc2::rc::autoreleasepool(|_| collect(&query, &category, &cancel))
+        objc2::rc::autoreleasepool(|_| {
+            #[cfg(not(feature = "macos-find-system-qa"))]
+            let grant = super::documents::snapshot(&scope_owner.0, &scope_owner.1)?.1;
+            #[cfg(feature = "macos-find-system-qa")]
+            let grant = None;
+            let outcome = collect(&query, &category, &cancel, grant).map_err(query_error);
+            #[cfg(not(feature = "macos-find-system-qa"))]
+            super::documents::snapshot(&scope_owner.0, &scope_owner.1)?;
+            outcome
+        })
     }).await.map_err(|_| error("fileSearchWorkerFailed"))?;
     if !window.is_visible().unwrap_or(false) { return Ok(None); }
     service.controller.with_visible_admission(&invocation_id, || {
         let mut rows = service.files.rows.lock().expect("Find rows");
         if !rows.owns(&invocation_id, query_sequence) { return Ok(None); }
         rows.search = None;
-        let (scope, batch) = outcome.map_err(query_error)?;
+        let (scope, batch) = outcome?;
         let revision = rows.revision.checked_add(1).ok_or_else(failed)?;
         let mut targets = Vec::with_capacity(batch.rows.len());
         let entries = batch.rows.into_iter().map(|row| {
@@ -187,6 +198,8 @@ pub(crate) async fn execute_file(window: WebviewWindow, request_id: String, resu
     let worker_claim = claimed.clone();
     let action = if document { FindAction::OpenDocument } else { FindAction::Default };
     let outcome = tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(not(feature = "macos-find-system-qa"))]
+        super::documents::snapshot(window.app_handle(), owner.invocation_id()).map_err(|_| FindError::Stale)?;
         submit_action(&scope, &target, action, || {
             if !window.is_visible().unwrap_or(false) { return false; }
             service.controller.with_visible_admission(owner.invocation_id(), || {
@@ -218,6 +231,8 @@ pub(crate) async fn execute_file(window: WebviewWindow, request_id: String, resu
         }
         match service.controller.begin_execution_hide(&ticket, registry) {
             ExecutionHideAdmission::Started => {
+                #[cfg(not(feature = "macos-find-system-qa"))]
+                super::documents::retire_panel(&service);
                 let hidden = app.get_webview_window("find").is_some_and(|w| w.hide().is_ok());
                 service.controller.finish_execution_hide(hidden, &registries);
                 if hidden { service.files.clear(); }

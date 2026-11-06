@@ -120,6 +120,8 @@
 - [ ] **8.3 执行与定位。** registry 私存对象身份；开文件和 Finder 定位前重新鉴别当前调用者、结果 ticket 与文件，系统 URL/参数不经过 shell。用特殊字符/空格/中文路径正向测试；将目标换成越界链接、删除文件或从 main 调 find 专属命令，各自拒绝，系统调用计数为零。
 - [ ] **8.4 实机复核。** 在 Spotlight 可检索与排除目录各放同名样例，搜索、取消、打开、Finder 定位、固定、关闭再打开，记录命中对象及界面反馈；Windows 重跑原 Find 查询和打开。对应宿主、UI、授权均通过才开放能力。
 
+文稿预览的自动验收已覆盖授权前后的范围、嵌套中文和 emoji 文件名、撤销与旧结果失效。实机复核时，在同一条已有查询上点击「允许本次搜索文稿」，取消应保留原结果，选择本地「文稿」后应自动重搜，停止搜索后文件应消失，重启后应恢复公共目录范围。全系统范围按 8.4 和专项设计另行验收。
+
 **Distinct test coverage:** 区分迟到查询与已关闭窗口；记录打开期间 pin 变化与当前 owner；拒绝先于受保护状态读取。
 **Verify:** `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib file_search::`、`cargo test --locked --manifest-path src-tauri/Cargo.toml --lib find_window::`、`npm test -- src/find-core.test.ts src/find-view.test.tsx`。交付查询时序、系统调用计数与 Finder 实机结果。
 

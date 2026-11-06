@@ -414,6 +414,11 @@ function mountFind(host: HTMLElement): void {
     listenThemeChanged: (handler) => listen(findThemeEvent, event => handler(event.payload), { target: 'find' }),
     macos: {
       scope,
+      ...(scope === 'public-preview' ? { documents: {
+        get: (input) => invoke<unknown>('get_find_documents_access', input),
+        grant: (input) => invoke<unknown>('grant_find_documents_access', input),
+        revoke: (input) => invoke<unknown>('revoke_find_documents_access', input),
+      } } : {}),
       cancelQuery: (input) => invoke<void>('cancel_find_query', input),
       openDocument: (input) => invoke<ExecuteOutcome>('open_find_document', input),
     },

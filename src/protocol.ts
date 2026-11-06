@@ -593,8 +593,14 @@ export type FindReadyOutcome =
 export interface FindPreviewPreferenceResult { filePreviewRevision: U64Decimal; filePreviewEnabled: boolean }
 export interface FindThemeChanged { themeRevision: U64Decimal; theme: ThemePreference }
 export type MacFindScope = 'public-preview' | 'indexed-local-qa'
+export type FindDocumentsOperation = 'get' | 'grant' | 'revoke'
+export type FindDocumentsAccess = Readonly<{
+  status: 'notGranted' | 'granted' | 'needsReauthorization'
+  revision: U64Decimal
+}>
 export interface FindClient {
   macos?: {
+    documents?: Record<FindDocumentsOperation, (input: { invocationId: string }) => Promise<unknown>>
     scope: MacFindScope
     cancelQuery(input: { invocationId: string; querySequence: number }): Promise<void>
     openDocument(input: { requestId: string; resultId: string }): Promise<ExecuteOutcome>
@@ -1553,6 +1559,15 @@ export function parseMessageHostCommandError(value: unknown): MessageHostCommand
     return { code: 'MessageStoreUnavailable', storeStatus: 'unavailable' }
   }
   return null
+}
+
+export function parseFindDocumentsAccess(value: unknown): FindDocumentsAccess | null {
+  const record = plainRecord(value)
+  if (!record || !exactKeys(record, ['revision', 'status'])) return null
+  const revision = parseU64Decimal(record.revision)
+  const status = record.status
+  if (!revision || (status !== 'granted' && status !== 'notGranted' && status !== 'needsReauthorization')) return null
+  return Object.freeze({ revision, status })
 }
 
 export function parseFindForwardPayload(value: unknown, macos = false): FindForwardPayload | null {

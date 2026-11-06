@@ -9270,6 +9270,9 @@ describe('real adapter and startup', () => {
         ...fileItem(), fullPath: '/Users/Shared/example.png', name: 'example.png', canOpenDocument: true,
       }])
       if (command === 'execute_result') return {status: 'fileRevealRequested'}
+      if (command === 'get_find_documents_access') return {status: 'notGranted', revision: '0'}
+      if (command === 'grant_find_documents_access') return {status: 'granted', revision: '1'}
+      if (command === 'revoke_find_documents_access') return {status: 'notGranted', revision: '2'}
       throw new Error(command)
     })
     try {
@@ -9282,7 +9285,19 @@ describe('real adapter and startup', () => {
       const row = document.querySelector<HTMLElement>('[role=option]')!
       expect(row.textContent).toContain('example.png')
       expect(document.body.textContent).toContain(description)
-      await act(async () => { row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
+      const documents = document.querySelector<HTMLButtonElement>('.find-documents-button')
+      if (scope === 'public-preview') {
+        expect(tauriCapture.invoke).toHaveBeenCalledWith('get_find_documents_access', { invocationId: 'find-1' })
+        await act(async () => documents!.click())
+        expect(tauriCapture.invoke).toHaveBeenCalledWith('grant_find_documents_access', { invocationId: 'find-1' })
+        await act(async () => documents!.click())
+        expect(tauriCapture.invoke).toHaveBeenCalledWith('revoke_find_documents_access', { invocationId: 'find-1' })
+      } else {
+        expect(documents).toBeNull()
+        expect(tauriCapture.invoke.mock.calls.some(([command]) => command.includes('documents_access'))).toBe(false)
+      }
+      const activeRow = document.querySelector<HTMLElement>('[role=option]')!
+      await act(async () => { activeRow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
       expect(tauriCapture.invoke).toHaveBeenCalledWith('execute_result', {requestId: 'file-request-1', resultId: 'file-result-1'})
       expect(tauriCapture.invoke.mock.calls.some(([command]) => command === 'load_find_thumbnail')).toBe(false)
       expect(tauriCapture.capabilities).not.toHaveBeenCalled()

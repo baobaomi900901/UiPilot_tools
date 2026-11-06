@@ -469,3 +469,133 @@ describe('Mac Spotlight execution', () => {
     core.destroy()
   })
 })
+
+describe('session Documents access in the Mac public preview', () => {
+  function setup() {
+    const fake = fakeClient()
+    const docs = {
+      get: vi.fn(async () => ({ status: 'notGranted', revision: '0' })),
+      grant: vi.fn(async () => ({ status: 'granted', revision: '1' })),
+      revoke: vi.fn(async () => ({ status: 'notGranted', revision: '2' })),
+    }
+    const core = createFindCore({ ...fake.client, macos: {
+      scope: 'public-preview', documents: docs, cancelQuery: vi.fn(), openDocument: vi.fn(),
+    } })
+    return { ...fake, docs, core }
+  }
+
+  it('keeps the current search after chooser cancellation, refreshes on authorization, and removes old rows on revoke', async () => {
+    const { core, client, docs, emitForward } = setup()
+    vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('public.ttf'))
+      .mockResolvedValueOnce(fileResponse('document.pdf')).mockResolvedValueOnce(fileResponse('public.ttf'))
+    await core.start()
+    expect(docs.get).not.toHaveBeenCalled()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: 'example' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('public.ttf'))
+    expect(docs.get).toHaveBeenCalledExactlyOnceWith({ invocationId: 'find' })
+    expect(docs.grant).not.toHaveBeenCalled()
+    docs.grant.mockResolvedValueOnce({ status: 'notGranted', revision: '0' })
+    await core.updateDocuments('grant')
+    expect(client.searchFiles).toHaveBeenCalledOnce()
+    expect(core.getSnapshot().documents?.notice).toContain('未更改')
+    await core.updateDocuments('grant')
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('document.pdf'))
+    const pending = deferred<{status: string; revision: string}>()
+    docs.revoke.mockReturnValueOnce(pending.promise)
+    const revoking = core.updateDocuments('revoke')
+    expect(core.getSnapshot().results).toEqual([])
+    core.submitSearch()
+    await core.updateDocuments('revoke')
+    expect(docs.revoke).toHaveBeenCalledExactlyOnceWith({ invocationId: 'find' })
+    pending.resolve({ status: 'notGranted', revision: '2' })
+    await revoking
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('public.ttf'))
+    expect(client.searchFiles).toHaveBeenCalledTimes(3)
+    core.destroy()
+  })
+
+  it('reconciles a rejected grant, shows a fixed message, and ignores a completion superseded by another invocation', async () => {
+    const { core, client, docs, emitForward } = setup()
+    await core.start()
+    emitForward({ invocationId: 'a', forwardSequence: '1', query: 'font' })
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.status).toBe('notGranted'))
+    docs.grant.mockRejectedValueOnce({ code: 'documentsAccessDenied', message: '/private/path' })
+    await core.updateDocuments('grant')
+    expect(core.getSnapshot().documents).toMatchObject({ access: { status: 'notGranted' } })
+    expect(core.getSnapshot().documents?.notice).toContain('系统选择框')
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('/private/path')
+    const pending = deferred<{status: string; revision: string}>()
+    docs.grant.mockReturnValueOnce(pending.promise)
+    const old = core.updateDocuments('grant')
+    emitForward({ invocationId: 'b', forwardSequence: '2', query: 'new' })
+    pending.resolve({ status: 'granted', revision: '1' })
+    await old
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.status).toBe('notGranted'))
+    expect(client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({ invocationId: 'b', querySequence: 1 }))
+    core.destroy()
+  })
+
+  it('restores results once when a previously granted scope is readable after a failed status check', async () => {
+    const { core, client, docs, emitForward } = setup()
+    const allowed = { status: 'granted', revision: '1' }
+    docs.get.mockResolvedValueOnce(allowed).mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce(allowed)
+    vi.mocked(client.searchFiles).mockResolvedValue(fileResponse('document.pdf'))
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: 'report' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('document.pdf'))
+    expect(client.searchFiles).toHaveBeenCalledOnce()
+    await core.updateDocuments('get')
+    expect(core.getSnapshot().documents?.access).toBeUndefined()
+    expect(core.getSnapshot().results).toEqual([])
+    await core.updateDocuments('get')
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('document.pdf'))
+    expect(client.searchFiles).toHaveBeenCalledTimes(2)
+    core.destroy()
+  })
+
+  it('searches public files even when the initial Documents state cannot be read', async () => {
+    const { core, client, docs, emitForward } = setup()
+    docs.get.mockRejectedValueOnce(new Error('unavailable'))
+    vi.mocked(client.searchFiles).mockResolvedValue(fileResponse('public.ttf'))
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: 'font' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('public.ttf'))
+    expect(client.searchFiles).toHaveBeenCalledOnce()
+    expect(docs.grant).not.toHaveBeenCalled()
+    expect(core.getSnapshot().documents?.access).toBeUndefined()
+    core.destroy()
+  })
+
+  it('rechecks a granted scope if the host retires the current search without a response', async () => {
+    const { core, client, docs, emitForward } = setup()
+    docs.get.mockResolvedValueOnce({status: 'granted', revision: '1'})
+      .mockResolvedValueOnce({status: 'needsReauthorization', revision: '2'})
+    vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('private.pdf'))
+      .mockResolvedValueOnce(null).mockResolvedValueOnce(fileResponse('public.ttf'))
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: 'old' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('private.pdf'))
+    core.setQuery('new')
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('public.ttf'))
+    expect(core.getSnapshot().documents?.access?.status).toBe('needsReauthorization')
+    expect(docs.get).toHaveBeenCalledTimes(2)
+    core.destroy()
+  })
+
+  it('refreshes access after a stale result and clears documents that need reauthorization', async () => {
+    const { core, client, docs, emitForward } = setup()
+    docs.get.mockResolvedValueOnce({ status: 'granted', revision: '1' })
+      .mockResolvedValueOnce({ status: 'needsReauthorization', revision: '2' })
+    vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('private.pdf'))
+      .mockResolvedValueOnce(fileResponse('public.ttf'))
+    vi.mocked(client.executeResult).mockRejectedValueOnce({ code: 'staleRequest' })
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: 'report' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.name).toBe('private.pdf'))
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.status).toBe('needsReauthorization'))
+    expect(core.getSnapshot().results[0]?.name).toBe('public.ttf')
+    expect(docs.grant).not.toHaveBeenCalled()
+    core.destroy()
+  })
+})

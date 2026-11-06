@@ -1,0 +1,10 @@
+{
+  "identifier": "macos-find-documents",
+  "platforms": ["macOS"],
+  "webviews": ["find"],
+  "permissions": [
+    "allow-get-find-documents-access",
+    "allow-grant-find-documents-access",
+    "allow-revoke-find-documents-access"
+  ]
+}

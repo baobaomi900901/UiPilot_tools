@@ -2,6 +2,7 @@ import {
   compareDecimalRevision,
   parseFileSearchResponse,
   parseFindForwardPayload,
+  parseFindDocumentsAccess,
   parseFindPreviewPreferenceResult,
   parseFindReadyOutcome,
   parseFindThumbnailDataUrl,
@@ -13,6 +14,8 @@ import {
   type FileResultView,
   type FileSort,
   type FindClient,
+  type FindDocumentsAccess,
+  type FindDocumentsOperation,
   type MacFindScope,
   type FindForwardPayload,
   type ThemePreference,
@@ -23,7 +26,14 @@ export const FIND_CATEGORY_ORDER: readonly FileCategory[] = [
   'all', 'folder', 'excel', 'word', 'ppt', 'pdf', 'image', 'video', 'audio', 'archive',
 ]
 
+interface DocumentsControl {
+  access?: FindDocumentsAccess
+  pending?: FindDocumentsOperation
+  notice?: string
+}
+
 export interface FindSnapshot {
+  documents?: Readonly<DocumentsControl>
   ready: boolean
   theme: ThemePreference
   invocationId?: string
@@ -48,6 +58,7 @@ export interface FindSnapshot {
 
 export interface FindCore {
   readonly macosScope?: MacFindScope
+  updateDocuments(operation: FindDocumentsOperation): Promise<void>
   openDocument(): void
   getSnapshot(): FindSnapshot
   subscribe(listener: () => void): () => void
@@ -72,6 +83,7 @@ interface PrivateResult {
 }
 
 interface Model {
+  documents?: DocumentsControl
   ready: boolean
   theme: ThemePreference
   invocationId?: string
@@ -130,7 +142,9 @@ function statusText(status: FileIndexStatus, hasResults: boolean, macos: boolean
 }
 
 export function createFindCore(client: FindClient, maximumQuerySequence = Number.MAX_SAFE_INTEGER): FindCore {
+  const documents = client.macos?.scope === 'public-preview' ? client.macos.documents : undefined
   const model: Model = {
+    documents: documents ? {} : undefined,
     ready: false,
     theme: 'system',
     query: '',
@@ -168,9 +182,12 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   let pinOwner = 0
   let executeOwner = 0
   let hideOwner = 0
+  let documentsOwner = 0
+  let documentsReadFailed = false
 
   function project(): FindSnapshot {
     return Object.freeze({
+      documents: model.documents && Object.freeze({ ...model.documents }),
       ready: model.ready,
       theme: model.theme,
       ...(model.invocationId ? { invocationId: model.invocationId } : {}),
@@ -274,7 +291,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
 
   function beginSearch(): void {
     const invocationId = model.invocationId
-    if (!model.ready || !invocationId || !model.query || model.executePending) return
+    if (!model.ready || !invocationId || !model.query || model.executePending || model.documents?.pending === 'revoke') return
     const sequence = nextSequence()
     if (sequence === null) return
     const owner = ++operationToken
@@ -300,6 +317,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         const response = raw === null ? null : parseFileSearchResponse(raw)
         if (!response) {
           publish()
+          if (raw === null && model.documents?.access?.status === 'granted') void updateDocuments('get')
           return
         }
         model.requestId = response.requestId
@@ -329,8 +347,99 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         model.indexStatus = 'unavailable'
         model.status = errorText(error, Boolean(client.macos))
         publish()
+        checkAccessError(error)
       },
     )
+  }
+
+  function refreshSearchScope(): void {
+    searchOwner = ++operationToken
+    model.searchPending = false
+    clearResults()
+    if (model.query && !model.executePending) beginSearch()
+    else publish()
+  }
+
+  async function updateDocuments(operation: FindDocumentsOperation): Promise<void> {
+    const invocationId = model.invocationId
+    const control = model.documents
+    if (!documents || !control || !invocationId || !model.ready || destroyed ||
+        control.pending || model.hidePending || model.executePending) return
+    if (operation === 'grant' && (!control.access || control.access.status === 'granted')) return
+    if (operation === 'revoke' && (!control.access || control.access.status === 'notGranted')) return
+    const owner = ++documentsOwner
+    const current = () => !destroyed && model.invocationId === invocationId && owner === documentsOwner
+    model.documents = { access: control.access, pending: operation }
+    if (operation === 'revoke') {
+      searchOwner = ++operationToken
+      model.searchPending = false
+      clearResults()
+    }
+    publish()
+
+    const read = async (action: FindDocumentsOperation): Promise<FindDocumentsAccess> => {
+      const next = parseFindDocumentsAccess(await documents[action]({ invocationId }))
+      if (!next || (control.access && compareDecimalRevision(next.revision, control.access.revision) < 0)) {
+        throw new Error('Invalid Documents access revision')
+      }
+      return next
+    }
+
+    let next: FindDocumentsAccess
+    let notice: string | undefined
+    let refresh = operation === 'revoke' || documentsReadFailed
+    try {
+      next = await read(operation)
+    } catch (error) {
+      if (!current()) return
+      if (operation === 'get') {
+        documentsReadFailed = true
+        model.documents = { notice: '无法读取文稿授权，可重试。' }
+        if (control.access?.status === 'granted') {
+          searchOwner = ++operationToken
+          clearResults()
+          model.searchPending = false
+        }
+        publish()
+        return
+      }
+      // A lost mutation reply may follow a successful native change. Retire old
+      // results and reconcile the grant before showing the scope again.
+      searchOwner = ++operationToken
+      clearResults()
+      model.searchPending = false
+      model.documents = { pending: 'get' }
+      publish()
+      notice = (error as { code?: unknown } | null)?.code === 'documentsAccessDenied'
+        ? '无法授权文稿。请在系统选择框选择当前用户的“文稿”文件夹。' : '未能确认文稿授权，请检查后重试。'
+      try {
+        next = await read('get')
+      } catch {
+        if (!current()) return
+        documentsReadFailed = true
+        model.documents = { notice: '无法读取文稿授权，可重试。' }
+        publish()
+        return
+      }
+      refresh = true
+    }
+    if (!current()) return
+    const changed = control.access && (next.revision !== control.access.revision || next.status !== control.access.status)
+    if (!notice && operation === 'grant') {
+      if (!changed) notice = '已取消选择，搜索范围未更改。'
+      else if (next.status === 'granted') notice = '本次搜索已包含文稿。'
+    }
+    if (!notice && operation === 'revoke') notice = next.status === 'notGranted'
+      ? '已停止搜索文稿。' : '文稿搜索范围未更改。'
+    documentsReadFailed = false
+    model.documents = { access: next, notice }
+    if (refresh || changed) refreshSearchScope()
+    else publish()
+  }
+
+  function checkAccessError(error: unknown): void {
+    const code = (error as {code?: unknown} | null)?.code
+    if (code === 'staleRequest' || code === 'fileOpenFailed') void updateDocuments('get')
   }
 
   function acceptForward(value: unknown): void {
@@ -338,6 +447,9 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const payload = parseFindForwardPayload(value, Boolean(client.macos))
     if (!payload || (lastForward && compareDecimalRevision(payload.forwardSequence, lastForward) <= 0)) return
     lastForward = payload.forwardSequence
+    documentsOwner++
+    documentsReadFailed = false
+    if (documents) model.documents = {}
     model.invocationId = payload.invocationId
     model.query = payload.query
     querySequence = 0
@@ -353,6 +465,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     model.status = ''
     clearResults()
     publish()
+    void updateDocuments('get')
     if (payload.query) beginSearch()
   }
 
@@ -450,6 +563,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         model.ready = true
         model.status = ''
         publish()
+        void updateDocuments('get')
         if (model.query) beginSearch()
         return
       }
@@ -460,6 +574,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
   function setQuery(query: string): void {
     if (!model.ready || !model.invocationId || model.executePending || query === model.query) return
     model.query = query
+    if (model.documents?.notice) model.documents = { ...model.documents, notice: undefined }
     searchOwner = ++operationToken
     model.searchPending = false
     model.status = ''
@@ -583,7 +698,8 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const invocationId = model.invocationId
     const selected = model.results[model.selectedIndex]
     const requestId = model.requestId
-    if (!model.ready || !invocationId || !selected || model.executePending) return
+    if (!model.ready || !invocationId || !selected || model.executePending ||
+        model.documents?.pending === 'grant' || model.documents?.pending === 'revoke') return
     if (!requestId) {
       model.status = '请重新搜索后再执行操作。'
       publish()
@@ -613,13 +729,14 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
         if (client.macos && (error as {code?: string} | null)?.code === 'fileActionUnconfirmed') retireMacResultSet()
         model.status = errorText(error, Boolean(client.macos))
         publish()
+        checkAccessError(error)
       },
     )
   }
 
   async function requestHide(force: boolean): Promise<void> {
     const invocationId = model.invocationId
-    if (!model.ready || !invocationId || model.executePending || model.hidePending || (model.pinned && !force)) return
+    if (!model.ready || !invocationId || model.executePending || model.hidePending || model.documents?.pending === 'grant' || (model.pinned && !force)) return
     const owner = ++operationToken
     hideOwner = owner
     model.hidePending = true
@@ -629,6 +746,8 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       await client.hide({ invocationId, force })
       if (destroyed || owner !== hideOwner || invocationId !== model.invocationId) return
       model.hidePending = false
+      documentsOwner++
+      if (documents) model.documents = {}
       if (force) {
         pinOwner = ++operationToken
         model.pinPending = false
@@ -677,6 +796,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
 
   return {
     macosScope: client.macos?.scope,
+    updateDocuments,
     openDocument: () => executeSelection(true),
     getSnapshot: () => snapshot,
     subscribe(listener) {

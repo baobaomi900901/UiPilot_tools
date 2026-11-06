@@ -117,7 +117,6 @@ impl FindPathIdentity {
         })
     }
 
-    #[cfg(feature = "macos-find-system-qa")]
     pub(crate) fn same_location(&self, other: &Self) -> bool {
         self.chain == other.chain && self.kind == other.kind
     }

@@ -3,7 +3,7 @@ import { File, FileSearch, Folder, ImageOff, Pin, X } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 
 import { FIND_CATEGORY_ORDER, type FindCore } from './find-core'
-import type { FileCategory, FileResultKind } from './protocol'
+import type { FileCategory, FileResultKind, FindDocumentsAccess, FindDocumentsOperation } from './protocol'
 import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
 import { createContextActionsMenu, type ContextActionsMenu } from './context-actions-ui'
 
@@ -46,6 +46,12 @@ function modified(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
+function documentsButton(access?: FindDocumentsAccess): { action: FindDocumentsOperation; title: string } {
+  if (!access) return { action: 'get', title: '读取文稿授权' }
+  if (access.status === 'granted') return { action: 'revoke', title: '停止搜索文稿' }
+  return { action: 'grant', title: '允许本次搜索文稿' }
+}
+
 export interface FindViewProps {
   core: FindCore
 }
@@ -53,10 +59,14 @@ export interface FindViewProps {
 export function FindView({ core }: FindViewProps): React.JSX.Element {
   const macos = core.macosScope !== undefined
   const primary = macos ? '⌘' : 'Ctrl'
-  const scopeText = core.macosScope === 'indexed-local-qa'
-    ? '本地 Spotlight 索引（隔离验收）'
-    : '预览范围：本机公共字体与共享目录（仅限 Spotlight 已索引项目）'
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
+  const documents = snapshot.documents
+  const documentsAction = documentsButton(documents?.access)
+  let scopeText = '预览范围：本机公共字体与共享目录（仅限 Spotlight 已索引项目）'
+  if (core.macosScope === 'indexed-local-qa') scopeText = '本地 Spotlight 索引（隔离验收）'
+  else if (documents?.access?.status === 'granted') scopeText = '预览范围：本机公共字体、共享目录与本次允许的文稿（仅限 Spotlight 已索引项目）'
+  else if (documents?.access?.status === 'needsReauthorization') scopeText = `文稿需重新授权 · ${scopeText}`
+  else if (documents && !documents.access) scopeText = `文稿授权待确认 · ${scopeText}`
   const [media] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(media.matches)
   const [failedThumbnail, setFailedThumbnail] = useState<string>()
@@ -125,6 +135,15 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         run() { if (current()) core.openDocument() },
       }] : [])],
       global: [
+        ...(owner.documents ? [{
+          id: 'find-documents-access', title: documentsButton(owner.documents.access).title, icon: 'settings' as const,
+          disabledReason: busy ?? (owner.documents.pending ? '正在确认文稿授权' : undefined),
+          run() { if (current()) void core.updateDocuments(documentsButton(owner.documents?.access).action) },
+        }, ...(owner.documents.access?.status === 'needsReauthorization' ? [{
+          id: 'find-stop-documents', title: '停止搜索文稿', icon: 'close' as const,
+          disabledReason: busy ?? (owner.documents.pending ? '正在确认文稿授权' : undefined),
+          run() { if (current()) void core.updateDocuments('revoke') },
+        }] : [])] : []),
         { id: 'find-category', title: '下一分类', shortcut: 'Tab', icon: 'arrow-right-to-line',
           disabledReason: busy,
           run() { if (current()) cycleCategory('next') } },
@@ -151,7 +170,8 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
       const state = core.getSnapshot()
       return JSON.stringify([state.ready, state.invocationId, state.query, state.category,
         state.results[state.selectedIndex]?.key, state.searchPending, state.executePending,
-        state.hidePending, state.pinned, state.pinPending, state.previewEnabled, state.previewPending])
+        state.hidePending, state.pinned, state.pinPending, state.previewEnabled, state.previewPending,
+        state.documents?.access?.revision, state.documents?.access?.status, state.documents?.pending])
     }
     let previous = stamp()
     const unsubscribe = core.subscribe(() => {
@@ -186,6 +206,13 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
     void core.start()
     return () => media.removeEventListener('change', changed)
   }, [core, media])
+
+  useEffect(() => {
+    if (core.macosScope !== 'public-preview') return
+    const refresh = () => { void core.updateDocuments('get') }
+    window.addEventListener('focus', refresh)
+    return () => window.removeEventListener('focus', refresh)
+  }, [core])
 
   useEffect(() => {
     if (snapshot.ready) inputRef.current?.focus()
@@ -269,7 +296,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
           data-color-scheme={scheme}
         >
           <div className="find-region find-header-region">
-            <header className="find-header">
+            <header className={documents ? "find-header has-documents" : "find-header"}>
             <span className="find-drag-handle" aria-hidden="true" />
             <Input
               ref={(node) => { inputRef.current = node?.input ?? null }}
@@ -288,6 +315,13 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
               onChange={(event) => core.setQuery(event.currentTarget.value)}
               onKeyDown={onKeyDown}
             />
+            {documents && <Tooltip title="只搜索 Spotlight 已索引的系统文稿文件夹。退出 UiPilot 后，本次授权结束。">
+              <Button className="find-documents-button" size="small" aria-busy={Boolean(documents.pending)}
+                disabled={disabled || !snapshot.invocationId || snapshot.hidePending || Boolean(documents.pending)}
+                onClick={() => void core.updateDocuments(documentsAction.action)}>
+                {documentsAction.title}
+              </Button>
+            </Tooltip>}
             <Tooltip title={`${snapshot.pinned ? '取消固定' : '固定窗口'} (${primary}+T)`}>
               <Button
                 className={snapshot.pinned ? 'find-icon-button is-selected' : 'find-icon-button'}
@@ -443,7 +477,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
           <div className="find-region find-footer-region">
             <footer className="find-footer file-toolbar">
               <span title={macos ? scopeText : undefined}>{macos ? `${snapshot.total} 条结果 · ${scopeText}` : snapshot.indexStatus === 'building' ? `正在索引，已有 ${snapshot.total} 条结果` : `共 ${snapshot.total} 条结果`}</span>
-              <div className="status-region" role="status" aria-live="polite" aria-atomic="true">{snapshot.status}</div>
+              <div className="status-region" role="status" aria-live="polite" aria-atomic="true">{documents?.notice || snapshot.status}</div>
               <button type="button" className="launcher-operations-trigger" tabIndex={-1} aria-label={`操作 ${primary}+K`}
                 aria-haspopup="dialog" aria-expanded={actionsOpen} aria-keyshortcuts={macos ? 'Meta+k' : 'Control+k'}
                 disabled={!snapshot.ready || !snapshot.invocationId || snapshot.hidePending}

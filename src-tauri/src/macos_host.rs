@@ -318,6 +318,12 @@ pub fn run() {
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::search_files,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::cancel_find_query,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_document,
+            #[cfg(all(feature = "macos-find-preview", not(feature = "macos-find-system-qa")))]
+            crate::macos_find_host::get_find_documents_access,
+            #[cfg(all(feature = "macos-find-preview", not(feature = "macos-find-system-qa")))]
+            crate::macos_find_host::grant_find_documents_access,
+            #[cfg(all(feature = "macos-find-preview", not(feature = "macos-find-system-qa")))]
+            crate::macos_find_host::revoke_find_documents_access,
         ])
         .on_window_event(|window, event| {
             #[cfg(feature = "macos-find-preview")]
@@ -349,10 +355,12 @@ pub fn run() {
         .run(|app, event| {
             match event {
                 tauri::RunEvent::Reopen { .. } => show(app),
-                tauri::RunEvent::ExitRequested { .. } => {
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    #[cfg(not(feature = "macos-find-preview"))]
+                    let _ = (code, &api);
                     app.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting = true;
                     #[cfg(feature = "macos-find-preview")]
-                    crate::macos_find_host::shutdown(app);
+                    crate::macos_find_host::shutdown(app, code, &api);
                     hotkey::stop(app);
                     app.remove_tray_by_id("launcher");
                 }
