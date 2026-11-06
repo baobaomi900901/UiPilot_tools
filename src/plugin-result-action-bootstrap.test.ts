@@ -4,14 +4,13 @@ import { describe, expect, it, vi } from 'vitest'
 const json = readFileSync('src-tauri/src/public_plugins/panel_action_json.js', 'utf8')
 const template = readFileSync('src-tauri/src/public_plugins/runtime.rs', 'utf8').match(/PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"([\s\S]*?)"#;/u)![1]!
 async function runtime(module: any, enabled = true) {
-  let callback: any
   const invoke = vi.fn(async (_command: string, _args?: any): Promise<void> => undefined)
-  const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke, transformCallback(next: any) { callback = next; return 1 } } }
+  const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke } }
   const document = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } }
   const source = template.replace('__RESULT_ACTIONS__', String(enabled)).replace('__WINDOW_ACTIONS__', 'false').replace('__PANEL_ACTIONS__', 'false').replace('__NETWORK_HTTPS__', 'false').replace('__PANEL_JSON__', json).replace('const module = entry ? await import(entry) : null;', 'const module = window.testModule;')
   vm.runInNewContext(source, { window, document, TextEncoder, Object, Reflect, Error, TypeError, Promise, WeakSet, Set, setTimeout })
   await vi.waitFor(() => expect(document.title).not.toBe(''))
-  return { callback, document, invoke }
+  return { callback: (message: { payload: unknown }) => window.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__(message.payload), document, invoke }
 }
 const context = { pluginId: 'com.example.test', pluginGeneration: 1, requestId: 'public-request-0000000000000001' }
 const invocation = { apiVersion: 1, requestId: context.requestId, commandId: 'constructor', resultId: 'constructor', actionId: 'save', payload: { value: 1 }, input: 'saved input', context: { platform: 'windows', theme: 'dark', invokedAt: '2026-10-25T00:00:00Z' } }

@@ -44,7 +44,7 @@ use std::{
 use tauri::{
     http::Response,
     webview::{NewWindowResponse, WebviewWindow},
-    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
 use crate::message_center::MessageCenterService;
@@ -110,6 +110,11 @@ pub(crate) enum PublicPluginResponse {
     },
     Window(PublicWindowResponse),
     Panel(PublicPanelResponse),
+}
+
+#[cfg(test)]
+pub(crate) fn with_panel_service_for_test(operation: impl FnOnce(&PublicPluginService, &PublicPluginManager, &crate::plugin_panel::PluginPanelController)) {
+    tests::with_panel_service_for_test(operation);
 }
 
 #[cfg(test)]
@@ -1361,6 +1366,13 @@ impl PublicPluginService {
                 let _ = service.expire_runtime_timeouts(&watchdog_app, Instant::now());
             });
         }
+        self.dispatch_to_runtime(app, request, theme, invoked_at)
+    }
+
+    fn dispatch_to_runtime<R: tauri::Runtime>(
+        &self, app: &AppHandle<R>, request: &ScheduledPluginRequest,
+        theme: PluginInvocationTheme, invoked_at: String,
+    ) -> Result<(), PublicPluginManagementError> {
         if self.manager()?.scheduler().context_status(&request.context)
             != PluginContextStatus::Current
         {
@@ -1370,9 +1382,10 @@ impl PublicPluginService {
         let label = runtime_label(&request.context.plugin_id, request.context.plugin_generation)
             .ok_or(PublicPluginManagementError::Unavailable)?;
         let window = app.get_webview_window(&label).ok_or(PublicPluginManagementError::Unavailable)?;
-        window.emit("uipilot-public-plugin-command", PluginCommandDispatch {
+        let script = runtime::public_runtime_dispatch(&PluginCommandDispatch {
             context: request.context.clone(), kind: kind.into(), invocation,
         }).map_err(|_| PublicPluginManagementError::Unavailable)?;
+        window.eval(script).map_err(|_| PublicPluginManagementError::Unavailable)?;
         Ok(())
     }
 

@@ -1,6 +1,13 @@
 use super::*;
 use crate::plugin_share::{Delivery, Payload, Phase, View};
 
+fn share_submit_input(session_epoch: String) -> Result<SubmitPluginPanelInput, CommandError> {
+    // The host created this target document for the explicit main-UI selection.
+    // Its monotonic session identity is the intent for this one empty initialization.
+    let ui_intent_epoch = parse_panel_session_epoch(&session_epoch)?;
+    Ok(SubmitPluginPanelInput { session_epoch, argument: String::new(), ui_intent_epoch })
+}
+
 fn check_packet(request: &tauri::ipc::Request<'_>) -> Result<(), CommandError> {
     let valid = match request.body() {
         tauri::ipc::InvokeBody::Json(value) => crate::plugin_share::envelope(value),
@@ -130,11 +137,7 @@ pub(crate) async fn plugin_share_select(
             public,
             controller.clone(),
             settings,
-            SubmitPluginPanelInput {
-                session_epoch: epoch,
-                argument: String::new(),
-                ui_intent_epoch: 0,
-            },
+            share_submit_input(epoch)?,
         )
         .await?;
         Ok(())
@@ -281,6 +284,34 @@ mod tests {
     ) -> Result<tauri::ipc::InvokeResponseBody, serde_json::Value> {
         tauri::test::get_ipc_response(&Caller(view.clone()), request)
     }
+    #[test]
+    fn sharing_fix_selected_target_enters_real_command_admission() {
+        crate::public_plugins::with_panel_service_for_test(|service, manager, controller| {
+            let first = controller.live_identity().unwrap();
+            let route = manager.panel_route(&first.plugin_id, "").unwrap().unwrap();
+            let identity = controller.open_session(PanelOwner {
+                plugin_id: route.plugin_id, plugin_generation: route.generation,
+                activation_id: route.activation_id, admission_epoch: route.admission_epoch,
+                command_label: route.command_label, request_id: String::new(), submission_token: String::new(),
+                argument: String::new(), host_keys: route.host_keys, host_key_focus: route.host_key_focus,
+            }).unwrap();
+            assert!(identity.session_epoch > 1);
+            let input = share_submit_input(identity.session_epoch.to_string()).unwrap();
+            let (current, _, prepared) = prepare_panel_submission(service, controller, &input).expect("selected target must reserve an ordinary command");
+            assert_eq!(current, identity);
+            let submission = service.admit_prepared_command(prepared, Instant::now()).unwrap();
+            let dispatch = submission.dispatch.expect("target initialization must enter the real scheduler");
+            let owner = dispatch.candidate.owner.command().unwrap();
+            assert_eq!(owner.ui_intent_epoch, identity.session_epoch);
+            assert_eq!(owner.control_value, "");
+            assert_eq!(dispatch.candidate.input, "");
+            assert_eq!(service.dispatch_invocation(&dispatch, PluginInvocationTheme::Dark, "now".into()).unwrap().0, "command");
+            assert!(prepare_panel_submission(service, controller, &share_submit_input(first.session_epoch.to_string()).unwrap()).is_err());
+            let mut zero = input; zero.ui_intent_epoch = 0;
+            assert!(prepare_panel_submission(service, controller, &zero).is_err(), "scheduler must retain nonzero admission invariant");
+        });
+    }
+
     #[test]
     fn plugin_share_generated_ipc_checks_actual_child_and_never_broadcasts_body_or_catalog() {
         let controller = Arc::new(PluginPanelController::default());

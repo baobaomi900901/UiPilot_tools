@@ -21,7 +21,7 @@ export function ShareSurface({ share, select, close }: { share: PluginShareView;
         event.preventDefault(); items[(index + (event.shiftKey ? -1 : 1) + items.length) % items.length]?.focus(); return
       }
       if (share.phase !== 'choosing') return
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setActive(rows.length ? (active + (event.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length : -1) }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setActive(rows.length ? active < 0 ? (event.key === 'ArrowDown' ? 0 : rows.length - 1) : (active + (event.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length : -1) }
       if (event.key === 'Enter' && event.target === search.current) { event.preventDefault(); if (!event.repeat) choose(active) }
     }}>
     {share.phase === 'choosing' ? <>

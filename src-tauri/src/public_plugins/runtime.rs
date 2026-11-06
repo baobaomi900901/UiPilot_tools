@@ -219,12 +219,8 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   };
   waitForInternals().then(async (tauri) => {
     const invoke = tauri.invoke.bind(tauri);
-    const listen = (event, callback) => invoke('plugin:event|listen', {
-      event,
-      target: { kind: 'Any' },
-      handler: tauri.transformCallback((message) => callback(message.payload)),
-    });
-    await listen('uipilot-public-plugin-command', async (dispatch) => {
+    // Payloads enter only this exact Runtime Webview, never the Tauri event bus.
+    objectDefineProperty(window, '__UIPILOT_PUBLIC_PLUGIN_DISPATCH__', { value: async (dispatch) => {
       if (!handler || busy) return;
       busy = true;
       let current = true;
@@ -363,7 +359,7 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
       } catch (_) {
         // Completion transport failure is not another handler completion.
       }
-    });
+    } });
     reflectDeleteProperty(window, '__TAURI_INTERNALS__');
     const entry = document.documentElement.dataset.runtimeEntry;
     const module = entry ? await import(entry) : null;
@@ -379,6 +375,14 @@ pub(crate) const PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE: &str = r#"
   }).catch(() => { document.title = 'uipilot-public-plugin-failed'; });
 })();
 "#;
+
+/// Double-encode the envelope: JSON.parse preserves JSON object semantics and
+/// cannot turn plugin text into executable JavaScript source.
+pub(crate) fn public_runtime_dispatch(dispatch: &PluginCommandDispatch) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string(dispatch)?;
+    let literal = serde_json::to_string(&json)?.replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
+    Ok(format!("window.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__(JSON.parse({literal}));"))
+}
 
 #[cfg(test)]
 pub(crate) fn public_runtime_bootstrap(network_https: bool) -> String {

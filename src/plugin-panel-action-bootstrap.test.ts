@@ -24,9 +24,8 @@ const panel = (actions = true, result: () => Promise<unknown> = async () => ({ o
   return { window, invoke, api: window.uipilotPluginPanel }
 }
 async function runtime(module: any, optedIn = true, windowActions = false) {
-  let callback: any
-  const invoke = vi.fn(async () => undefined)
-  const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke, transformCallback(next: any) { callback = next; return 1 } } }
+  const invoke = vi.fn(async (_command: string, _args?: unknown) => undefined)
+  const window: any = { testModule: module, __TAURI_INTERNALS__: { invoke } }
   const document = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } }
   const source = template('src-tauri/src/public_plugins/runtime.rs', 'PUBLIC_RUNTIME_BOOTSTRAP_TEMPLATE')
     .replace('__RESULT_ACTIONS__', 'false').replace('__WINDOW_ACTIONS__', String(windowActions)).replace('__CONTEXT_ACTIONS_UI__', readFileSync('src/context-actions-ui.js', 'utf8').replace('export function', 'function') + '\n' + readFileSync('src/panel-context-actions.js', 'utf8').replace('export function', 'function').replace('export function', 'function'))
@@ -34,7 +33,7 @@ async function runtime(module: any, optedIn = true, windowActions = false) {
     .replace('const module = entry ? await import(entry) : null;', 'const module = window.testModule;')
   vm.runInNewContext(source, { ...env, window, document })
   await vi.waitFor(() => expect(document.title).not.toBe(''))
-  return { callback, document, invoke }
+  return { callback: (message: { payload: unknown }) => window.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__(message.payload), document, invoke, window }
 }
 const context = { pluginId: 'com.example.panel', pluginGeneration: 1, requestId: 'public-request-0000000000000001' }
 const invocation = { apiVersion: 1, requestId: context.requestId, action: 'preview', payload: { body: 'Hi', values: [1, 2] }, context: { platform: 'windows', theme: 'dark', invokedAt: '2026-10-24T00:00:00Z' } }
@@ -230,4 +229,22 @@ describe('single Panel receive errors', () => {
     await vi.waitFor(() => expect(draft).toBe(' independent draft '))
     expect(p.invoke.mock.calls.some(([command]) => command === 'plugin_panel_request')).toBe(false)
   })
+})
+
+
+it('accepts a private injected Runtime PanelAction while preserving ordinary command completion', async () => {
+  const onCommand = vi.fn(async (next: any) => ({ requestId: next.requestId, results: [] }))
+  const onPanelAction = vi.fn(async (next: any) => {
+    expect(next.payload.text).toBe(' edited\n原文 \"\\</script>\u2028\u2029')
+    expect(Object.isFrozen(next.payload)).toBe(true)
+    return { requestId: next.requestId, data: { translated: 'done' } }
+  })
+  const r = await runtime({ onCommand, onPanelAction })
+  expect(typeof r.window.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__).toBe('function')
+  await r.window.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__({ context, kind: 'panelAction', invocation: { ...invocation, payload: { text: ' edited\n原文 \"\\</script>\u2028\u2029' } } })
+  expect(onPanelAction).toHaveBeenCalledTimes(1)
+  expect(r.invoke).toHaveBeenCalledWith('complete_plugin_command', { completion: { context, response: { requestId: context.requestId, data: { translated: 'done' } } } })
+  await r.window.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__({ context, kind: 'command', invocation: { apiVersion: 1, requestId: context.requestId, input: 'ordinary' } })
+  expect(onCommand).toHaveBeenCalledTimes(1)
+  expect(r.invoke.mock.calls.filter(([command]) => command === 'plugin:event|listen')).toHaveLength(0)
 })

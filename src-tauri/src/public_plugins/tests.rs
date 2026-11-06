@@ -4420,3 +4420,68 @@ fn current_host_still_rejects_packages_requiring_a_future_release() {
         PublicPackageError::IncompatibleApi,
     );
 }
+
+
+pub(super) fn with_panel_service_for_test(operation: impl FnOnce(&PublicPluginService, &PublicPluginManager, &crate::plugin_panel::PluginPanelController)) {
+    let (_root, service, manager, controller, _) = panel_action_fixture("share-submit-admission");
+    operation(&service, &manager, &controller);
+}
+
+#[test]
+fn sharing_fix_panel_action_dispatch_never_reaches_unrelated_any_listener() {
+    use tauri::Listener;
+    let (_root, service, _manager, controller, identity) = panel_action_fixture("private-panel-dispatch");
+    let mut input = panel_action_input();
+    input.payload = json!({"text":" edited\n原文 ", "escape":"</script>\u{2028}\u{2029}\"\\"});
+    let (action, _receiver) = controller.admit_panel_action(&service, &identity.content_label, identity.session_epoch, input).unwrap();
+    let app = tauri::test::mock_app();
+    let label = super::runtime_label(&action.context.plugin_id, action.context.plugin_generation).unwrap();
+    tauri::WebviewWindowBuilder::new(&app, &label, Default::default()).build().unwrap();
+    let unrelated = tauri::WebviewWindowBuilder::new(&app, "plugin-runtime-unrelated", Default::default()).build().unwrap();
+    let leaks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = leaks.clone();
+    unrelated.listen_any("uipilot-public-plugin-command", move |_| { observed.fetch_add(1, Ordering::SeqCst); });
+    service.dispatch_to_runtime(app.handle(), &action, super::PluginInvocationTheme::Dark, "2026-11-06T00:00:00Z".into()).unwrap();
+    assert_eq!(leaks.load(Ordering::SeqCst), 0, "PanelAction original escaped through the event bus");
+    // MockRuntime does not run eval. Execute the same production serializer and
+    // generated bootstrap in Node VM to verify both sides of the private wire.
+    let (kind, invocation) = service.dispatch_invocation(&action, super::PluginInvocationTheme::Dark, "2026-11-06T00:00:00Z".into()).unwrap();
+    let expected = invocation["payload"].clone();
+    let script = super::runtime::public_runtime_dispatch(&super::PluginCommandDispatch {
+        context: action.context.clone(), kind: kind.into(), invocation,
+    }).unwrap();
+    let bootstrap = super::runtime::public_runtime_bootstrap_with_panel(false, true);
+    let mut child = std::process::Command::new("node")
+        .args(["-e", r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', s => input += s);
+process.stdin.on('end', async () => {
+  try {
+    const { bootstrap, script, expected } = JSON.parse(input);
+    const calls = [], completions = [];
+    const window = { __TAURI_INTERNALS__: { invoke: async (command, args) => {
+      assert.equal(command, 'complete_plugin_command'); completions.push(args);
+    } }, testModule: { onCommand() { throw Error('wrong handler'); }, async onPanelAction(next, api) {
+      assert(Object.isFrozen(next.payload)); calls.push(next); return { requestId: next.requestId, data: { ok: true } };
+    } } };
+    const document = { title: '', documentElement: { dataset: { runtimeEntry: '/runtime.js' } } };
+    const context = vm.createContext({ window, document, TextEncoder, setTimeout, Object, Reflect, Error, TypeError, Promise, WeakSet, Set });
+    vm.runInContext(bootstrap.replace('const module = entry ? await import(entry) : null;', 'const module = window.testModule;'), context);
+    await new Promise(setImmediate);
+    assert.equal(document.title, 'uipilot-public-plugin-ready');
+    await vm.runInContext(script, context);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), expected);
+    assert.equal(completions.length, 1);
+    assert.equal(completions[0].completion.response.data.ok, true);
+    console.log('production private dispatch script + generated bootstrap: 1 PanelAction, exact payload, 1 completion');
+  } catch (error) { console.error(error); process.exitCode = 1; }
+});
+"#])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    serde_json::to_writer(child.stdin.take().unwrap(), &json!({"bootstrap":bootstrap,"script":script,"expected":expected})).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+}

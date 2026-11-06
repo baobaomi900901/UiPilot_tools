@@ -4796,13 +4796,9 @@ async fn open_plugin_panel_impl(
     ).with_images(images_enabled)))
 }
 
-async fn submit_plugin_panel_impl(
-    app: AppHandle,
-    public: State<'_, Arc<PublicPluginService>>,
-    controller: State<'_, Arc<PluginPanelController>>,
-    settings: State<'_, SettingsStore>,
-    input: SubmitPluginPanelInput,
-) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+fn prepare_panel_submission(
+    public: &PublicPluginService, controller: &PluginPanelController, input: &SubmitPluginPanelInput,
+) -> Result<(PanelSessionIdentity, Option<String>, PreparedPublicSubmission), CommandError> {
     let session_epoch = parse_panel_session_epoch(&input.session_epoch)?;
     let identity = controller
         .live_identity()
@@ -4815,6 +4811,18 @@ async fn submit_plugin_panel_impl(
         .ok_or_else(CommandError::plugin_query_failed)?;
     let input_placeholder = route.input_placeholder.clone();
     let prepared = public.prepare_command(route, input.ui_intent_epoch, input.argument.clone())?;
+    Ok((identity, input_placeholder, prepared))
+}
+
+async fn submit_plugin_panel_impl(
+    app: AppHandle,
+    public: State<'_, Arc<PublicPluginService>>,
+    controller: State<'_, Arc<PluginPanelController>>,
+    settings: State<'_, SettingsStore>,
+    input: SubmitPluginPanelInput,
+) -> Result<Option<PluginPanelCommandResult>, CommandError> {
+    let (identity, input_placeholder, prepared) = prepare_panel_submission(&public, &controller, &input)?;
+    let session_epoch = identity.session_epoch;
     let pending = PendingDispatch {
         request_id: prepared.request_context().request_id.clone(),
         submission_token: prepared.token.clone(),

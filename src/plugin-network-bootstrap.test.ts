@@ -81,7 +81,7 @@ async function executeRuntimeBootstrap(
     window: hostWindow,
   })
   await vi.waitFor(() => expect(document.title).toBe('uipilot-public-plugin-ready'))
-  if (!eventCallback) throw new Error('runtime event callback was not registered')
+  eventCallback = (message: { payload: unknown }) => (hostWindow.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__ as (dispatch: unknown) => Promise<void>)(message.payload)
   const dispatch = async () => {
     await eventCallback!({
       payload: {
@@ -306,7 +306,7 @@ describe('public plugin Runtime network bootstrap', () => {
       window: hostWindow,
     })
     await vi.waitFor(() => expect(document.title).toBe('uipilot-public-plugin-ready'))
-    if (!eventCallback) throw new Error('runtime event callback was not registered')
+    eventCallback = (message: { payload: unknown }) => (hostWindow.__UIPILOT_PUBLIC_PLUGIN_DISPATCH__ as (dispatch: unknown) => Promise<void>)(message.payload)
     await (eventCallback as unknown as (message: { payload: unknown }) => Promise<void>)({
       payload: {
         context: {
