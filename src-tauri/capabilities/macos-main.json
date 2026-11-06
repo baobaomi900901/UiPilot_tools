@@ -17,6 +17,8 @@
     "allow-search-apps",
     "allow-execute-result",
     "allow-set-theme-preference",
-    "allow-hide-launcher"
+    "allow-hide-launcher",
+    "allow-save-hotkey",
+    "allow-set-hotkey-recording"
   ]
 }

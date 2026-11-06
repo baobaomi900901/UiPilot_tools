@@ -2038,6 +2038,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           <Form component="div" layout="vertical" className="settings-basic-form">
             <Form.Item label="快捷键" htmlFor={`settings-hotkey-${settings.hotkey.key}`}>
               <HotkeyRecorderInput
+                allowSameValue={core.capabilities.platform === 'macos'}
                 allowDoubleTap={core.capabilities.doubleTap}
                 platform={core.capabilities.platform}
                 onCommit={core.saveHotkeyCanonical}
