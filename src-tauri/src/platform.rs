@@ -38,3 +38,11 @@ pub fn public_plugin_manifest_schema() -> serde_json::Value {
     serde_json::to_value(manifest::public_manifest_v1_schema())
         .expect("public plugin schema must serialize")
 }
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // Awaiting the Find backend and its independent authorization checks.
+mod macos_find_identity;
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // Private worker bridge, pending Find controller and scope integration.
+mod macos_find_query;

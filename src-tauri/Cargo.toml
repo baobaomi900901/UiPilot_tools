@@ -70,7 +70,7 @@ base64 = "=0.22.1"
 core-foundation = "=0.10.1"
 block2 = "=0.6.2"
 objc2 = "=0.6.4"
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSError", "NSPropertyList", "NSString", "NSURL"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSError", "NSPropertyList", "NSString", "NSURL", "NSDate", "NSMetadata", "NSMetadataAttributes", "NSNotification", "NSOperation", "NSPredicate", "NSRunLoop", "NSSortDescriptor", "NSThread", "block2"] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "block2"] }
 plist = { version = "=1.10.0", features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 rustix = { version = "=1.1.4", features = ["fs"] }
