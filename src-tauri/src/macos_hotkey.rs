@@ -207,7 +207,13 @@ pub(super) async fn save_hotkey(window: WebviewWindow, hotkey: HotkeyValue) -> R
 mod tests {
     use super::*;
     #[derive(Default)]
-    struct TestPort { keys: Vec<Shortcut>, disk: String, fail_save: bool, fail_remove: Option<Shortcut> }
+    struct TestPort {
+        keys: Vec<Shortcut>,
+        disk: String,
+        store: Option<SettingsStore>,
+        fail_save: bool,
+        fail_remove: Option<Shortcut>,
+    }
     impl Port for TestPort {
         fn register(&mut self, key: Shortcut) -> Result<(), HotkeyError> {
             if self.keys.contains(&key) { return Err(CONFLICT); }
@@ -219,8 +225,48 @@ mod tests {
         }
         fn save(&mut self, text: &str) -> Result<(), HotkeyError> {
             if self.fail_save { return Err(FAILED); }
+            if let Some(store) = &self.store {
+                store.update_hotkey(text.to_owned()).map_err(|_| FAILED)?;
+            }
             self.disk = text.to_owned(); Ok(())
         }
+    }
+
+    #[test]
+    fn cold_start_reads_the_last_committed_chord_after_conflict_and_retry() {
+        use crate::settings::ThemePreference;
+        use std::fs;
+
+        let dir = std::env::temp_dir().canonicalize().unwrap()
+            .join(format!("uipilot-mac-hotkey-restart-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let settings = SettingsStore::load(&dir).unwrap();
+        settings.update_hotkey("Alt+Space".into()).unwrap();
+        settings.set_theme_preference_with_revision(ThemePreference::Dark).unwrap();
+
+        let candidate = chord("Meta+K").unwrap();
+        let mut port = TestPort { store: Some(settings), keys: vec![candidate], ..Default::default() };
+        let mut bindings = Bindings::default();
+        let original = bindings.initialize("Alt+Space", &mut port).unwrap();
+        let path = dir.join("settings.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(bindings.rebind("Meta+K", "Alt+Space", &mut port), Err(CONFLICT));
+        assert_eq!(bindings.active, Some(original));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(SettingsStore::load(&dir).unwrap().snapshot().hotkey, "Alt+Space");
+
+        port.keys.retain(|key| *key != candidate);
+        bindings.rebind("Meta+K", "Alt+Space", &mut port).unwrap();
+        assert_eq!(port.keys, [candidate]);
+        drop(port);
+        let restored = SettingsStore::load(&dir).unwrap().snapshot();
+        assert_eq!(restored.theme, ThemePreference::Dark);
+        assert_eq!(restored.hotkey, "Meta+K");
+        let mut restarted = Bindings::default();
+        let mut fresh_port = TestPort::default();
+        assert_eq!(restarted.initialize(&restored.hotkey, &mut fresh_port), Ok(candidate));
+        assert_eq!(fresh_port.keys, [candidate]);
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn failed_save_keeps_the_previous_os_registration_and_disk_value() {
