@@ -222,7 +222,7 @@ impl PluginPanelController {
 
 #[cfg(test)]
 impl PluginPanelController {
-    pub(crate) fn share_test_target(&self) -> (PanelSessionIdentity, PanelSessionIdentity) {
+    pub(crate) fn share_test_opening_target(&self) -> (PanelSessionIdentity, PanelSessionIdentity) {
         fn owner(plugin: &str) -> PanelOwner {
             PanelOwner {
                 plugin_id: plugin.into(),
@@ -267,6 +267,13 @@ impl PluginPanelController {
             .replace_session(owner("com.test.translate"), Some("1"))
             .unwrap()
             .0;
+        assert_eq!(self.share_view().unwrap().phase, Phase::Opening);
+        assert_eq!(self.live_identity(), Some(target.clone()));
+        (source, target)
+    }
+
+    pub(crate) fn share_test_target(&self) -> (PanelSessionIdentity, PanelSessionIdentity) {
+        let (source, target) = self.share_test_opening_target();
         let mut core = self.core.lock().unwrap();
         let live = core.session.as_mut().unwrap();
         live.phase = PanelPhase::Ready;
@@ -283,6 +290,111 @@ impl PluginPanelController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plugin_share_opening_target_ready_failure_retains_error_without_descriptor() {
+        let c = PluginPanelController::default();
+        let (source, target) = c.share_test_opening_target();
+        // A late source teardown cannot retire the replacement target.
+        assert!(c.teardown_session(Some(source.session_epoch)).is_none());
+        assert_eq!(c.share_view().unwrap().phase, Phase::Opening);
+        assert!(c
+            .core
+            .lock()
+            .unwrap()
+            .share
+            .as_ref()
+            .unwrap()
+            .payload
+            .is_some());
+        // mount_scoped uses this controller timeout -> teardown before share_target.
+        assert_eq!(
+            c.wait_until_ready(target.session_epoch, Duration::ZERO),
+            Err(PublicPluginManagementError::RuntimeNotReady)
+        );
+        assert_eq!(
+            c.teardown_session(Some(target.session_epoch)),
+            Some(target.clone())
+        );
+        let view = c
+            .share_view()
+            .expect("failed opening target must retain its error");
+        assert_eq!(view.phase, Phase::Error);
+        assert_eq!(view.target_label.as_deref(), Some("Translate"));
+        assert!(
+            view.target.is_none(),
+            "mount never returned a target descriptor"
+        );
+        assert!(view.error.is_some());
+        assert!(
+            c.live_identity().is_none(),
+            "neither target nor source is restored"
+        );
+        assert!(c
+            .core
+            .lock()
+            .unwrap()
+            .share
+            .as_ref()
+            .unwrap()
+            .payload
+            .is_none());
+        // Actual DTO consumed by pollShare while its panel is still the source.
+        let dto = serde_json::to_value(view).unwrap();
+        assert_eq!(dto["sourceEpoch"], source.session_epoch.to_string());
+        assert_eq!(dto["phase"], "error");
+        assert_eq!(dto["targetLabel"], "Translate");
+        assert!(dto["target"].is_null());
+        assert!(!dto.to_string().contains("原文"));
+        assert!(!c.mark_ready(&target.content_label, target.session_epoch, true, false));
+        assert!(c
+            .share_claim(&target.content_label, target.session_epoch, "init")
+            .is_err());
+        assert!(c
+            .share_received(
+                &target.content_label,
+                target.session_epoch,
+                "init",
+                "1",
+                true
+            )
+            .is_err());
+        assert!(c
+            .replace_session(test_owner("com.test.translate"), Some("1"))
+            .is_none());
+        assert_eq!(c.share_view().unwrap().phase, Phase::Error);
+        assert!(c.share_end("1").unwrap().is_none());
+        assert!(c.share_view().is_none());
+    }
+
+    fn test_owner(plugin: &str) -> PanelOwner {
+        PanelOwner {
+            plugin_id: plugin.into(),
+            plugin_generation: 1,
+            activation_id: 2,
+            admission_epoch: 3,
+            command_label: plugin.into(),
+            request_id: "new".into(),
+            submission_token: "new".into(),
+            argument: String::new(),
+            host_keys: vec![],
+            host_key_focus: PanelHostKeyFocus::Content,
+        }
+    }
+
+    #[test]
+    fn plugin_share_opening_target_teardown_cannot_poison_new_navigation_or_close() {
+        let c = PluginPanelController::default();
+        let (_, target) = c.share_test_opening_target();
+        let new = c.open_session(test_owner("com.test.new")).unwrap();
+        assert!(c.teardown_session(Some(target.session_epoch)).is_none());
+        c.share_fail("1"); // late plugin_share_select error completion
+        assert!(c.share_view().is_none());
+        assert_eq!(c.live_identity(), Some(new.clone()));
+        assert_eq!(c.teardown_session(Some(new.session_epoch)), Some(new));
+        assert!(c.share_view().is_none());
+        assert!(c.live_identity().is_none());
+    }
+
     #[test]
     fn plugin_share_claim_once_and_receiver_failure_never_restores_source() {
         let c = PluginPanelController::default();

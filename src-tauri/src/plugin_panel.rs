@@ -397,6 +397,7 @@ fn invalidate_session_locked(core: &mut ControllerCore) -> Option<LiveSession> {
     if let Some(share) = core.share.as_mut() {
         match share.view.phase {
             crate::plugin_share::Phase::Opening if share.source == session.identity => {},
+            crate::plugin_share::Phase::Opening if share.target.as_ref() == Some(&session.identity) => share.fail(),
             crate::plugin_share::Phase::Error => {},
             crate::plugin_share::Phase::Delivering => share.fail(),
             _ => { core.share = None; },
