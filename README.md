@@ -1,6 +1,12 @@
 # UiPilot
 
-Windows x64 启动器与本地公开插件宿主（当前版本 0.14.0）。宿主为 Tauri 2、React 和 Rust；公开插件使用受控的 v1 Runtime / Panel / Window API。
+Windows x64 启动器与本地公开插件宿主（当前版本 0.19.0）。宿主为 Tauri 2、React 和 Rust；公开插件使用受控的 v1 Runtime / Panel / Window API。
+
+## Apple Silicon 开发
+
+Mac 移植在开发中。构建入口支持原生 arm64，首版目标是通过菜单栏或全局快捷键唤起、搜索并打开应用。候选最低系统为 macOS 15.7.4，当前进度可在[逐步实施与验收](docs/superpowers/plans/2026-11-06-macos-port-steps.md)查看。
+
+在 arm64 的 Node 22 环境运行 `npm ci`，再运行 `npm run dev` 预览前端，或用 `npm run build` 检查 TypeScript 并构建页面。Mac 原生入口为 `npm run tauri -- dev`，要求 aarch64-apple-darwin Rust 1.96.1 和 macOS SDK。当前 Rust 宿主仍含 Windows 专用模块；上述原生入口用于移植开发，完整 Mac 启动器尚不可用。前端预览不覆盖原生快捷键、窗口焦点或 IPC。
 
 ## 工具链与开发
 
