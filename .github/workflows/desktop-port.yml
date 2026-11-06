@@ -45,6 +45,9 @@ jobs:
           npm ci
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+      # The owned Tauri build stages the Provider files required by tauri-build during cargo test.
+      - name: Build Windows installer
+        run: npm run tauri -- build -- --locked
       - name: Run local checks
         run: npm run verify:local
       - name: Verify platform entry and staging
@@ -52,5 +55,3 @@ jobs:
           node --test scripts/platform-launcher.test.mjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm run test:managed-everything
-      - name: Build Windows installer
-        run: npm run tauri -- build -- --locked
