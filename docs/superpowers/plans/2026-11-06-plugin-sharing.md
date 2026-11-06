@@ -17,7 +17,7 @@ Architecture: an independent ShareCoordinator owns bounded snapshots, tickets, d
 
 Each task uses focused failing tests, minimum implementation, focused passing verification and an atomic commit excluding preexisting changes. Each task receives specification and quality review before dependent work. Commands run from the repository root unless a working directory is stated. Run one Cargo process at a time. Persist brief, report, review and progress evidence under `.superpowers/sdd/sharing/`.
 
-Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6. Tasks 2–4 form an internal integration boundary and are not independently advertised as usable sharing.
+Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 → Task 7 → Task 8 → Task 9. Tasks 2–7 form an internal integration boundary and are not independently advertised as usable sharing.
 
 ### Task 1: Manifest, SDK and Host version contracts
 
@@ -27,11 +27,11 @@ Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6.
 
 - [ ] Add strict optional `share` declarations and receiver validation consistently to Rust, schema and CLI, preserving legacy commandId omission.
 - [ ] Declare optional Panel share APIs, readonly DTOs and optional `sharePrepare` entry for Runtime context and Panel update. Runtime implementation follows in Task 3.
-- [ ] Raise Host/default CLI target to 0.22.0 while preserving old capability floors. Keep prose docs for Task 6.
+- [ ] Raise Host/default CLI target to 0.22.0 while preserving old capability floors. Keep prose docs for Task 9.
 
 **Distinct test coverage:** valid source/receiver/both; unknown/null/duplicates, unsafe IDs, Unicode title/control limits, receiver count/type/byte limits, platform/output/multi-command/minimumHost rejection; old packages unchanged; SDK positive/negative contracts.
 
-**Verify:** `npm.cmd test --workspace @uipilot/plugin-cli -- manifest`; `npm.cmd run check --workspace @uipilot/plugin-cli`; `cargo test public_plugins::manifest` in `src-tauri`; focused SDK compile via `node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict <contract-test>`.
+**Verify:** `npm.cmd test --workspace @uipilot/plugin-cli -- manifest`; `npm.cmd run check --workspace @uipilot/plugin-cli`; `cargo test --lib public_plugins::manifest` in `src-tauri`; focused SDK compile via `node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict <contract-test>`.
 
 ### Task 2: ShareCoordinator and discovery model
 
@@ -43,31 +43,76 @@ Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6.
 - [ ] Implement state transitions, commit prerequisites, one-time body claim/ACK, local-cancellation qualification, deadline/recovery cleanup and body-free spent metadata using injected time/identities.
 - [ ] Provide explicit coordinator operations usable by Task 3 without embedding native calls under its commit lock.
 
-**Distinct test coverage:** immutable snapshots and source confirmation; invalidation-before-commit versus commit-before-invalidation; disabled/updated/self/size-limited receivers; claim lost/repeated/late and ACK late versus revoked; active cancellation versus unexpected document loss; recovery expiry never extended; metadata/body release at every terminal path. Real orchestration belongs to Task 3.
+**Distinct test coverage:** immutable snapshots and source confirmation; invalidation-before-commit versus commit-before-invalidation; disabled/updated/self/size-limited receivers; claim lost/repeated/late and ACK late versus revoked; active cancellation versus unexpected document loss; recovery expiry never extended; metadata/body release at every terminal path. Real orchestration belongs to Tasks 4–6.
 
-**Verify:** `cargo test plugin_share` in `src-tauri`.
+**Verify:** `cargo test --lib plugin_share` in `src-tauri`.
 
-### Task 3: Native handoff, restricted preparation and production bridges
+### Task 3: Restricted preparation Runtime authority
 
-**Files:** `plugin_panel.rs` and focused lifecycle submodules; `public_plugins.rs`, `public_plugins/{activation,runtime,scheduler}.rs`; `commands.rs`/focused share commands; `lib.rs`, lifecycle/ACL command registrations; new generated share bridge; production bootstrap and mock IPC tests.
+**Files:** `public_plugins/{scheduler,runtime,activation}.rs`, `public_plugins.rs`, focused Runtime/service tests.
 
-**Dependencies:** Task 2; design sections 2, 4–7 and acceptance 3, 5–11, 13, 15.
+**Dependencies:** Task 2; design sections 6.2 and 7; `.superpowers/sdd/sharing/host-integration-map.md` scheduling/authorization map.
 
-- [ ] Add separate hidden pending session and empty `sharePrepare` initialization, without replacing source DOM/image or sending ordinary Ready before commit.
-- [ ] Enforce preparation read-only restrictions at native Runtime and Panel IPC boundaries; cancellation revokes logical permission while retaining physical execution occupancy.
-- [ ] Serialize commit and lifecycle invalidation; implement reversible native preparation, active target promotion, source revocation, hidden delivery, acceptance exposure and safe recovery/cancel handshake.
-- [ ] Wire actual source snapshot/invalidation/confirmation, synchronous Ready barrier, one-shot private claim/receive/ACK and local pending/consumed/revoked bridge state. Public registration cannot mint gesture tickets.
-- [ ] Expose strictly validated host-only discovery/selection/state/cancel/copy commands and events for Task 4. Record exact frontend wire signatures in the task report.
+- [ ] Add host-owned prepare request authority, empty onCommand input/no image and optional context.entry without changing ordinary legacy invocation.
+- [ ] Fail Busy without queue/retry; logical cancellation revokes API authority while preserving the physical slot/original deadline until completion.
+- [ ] Allow only own storage.get/settings.get/isSecretConfigured, rejecting effects at native scheduler/API/network/service admission, not only facade.
+- [ ] Return initialization result to the pending handoff owner, never launcher result publication. Provide explicit preparation APIs for Task 4.
 
-**Distinct test coverage:** actual generated IPC distinguishes main/child/other/stale caller; prepare effects rejected even through private IPC; source survives prepare failure; target Busy no queue; Ready/offer/claim/handler/ACK ordering through production bootstrap; Promise Ready rejected only for sharing; cancellation ACK lost destroys document before input; delayed claim after continued editing never calls handler; native preparation failure before commit versus display failure after Accepted; source/target lifecycle invalidation serialized against commit and ACK. Use mock native adapters, not live desktop control.
+**Distinct test coverage:** real scheduler/service prepare admission with Busy and cancellation/late completion; malicious direct native API calls for each effect family denied with already-granted install permissions; read calls allowed only while current; normal commands/actions remain unchanged.
 
-**Verify:** `cargo test plugin_share` and `cargo test plugin_panel` in `src-tauri`; `npm.cmd test -- src/plugin-panel-share-bootstrap.test.ts src/plugin-panel-action-bootstrap.test.ts src/plugin-panel-image-bootstrap.test.ts`; additional exact IPC/service filter recorded in report.
+**Verify:** `cargo test --lib share_prepare` and `cargo test --lib public_plugins::scheduler` in `src-tauri`; production Runtime bootstrap compatibility via `npm.cmd test -- src/plugin-panel-action-bootstrap.test.ts`.
 
-### Task 4: Launcher share selector and recovery UI
+### Task 4: Pending Panel lifecycle and commit serialization
+
+**Files:** `plugin_panel.rs` and focused submodules, `plugin_share.rs`, manager/controller lifecycle authorization seams, mock native adapter tests.
+
+**Dependencies:** Task 3; design sections 6.2–6.5, 7; host integration map lock-order/lifecycle sections.
+
+- [ ] Add one hidden pending session retaining source DOM/image/model; use separate mount/bounds/ready path, not ordinary teardown-first mount.
+- [ ] Establish shared commit/lifecycle serialization or equivalent atomic identity lease with a documented lock order; move teardown/effects outside short state critical sections.
+- [ ] Implement reversible native preparation, target promotion/source authority revocation, hidden committed target, accepted exposure and safe cancellation/recovery intent termination.
+- [ ] Classify unexpected document loss versus intentional navigation/hide/revocation; cover pending and active identities in all lifecycle hooks.
+- [ ] Enforce pending private IPC read-only classes and unaccepted input barrier, including helpers bypassing begin_content_call. Provide bridge/host orchestration interfaces in report.
+
+**Distinct test coverage:** source object/DOM adapter identity retained on preparation failure; invalidation before versus after commit yields one terminal outcome; manager permission/settings/update reservations cannot race promotion; native precommit failure restores only valid source, postaccept display failure never rolls back; source cleanup after commit does not cancel target; revoke ACK loss destroys before input, unexpected preaccept target loss keeps bounded recovery, intentional revoke releases immediately.
+
+**Verify:** `cargo test --lib plugin_share` and `cargo test --lib plugin_panel` in `src-tauri`; exact focused authorization/lifecycle filters recorded in report.
+
+### Task 5: Production source and receiver handshake bridges
+
+**Files:** new `panel_share_bridge.js`, generated Panel bootstrap integration, share bridge private IPC handlers, `src/plugin-panel-share-bootstrap.test.ts` and existing bridge tests.
+
+**Dependencies:** Task 4; design sections 4–7 and acceptance 6–7,9–10,15.
+
+- [ ] Implement optional source/receive registration, local invalidation, bounded immutable snapshot and confirmation, receiver registration and Prepared ACK.
+- [ ] Add synchronous sharing Ready barrier, one-shot offer/claim/handler/ACK and bridge-private pending/consumed/revoked intent; keep ordinary async Ready.
+- [ ] Wire exact document/epoch/init/transfer checks at native bridge boundaries; no plugin-callable gesture mint or target selection.
+- [ ] Implement cancellation ACK with late response discard and preserve theme-only UI updates without resetting initialization or received text.
+
+**Distinct test coverage:** execute actual generated bootstrap for Ready/offer ordering, Promise/throw contract rejection, source provider timeout/changed snapshot, lost/repeated claims/ACK, deadline admission vs in-flight response, cancellation before delayed body prevents handler/new editor overwrite; native actual Webview mismatch rejected.
+
+**Verify:** `npm.cmd test -- src/plugin-panel-share-bootstrap.test.ts src/plugin-panel-action-bootstrap.test.ts src/plugin-panel-image-bootstrap.test.ts`; `cargo test --lib plugin_share` in `src-tauri`.
+
+### Task 6: Trusted menu authority and host sharing orchestration
+
+**Files:** native Panel accelerator hook, share host commands/service, `commands.rs`, `lib.rs`, `build.rs`, capabilities/ACL, `panel-context-actions.js`, actual generated IPC tests.
+
+**Dependencies:** Task 5; design sections 4,6–8 and acceptance 1,3–11,13,15; host integration map trusted-input section.
+
+- [ ] Mint content source-menu tickets only from native active/focused Ctrl+K hook; actual main caller handles host input/footer gestures. No Panel IPC can mint user intent. Exposed JS ordinary menu cannot start sharing without ticket; separate selector token remains host-only.
+- [ ] Wire complete snapshot → discovery → selected receiver → prepare → confirmation → native preparation → commit → Ready/claim/ACK lifecycle, with deadline-driven cancellation/recovery.
+- [ ] Expose validated host-only selection/state/cancel/continue/copy interfaces/events. Native source/target input ownership and privacy cleanup apply to every exit path.
+- [ ] Register state, commands and ACL together. Record exact frontend wire signatures for Task 7.
+
+**Distinct test coverage:** actual generated Tauri IPC main/child/other/stale callers, synthetic/no-ticket menu denial, native repeat/IME conservative gating, independent selector token consumed once; production scheduling plus bridge ordering through fake adapters, not just isolated models; phase-specific update/hide/revocation races and failed copy/cancel feedback.
+
+**Verify:** `cargo test --lib plugin_share` and relevant generated IPC/ACL tests in `src-tauri`; `npm.cmd test -- src/plugin-panel-share-bootstrap.test.ts src/panel-context-actions.test.ts`.
+
+### Task 7: Launcher share selector and recovery UI
 
 **Files:** `src/launcher-{core,view}.tsx` or existing `.ts` equivalent, `protocol.ts`, `public-plugin-panel.tsx`, focused share components/styles/tests, `panel-context-actions.js` if needed.
 
-**Dependencies:** Task 3 frontend wire interfaces; design sections 6, 8; `docs/ui-guidelines.md`.
+**Dependencies:** Task 6 frontend wire interfaces; design sections 6, 8; `docs/ui-guidelines.md`.
 
 - [ ] Add host-owned Share action, searchable receiver selection with limits/reasons and deterministic IDs, preparing state and cancellation.
 - [ ] Keep source focus/selection on cancelled selection; disable host input and hide native target through delivery; show target tag/empty input after accepted.
@@ -77,11 +122,11 @@ Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6.
 
 **Verify:** `npm.cmd test -- src/plugin-share.test.tsx src/launcher.test.tsx src/panel-context-actions.test.ts`; `npm.cmd run build`.
 
-### Task 5: OCR and translation sharing integration
+### Task 8: OCR and translation sharing integration
 
 **Files:** `examples/public-plugins/com.uipilot.{ocr,translate}/package/{plugin.json,dist/*}`, plugin tests and README.
 
-**Dependencies:** Tasks 1–4; design sections 4–5, 6.2–6.3, 9–10; public-plugin skill/guide/UI guidelines.
+**Dependencies:** Tasks 1–7; design sections 4–5, 6.2–6.3, 9–10; public-plugin skill/guide/UI guidelines.
 
 - [ ] OCR source shares current edited valid full text; content/availability changes increment revision, theme/focus do not.
 - [ ] Translation declares receiver and translated-text source; prepare without business, synchronous receipt writes editor and defers one automatic translation; newer input guards stale work.
@@ -91,11 +136,11 @@ Dependency order: Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6.
 
 **Verify:** `node --test examples/public-plugins/com.uipilot.ocr/tests/*.test.js examples/public-plugins/com.uipilot.translate/tests/*.test.js`; compile both SDK contract tests; CLI validate both packages.
 
-### Task 6: Integrated acceptance, developer documentation and packages
+### Task 9: Integrated acceptance, developer documentation and packages
 
 **Files:** focused integration fixtures/tests, SDK prose/developer guide, plugin examples/skill relevant paragraphs, manual acceptance record, delivery archives under `artifacts/sharing-delivery/`.
 
-**Dependencies:** Tasks 1–5; design section 10 complete matrix.
+**Dependencies:** Tasks 1–8; design section 10 complete matrix.
 
 - [ ] Exercise production host scheduling/bridges with fake OCR, translation and an independent draft-only receiver; demonstrate user-selected delivery and plugin-owned business decision.
 - [ ] Document source/receiver authoring, preparation restrictions, cancellation/Ready contracts, versions and honest native acceptance boundary.
