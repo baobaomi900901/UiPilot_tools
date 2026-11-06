@@ -5550,27 +5550,7 @@ fn publish_public_main_results(
     )
 }
 
-fn search_response(
-    request_id: String,
-    items: Vec<(String, crate::model::ResultItem)>,
-) -> SearchResponse {
-    SearchResponse {
-        request_id,
-        items: items
-            .into_iter()
-            .map(|(result_id, mut item)| {
-                item.result_id = result_id;
-                item
-            })
-            .collect(),
-        command_hint: None,
-        main_result_command: None,
-        window_transfer_token: None,
-        auto_execute_result_id: None,
-        replace_local_results: false,
-        refresh_at_utc: None,
-    }
-}
+use crate::model::search_response;
 #[tauri::command]
 pub(crate) fn publish_plugin_results(
     window: WebviewWindow,

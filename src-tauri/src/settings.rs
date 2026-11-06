@@ -8,7 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
-use crate::{apps::{AppCache, Application}, atomic_file::{quarantine_invalid, read_optional}};
+use crate::atomic_file::{quarantine_invalid, read_optional};
+use crate::apps::{AppCache, Application};
 use crate::atomic_file::{commit_with_backup, AtomicFileError, AtomicPaths};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -280,7 +281,6 @@ impl SettingsStore {
         })
     }
 
-    #[cfg(windows)]
     pub(crate) fn decorate_applications(&self, applications: &mut [Application]) {
         let state = self.state.lock().expect("settings lock poisoned");
         for application in applications {
@@ -508,7 +508,6 @@ impl SettingsStore {
         self.persist(&mut state, candidate)
     }
 
-    #[cfg(windows)]
     pub(crate) fn increment_use_count(
         &self,
         app_id: &str,
@@ -993,13 +992,10 @@ mod tests {
     };
 
     use super::*;
-    #[cfg(windows)]
     use std::{sync::{Arc, Barrier}, thread};
-    #[cfg(windows)]
     use crate::apps::{AppCache, Application, ApplicationLaunchTarget};
 
     const APP_A: &str = "app-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    #[cfg(windows)]
     const APP_B: &str = "app-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const APP_ABSENT: &str = "app-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1038,7 +1034,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn application(app_id: &str, display_name: &str) -> Application {
         Application {
             app_id: app_id.into(),
@@ -1052,7 +1047,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn cache(apps: &[(&str, &str)]) -> AppCache {
         AppCache::from_apps(
             apps.iter()
@@ -1078,7 +1072,6 @@ mod tests {
         serde_json::from_slice(&fs::read(dir.current()).unwrap()).unwrap()
     }
 
-    #[cfg(windows)]
     fn read_backup(dir: &TestDir) -> Settings {
         serde_json::from_slice(&fs::read(dir.backup()).unwrap()).unwrap()
     }
@@ -1626,7 +1619,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn unknown_increment_and_overflow_leave_memory_and_disk_unchanged() {
         let dir = TestDir::new("bad-increment");
         let persisted = Settings {
@@ -1651,7 +1643,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn decoration_uses_stable_id_when_display_names_are_duplicates() {
         let dir = TestDir::new("decorate");
         let persisted = Settings {
@@ -1693,7 +1684,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn concurrent_increments_are_serialized_in_memory_and_on_disk() {
         let dir = TestDir::new("concurrent-increments");
         let store = Arc::new(SettingsStore::load(dir.path()).unwrap());
@@ -1720,7 +1710,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn second_save_after_defaults_creates_backup_from_first_save() {
         let dir = TestDir::new("defaults-then-two-saves");
         let store = SettingsStore::load(dir.path()).unwrap();
@@ -1735,7 +1724,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn second_save_after_backup_recovery_backs_up_first_new_current() {
         let dir = TestDir::new("backup-then-two-saves");
         let recovered = Settings {

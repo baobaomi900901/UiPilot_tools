@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    apps::ApplicationLaunchTarget, file_search::FileExecutionAction, settings::WebSearchEngine,
+    apps::ApplicationLaunchTarget, settings::WebSearchEngine,
 };
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ResultAction {
@@ -16,7 +16,8 @@ pub(crate) enum ResultAction {
         app_id: String,
         target: ApplicationLaunchTarget,
     },
-    OpenFile(FileExecutionAction),
+    #[cfg(windows)]
+    OpenFile(crate::file_search::FileExecutionAction),
     CopyBuiltInText {
         text: String,
     },
@@ -108,6 +109,9 @@ pub(crate) struct ExecutionTicket {
 }
 
 impl ExecutionTicket {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn invocation_id(&self) -> &str { &self.invocation_id }
+
     #[cfg(test)]
     pub(crate) fn request_id(&self) -> &str {
         &self.request_id
@@ -131,6 +135,7 @@ struct ResultSet {
     domain: QueryDomain,
     generation: u64,
     actions: HashMap<String, ResultAction>,
+    #[cfg(windows)]
     result_actions: Option<crate::public_plugins::result_action::ResultActionSnapshot>,
 }
 
@@ -146,6 +151,7 @@ struct RegistryState {
     domain_exhausted: [bool; 3],
     plugin_reservation: Option<PluginDomainEpochReservation>,
     current: Option<ResultSet>,
+    #[cfg(windows)]
     retired_action: Option<crate::public_plugins::PluginRequestContext>,
 }
 
@@ -215,6 +221,11 @@ impl Default for ResultRegistry {
 }
 
 impl ResultRegistry {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn for_main() -> Self {
+        Self::scoped(WindowScope::Main, Arc::new(OpaqueIdAllocator::default()))
+    }
+
     fn scoped(scope: WindowScope, allocator: Arc<OpaqueIdAllocator>) -> Self {
         Self::new(scope, allocator, true)
     }
@@ -367,6 +378,7 @@ impl ResultRegistry {
             domain: token.domain,
             generation: next_result_set_generation,
             actions,
+            #[cfg(windows)]
             result_actions: None,
         });
         Some(response(request_id, items))
@@ -392,7 +404,9 @@ impl ResultRegistry {
             .lock()
             .expect("result registry lock poisoned");
         let current = state.current.as_ref().ok_or(RegistryError::StaleRequest)?;
-        if current.request_id != request_id || current.result_actions.is_some() {
+        #[cfg(windows)]
+        if current.result_actions.is_some() { return Err(RegistryError::StaleRequest); }
+        if current.request_id != request_id {
             return Err(RegistryError::StaleRequest);
         }
 
@@ -525,6 +539,7 @@ impl ResultRegistry {
         true
     }
 
+    #[cfg(windows)]
     pub(crate) fn reserve_plugin_epoch(
         &self,
     ) -> Result<PluginDomainEpochReservation, PluginDomainReservationError> {
@@ -669,6 +684,9 @@ impl ResultRegistry {
     }
 
     fn retire_current(state: &mut RegistryState) {
+        #[cfg(target_os = "macos")]
+        { state.current = None; }
+        #[cfg(windows)]
         if let Some(mut current) = state.current.take() {
             if let Some(snapshot) = current.result_actions.as_mut() {
                 snapshot.lease.revoke();
@@ -678,6 +696,10 @@ impl ResultRegistry {
             }
         }
     }
+}
+
+#[cfg(windows)]
+impl ResultRegistry {
     pub(crate) fn take_retired_result_action(
         &self,
     ) -> Option<crate::public_plugins::PluginRequestContext> {
@@ -987,6 +1009,9 @@ impl ResultRegistry {
         })
     }
 
+}
+
+impl ResultRegistry {
     fn allows_domain(&self, domain: QueryDomain) -> bool {
         if !self.inner.restrict_domains {
             return true;
@@ -1008,11 +1033,7 @@ impl ResultRegistry {
             && state.current.as_ref().is_some_and(|current| {
                 current.generation == ticket.result_set_generation
                     && current.request_id == ticket.request_id
-                    && (current.actions.contains_key(&ticket.result_id)
-                        || current
-                            .result_actions
-                            .as_ref()
-                            .is_some_and(|s| s.rows.contains_key(&ticket.result_id)))
+                    && current.contains_result(&ticket.result_id)
             })
     }
 
@@ -1029,6 +1050,14 @@ impl ResultRegistry {
     }
 }
 
+impl ResultSet {
+    fn contains_result(&self, id: &str) -> bool {
+        #[cfg(windows)]
+        if self.result_actions.as_ref().is_some_and(|s| s.rows.contains_key(id)) { return true; }
+        self.actions.contains_key(id)
+    }
+}
+
 impl QueryDomain {
     const fn index(self) -> usize {
         match self {
@@ -1039,7 +1068,7 @@ impl QueryDomain {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use std::{cell::Cell, path::PathBuf, sync::atomic::Ordering};
 
@@ -2168,12 +2197,13 @@ mod tests {
     }
 }
 
+#[cfg(windows)]
 pub(crate) struct PreparedResultActionSet {
     pub(crate) response: crate::model::SearchResponse,
     snapshot: crate::public_plugins::result_action::ResultActionSnapshot,
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod result_action_fail_closed_tests {
     use super::*;
     #[test]

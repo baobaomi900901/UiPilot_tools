@@ -5218,6 +5218,8 @@ dependencies = [
 name = "uipilot"
 version = "0.19.0"
 dependencies = [
+ "base64 0.22.1",
+ "block2",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -5227,6 +5229,10 @@ dependencies = [
  "hyper-util",
  "icu_casemap",
  "native-tls",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "plist",
  "png 0.18.1",
  "rcgen",
  "reqwest 0.12.28",

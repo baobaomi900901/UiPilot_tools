@@ -232,19 +232,7 @@ impl ResultActionOutcome {
         }
     }
 }
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ResultActionMetadata {
-    pub(crate) actions: Vec<ResultActionDisplay>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) default_action_id: Option<String>,
-}
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ResultActionDisplay {
-    pub(crate) action_id: String,
-    pub(crate) title: String,
-}
+pub(crate) use crate::model::{ResultActionMetadata, ResultActionDisplay};
 
 // The Runtime service supplies the timeout operation; this is its single observer.
 pub(crate) fn prepare_deadline_observer(

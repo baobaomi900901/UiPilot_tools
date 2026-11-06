@@ -1,6 +1,23 @@
 use serde::Serialize;
 
 use crate::settings::BuiltinFeature;
+#[cfg(windows)]
+use crate::public_plugins::valid_plugin_id;
+#[cfg(target_os = "macos")]
+use crate::manifest::valid_plugin_id;
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResultActionMetadata {
+    pub(crate) actions: Vec<ResultActionDisplay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) default_action_id: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResultActionDisplay {
+    pub(crate) action_id: String,
+    pub(crate) title: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +60,7 @@ impl ResultFavorite {
         command_id: String,
         favorite: bool,
     ) -> Option<Self> {
-        (crate::public_plugins::valid_plugin_id(&plugin_id) && valid_launcher_command(&command_id))
+        (valid_plugin_id(&plugin_id) && valid_launcher_command(&command_id))
             .then_some(Self {
                 target: ResultFavoriteTarget::PublicPlugin {
                     plugin_id,
@@ -125,7 +142,7 @@ impl LauncherResultActivation {
         initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
-        (crate::public_plugins::valid_plugin_id(&plugin_id)
+        (valid_plugin_id(&plugin_id)
             && valid_launcher_command(&command_id)
             && valid_launcher_command(&command_label)
             && valid_panel_initial_argument(&initial_argument))
@@ -145,7 +162,7 @@ impl LauncherResultActivation {
         initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
-        (crate::public_plugins::valid_plugin_id(&plugin_id)
+        (valid_plugin_id(&plugin_id)
             && valid_launcher_command(&command_id)
             && valid_launcher_command(&command_label)
             && valid_panel_initial_argument(&initial_argument))
@@ -164,7 +181,7 @@ impl LauncherResultActivation {
         initial_argument: String,
         favorite: bool,
     ) -> Option<Self> {
-        (crate::public_plugins::valid_plugin_id(&plugin_id)
+        (valid_plugin_id(&plugin_id)
             && valid_launcher_command(&command_id)
             && valid_panel_initial_argument(&initial_argument))
         .then_some(Self::PanelActivation {
@@ -246,7 +263,7 @@ pub(crate) struct SearchResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResultItem {
     #[serde(flatten)]
-    pub(crate) result_actions: Option<crate::public_plugins::result_action::ResultActionMetadata>,
+    pub(crate) result_actions: Option<ResultActionMetadata>,
     pub(crate) result_id: String,
     pub(crate) activation: LauncherResultActivation,
     pub(crate) title: String,
@@ -263,6 +280,28 @@ pub(crate) struct ResultItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) favorite: Option<ResultFavorite>,
     pub(crate) has_default_action: bool,
+}
+
+pub(crate) fn search_response(
+    request_id: String,
+    items: Vec<(String, crate::model::ResultItem)>,
+) -> SearchResponse {
+    SearchResponse {
+        request_id,
+        items: items
+            .into_iter()
+            .map(|(result_id, mut item)| {
+                item.result_id = result_id;
+                item
+            })
+            .collect(),
+        command_hint: None,
+        main_result_command: None,
+        window_transfer_token: None,
+        auto_execute_result_id: None,
+        replace_local_results: false,
+        refresh_at_utc: None,
+    }
 }
 
 #[cfg(test)]
