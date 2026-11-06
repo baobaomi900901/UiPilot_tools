@@ -210,7 +210,9 @@ export interface PluginYoudaoTranslationResponse {
 }
 export interface PluginServicesApi {
  readonly baidu: {
-  /** Windows Host 0.20.0+, submit/mainResult with image.ocr. Requires current
+  /** Windows image.ocr: Host 0.20.0+ submit/mainResult, or Host 0.21.0+
+   * single-command submit/panel Runtime action with ui.panel and runtimeActions.
+   * Requires current
    * credentials.baiduOcr, network.https and aip.baidubce.com authorization.
    * Only the invocation image ID is accepted; no credentials reach the plugin.
    */
@@ -321,7 +323,7 @@ export interface PluginPanelImageChangedEvent {
 export interface PluginPanelRequest {
   action: string
   payload: JsonValue
-  /** Host 0.21.0+: current Panel image reference, at most 512 characters. */
+  /** Host 0.21.0+: current Panel image reference; nonempty, no NUL, at most 512 UTF-8 bytes. */
   imageId?: string
 }
 export interface PluginPanelActionInvocation {

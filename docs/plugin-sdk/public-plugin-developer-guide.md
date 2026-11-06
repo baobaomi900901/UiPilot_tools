@@ -1119,7 +1119,7 @@ Windows `mainResult` 插件可声明 `clipboard.paste` 与 `clipboard.write`，�
 
 ## Host 0.15.0：主程序密钥业务服务
 
-Host 0.15.0–0.17.x 的有道业务调用仅支持旧 `command` 形态的 `mainResult` 包，且 `runtime.resultActions` 必须省略或为 `false`。`commands` 多命令包、Panel、子窗口及启用结果动作的包均不能调用有道业务方法；即使权限已授予，也会拒绝 `InvalidServiceRequestError`。其他插件形态仍可声明和管理三项服务授权，以供未来能力使用。`api.services` 随 Runtime 网络能力提供，其存在不代表服务已授权，也不代表插件命令/输出形态兼容。百度 OCR 与 DeepSeek 仍无公开业务方法。
+Host 0.15.0–0.17.x 的有道业务调用仅支持旧 `command` 形态的 `mainResult` 包，且 `runtime.resultActions` 必须省略或为 `false`。`commands` 多命令包、Panel、子窗口及启用结果动作的包均不能调用有道业务方法；即使权限已授予，也会拒绝 `InvalidServiceRequestError`。其他插件形态仍可声明和管理三项服务授权，以供未来能力使用。`api.services` 随 Runtime 网络能力提供，其存在不代表服务已授权，也不代表插件命令/输出形态兼容。该早期 Host 的百度 OCR 与 DeepSeek 没有公开业务方法；百度 OCR 从 Host 0.20.0 起支持 mainResult，并从 Host 0.21.0 起支持下述图片 Panel，DeepSeek 仍未开放。
 
 
 Windows Runtime 的 `api.services?.youdao.translate({text, from, to})` 使用宿主配置的有道翻译密钥；插件不接收密钥、签名、URL 或认证参数。声明 `credentials.youdaoTranslation`、`network.https`，最低版本 `0.15.0`，并声明 `network.httpsHosts: ["openapi.youdao.com"]`。用户在设置 → 权限单独授权，在设置 → 密钥配置中配置并启用服务；两者独立，关闭配置不会清除授权。
@@ -1254,26 +1254,43 @@ The hook grants no effect permission and does not authorize automatic speech.
 
 有道文本翻译和本地朗读使用 [112 种规范语言代码](./youdao-languages.json)。新增翻译语言要求 `minimumHostVersion >= 0.19.0`；源语言可用 `auto`，目标语言不能用 `auto`。目录同时记录服务支持自动识别的 83 种语言，其余请提供手动选择。`speech.voices()` 仅报告系统实际安装且能匹配的 SAPI 声音，翻译语种可用不代表朗读可用。参考 `examples/public-plugins/com.uipilot.translate/package/` 的多语言 Panel。
 
-## Host 0.20.0 图片 OCR 插件
+## Host 0.20.0 图片 OCR 兼容合同
 
-参考 [百度 OCR](../../examples/public-plugins/com.uipilot.baidu-ocr/README.md)。它使用宿主图片输入、已保存的百度配置和主结果复制流程，插件无需读取剪贴板或再次保存密钥。
+Windows 的 `submit + mainResult + image.ocr` 从 Host 0.20.0 起可用，单命令和多命令保持兼容。用户先粘贴图片，再选择命令识别，结果使用显式 `copyText`；无需读取系统剪贴板或保存供应商密钥。当前业务示例已迁移为下面的 Host 0.21.0 Panel。
 
-命令声明 `inputCapabilities: ["image.ocr"]`，使用 Windows、`submit + mainResult` 和 `minimumHostVersion: "0.20.0"`。声明并获得 `credentials.baiduOcr`、`network.https`、`clipboard.write` 授权，网络主机固定为 `aip.baidubce.com`。图片 capability 不代替这些授权。
+## Host 0.21.0 图片 OCR Panel 插件
+
+参考 [ocr](../../examples/public-plugins/com.uipilot.ocr/README.md)：Windows 单命令 `submit + panel`，`inputCapabilities: ["image.ocr"]`、`panel.runtimeActions: true`、`minimumHostVersion: "0.21.0"`。声明并获得 `ui.panel`、`credentials.baiduOcr`、`network.https`、`clipboard.write` 授权，网络主机固定为 `aip.baidubce.com`。图片能力不代替这些授权，也不开放通用剪贴板读取。
+
+两种入口共用一个 Panel：先粘贴图片再选 `ocr`，或先打开 `/ocr` 再在宿主输入框粘贴。空入口不识别；进入后顶部是命令 tag，左侧预览，右侧可编辑文本。插件不重复绘制主输入或状态栏，反馈用 `setStatus`。后续有效换图立即清空旧文字并自动识别最新图，清图恢复空态，隐藏或退出后重入为空。
+
+在首次 `onUpdate` 前安装 `onImageChanged`、`onReady` 和所声明的 Host Key 接收器。图片事件深只读，含 `{sessionEpoch, revision, image}`，`image` 为 null 或图片描述符加 `previewDataUrl`。修订号使用十进制 u64 字符串；PNG 预览最长边 512px、编码最多 40 KiB、事件最多 64 KiB，预览不放大且不用于识别。Ready 前只保留最新快照，匹配 Ready 后才发 Runtime request；重复 Ready 或主题变化不重识别。图片桥是可选方法，先检查目标 Host 与能力。
+
+内容页请求 `panel.request({action:'recognize', imageId:snapshot.id, payload:{providerId:'baidu'}})`。图片 ID 属于独立字段，非空、不含 NUL，UTF-8 编码最多 512 字节，业务 payload 不建立图片权限。宿主把该图绑定为 `onPanelAction` 的只读 `invocation.image`；Runtime 必须使用这个请求专用 ID，不能把通知中的 Panel ID 直接交给服务。
 
 ```javascript
-export async function onCommand(invocation, api) {
+export async function onCommand(invocation) {
+  return { requestId: invocation.requestId, data: { ok: true } }
+}
+
+export async function onPanelAction(invocation, api) {
   if (!invocation.image) {
-    return { requestId: invocation.requestId, results: [{ id: 'missing', title: '请粘贴一张图片' }] }
+    return { requestId: invocation.requestId, data: { ok: false, code: 'missingImage', message: '请粘贴一张图片' } }
   }
-  const { text } = await api.services.baidu.ocr({ imageId: invocation.image.id })
+  const { text, lines } = await api.services.baidu.ocr({ imageId: invocation.image.id })
   return {
     requestId: invocation.requestId,
-    results: text ? [{ id: 'text', title: '识别结果', detail: text, defaultAction: { type: 'copyText', text } }]
-      : [{ id: 'empty', title: '未识别到文字' }],
+    data: { ok: true, text, lines },
   }
 }
 ```
 
-示例片段展示正常调用；正式包还需像参考包一样处理固定错误、过期请求和结果大小限制。不要持久化图片 ID，或把它当文件路径。主程序在粘贴后列出 OCR 插件，第一次回车识别，结果出现后再次回车复制；结果不能自动复制，长按回车也不能触发第二个动作。
+片段只展示正常桥接；正式包还需检查 action/provider、固定错误、过期请求和大小，参考包已有实现。服务仍由宿主使用已配置并启用的百度 OCR；正文最多 16 KiB UTF-8、回复最多 64 KiB，超限明确失败而不截断，不持久化图片、ID 或正文，不把 ID 当路径。
 
-自动测试替换服务实现，并验证图片 ID、完整换行、空结果、错误及不自动重试。打包和 SDK 类型检查完成后，再用用户指定图片在真实 Host 中验证；离线通过不代表供应商请求、原生粘贴和复制已经验收。详细资源边界、权限与生命周期见 API v1 的“Host 0.20.0：图片输入与百度 OCR”。
+最多保持一个物理在途请求与一个最新 pending 图片：A 在途换 B/C，只识别最新 C，并拒绝 A 回填。不能在 `onUpdate`/ACK 或 Host Key 中等待 request，也不能收到 Busy 后自动循环重试。清图调用当前会话 `clearImage()`，立即清空旧结果并禁止迟到反馈恢复它。会话、图片修订、复制与清除任务均需检查归属；退出、隐藏、撤权及凭据变化让旧工作失效。
+
+复制读取当前文本域完整编辑值并调用 `panel.clipboard.writeText`；无图、识别中、空文字或错误时禁用。空主输入中的非重复 Enter 复制，文本域 Enter 保留换行/IME；Tab/Shift+Tab 交接内容焦点。失败可显式重试，识别完成不自动复制，同一源不重识别。
+
+新身份 `com.uipilot.ocr@1.0.0` 安装包为 `artifacts/ocr-delivery/com.uipilot.ocr-1.0.0.uipilot-plugin`。先使用 Host 0.21.0+，按正常流程安装并确认新权限和百度主机。宿主百度配置可继续用；旧 `com.uipilot.baidu-ocr` 的授权、收藏和快捷键不迁移，也不自动卸载。若只用新版，在设置中手动停用旧版，避免图片列表出现两个条目；保留历史旧包。
+
+自动测试使用合成图片、假服务/剪贴板，覆盖真实 Runtime、模型、DOM 与实际桥脚本；同时执行 SDK 类型检查、目录与归档校验。Light/Dark、真实粘贴、跨 WebView 焦点、百度服务和系统复制仍由用户手动验收，离线通过不能替代。本次不使用 Computer Use，不自动安装、授权或调用真实服务。详细字段、错误与生命周期见 API v1 的“Host 0.21.0：图片 OCR Panel”。
