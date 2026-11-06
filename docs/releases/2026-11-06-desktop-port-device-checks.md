@@ -10,9 +10,9 @@
 | 包内主程序 SHA-256 | `5656161a61cb60c9480023ddd4f94b28e3711785ad8e5aeaff7e5a608df02b6d` |
 | Windows 可选源码档案 | `UiPilot-source-a79f612.zip`，SHA-256 `47970c7579ee4c381afc90092d620122f84d67760eaead827ebe19b7d75ff673` |
 
-此 DMG 为内部 ad-hoc 签名候选。M1 Pro / macOS 15.7.4（24G517）已从单独的候选 .app 验过唤起、搜索、启动、激活、隐藏和退出。最低系统设备的 DMG 安装、升级等未测项目请单独补记。[已有记录](../superpowers/plans/2026-11-06-macos-port.md)
+此 DMG 为内部 ad-hoc 签名候选。M1 Pro / macOS 15.7.4（24G517）已从单独的候选 .app 验过唤起、搜索、启动、激活、隐藏和退出。[已有记录](../superpowers/plans/2026-11-06-macos-port.md)
 
-2026-11-06，测试者在 M1 Pro（arm64，macOS 15.7.4，24G517）上对手动传输的候选 DMG 运行预检。SHA-256 与上表一致，脚本报告 `Preflight passed`。本次覆盖最低系统设备的包校验，从“应用程序”启动的结果待回传。
+2026-11-06，测试者在 M1 Pro（arm64，macOS 15.7.4，24G517）上对手动传输的候选 DMG 运行预检。SHA-256 与上表一致，脚本报告 `Preflight passed`。测试者随后确认「M1 从应用程序启动成功，快捷键能唤起并输入」。最低系统设备的 DMG 安装启动、Option+空格唤起及直接输入通过。
 
 ## 较新 Mac
 
