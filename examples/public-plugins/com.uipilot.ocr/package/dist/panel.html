@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ocr</title><link rel="stylesheet" href="./panel.css"></head>
+<body>
+ <main class="ocr-panel" aria-label="图片文字识别">
+  <section class="content-block image-block" aria-label="图片">
+   <div class="preview"><img id="image" alt="待识别图片预览" hidden><div id="image-empty"><span data-icon="image" aria-hidden="true"></span><p>暂无图片</p><p class="muted">粘贴一张图片</p></div></div>
+   <div class="text-tools"><button id="clear-image" class="icon-button" type="button" aria-label="清除图片" title="清除图片" data-icon="close" disabled></button></div>
+  </section>
+  <section class="content-block output-block" aria-label="识别文字">
+   <div class="output-body" id="output-body" aria-busy="false">
+    <label class="sr-only" for="ocr-text">识别文字，可编辑</label><textarea id="ocr-text" aria-describedby="ocr-status" dir="auto" spellcheck="false" placeholder="识别文字将显示在这里" readonly></textarea>
+    <div id="result-notice"><p id="ocr-status" role="status">等待图片</p><button id="retry" type="button" hidden>重试</button></div>
+   </div>
+   <div class="text-tools"><button id="copy" class="icon-button" type="button" aria-label="复制文字" title="复制文字" data-icon="copy" disabled></button><button id="provider" class="provider-button" type="button" aria-haspopup="dialog" aria-expanded="false"><span>百度 OCR</span><span data-icon="chevron"></span></button></div>
+  </section>
+ </main>
+ <dialog id="source-dialog" aria-labelledby="source-title"><div class="choice-header"><h2 id="source-title">OCR 源</h2><button id="source-close" class="icon-button" type="button" aria-label="关闭源选择" title="关闭" data-icon="close"></button></div><div role="listbox" aria-label="OCR 源"><button id="provider-option" class="choice-option" type="button" role="option" aria-selected="true">百度 OCR<span aria-hidden="true">✓</span></button></div></dialog>
+ <script type="module" src="./panel.js"></script>
+</body></html>

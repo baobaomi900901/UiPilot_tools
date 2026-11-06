@@ -1,0 +1,41 @@
+/* Host owns outer dividers. Only public Host tokens are consumed. */
+:root { font-family: var(--uipilot-font-family, Inter, 'Microsoft YaHei UI', system-ui, sans-serif); font-size: 14px; font-feature-settings: 'calt', 'kern', 'liga', 'ss03'; letter-spacing: 0; color: var(--uipilot-color-text, CanvasText); background: var(--uipilot-color-background, Canvas); color-scheme: light dark; }
+:root[data-theme='light'] { color-scheme: light; }
+:root[data-theme='dark'] { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; min-width: 0; }
+body { overflow: hidden; }
+button, textarea { font: inherit; color: inherit; letter-spacing: 0; }
+button { cursor: pointer; font-weight: 500; border: 1px solid var(--uipilot-color-border, GrayText); border-radius: 8px; background: var(--uipilot-color-surface, Canvas); height: 32px; padding: 0 12px; }
+button:disabled { cursor: default; color: var(--uipilot-color-text-muted, GrayText); }
+button:focus-visible { outline: 2px solid var(--uipilot-color-accent, Highlight); outline-offset: -2px; }
+button:hover:not(:disabled) { background: color-mix(in srgb, var(--uipilot-color-text, CanvasText) 7%, var(--uipilot-color-surface, Canvas)); }
+.ocr-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 12px; padding: 12px; height: 100%; min-height: 0; }
+.content-block { display: grid; grid-template-rows: minmax(0, 1fr) 36px; min-width: 0; min-height: 0; background: var(--uipilot-color-surface, Canvas); border-radius: 8px; overflow: hidden; }
+.preview { display: flex; justify-content: center; align-items: center; padding: 12px; min-width: 0; min-height: 0; overflow: hidden; }
+#image { max-width: 100%; max-height: 100%; object-fit: contain; width: auto; height: auto; }
+#image-empty { text-align: center; color: var(--uipilot-color-text-muted, GrayText); }
+#image-empty > span { display: flex; justify-content: center; }
+p { margin: 8px 0; line-height: 1.6; }
+.muted { font-size: 12px; }
+.output-body { position: relative; min-height: 0; min-width: 0; }
+textarea { display: block; width: 100%; height: 100%; resize: none; min-width: 0; min-height: 0; border: 1px solid transparent; border-radius: 8px; outline: none; padding: 12px; background: transparent; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+textarea:focus-visible { border-color: var(--uipilot-color-accent, Highlight); }
+textarea::placeholder { color: var(--uipilot-color-text-muted, GrayText); opacity: 1; }
+#result-notice { position: absolute; inset: 42px 12px auto; pointer-events: none; color: var(--uipilot-color-text-muted, GrayText); overflow-wrap: anywhere; }
+#retry { pointer-events: auto; }
+#ocr-status[data-error='true'] { color: var(--uipilot-color-danger, CanvasText); }
+.text-tools { display: flex; align-items: center; gap: 4px; padding: 0 8px 4px; min-width: 0; }
+.icon-button { flex: 0 0 28px; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; }
+svg { display: block; width: 16px; height: 16px; flex-shrink: 0; }
+.provider-button { display: flex; align-items: center; gap: 4px; max-width: calc(100% - 32px); min-width: 0; height: 28px; margin-left: auto; border: 0; border-radius: 6px; background: transparent; padding: 0 4px; font-size: 13px; }
+.provider-button > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[hidden] { display: none !important; }
+dialog { color: inherit; background: var(--uipilot-color-surface, Canvas); border: 1px solid var(--uipilot-color-border, GrayText); border-radius: 10px; padding: 12px; width: min(320px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow: auto; }
+dialog::backdrop { background: transparent; }
+.choice-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+h2 { margin: 0; font-size: 14px; font-weight: 500; }
+.choice-option { display: flex; justify-content: space-between; align-items: center; width: 100%; height: 36px; border-radius: 6px; background: color-mix(in srgb, var(--uipilot-color-accent, Highlight) 14%, var(--uipilot-color-surface, Canvas)); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+@media (max-width: 360px) { .ocr-panel { padding: 8px; gap: 8px; } }
+@media (forced-colors: active) { .content-block { border: 1px solid CanvasText; } button:disabled { color: GrayText; } .choice-option { border-color: Highlight; } }

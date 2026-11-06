@@ -1,0 +1,10 @@
+{
+ "schemaVersion": 1, "pluginId": "com.uipilot.ocr", "version": "1.0.0", "apiVersion": 1,
+ "minimumHostVersion": "0.21.0", "name": "ocr", "description": "在面板中识别图片、编辑并复制完整文字。",
+ "supportedPlatforms": ["windows"],
+ "command": { "defaultName": "ocr", "summary": "识别图片中的文字", "activationMode": "submit", "outputMode": "panel", "inputRequired": false, "inputPlaceholder": "粘贴图片", "inputCapabilities": ["image.ocr"] },
+ "runtime": { "entry": "dist/runtime.js" },
+ "panel": { "entry": "dist/panel.html", "runtimeActions": true, "hostKeys": ["Enter", "Tab", "Shift+Tab"], "hostKeyFocus": "content" },
+ "permissions": ["ui.panel", "clipboard.write", "credentials.baiduOcr", "network.https"],
+ "network": { "httpsHosts": ["aip.baidubce.com"] }, "settings": []
+}
