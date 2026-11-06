@@ -16,13 +16,14 @@ if ($profile.bundle.windows.nsis.installMode -cne 'perMachine' -or
     throw 'Protected package profile does not match its fixed installation policy.'
 }
 $base = Get-Content -Raw -LiteralPath (Join-Path $packageRoot 'src-tauri/tauri.conf.json') | ConvertFrom-Json
+$windowsConfig = Get-Content -Raw -LiteralPath (Join-Path $packageRoot 'src-tauri/tauri.windows.conf.json') | ConvertFrom-Json
 $inventory = @(
-    foreach ($relative in @('src-tauri/tauri.conf.json', 'src-tauri/tauri.elevation.conf.json',
+    foreach ($relative in @('src-tauri/tauri.conf.json', 'src-tauri/tauri.windows.conf.json', 'src-tauri/tauri.elevation.conf.json',
         'src-tauri/windows/elevation-installer-hooks.nsh')) {
         $path = Join-Path $packageRoot $relative
         [pscustomobject]@{ path = $relative; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
     }
-    foreach ($resource in $base.bundle.resources) {
+    foreach ($resource in $windowsConfig.bundle.resources) {
         $path = Join-Path $packageRoot "src-tauri/$resource"
         [pscustomobject]@{ path = "src-tauri/$resource"; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
     }

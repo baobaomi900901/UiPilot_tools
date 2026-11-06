@@ -42,3 +42,25 @@ function Get-UiPilotAvailableDevPort {
 
     throw "No available development port was found between $StartPort and $EndPort."
 }
+
+function New-UiPilotDevConfigOverride {
+    param(
+        [Parameter(Mandatory = $true)] [string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)] [int]$Port,
+        [Parameter(Mandatory = $true)] [string]$ProviderExe
+    )
+
+    # Tauri replaces resource arrays when merging the Windows configuration.
+    $windows = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'src-tauri/tauri.windows.conf.json') -Raw | ConvertFrom-Json
+    $resources = @{}
+    foreach ($resource in $windows.bundle.resources) {
+        if ($resource -notlike 'resources/provider/*') { $resources[$resource] = $resource }
+    }
+    $resources[$ProviderExe] = 'resources/provider/UIAutoma.UIAutomation.Provider.exe'
+    $manifest = Join-Path (Split-Path -Parent $ProviderExe) 'asset-manifest.json'
+    $resources[$manifest] = 'resources/provider/asset-manifest.json'
+    return @{
+        build = @{ devUrl = "http://127.0.0.1:$Port" }
+        bundle = @{ resources = $resources }
+    }
+}
