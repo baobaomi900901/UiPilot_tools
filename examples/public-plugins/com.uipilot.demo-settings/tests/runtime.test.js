@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile, mkdtemp, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import test from 'node:test'
 const root = new URL('../', import.meta.url)
@@ -26,11 +27,11 @@ test('offline settings demo reads all current settings on every command without 
 })
 test('compatible upgrade changes only the manifest version and visible build mark', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'uipilot-settings-fixture-'))
-  execFileSync(process.execPath, [new URL('prepare-upgrade.mjs', root).pathname.replace(/^\/(\w:)/, '$1'), directory])
+  execFileSync(process.execPath, [fileURLToPath(new URL('prepare-upgrade.mjs', root)), directory])
   const original = JSON.parse(await readFile(new URL('package/plugin.json', root), 'utf8'))
   const upgraded = JSON.parse(await readFile(join(directory, 'plugin.json'), 'utf8'))
   assert.equal(upgraded.version, '1.0.1'); assert.deepEqual({ ...upgraded, version: original.version }, original)
-  const runtime = await load(new URL('file:///' + join(directory, 'runtime.js').replaceAll('\\', '/')))
+  const runtime = await load(join(directory, 'runtime.js'))
   const values = { greeting: 'Keep', count: 4, uppercase: false, style: 'plain' }
   const result = await runtime.onCommand({ requestId: 'upgrade' }, { settings: { async get(key) { return values[key] } } })
   assert.equal(result.results[0].title, 'Keep × 4'); assert.match(result.results[0].subtitle, /build 1.0.1/)
