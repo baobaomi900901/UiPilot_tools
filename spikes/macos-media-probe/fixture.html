@@ -1,0 +1,46 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-__NONCE__'; media-src data:; connect-src 'none'; img-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+<title>固定媒体观察页</title><p>仅本次合成媒体测试，不加载插件或网络。</p>
+<script nonce="__NONCE__">
+'use strict';
+(() => {
+  const nonce='__NONCE__', generation='__GENERATION__', speechEnabled=__SPEECH__;
+  let context, oscillator, audio, stopped=false;
+  const state = () => ({kind:'sample', generation, nonce,
+    htmlPaused: audio ? audio.paused : true, htmlTime: audio ? audio.currentTime : 0,
+    audioState: context ? context.state : 'unavailable', audioTime: context ? context.currentTime : 0});
+  const send = kind => window.webkit.messageHandlers.probe.postMessage({...state(),kind});
+  const cleanup = () => { if(stopped)return; stopped=true;
+    try { if(audio){audio.pause();audio.removeAttribute('src');audio.load();} } catch {}
+    try { if(oscillator)oscillator.stop(); if(context)void context.close(); } catch {}
+    if(speechEnabled)try{speechSynthesis.cancel();}catch{}
+  };
+  window.probeStop=cleanup;
+  send('fixtureStarted');
+  try {
+    // 1.4 seconds of low-amplitude 330 Hz mono PCM, no downloaded resources.
+    const rate=22050, count=Math.floor(rate*1.4), bytes=new Uint8Array(44+count*2), v=new DataView(bytes.buffer);
+    const ascii=(at,s)=>{for(let i=0;i<s.length;i++)bytes[at+i]=s.charCodeAt(i);};
+    ascii(0,'RIFF');v.setUint32(4,36+count*2,true);ascii(8,'WAVE');ascii(12,'fmt ');
+    v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,rate,true);
+    v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);ascii(36,'data');v.setUint32(40,count*2,true);
+    for(let i=0;i<count;i++)v.setInt16(44+i*2,Math.sin(i*2*Math.PI*330/rate)*650,true);
+    let binary='';for(const b of bytes)binary+=String.fromCharCode(b);
+    audio=new Audio('data:audio/wav;base64,'+btoa(binary));audio.volume=0.2;
+    audio.play().then(()=>send('htmlStarted'),()=>send('htmlRejected'));
+  }catch{send('htmlError');}
+  try {
+    context=new AudioContext();oscillator=context.createOscillator();const gain=context.createGain();
+    gain.gain.value=0.008;oscillator.frequency.value=440;oscillator.connect(gain).connect(context.destination);
+    oscillator.start();oscillator.stop(context.currentTime+1.4);
+    context.resume().then(()=>send('audioResumed'),()=>send('audioRejected'));
+  }catch{send('audioError');}
+  if(speechEnabled){try{
+    const phrase=new SpeechSynthesisUtterance('测试');phrase.volume=0.1;phrase.rate=1.2;
+    phrase.onstart=()=>send('speechStart');phrase.onend=()=>send('speechEnd');phrase.onerror=()=>send('speechError');
+    speechSynthesis.speak(phrase);
+  }catch{send('speechError');}}
+  for(const delay of [0,400,1000,1600])setTimeout(()=>send('sample'),delay);
+  setTimeout(()=>{send('finished');cleanup();},1700);
+})();
+</script></html>

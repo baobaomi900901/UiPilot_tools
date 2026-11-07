@@ -302,3 +302,11 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 | `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview` | 432 通过/8 默认忽略 |
 
 日志 `/private/tmp/uipilot-network-{unwired-red,module-red,green,native-green,verify,check,preview}.log`。真实 native TLS 的成功/未信任/错 hostname/过期证书、不得降级、限额/取消和 proxy 环境子进程均执行，未跳过 Mac 失败或改 production trust policy。Windows 原生验证未执行；本单元不增加同包双端插件通过计数。
+
+## 2026-11-07 WKWebView 独立媒体探针构建验证
+
+[媒体探针规格](../superpowers/specs/2026-11-07-macos-media-probe-design.md)与 `spikes/macos-media-probe/` 已完成实现和独立复审。仅固定内存 WAV、oscillator 和默认关闭的可选语音，不运行插件。默认启动不创建媒体 WebView；人工点击才进入案例。C 生命周期核心用于实际探针准入，默认自动验证不启动 AppKit/WKWebView。
+
+纯 C stub 实际红阶段断言退出 134，补齐状态机后三组绿色；Objective-C 使用 arm64/min15.7.4 与 `-Wall -Wextra -Werror` 编译/link，签名 strict、Info.plist、Mach-O/load commands 与 JS 语法检查通过；已有输出拒绝重建退出 2。复审发现截止采样异步完成必被退役丢弃，改为加载准入后 1 秒单次采样，2 秒截止独立 retire/stop，不等采样延长播放。迟到回调与正常 completion 走同一准入方法，逐通道记录分开；终审无严重问题。
+
+日志 `/private/tmp/uipilot-media-lifecycle-red.log` 及构建输出中的 `lifecycle-tests.log`、`signature-check.log`、`macho-check.log`、`load-commands.log` 和源文件 SHA-256。实际 GUI/音频/语音、系统调度延迟与 WebContent 进程恢复仍未验证；本轮没有运行媒体。原生活动状态不是静音开关，探针不颁发 production GuardProof；UiPilot 插件运行仍关闭。
