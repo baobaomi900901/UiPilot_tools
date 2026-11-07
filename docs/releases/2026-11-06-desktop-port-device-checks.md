@@ -153,3 +153,19 @@ python -I -c "from pathlib import Path; import hashlib; files=[Path('third-party
 | M1 Pro 最低系统 | 同一 DMG 哈希和新增的安装/升级/卸载等记录；保留原有交互结果 |
 
 缺少必需设备行时，双平台发布验收维持待完成。公开分发另需经授权的 Developer ID 签名、公证、staple 和带隔离属性的安装证据。
+
+## 2026-11-07 剪贴板共用基础自动验证
+
+按[专项规格](../superpowers/specs/2026-11-07-macos-clipboard-foundation-design.md)，Mac 现已编译共享模型、格式选择与预览逻辑。路径指纹回归先复现了大小写不同路径被误合并，修复后 8 项共享测试通过；Windows 旧指纹的固定向量也在本机验证。独立审核未发现严重问题。该单元未接入原生历史服务、持久化、复制或插件权限，不改变现有安装包的实机验收结论。
+
+环境沿用 M1 Pro / macOS 15.7.4、Node 22.22.1、Rust 1.96.1 及隔离 Cargo 缓存；仅使用合成内容，未访问真实剪贴板。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib clipboard_history::` | 8 通过；包含 Mac 路径字节、Windows 固定指纹、格式优先级、摘要 DTO、文字和图片边界 |
+| `npm run verify:local` | 退出 0；前端 774 通过/18 既有跳过，普通 Mac Rust 160 通过/3 既有忽略，CLI 186 通过，公开插件测试 323 通过，SDK/schema/包校验通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0；普通 Mac 所有目标编译通过 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 194 通过/6 既有忽略，退出 0 |
+| Windows 原生回归、Mac 原生采集/授权/退出和复制 | 待后续实现与实机验证，未标记通过 |
+
+本机日志为 `/private/tmp/uipilot-clipboard-red.log`、`/private/tmp/uipilot-clipboard-shared-tests.log`、`/private/tmp/uipilot-clipboard-foundation-{verify,check,preview}.log`。原计划 Task 10.1 仍未完成，下一单元为原生 reader/observer 及停止/重启时的代际隔离。人工测试按用户安排延后。

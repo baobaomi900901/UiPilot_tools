@@ -11,6 +11,10 @@ include!("lib.rs");
 mod atomic_file;
 #[cfg(target_os = "macos")]
 mod settings;
+// Share clipboard value/preview semantics without installing an observer or
+// exposing the still-unavailable macOS history service.
+#[cfg(target_os = "macos")]
+mod clipboard_history;
 #[cfg(target_os = "macos")]
 mod webview_reload_guard;
 #[cfg(target_os = "macos")]

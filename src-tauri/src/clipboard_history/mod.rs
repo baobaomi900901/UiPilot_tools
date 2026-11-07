@@ -1,15 +1,22 @@
 #![allow(dead_code, unused_imports)]
-// Task 3 lands the host-owned clipboard history core before Task 4 wires it into
-// the public plugin lifecycle service. Keep the core warning-clean while it is
-// intentionally unused by non-test code.
+// macOS compiles shared value/format/preview logic only. Native history remains
+// unavailable until its observer, storage and lifecycle contracts are implemented.
 
+mod format;
 mod model;
+#[cfg(windows)]
 mod observer;
+#[cfg(windows)]
 mod paste;
 mod preview;
+#[cfg(windows)]
 mod service;
+#[cfg(windows)]
 mod store;
 
+pub(crate) use format::{
+    normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
+};
 pub(crate) use model::{
     CaptureOutcome, ClipboardCapture, ClipboardHistoryBridgeError, ClipboardHistoryCopyOutcome,
     ClipboardHistoryCopyStatus, ClipboardHistoryEntrySummary, ClipboardHistoryError,
@@ -17,18 +24,24 @@ pub(crate) use model::{
     ClipboardHistoryRecord, ClipboardHistoryRecordPayload, ClipboardHistorySnapshot,
     IgnoredCaptureReason,
 };
+#[cfg(windows)]
 pub(crate) use observer::{
-    normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot,
     ClipboardObserver, ClipboardObserverHandle, ClipboardReadError, ClipboardReader,
 };
+#[cfg(windows)]
 pub(crate) use paste::{
     paste_clipboard_history_record, send_ctrl_v_to_foreground_target, ClipboardHistoryPasteDriver,
     ClipboardHistoryPasteWrite,
 };
+#[cfg(windows)]
 pub(crate) use service::{ClipboardHistoryService, TemporaryClipboardCopy};
+#[cfg(windows)]
 pub(crate) use store::ClipboardHistoryStore;
 
 #[cfg(test)]
+mod shared_tests;
+
+#[cfg(all(test, windows))]
 mod tests {
     use std::{
         collections::VecDeque,

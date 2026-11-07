@@ -53,12 +53,37 @@ pub(super) fn image_fingerprint(width: u32, height: u32, rgba: &[u8]) -> String 
     hex_digest(hasher.finalize().as_slice())
 }
 
+#[cfg(windows)]
 pub(super) fn files_fingerprint(paths: &[std::path::PathBuf]) -> String {
+    windows_files_fingerprint(paths)
+}
+
+// Keep the persisted Windows algorithm byte-for-byte compatible. This helper
+// also compiles in tests so other hosts can check its fixed compatibility vectors.
+#[cfg(any(windows, test))]
+pub(super) fn windows_files_fingerprint(paths: &[std::path::PathBuf]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"files\0");
     for path in paths {
         hasher.update(normalize_windows_path(path).as_bytes());
         hasher.update(b"\0");
+    }
+    hex_digest(hasher.finalize().as_slice())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn files_fingerprint(paths: &[std::path::PathBuf]) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    // This is spelling-based deduplication, not filesystem identity or authority.
+    // Length boundaries preserve arbitrary OS bytes without lossy conversion.
+    let mut hasher = Sha256::new();
+    hasher.update(b"files\0macos\0raw-paths-v1\0");
+    hasher.update((paths.len() as u64).to_le_bytes());
+    for path in paths {
+        let bytes = path.as_os_str().as_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
     hex_digest(hasher.finalize().as_slice())
 }
@@ -179,6 +204,7 @@ fn resize_rgba_nearest(
     output
 }
 
+#[cfg(any(windows, test))]
 fn normalize_windows_path(path: &std::path::Path) -> String {
     let mut value = path.as_os_str().to_string_lossy().replace('/', "\\");
     if let Some(stripped) = value.strip_prefix(r"\\?\") {

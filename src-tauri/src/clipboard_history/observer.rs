@@ -1,5 +1,4 @@
 use std::{
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -8,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use super::format::{normalize_clipboard_formats, ClipboardFormatSnapshot, ClipboardImageSnapshot};
 use super::{ClipboardCapture, ClipboardHistoryError};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -16,20 +16,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) enum ClipboardReadError {
     Busy,
     Unavailable,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ClipboardFormatSnapshot {
-    pub(crate) files: Option<Vec<PathBuf>>,
-    pub(crate) image: Option<ClipboardImageSnapshot>,
-    pub(crate) text: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClipboardImageSnapshot {
-    pub(crate) rgba: Vec<u8>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
 }
 
 pub(crate) trait ClipboardReader: Send + Sync {
@@ -49,27 +35,6 @@ pub(crate) trait ClipboardObserver: Send + Sync {
 
 pub(crate) trait ClipboardObserverHandle: Send {
     fn stop(&self);
-}
-
-pub(crate) fn normalize_clipboard_formats(
-    formats: ClipboardFormatSnapshot,
-    captured_at: impl Into<String>,
-) -> Option<ClipboardCapture> {
-    let captured_at = captured_at.into();
-    if let Some(paths) = formats.files.filter(|paths| !paths.is_empty()) {
-        return Some(ClipboardCapture::files(paths, captured_at));
-    }
-    if let Some(image) = formats.image {
-        return Some(ClipboardCapture::image(
-            image.rgba,
-            image.width,
-            image.height,
-            captured_at,
-        ));
-    }
-    formats
-        .text
-        .map(|text| ClipboardCapture::text(text, captured_at))
 }
 
 pub(crate) fn default_clipboard_reader() -> Arc<dyn ClipboardReader> {
