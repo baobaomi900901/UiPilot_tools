@@ -31,7 +31,7 @@ fn shutdown_releases_locks_even_while_old_tokens_and_instance_survive() {
     let fresh = MacHistory::open(&temp.0).unwrap();
     let fresh_token = fresh.authorize(A).unwrap();
     assert!(matches!(fresh.snapshot(&token, None), Err(HistoryError::PermissionDenied)));
-    assert!(matches!(fresh.ingest(&ClipboardEvent::synthetic_text("old"), batch), Err(HistoryError::PermissionDenied)));
+    assert!(matches!(fresh.ingest_unbound_for_test(&ClipboardEvent::synthetic_text("old"), batch), Err(HistoryError::PermissionDenied)));
     assert!(fresh.snapshot(&fresh_token, None).unwrap().entries.is_empty());
 }
 
@@ -47,7 +47,7 @@ fn revoked_tokens_hold_no_files_and_reauthorization_reloads() {
     let fresh = history.authorize(A).unwrap();
     assert!(matches!(history.clear(&token), Err(HistoryError::PermissionDenied)));
     assert!(matches!(history.remove(&token, "1"), Err(HistoryError::PermissionDenied)));
-    assert_eq!(history.ingest(&ClipboardEvent::synthetic_text("old"), batch).unwrap().denied, 1);
+    assert_eq!(history.ingest_unbound_for_test(&ClipboardEvent::synthetic_text("old"), batch).unwrap().denied, 1);
     assert!(history.snapshot(&fresh, None).unwrap().entries.is_empty());
 }
 
@@ -59,10 +59,10 @@ fn stopped_events_and_cross_instance_requests_do_no_history_io() {
     assert!(matches!(second.snapshot(&token, None), Err(HistoryError::PermissionDenied)));
     assert!(matches!(second.clear(&token), Err(HistoryError::PermissionDenied)));
     assert!(matches!(second.remove(&token, "1"), Err(HistoryError::PermissionDenied)));
-    assert!(matches!(second.ingest(&ClipboardEvent::synthetic_text("foreign"), batch), Err(HistoryError::PermissionDenied)));
+    assert!(matches!(second.ingest_unbound_for_test(&ClipboardEvent::synthetic_text("foreign"), batch), Err(HistoryError::PermissionDenied)));
     assert!(!second_temp.0.join("clipboard-history").join(A).exists());
     let batch = first.bind_capture().unwrap(); let event = ClipboardEvent::synthetic_text("late"); event.request_stop();
-    assert!(matches!(first.ingest(&event, batch), Err(HistoryError::PermissionDenied)));
+    assert!(matches!(first.ingest_unbound_for_test(&event, batch), Err(HistoryError::PermissionDenied)));
     assert!(first.snapshot(&token, None).unwrap().entries.is_empty());
 }
 
@@ -78,7 +78,7 @@ fn revoke_drains_write_before_regrant_and_other_plugin_stays_available() {
         entered_tx.send(()).unwrap(); release_rx.recv_timeout(timeout).unwrap();
     }));
     let writer_history = Arc::clone(&history);
-    let writer = thread::spawn(move || writer_history.ingest(&ClipboardEvent::synthetic_text("admitted"), batch));
+    let writer = thread::spawn(move || writer_history.ingest_unbound_for_test(&ClipboardEvent::synthetic_text("admitted"), batch));
     entered_rx.recv_timeout(timeout).unwrap();
     let revoker_history = Arc::clone(&history); let (revoked_tx, revoked_rx) = mpsc::channel();
     let revoker = thread::spawn(move || { revoker_history.revoke(A).unwrap(); revoked_tx.send(()).unwrap(); });
@@ -108,7 +108,7 @@ fn shutdown_waits_for_write_and_reopen_starts_without_authority() {
         entered_tx.send(()).unwrap(); release_rx.recv_timeout(timeout).unwrap();
     }));
     let writer_history = Arc::clone(&history);
-    let writer = thread::spawn(move || writer_history.ingest(&ClipboardEvent::synthetic_text("admitted"), batch));
+    let writer = thread::spawn(move || writer_history.ingest_unbound_for_test(&ClipboardEvent::synthetic_text("admitted"), batch));
     entered_rx.recv_timeout(timeout).unwrap();
     let shutting_history = Arc::clone(&history); let (done_tx, done_rx) = mpsc::channel();
     let shutting = thread::spawn(move || { shutting_history.shutdown(); done_tx.send(()).unwrap(); });

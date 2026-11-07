@@ -205,3 +205,22 @@ python -I -c "from pathlib import Path; import hashlib; files=[Path('third-party
 环境仍为 M1 Pro / macOS 15.7.4、Node 22.22.1、Rust 1.96.1。日志：`/private/tmp/uipilot-history-{red,lock-red,tests,verify,check,preview}.log`。`red` 为新 API 缺失的编译红阶段；`lock-red` 为独立复现的文件锁回归，二者分开记录。
 
 Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO 保留；共享测试覆盖文本去重/容量/计数，以及图片文件名与预算淘汰名单，但不替代 Windows 原生回归。本轮仍未开放 Mac 宿主服务或 SDK。读取前批次钩子、原生采集时间传递、真实授权与退出、图片/文件、复制和插件双端验收均待后续；当前协调器记录的是首次消费入库时间。整体 Task 10.1 未完成，人工测试继续延后。
+
+## 2026-11-07 读取前授权与内部采集自动验证
+
+依[采集接线规格](../superpowers/specs/2026-11-07-macos-clipboard-collection-design.md)将 Mac observer、读取前授权与私有历史接成内部 collector。没有授权时正文读取为零；授权集合改变只重建 count 基线，避免后来授予权限时补采停用期间的内容。生产历史入口只消费密封的事件，绑定原批次、observer 会话及正文读取前的 UTC 观测时间，不再接受任意 event 与新 batch 配对。
+
+原生读取使用独立许可，读取期间不持 history state 或 store 锁；许可在回调前释放。撤权和 shutdown 先关闭准入，再在状态锁外等待已开始的读取及历史操作结束。独立审核补查了启动基线排序、幂等授权、测试的真实撤权信号，以及 shutdown 的阻塞读取路径；复审无严重问题。
+
+13 项新增测试实际使用 fake source、合成文本和专用临时目录。包括无授权后晚授权、读取中新增授权不接收旧批次、撤权/重授权/关闭排空、时钟与回调错误、panic 清理、跨实例与旧会话事件拒绝、固定观测时间，以及 collector → index → snapshot → 关闭重开。初始红阶段仅为新 API 缺失的编译失败，未将其称为真实系统竞态复现。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib clipboard_history::` | 64 通过、1 原生命名剪贴板用例默认忽略；本轮未重跑该原生用例 |
+| `npm run verify:local` | 退出 0；前端 774 通过/18 既有跳过，普通 Mac 库 216 通过/4 默认忽略，CLI 186 通过，公开插件 323 通过，schema/SDK/参考包校验通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 250 通过/7 默认忽略，退出 0 |
+
+环境沿用 M1 Pro / macOS 15.7.4、Node 22.22.1、Rust 1.96.1。日志为 `/private/tmp/uipilot-collector-{red,tests,verify,check,preview}.log`。本轮无 Windows 原生代码变更，未重新执行 Windows 原生验证；未读取 general pasteboard 或个人历史，未变更系统权限，未开放生产宿主或 SDK。Task 10.1 仍需复制与外部写入保护等后续工作。
+
+用户本轮指定完整目标达到约 70% 时统一人工测试。当前仍估计约 55%；到达该节点再冻结版本、交付带 SHA-256 的测试包及清单并通知测试者。本轮没有新的用户安装包，既有实机证据不自动转移为新功能验收结果。

@@ -28,7 +28,7 @@ start 创建独立会话和 worker，等待基线 count 建立后才返回可用
 
 每次 start 创建永久独立的 session。request_stop 在同一 admission 状态锁内将 session 标为失效并唤醒 worker；它不等待原生读取或回调完成，可在回调内使用。失效会话不能重新启用，重启必须新建 session 并重新取得基线。
 
-捕获事件不直接公开 payload getter；消费者通过 `with_current` 同步闭包取得内容。闭包进入前，在 session 锁内检查 active 并登记在途消费；退出时由 RAII 释放登记，包含 panic 路径。回调本身也属于在途工作。已经排队但尚未接纳的旧事件，在 request_stop 后必须拒绝。后续存储接线必须在该受控闭包内完成需要保护的写入，不能将正文转存到不受会话控制的延迟任务。
+捕获事件不直接公开 payload getter；消费者通过受控同步闭包取得内容。闭包进入前，在 session 锁内检查 active 并登记在途消费；退出时由 RAII 释放登记，包含 panic 路径。回调本身也属于在途工作。已经排队但尚未接纳的旧事件，在 request_stop 后必须拒绝。存储接线必须在该受控闭包内完成需要保护的写入，不能将正文转存到不受会话控制的延迟任务。[后续采集接线](2026-11-07-macos-clipboard-collection-design.md)进一步要求事件消费所有权、绑定读取前授权上下文与观测时间；原独立观察器的可重复借用事件接口不再用于生产历史采集。
 
 stop 先请求失效，再等待 worker 和已接纳的消费者结束；仅全部结束后返回 Stopped。并发 stop 共用同一次 join 和终态；等待时不得持有消费者需要的 session 锁。回调、该会话消费者或 worker 收尾析构中重入 stop 时，只返回 RequestedFromCallback，不自等、不声称已停止；检查 worker 身份不能只依赖回调的作用域。可由外部再次 stop 完成等待。Drop 同样请求停止；重入路径不等待自身。
 

@@ -19,7 +19,7 @@ const TEXT_TYPE: &str = "public.utf8-plain-text";
 
 /// Native NSInteger, opaque and compared only for equality. Zero is valid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ChangeCount(isize);
+pub(super) struct ChangeCount(pub(super) isize);
 
 #[derive(Eq, PartialEq)]
 pub(super) enum ReadOutcome {
@@ -63,6 +63,44 @@ impl ClipboardEvent {
     }
 
     pub(super) fn request_stop(&self) { self.session.request_stop(); }
+}
+
+/// Opaque authorization-set identity, never a wrapping integer counter.
+#[derive(Clone)]
+pub(super) struct AuthorizationRevision(Arc<()>);
+impl AuthorizationRevision {
+    pub(super) fn new() -> Self { Self(Arc::new(())) }
+    fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+
+pub(super) struct ReadBinding<C, P> {
+    revision: AuthorizationRevision,
+    context: Option<(C, P)>,
+}
+impl<C, P> ReadBinding<C, P> {
+    pub(super) fn new(revision: AuthorizationRevision, context: Option<(C, P)>) -> Self {
+        Self { revision, context }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CaptureFailure { BindingUnavailable, ClockUnavailable }
+
+/// Only the worker can construct a production envelope. Its context, observation
+/// time, payload and observer session cannot be replaced or recombined by callers.
+pub(super) struct CapturedEvent<C> {
+    event: ClipboardEvent,
+    context: C,
+    captured_at: String,
+}
+impl<C> CapturedEvent<C> {
+    pub(super) fn with_current<T>(self, action: impl FnOnce(&ReadOutcome, C, &str) -> T) -> Option<T> {
+        let Self { event, context, captured_at } = self;
+        event.with_current(|outcome| action(outcome, context, &captured_at))
+    }
+}
+
+fn observation_time() -> Result<String, ()> {
+    time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(|_| ())
 }
 
 #[derive(Clone)]
@@ -142,15 +180,33 @@ pub(super) struct MacClipboardObserver {
 }
 
 impl MacClipboardObserver {
-    /// This is deliberately unassembled. Starting it is a future explicit host action.
-    pub(super) fn start(callback: impl FnMut(ClipboardEvent) + Send + 'static) -> Result<Self, StartError> {
-        Self::start_with(|| Ok(NativeSource(NSPasteboard::generalPasteboard())), POLL_INTERVAL, callback)
+    /// Explicit internal construction only; no production host call site exists.
+    pub(super) fn start_bound<C: Send + 'static, P: Send + 'static>(
+        before_read: impl FnMut() -> Result<ReadBinding<C, P>, ()> + Send + 'static,
+        callback: impl FnMut(Result<CapturedEvent<C>, CaptureFailure>) + Send + 'static,
+    ) -> Result<Self, StartError> {
+        Self::start_with_binding(|| Ok(NativeSource(NSPasteboard::generalPasteboard())),
+            POLL_INTERVAL, before_read, observation_time, callback)
     }
 
+    #[cfg(test)]
     fn start_with<S: Source + 'static>(
         factory: impl FnOnce() -> Result<S, StartError> + Send + 'static,
         interval: Duration,
         mut callback: impl FnMut(ClipboardEvent) + Send + 'static,
+    ) -> Result<Self, StartError> {
+        let revision = AuthorizationRevision::new();
+        Self::start_with_binding(factory, interval,
+            move || Ok(ReadBinding::new(revision.clone(), Some(((), ())))), observation_time,
+            move |delivery| { if let Ok(event) = delivery { callback(event.event); } })
+    }
+
+    pub(super) fn start_with_binding<S: Source + 'static, C: Send + 'static, P: Send + 'static>(
+        factory: impl FnOnce() -> Result<S, StartError> + Send + 'static,
+        interval: Duration,
+        mut before_read: impl FnMut() -> Result<ReadBinding<C, P>, ()> + Send + 'static,
+        mut clock: impl FnMut() -> Result<String, ()> + Send + 'static,
+        mut callback: impl FnMut(Result<CapturedEvent<C>, CaptureFailure>) + Send + 'static,
     ) -> Result<Self, StartError> {
         let session = Arc::new(Session::new());
         let worker_session = Arc::clone(&session);
@@ -160,26 +216,58 @@ impl MacClipboardObserver {
             // Factory and baseline run on the owning worker, never on the caller.
             let initialized = autoreleasepool(|_| {
                 let source = factory()?;
+                let binding = before_read().map_err(|_| StartError::Unavailable)?;
                 let baseline = source.change_count().map_err(|_| StartError::Unavailable)?;
-                Ok::<_, StartError>((source, baseline))
+                let revision = binding.revision.clone();
+                drop(binding); // Baseline never reads a body or retains read permission.
+                Ok::<_, StartError>((source, baseline, revision))
             });
-            let (mut source, mut last_count) = match initialized {
+            let (mut source, mut last_count, mut last_revision) = match initialized {
                 Ok(value) => value,
                 Err(error) => { let _ = ready_tx.send(Err(error)); return; }
             };
             if ready_tx.send(Ok(())).is_err() { return; }
             while worker_session.wait_tick(interval) {
                 autoreleasepool(|_| {
-                    let Ok(count) = source.change_count() else { return; };
-                    if count == last_count { return; }
-                    // At most one attempt per observed count, including transient failure.
-                    last_count = count;
-                    let outcome = {
-                        let Some(_reading) = worker_session.admit() else { return; };
-                        sample(&mut source, count)
+                    let Some(reading) = worker_session.admit() else { return; };
+                    let binding = match before_read() {
+                        Ok(binding) => binding,
+                        Err(()) => {
+                            drop(reading);
+                            if let Some(_admission) = worker_session.admit() {
+                                callback(Err(CaptureFailure::BindingUnavailable));
+                            }
+                            worker_session.request_stop();
+                            return;
+                        }
                     };
+                    let Ok(count) = source.change_count() else { return; };
+                    if !last_revision.same(&binding.revision) {
+                        last_revision = binding.revision.clone();
+                        last_count = count;
+                        return; // Never backfill content across an authorization change.
+                    }
+                    if count == last_count { return; }
+                    last_count = count;
+                    let Some((context, permit)) = binding.context else { return; };
+                    // Observation time is sampled AFTER read admission, BEFORE body read.
+                    let captured_at = match clock() {
+                        Ok(value) => value,
+                        Err(()) => {
+                            drop(permit);
+                            drop(reading);
+                            if let Some(_admission) = worker_session.admit() {
+                                callback(Err(CaptureFailure::ClockUnavailable));
+                            }
+                            return;
+                        }
+                    };
+                    let outcome = sample(&mut source, count);
+                    drop(permit); // Revoke may drain read permissions before ingest.
+                    drop(reading);
                     if let Some(_admission) = worker_session.admit() {
-                        callback(ClipboardEvent { session: Arc::clone(&worker_session), outcome });
+                        callback(Ok(CapturedEvent { event: ClipboardEvent {
+                            session: Arc::clone(&worker_session), outcome }, context, captured_at }));
                     }
                 });
             }
@@ -230,12 +318,12 @@ impl Drop for MacClipboardObserver {
     fn drop(&mut self) { let _ = self.stop(); }
 }
 
-trait Source {
+pub(super) trait Source {
     fn change_count(&self) -> Result<ChangeCount, ()>;
     fn read_content(&mut self) -> Content;
 }
 #[derive(Eq, PartialEq)]
-enum Content { Text(String), Unsupported, Unavailable, TooLarge }
+pub(super) enum Content { Text(String), Unsupported, Unavailable, TooLarge }
 
 fn sample(source: &mut impl Source, expected: ChangeCount) -> ReadOutcome {
     match source.change_count() {

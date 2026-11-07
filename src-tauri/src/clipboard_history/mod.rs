@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports)]
-// macOS compiles shared core logic and an unassembled text observer. Native
-// history remains unavailable until storage, authorization and host wiring land.
+// macOS compiles shared core logic and an internal authorized text collector.
+// Native history remains unavailable until production host wiring is verified.
 
 mod format;
 mod model;
@@ -11,6 +11,8 @@ mod macos_observer;
 mod macos_store;
 #[cfg(target_os = "macos")]
 mod macos_history;
+#[cfg(target_os = "macos")]
+mod macos_collector;
 #[cfg(windows)]
 mod observer;
 #[cfg(windows)]
