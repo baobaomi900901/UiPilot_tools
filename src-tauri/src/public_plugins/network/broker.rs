@@ -6,7 +6,7 @@ use std::{
 
 use super::super::{
     manifest::{valid_setting_key, PluginNetworkCredential},
-    secrets::SensitiveBytes,
+    sensitive_bytes::SensitiveBytes,
 };
 use hyper::{
     header::{HeaderName, HeaderValue, AUTHORIZATION},
@@ -1565,7 +1565,7 @@ mod tests {
             ..request(PluginNetworkRequestMethod::Get)
         };
         let token =
-            || crate::public_plugins::secrets::SensitiveBytes::new(b"synthetic-token".to_vec());
+            || crate::public_plugins::sensitive_bytes::SensitiveBytes::new(b"synthetic-token".to_vec());
         for (count, expected) in [
             (31, None),
             (32, Some(PluginNetworkErrorCode::InvalidNetworkRequest)),
@@ -1623,7 +1623,7 @@ mod tests {
                 input,
                 |_| {
                     assert_eq!(broker.global_active_for_test(), 0);
-                    Ok(crate::public_plugins::secrets::SensitiveBytes::new(
+                    Ok(crate::public_plugins::sensitive_bytes::SensitiveBytes::new(
                         b"synthetic-token".to_vec(),
                     ))
                 },

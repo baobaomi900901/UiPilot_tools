@@ -135,6 +135,8 @@
 
 - [ ] **9.1 审核装载边界。** 逐项维护[双端能力表](../../plugin-sdk/public-plugin-developer-guide.md#windows-与-macos-兼容性)。共同能力复用公开 SDK 的请求/响应、错误、权限和生命周期合同，原生实现由各端宿主负责；共用的行为用同一组输入、授权/撤权和预期结果对两端验收。 针对每种 manifest 权限记录 Task 8/10 真实可用性。校验安装、升级、禁用/重启恢复 与 `PublicPluginHost`、`PluginInvocationEnvironment` 的平台，未验证能力在权限读取前拒绝。旧 PluginManager 单独演练；不能证明隔离就保持关闭。升级增加权限应重新授权；安装失败保留原版本/原授权。
 - [ ] **9.2 先验证隐藏 runtime。** mainResult 也需惰性创建 WKWebView。安装来源、导航/下载边界 → 原生静音 → 注册 unmute → 读回静音 → 复核 generation → 导航受信包入口 → 第一条包指令。为各导航前步骤注入失败，要求零包指令、撤销 generation/拒绝 RPC、销毁实例。成功后触发 unmute，同样先撤销权限再销毁；旧回调晚于同标签新实例时只能指向旧 generation。生产 WKWebView 不能证明顺序就继续关闭 mainResult。
+  在生产 runtime 仍关闭时，按[HTTPS 共用基础规格](../specs/2026-11-07-macos-plugin-network-foundation-design.md)接入 `public_plugins_macos.rs`、共享 `sensitive_bytes.rs` 与 `network/` 核心；Windows secrets 保持原导出和 DPAPI 行为。依赖现有共享 manifest/HTTPS 合同，不能为 Mac 编译提供假的权限 gateway。运行 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib public_plugins::`，实际验证 localhost native TLS 的正常链路、错误/过期证书、主机名、限额、取消和代理隔离，并保留 proxy 子进程实际命中数；共用音频 authority 测试不算 WK 原生隔离。临时证书只在内存信任，真实系统 trust store 不改动。
+
 - [ ] **9.3 将宿主凭据与插件秘密隔离。** 分别接入 credentials/ 与 public_plugins/secrets.rs 的 Keychain 后端，按 approved 命名与所有者检查。测试创建/读取/更新/删除、Keychain 锁定、写入失败、撤权和插件冒用 ID；验证未授权请求不触及 Keychain，失败保留旧记录、状态不报成功、日志/JSON 不含测试秘密。
 
   内部介质先依[Keychain 基础规格](../specs/2026-11-07-macos-keychain-foundation-design.md)的「身份、授权与介质」「数据与失败」实现 `macos_keychain.rs`、`macos_keychain/{native,tests}.rs`，由 `platform.rs` 编译但不装配。宿主与插件分别使用固定 namespace，当前 token 决定 owner；精确地址、无交互请求、撤回排空、有界秘密缓冲和错误脱敏分别验证。运行 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib macos_keychain::`。原生 Keychain CRUD/锁定及签名访问控制留统一人工节点，不提前称为生产凭据支持。

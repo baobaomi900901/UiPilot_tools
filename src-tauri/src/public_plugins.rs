@@ -20,6 +20,7 @@ pub(crate) mod result_action;
 mod runtime;
 mod scheduler;
 mod secrets;
+mod sensitive_bytes;
 mod state;
 mod storage;
 mod timers;

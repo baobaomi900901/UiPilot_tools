@@ -28,32 +28,7 @@ const MAX_SECRET_BYTES: usize = 64 * 1024;
 // DPAPI adds a small fixed envelope; never allocate from an untrusted record length.
 const MAX_RECORD_BYTES: usize = MAX_SECRET_BYTES + 4096;
 
-pub(crate) struct SensitiveBytes(Vec<u8>);
-
-impl SensitiveBytes {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SensitiveBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SensitiveBytes([REDACTED])")
-    }
-}
-
-impl Drop for SensitiveBytes {
-    fn drop(&mut self) {
-        for byte in &mut self.0 {
-            // Volatile writes prevent the compiler from eliding the wipe.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    }
-}
+pub(crate) use super::sensitive_bytes::SensitiveBytes;
 
 fn valid_bearer(bytes: &[u8]) -> bool {
     if bytes.is_empty() || bytes.len() > 8192 {
@@ -401,7 +376,7 @@ fn blob(bytes: &[u8]) -> Result<CRYPT_INTEGER_BLOB, PluginSecretError> {
 }
 
 fn take_output(output: CRYPT_INTEGER_BLOB) -> Result<Vec<u8>, PluginSecretError> {
-    let mut result = SensitiveBytes::new(if output.cbData == 0 {
+    let result = SensitiveBytes::new(if output.cbData == 0 {
         Vec::new()
     } else if output.pbData.is_null() {
         return Err(PluginSecretError::ProtectFailed);
@@ -418,7 +393,7 @@ fn take_output(output: CRYPT_INTEGER_BLOB) -> Result<Vec<u8>, PluginSecretError>
             return Err(PluginSecretError::ProtectFailed);
         }
     }
-    Ok(std::mem::take(&mut result.0))
+    Ok(result.into_vec())
 }
 
 fn encode_record(ciphertext: &[u8]) -> Result<Vec<u8>, PluginSecretError> {

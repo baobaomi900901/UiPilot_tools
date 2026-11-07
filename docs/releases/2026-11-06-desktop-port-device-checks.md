@@ -288,3 +288,17 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 | `node --test scripts/macos-host-acl.test.mjs` | 4 通过 |
 
 日志 `/private/tmp/uipilot-login-{red,tests,host,client-red,client-green,ui-red,ui-green,focused,verify,check,preview,acl}.log`。签名、系统通知、外部撤销及真实注销/登录行为在 70% 统一人工节点验收，Task 10.5 不提前勾选完成。
+
+## 2026-11-07 Mac 插件 HTTPS 共用核心自动验证
+
+按[共用基础规格](../superpowers/specs/2026-11-07-macos-plugin-network-foundation-design.md)编译真实 broker/registry/address policy/native transport 与共享音频 authority。生产插件、权限 gateway、runtime、secret store 未装配。SensitiveBytes 提取并保留 Windows re-export；DPAPI 成功路径通过等价 into_vec 转移，错误清理行为未变。独立源码终审通过。
+
+首次未接线时为零测试，随后缺模块编译失败；这两次仅作为装配红阶段。首次实际套件 44 通过/9 失败，9 项均因沙箱禁止 localhost bind（EPERM），非 TLS 逻辑失败。经工具自动审批在允许本地监听的环境重跑，53 项通过（41 网络、9 共用 guard authority、2 内存容器、1 manifest 类型同一性），代理环境子进程另明确 1 项通过。动态 rcgen 证书与内存 root 仅用于 127.0.0.1 临时 TLS 服务，未访问公网或改系统信任/Keychain。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `npm run verify:local` | 退出 0；前端 789 通过/18 跳过，Mac 库 398 通过/5 默认忽略（代理子进程另 1 通过），CLI 186、公开插件 323 通过，schema/SDK/参考包通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview` | 432 通过/8 默认忽略 |
+
+日志 `/private/tmp/uipilot-network-{unwired-red,module-red,green,native-green,verify,check,preview}.log`。真实 native TLS 的成功/未信任/错 hostname/过期证书、不得降级、限额/取消和 proxy 环境子进程均执行，未跳过 Mac 失败或改 production trust policy。Windows 原生验证未执行；本单元不增加同包双端插件通过计数。

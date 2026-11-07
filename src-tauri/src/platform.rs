@@ -27,6 +27,10 @@ mod web_search;
 mod macos_browser_open;
 #[cfg(target_os = "macos")]
 mod macos_login_item;
+// Shared plugin foundations only; no runtime, manager or permission gateway.
+#[cfg(target_os = "macos")]
+#[path = "public_plugins_macos.rs"]
+mod public_plugins;
 #[cfg(target_os = "macos")]
 mod webview_reload_guard;
 #[cfg(target_os = "macos")]
@@ -48,7 +52,7 @@ pub use macos_host::run;
 #[cfg(target_os = "macos")]
 #[path = "public_plugins/manifest.rs"]
 #[allow(dead_code)]
-mod manifest;
+pub(crate) mod manifest;
 #[cfg(target_os = "macos")]
 pub fn public_plugin_manifest_schema() -> serde_json::Value {
     serde_json::to_value(manifest::public_manifest_v1_schema())
