@@ -190,6 +190,11 @@ impl MacTextStore {
             .filter(|entry| match &entry.payload { HistoryEntryPayload::Text { text, .. } => text.to_lowercase().contains(&query), _ => false })
             .filter_map(document::text_summary).collect() })
     }
+    pub(super) fn text_record(&self, id: &str) -> Result<Option<String>> {
+        self.check_current()?;
+        Ok(self.document.entries.iter().find(|entry| entry.id == id).and_then(|entry|
+            match &entry.payload { HistoryEntryPayload::Text { text, .. } => Some(text.clone()), _ => None }))
+    }
     pub(super) fn capture(&mut self, text: String, captured_at: String) -> Result<CaptureOutcome> {
         if text.len() > MAX_TEXT || captured_at.len() > 64 { return Err(StoreError::InvalidInput); }
         self.check_current()?;

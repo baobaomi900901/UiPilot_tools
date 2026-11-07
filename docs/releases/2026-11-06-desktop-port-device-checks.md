@@ -224,3 +224,11 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 环境沿用 M1 Pro / macOS 15.7.4、Node 22.22.1、Rust 1.96.1。日志为 `/private/tmp/uipilot-collector-{red,tests,verify,check,preview}.log`。本轮无 Windows 原生代码变更，未重新执行 Windows 原生验证；未读取 general pasteboard 或个人历史，未变更系统权限，未开放生产宿主或 SDK。Task 10.1 仍需复制与外部写入保护等后续工作。
 
 用户本轮指定完整目标达到约 70% 时统一人工测试。当前仍估计约 55%；到达该节点再冻结版本、交付带 SHA-256 的测试包及清单并通知测试者。本轮没有新的用户安装包，既有实机证据不自动转移为新功能验收结果。
+
+## 2026-11-07 显式历史文本复制自动验证
+
+按[复制规格](../superpowers/specs/2026-11-07-macos-clipboard-copy-design.md)实现独立复制授权、单次请求、最终记录复验及原生一次 declareTypes/setData。读取授权不自动扩为复制；撤回读取、撤回复制和 shutdown 分别排空已接纳提交。独立终审通过。
+
+`clipboard_history::macos_copy::` 聚焦 15 项通过、1 项原生用例默认忽略；剪贴板整体 79 项通过、2 项默认忽略。新增 fake 用例明确展示 count 检查到 claim 之间不是 CAS，并验证观察到变化时零 claim、claim 后所有权丢失/异常没有第二次写入、之后的外部 B 不被恢复动作覆盖，以及准备期间删除/撤权/重授权的拒绝。原生夹具使用系统唯一命名 board，仅定义、未运行；通用剪贴板未访问。红阶段仅为缺失新 API 的编译失败。
+
+日志：`/private/tmp/uipilot-copy-{red,tests,clipboard}.log`。本单元未装配宿主/SDK、未修改 Windows 行为；自动临时恢复仍为 Unsupported，未虚构原子条件写保证。人工测试继续汇总到整体约 70% 的统一节点。

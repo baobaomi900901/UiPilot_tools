@@ -8,6 +8,17 @@ pub(super) enum HistoryError { PermissionDenied, Stopped, Storage, InvalidQuery 
 impl From<StoreError> for HistoryError { fn from(error: StoreError) -> Self { match error { StoreError::InvalidQuery => Self::InvalidQuery, _ => Self::Storage } } }
 type Result<T> = std::result::Result<T, HistoryError>;
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> { value.lock().unwrap_or_else(|error| error.into_inner()) }
+struct CopyEpoch { active: AtomicBool, gate: Mutex<()> }
+#[derive(Clone)]
+pub(super) struct CopyToken { read: AccessToken, epoch: Arc<CopyEpoch> }
+
+#[cfg(test)]
+impl CopyToken {
+    pub(super) fn active_for_test(&self) -> bool {
+        self.epoch.active.load(Ordering::Acquire) && self.read.epoch.active.load(Ordering::Acquire)
+    }
+}
+
 struct Epoch { active: AtomicBool, gate: Mutex<()>, read: Arc<ReadGate> }
 struct ReadState { active: bool, in_flight: usize }
 struct ReadGate { state: Mutex<ReadState>, drained: Condvar }
@@ -46,6 +57,7 @@ struct State {
     stopped: bool,
     revision: AuthorizationRevision,
     active: BTreeMap<String, Arc<Epoch>>,
+    copies: BTreeMap<String, Arc<CopyEpoch>>,
     stores: BTreeMap<String, Arc<Mutex<MacTextStore>>>,
 }
 struct Inner { location: PathBuf, root_identity: RootIdentity, lifecycle: Mutex<()>, state: Mutex<State> }
@@ -55,7 +67,7 @@ impl MacHistory {
     pub(super) fn open(location: &Path) -> Result<Self> {
         let root_identity = MacTextStore::prepare_root(location)?;
         Ok(Self { inner: Arc::new(Inner { location: location.to_owned(), root_identity, lifecycle: Mutex::new(()),
-            state: Mutex::new(State { stopped: false, revision: AuthorizationRevision::new(), active: BTreeMap::new(), stores: BTreeMap::new() }) }) })
+            state: Mutex::new(State { stopped: false, revision: AuthorizationRevision::new(), active: BTreeMap::new(), copies: BTreeMap::new(), stores: BTreeMap::new() }) }) })
     }
     pub(super) fn authorize(&self, id: &str) -> Result<AccessToken> {
         if !valid_id(id) { return Err(HistoryError::PermissionDenied); }
@@ -80,6 +92,67 @@ impl MacHistory {
         }
         Ok(AccessToken { owner: Arc::downgrade(&self.inner), id: id.into(), epoch })
     }
+    /// Host-private explicit copy approval. Read access alone never creates it.
+    pub(super) fn authorize_copy(&self, read: &AccessToken) -> std::result::Result<CopyToken, super::macos_copy::CopyError> {
+        use super::macos_copy::CopyError;
+        let _lifecycle = lock(&self.inner.lifecycle);
+        let mut state = lock(&self.inner.state);
+        if !Weak::ptr_eq(&read.owner, &Arc::downgrade(&self.inner)) || state.stopped
+            || !read.epoch.active.load(Ordering::Acquire)
+            || !state.active.get(&read.id).is_some_and(|epoch| Arc::ptr_eq(epoch, &read.epoch)) {
+            return Err(CopyError::PermissionDenied);
+        }
+        let epoch = state.copies.entry(read.id.clone()).or_insert_with(||
+            Arc::new(CopyEpoch { active: AtomicBool::new(true), gate: Mutex::new(()) }));
+        Ok(CopyToken { read: read.clone(), epoch: Arc::clone(epoch) })
+    }
+    pub(super) fn revoke_copy(&self, token: &CopyToken) -> std::result::Result<(), super::macos_copy::CopyError> {
+        use super::macos_copy::CopyError;
+        let _lifecycle = lock(&self.inner.lifecycle);
+        let retired = {
+            let mut state = lock(&self.inner.state);
+            if !Weak::ptr_eq(&token.read.owner, &Arc::downgrade(&self.inner))
+                || !state.copies.get(&token.read.id).is_some_and(|epoch| Arc::ptr_eq(epoch, &token.epoch)) {
+                return Err(CopyError::PermissionDenied);
+            }
+            let epoch = state.copies.remove(&token.read.id).unwrap();
+            epoch.active.store(false, Ordering::Release);
+            epoch
+        };
+        drop(lock(&retired.gate));
+        Ok(())
+    }
+    /// Record lookup and final synchronous effect share the same authority. The
+    /// store mutex is released BEFORE effect runs; revoke drains both gates.
+    pub(super) fn with_copy_record<T>(&self, token: &CopyToken, id: &str,
+        effect: impl FnOnce(&str) -> std::result::Result<T, super::macos_copy::CopyError>,
+    ) -> std::result::Result<T, super::macos_copy::CopyError> {
+        use super::macos_copy::CopyError;
+        if !Weak::ptr_eq(&token.read.owner, &Arc::downgrade(&self.inner))
+            || !token.read.epoch.active.load(Ordering::Acquire) || !token.epoch.active.load(Ordering::Acquire) {
+            return Err(CopyError::PermissionDenied);
+        }
+        let _read = lock(&token.read.epoch.gate);
+        let _copy = lock(&token.epoch.gate);
+        if !token.read.epoch.active.load(Ordering::Acquire) || !token.epoch.active.load(Ordering::Acquire) {
+            return Err(CopyError::PermissionDenied);
+        }
+        let store = {
+            let state = lock(&self.inner.state);
+            if state.stopped || !state.active.get(&token.read.id).is_some_and(|epoch| Arc::ptr_eq(epoch, &token.read.epoch))
+                || !state.copies.get(&token.read.id).is_some_and(|epoch| Arc::ptr_eq(epoch, &token.epoch)) {
+                return Err(CopyError::PermissionDenied);
+            }
+            state.stores.get(&token.read.id).cloned().ok_or(CopyError::RecordUnavailable)?
+        };
+        let text = {
+            let store = store.lock().map_err(|_| CopyError::RecordUnavailable)?;
+            store.text_record(id).map_err(|_| CopyError::RecordUnavailable)?.ok_or(CopyError::RecordNotFound)?
+        };
+        drop(store);
+        effect(&text)
+    }
+
     pub(super) fn prepare_read(&self) -> Result<ReadBinding<CaptureBatch, CaptureReadPermit>> {
         let state = lock(&self.inner.state);
         if state.stopped { return Err(HistoryError::Stopped); }
@@ -137,7 +210,7 @@ impl MacHistory {
             .ok_or(HistoryError::PermissionDenied)?
     }
     #[cfg(test)]
-    fn ingest_unbound_for_test(&self, event: &ClipboardEvent, batch: CaptureBatch) -> Result<IngestReport> {
+    pub(super) fn ingest_unbound_for_test(&self, event: &ClipboardEvent, batch: CaptureBatch) -> Result<IngestReport> {
         self.ingest_at(event, batch, "2026-11-07T00:00:00Z")
     }
     #[cfg(test)]
@@ -167,6 +240,7 @@ impl MacHistory {
             let mut state = lock(&self.inner.state);
             if state.stopped { return Err(HistoryError::Stopped); }
             let retired = state.active.remove(id);
+            if let Some(copy) = state.copies.remove(id) { copy.active.store(false, Ordering::Release); }
             if let Some(epoch) = &retired {
                 epoch.active.store(false, Ordering::Release);
                 epoch.read.close();
@@ -185,6 +259,8 @@ impl MacHistory {
             let mut state = lock(&self.inner.state);
             state.stopped = true;
             state.revision = AuthorizationRevision::new();
+            for copy in state.copies.values() { copy.active.store(false, Ordering::Release); }
+            state.copies.clear();
             let active = std::mem::take(&mut state.active);
             for epoch in active.values() { epoch.active.store(false, Ordering::Release); epoch.read.close(); }
             active.into_values().collect::<Vec<_>>()

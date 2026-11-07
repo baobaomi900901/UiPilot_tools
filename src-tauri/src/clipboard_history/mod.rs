@@ -13,6 +13,8 @@ mod macos_store;
 mod macos_history;
 #[cfg(target_os = "macos")]
 mod macos_collector;
+#[cfg(target_os = "macos")]
+mod macos_copy;
 #[cfg(windows)]
 mod observer;
 #[cfg(windows)]
