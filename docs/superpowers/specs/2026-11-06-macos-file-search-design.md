@@ -44,7 +44,9 @@
 ## 范围验收与发布条件
 
 - 普通构建不开启 Find。内部 `macos-find-preview` 构建将本地公共字体目录和 `/Users/Shared` 的目录 URL 传给 Spotlight，当前进程获准访问本地文稿后再加入文稿根。每项结果都复验。本构建用于验收查询、收藏、窗口转发、文稿授权和 Finder 动作。
-- `macos-find-system-qa` 仅为受控签名身份和隔离测试账户准备；它使用系统 `NSMetadataQueryIndexedLocalComputerScope`。只有 QA 构建、宿主环境显式设置 `UIPILOT_FIND_ISOLATED_QA=1` 且 `UIPILOT_FIND_QA_VERIFIED_ROOTS` 有值时才启用入口。后者是本次已独立核验权限的目录，以冒号分隔；只接受小范围规范本地根，不接受整个用户主目录、上级、重叠根或跨卷逃逸。该证据限 QA 流程，不是最终用户的搜索偏好。该模式不分发给普通用户。
+- `macos-find-system-qa` 使用系统 `NSMetadataQueryIndexedLocalComputerScope`。操作员须直接登录专用的本地标准账户 `uipilot-qa`，或短名称为 `uipilot-qa-<小写字母或数字>` 的账户。宿主核对进程 UID、系统账户记录和主目录。QA 构建还要求 `UIPILOT_FIND_ISOLATED_QA=1` 及 `UIPILOT_FIND_QA_VERIFIED_ROOTS`。后者只接受已独立核验的窄目录，位于此账户的本地主目录内，或位于 `/Users/Shared` 下由该账户独占的 QA 样例目录。普通预览使用原有公开目录及文稿授权。
+- 全机查询从 Spotlight 接收有上限的候选，并在读取结果文件属性、返回名称或执行动作前复核允许范围。系统查询可能接收范围外的路径元数据。QA 的成功响应统一标为部分结果，结果数只计通过授权的行。候选上限和平台调度都可能影响命中率或耗时。
+- 独立测试包先验证允许目录和对照目录中的两个同名样例均已收录，再使用产品的全机查询、结果授权和动作检查验证允许的样例与旧结果。包的输出将 Spotlight 索引、宿主核准范围的撤回和真实系统隐私权限分别记录。运行方法见[设备验收单](../../releases/2026-11-06-desktop-port-device-checks.md)。
 - 系统 QA 验收需分别覆盖已允许、未授权、明确拒绝、撤权与对象替换，确认没有意外隐私弹窗、受拒行或错误系统动作，才能扩大公开支持范围。Apple 说明在缺少明确或隐含授权时首次访问桌面可能触发系统询问。[Apple 桌面目录访问说明](https://developer.apple.com/documentation/bundleresources/information-property-list/nsdesktopfolderusagedescription)
 
 ## 生命周期与并发顺序

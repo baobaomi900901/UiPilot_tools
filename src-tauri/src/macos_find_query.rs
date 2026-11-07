@@ -91,6 +91,7 @@ struct NativeQuery {
     observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     finished: Arc<AtomicBool>,
     approved_paths: Vec<PathBuf>,
+    system_query: bool,
 }
 
 impl NativeQuery {
@@ -143,7 +144,7 @@ impl NativeQuery {
                 &block,
             )
         };
-        Ok(Self { query, center, observer, finished, approved_paths })
+        Ok(Self { query, center, observer, finished, approved_paths, system_query })
     }
 
     fn gather(&self, cancel: &QueryCancellation, deadline: Instant) -> Result<Candidates, GatherError> {
@@ -155,6 +156,12 @@ impl NativeQuery {
             cancel.check()?;
             return Err(GatherError::ServiceUnavailable);
         }
+        let gathered = self.sample_until(cancel, deadline);
+        cancel.check()?;
+        sample_response(self.system_query, gathered)
+    }
+
+    fn sample_until(&self, cancel: &QueryCancellation, deadline: Instant) -> Result<Candidates, GatherError> {
         let run_loop = NSRunLoop::currentRunLoop();
         loop {
             cancel.check()?;
@@ -202,6 +209,19 @@ impl Drop for NativeQuery {
         }
         // SAFETY: this is the exact observer token registered with this center.
         unsafe { self.center.removeObserver((*self.observer).as_ref()) };
+    }
+}
+
+// A successful system query samples at most CANDIDATE_LIMIT Spotlight rows.
+// Global count, path-filter misses, truncation and the sampling deadline reveal
+// nothing through the returned status. They can still affect which authorized
+// hits fit in the sample and how long Spotlight takes; the sample is not exhaustive.
+fn sample_response(system: bool, result: Result<Candidates, GatherError>) -> Result<Candidates, GatherError> {
+    if !system { return result; }
+    match result {
+        Ok(sample) => Ok(Candidates { paths: sample.paths, partial: true, timed_out: false }),
+        Err(GatherError::TimedOut) => Ok(Candidates { paths: Vec::new(), partial: true, timed_out: false }),
+        Err(err) => Err(err),
     }
 }
 
@@ -262,6 +282,17 @@ pub(crate) fn gather_on_worker(
     })
 }
 
+/// Inspect the exact builder used by gather_on_worker without starting an extra native query.
+#[cfg(all(feature = "macos-find-system-qa", any(test, feature = "macos-find-qa-probe")))]
+pub(crate) fn configured_for_indexed_local(scope: &IndexedLocalScope, text: &str) -> bool {
+    let Ok(native) = NativeQuery::new(ApprovedScope::IndexedLocal(scope), text) else { return false; };
+    let scopes = native.query.searchScopes();
+    if scopes.count() != 1 { return false; }
+    let Ok(setting) = scopes.objectAtIndex(0).downcast::<NSString>() else { return false; };
+    // SAFETY: this Foundation scope identifier is an immortal NSString constant.
+    &*setting == unsafe { objc2_foundation::NSMetadataQueryIndexedLocalComputerScope }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +339,31 @@ mod tests {
         assert_eq!(snapshot(1, false, &cancel, || false, |_| None).err(), Some(GatherError::TimedOut));
         let result = snapshot(1, false, &cancel, || false, |_| Some("/test".into())).unwrap();
         assert!(result.timed_out && result.partial);
+    }
+
+    #[test]
+    fn system_samples_do_not_report_global_count_misses_or_truncation() {
+        fn sample(count: usize, approved_index: Option<usize>, finished: bool, expired: bool) -> Candidates {
+            let mut copies = 0;
+            let raw = snapshot(count, finished, &QueryCancellation::default(), || expired, |i| {
+                copies += 1;
+                (Some(i) == approved_index).then(|| PathBuf::from("/approved/example.pdf"))
+            });
+            assert!(copies <= CANDIDATE_LIMIT);
+            sample_response(true, raw).unwrap()
+        }
+        for (count, finished, expired) in [(0,true,false),(1,true,false),(600,true,false),
+                                          (600,false,true),(0,false,false)] {
+            let result = sample(count, None, finished, expired);
+            assert!(result.paths.is_empty() && result.partial && !result.timed_out);
+        }
+        for count in [1, 2, CANDIDATE_LIMIT + 1] {
+            let result = sample(count, Some(0), true, false);
+            assert_eq!(result.paths, [PathBuf::from("/approved/example.pdf")]);
+            assert!(result.partial && !result.timed_out);
+        }
+        assert_eq!(sample_response(true, Err(GatherError::Cancelled)).unwrap_err(), GatherError::Cancelled);
+        assert_eq!(sample_response(true, Err(GatherError::ServiceUnavailable)).unwrap_err(), GatherError::ServiceUnavailable);
     }
 
     #[test]

@@ -52,5 +52,13 @@ mod find_window;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // Neither the default host nor plugin windows register file search IPC.
 mod macos_find_results;
+#[cfg(all(target_os = "macos", feature = "macos-find-qa-probe"))]
+pub fn run_system_qa_probe() -> Result<(), String> {
+    macos_find_results::run_system_qa_probe()
+}
+#[cfg(all(target_os = "macos", feature = "macos-find-qa-probe"))]
+pub fn qa_shared_workspace_identity() -> Result<String, &'static str> {
+    macos_find_results::qa_shared_workspace_identity()
+}
 #[cfg(all(target_os = "macos", feature = "macos-find-preview"))]
 mod macos_find_host;

@@ -13,6 +13,30 @@ pub(crate) use documents::documents_directory_url;
 #[cfg(feature = "macos-find-system-qa")]
 #[path = "macos_find_system_qa.rs"]
 mod system_qa;
+#[cfg(feature = "macos-find-qa-probe")]
+pub(crate) use system_qa::probe::run as run_system_qa_probe;
+
+#[cfg(feature = "macos-find-system-qa")]
+pub(crate) fn qa_account_eligible() -> bool { system_qa::qa_account().is_ok() }
+
+#[cfg(feature = "macos-find-qa-probe")]
+pub(crate) fn qa_shared_workspace_identity() -> Result<String, &'static str> {
+    let account = system_qa::qa_account().map_err(|_| "dedicated standard QA account required")?;
+    let mounts = Mounts::current().map_err(|_| "mount table unavailable")?;
+    system_qa::LocalHome::bind(account, &mounts).map_err(|_| "verified local QA home required")?;
+    let shared = Path::new("/Users/Shared");
+    if !mounts.allows_path(shared) {
+        return Err("QA workspace is not on a verified local mount");
+    }
+    let directory = open_directory(shared).map_err(|_| "QA workspace is not a local directory")?;
+    ensure_local_fd(&directory).map_err(|_| "QA workspace is not a local directory")?;
+    let stat = fstat(&directory).map_err(|_| "QA workspace identity unavailable")?;
+    if stat.st_uid != 0 || (stat.st_mode & 0o022 != 0 && stat.st_mode & 0o1000 == 0)
+        || !system_qa::no_extended_acl(&directory) {
+        return Err("QA workspace cannot protect private fixture directories");
+    }
+    Ok(format!("{}:{}", stat.st_dev, stat.st_ino))
+}
 
 use crate::{
     macos_find_identity::FindPathIdentity,
@@ -163,6 +187,8 @@ pub(crate) struct IndexedLocalScope {
     roots: Vec<Arc<Root>>,
     #[cfg(feature = "macos-find-system-qa")]
     qa_home: Option<system_qa::LocalHome>,
+    #[cfg(feature = "macos-find-system-qa")]
+    qa_retired: std::sync::atomic::AtomicBool,
 }
 
 impl IndexedLocalScope {
@@ -214,7 +240,7 @@ impl IndexedLocalScope {
                     #[cfg(feature = "macos-find-system-qa")] anchor: None }));
             }
         }
-        let mut scope = Self { roots, documents: None, #[cfg(feature = "macos-find-system-qa")] qa_home: None };
+        let mut scope = Self { roots, documents: None, #[cfg(feature = "macos-find-system-qa")] qa_home: None, #[cfg(feature = "macos-find-system-qa")] qa_retired: false.into() };
         scope.add_documents(grant);
         if scope.roots.is_empty() { return Err(FindError::Unavailable); }
         Ok(scope)
@@ -245,13 +271,22 @@ impl IndexedLocalScope {
 
     #[cfg(feature = "macos-find-system-qa")]
     fn recheck_qa_evidence(&self, mounts: &Mounts) -> Result<(), FindError> {
-        if let Some(home) = &self.qa_home {
-            let current = system_qa::current_evidence()?;
+        use std::sync::atomic::Ordering;
+        let Some(home) = &self.qa_home else { return Ok(()); };
+        if self.qa_retired.load(Ordering::Acquire) { return Err(FindError::Stale); }
+        let validation = system_qa::current_evidence().and_then(|current| {
             if !current.iter().eq(self.roots.iter().map(|root| &root.path)) {
                 return Err(FindError::Stale);
             }
             home.revalidate(mounts)?;
+            for root in &self.roots { home.check_bound_root(root, mounts)?; }
+            Ok(())
+        });
+        if validation.is_err() {
+            self.qa_retired.store(true, Ordering::Release);
         }
+        validation?;
+        if self.qa_retired.load(Ordering::Acquire) { return Err(FindError::Stale); }
         Ok(())
     }
 
@@ -430,8 +465,14 @@ pub(crate) fn authorize_batch(scope: &IndexedLocalScope, candidates: Candidates,
     let category = FileCategory::parse_wire(category).ok_or(FindError::InvalidInput)?;
     cancel.check().map_err(|_| FindError::Cancelled)?;
     scope.recheck_documents()?;
+    #[cfg(feature = "macos-find-system-qa")]
+    if scope.uses_system_query() { scope.recheck_qa_evidence(&Mounts::current()?)?; }
     let mut rows = Vec::new();
-    let mut partial = candidates.partial || candidates.paths.len() > 400;
+    #[cfg(feature = "macos-find-system-qa")]
+    let system_sample = scope.uses_system_query();
+    #[cfg(not(feature = "macos-find-system-qa"))]
+    let system_sample = false;
+    let mut partial = system_sample || candidates.partial || candidates.paths.len() > 400;
     let mut seen = HashSet::new();
     for candidate in candidates.paths.into_iter().take(400) {
         cancel.check().map_err(|_| FindError::Cancelled)?;
@@ -454,7 +495,7 @@ pub(crate) fn authorize_batch(scope: &IndexedLocalScope, candidates: Candidates,
     #[cfg(feature = "macos-find-system-qa")]
     if scope.uses_system_query() { scope.query_paths()?; }
     cancel.check().map_err(|_| FindError::Cancelled)?;
-    if candidates.timed_out && rows.is_empty() { return Err(FindError::TimedOut); }
+    if !system_sample && candidates.timed_out && rows.is_empty() { return Err(FindError::TimedOut); }
     Ok(AuthorizedBatch { rows, partial })
 }
 
@@ -469,6 +510,8 @@ fn submit_with<T>(
     admit: impl FnOnce() -> bool, submit: impl FnOnce(&NSURL, Submission) -> T,
 ) -> Result<T, FindError> {
     scope.recheck_documents()?;
+    #[cfg(feature = "macos-find-system-qa")]
+    if scope.uses_system_query() { scope.recheck_qa_evidence(&Mounts::current()?)?; }
     let (root, _) = scope.routed_path(&target.path).map_err(|_| FindError::Stale)?;
     if !Arc::ptr_eq(root, &target.root) { return Err(FindError::Stale); }
     let (current, _) = root.validate(&target.path)?;
@@ -484,6 +527,10 @@ fn submit_with<T>(
     if scope.uses_system_query() { scope.recheck_qa_evidence(&Mounts::current()?)?; }
     scope.recheck_documents()?;
     if !admit() { return Err(FindError::Stale); }
+    // The controller admission can wait behind newer work. System QA authority is
+    // external to that lock; recheck after admission and before any native submit.
+    #[cfg(feature = "macos-find-system-qa")]
+    if scope.uses_system_query() { scope.recheck_qa_evidence(&Mounts::current()?)?; }
     let dispatch = || submit(&target.reference, submission);
     // Controller admission has finished. Only the grant's own mutex covers the native
     // submission, so revocation can mark it stale without taking this mutex under host locks.

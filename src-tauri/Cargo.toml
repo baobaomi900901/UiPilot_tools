@@ -27,8 +27,14 @@ macos-find-preview = [
 ]
 # For an isolated macOS permission-validation account; never implied by a normal build.
 macos-find-system-qa = ["macos-find-preview"]
+macos-find-qa-probe = ["macos-find-system-qa"]
 fault-injection = []
 installer-helper-build = []
+
+[[bin]]
+name = "uipilot-find-system-qa"
+path = "src/bin/uipilot_find_system_qa.rs"
+required-features = ["macos-find-qa-probe"]
 
 [[bin]]
 name = "generate_public_plugin_schema"

@@ -122,6 +122,8 @@
 
 文稿预览的自动验收覆盖授权前后的范围、嵌套中文和 emoji 文件名、撤销与旧结果失效。M1 实机已验证原生选择文稿后完整中文文件名可以命中；在候选 `9a1c17d` 记住授权后，完全退出再启动，首次搜索直接命中且无需再次选择目录。忘记授权后重启的 M1 界面操作待测。全系统范围按 8.4 和专项设计另行验收。
 
+全机查询使用[专用账户测试包](../../releases/macos-spotlight-qa.md)。两个目录分别命中同名样例后，全机查询应只交付允许目录中的文件；从宿主核准范围撤回后，原目标应无法再次提交。另用目标 UiPilot 签名身份测试真实系统授权与撤权，各项分别保留结果。
+
 **Distinct test coverage:** 区分迟到查询与已关闭窗口；记录打开期间 pin 变化与当前 owner；拒绝先于受保护状态读取。
 **Verify:** `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib file_search::`、`cargo test --locked --manifest-path src-tauri/Cargo.toml --lib find_window::`、`npm test -- src/find-core.test.ts src/find-view.test.tsx`。交付查询时序、系统调用计数与 Finder 实机结果。
 

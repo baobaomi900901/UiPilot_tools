@@ -39,10 +39,14 @@ fn trusted_caller(label: &str, expected: &str, page: &url::Url, config: &tauri::
 }
 
 pub(crate) fn mac_find_enabled() -> bool {
-    cfg!(all(target_os = "macos", feature = "macos-find-preview")) &&
-        (!cfg!(feature = "macos-find-system-qa") ||
-            (std::env::var_os("UIPILOT_FIND_ISOLATED_QA").as_deref() == Some(std::ffi::OsStr::new("1")) &&
-                std::env::var_os("UIPILOT_FIND_QA_VERIFIED_ROOTS").is_some_and(|roots| !roots.is_empty())))
+    #[cfg(all(target_os = "macos", feature = "macos-find-system-qa"))]
+    {
+        std::env::var_os("UIPILOT_FIND_ISOLATED_QA").as_deref() == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("UIPILOT_FIND_QA_VERIFIED_ROOTS").is_some_and(|roots| !roots.is_empty())
+            && crate::macos_find_results::qa_account_eligible()
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-find-system-qa")))]
+    { cfg!(all(target_os = "macos", feature = "macos-find-preview")) }
 }
 
 pub(crate) fn trusted_page(label: &str, page: &url::Url, config: &tauri::Config) -> bool {
