@@ -188,3 +188,20 @@ python -I -c "from pathlib import Path; import hashlib; files=[Path('third-party
 普通库与 Find 预览各新增的 1 个默认忽略均为上述原生用例，其余分别是已有 3/6 个忽略，未将它们计为通过。日志：`/private/tmp/uipilot-observer-{red,tests,native,native-unsandboxed,verify,check,preview}.log`。
 
 生产 Mac 宿主没有启动该观察器，SDK 权限和能力开关不变。本单元未修改 Windows 原生 observer/service/store/paste，也未补做 Windows 原生回归。私有存储、插件授权撤回、图片/文件格式、复制及通用剪贴板实机测试仍未完成；人工测试按用户安排延后。
+
+## 2026-11-07 私有文本历史与授权自动验证
+
+依[存储与授权规格](../superpowers/specs/2026-11-07-macos-clipboard-storage-design.md)实现共享纯变换、Mac 私有文本介质和未装配的授权协调器。最多 50 条，Mac 序列化预算 8 MiB；删除/清空不复用 ID，重复文本保留首次入库时间。所有测试仅使用合成事件与新建的临时目录；ACL/文件权限操作只作用于这些夹具，不修改系统隐私设置或个人历史。
+
+独立审核修正并验证了撤权后残留 store 锁、根目录替换、无授权批次和错误分类。实际测试还复现了仅依赖 close 解锁时，fork/dup 暂时保留文件描述符会使立即重开失败；显式解锁并新增保留 dup FD 的回归后通过。正常遗留 staging 在排他锁和严格身份检查后丢弃，不恢复为历史；异常 staging、损坏 current、链接/硬链、宽松权限或扩展 ACL 均拒绝。提交前失败保留旧快照和原始文件，提交后不确定则拒绝继续读写，关闭重开再校验。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib clipboard_history::` | 51 通过、1 原生命名剪贴板用例默认忽略；本轮未重跑该原生用例 |
+| `npm run verify:local` | 退出 0；前端 774 通过/18 既有跳过，普通 Mac 库 203 通过/4 既有默认忽略，CLI 186 通过，公开插件测试 323 通过，schema/SDK/包校验通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 237 通过/7 既有默认忽略，退出 0 |
+
+环境仍为 M1 Pro / macOS 15.7.4、Node 22.22.1、Rust 1.96.1。日志：`/private/tmp/uipilot-history-{red,lock-red,tests,verify,check,preview}.log`。`red` 为新 API 缺失的编译红阶段；`lock-red` 为独立复现的文件锁回归，二者分开记录。
+
+Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO 保留；共享测试覆盖文本去重/容量/计数，以及图片文件名与预算淘汰名单，但不替代 Windows 原生回归。本轮仍未开放 Mac 宿主服务或 SDK。读取前批次钩子、原生采集时间传递、真实授权与退出、图片/文件、复制和插件双端验收均待后续；当前协调器记录的是首次消费入库时间。整体 Task 10.1 未完成，人工测试继续延后。

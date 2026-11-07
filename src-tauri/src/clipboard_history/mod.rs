@@ -4,8 +4,13 @@
 
 mod format;
 mod model;
+mod document;
 #[cfg(target_os = "macos")]
 mod macos_observer;
+#[cfg(target_os = "macos")]
+mod macos_store;
+#[cfg(target_os = "macos")]
+mod macos_history;
 #[cfg(windows)]
 mod observer;
 #[cfg(windows)]

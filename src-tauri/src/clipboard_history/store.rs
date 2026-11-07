@@ -8,6 +8,8 @@ use crate::atomic_file::{
     commit_with_backup, quarantine_invalid, read_optional, replace_current, AtomicPaths,
 };
 
+use super::document::{parse_decimal, take_next_decimal, increment_revision, sort_entries, image_files};
+
 use super::{
     model::{
         CaptureOutcome, ClipboardCapture, ClipboardHistoryEntrySummary, ClipboardHistoryError,
@@ -85,54 +87,17 @@ impl ClipboardHistoryStore {
             }
         };
 
-        if let Some(index) = candidate
-            .entries
-            .iter()
-            .position(|entry| entry.fingerprint == prepared.fingerprint)
-        {
-            let id = candidate.entries[index].id.clone();
-            if index == 0 {
-                return Ok(CaptureOutcome::Unchanged {
-                    id,
-                    revision: candidate.revision,
-                });
-            }
-            candidate.entries[index].recency_rank =
-                take_next_decimal(&mut candidate.next_recency_rank)?;
-            increment_revision(&mut candidate)?;
-            sort_entries(&mut candidate);
-            self.persist_candidate(&mut state, candidate, None, Vec::new())?;
-            return Ok(CaptureOutcome::MovedToFront {
-                id,
-                revision: state.document.revision.clone(),
-            });
+        let mutation = super::document::capture(&mut candidate, prepared.fingerprint,
+            prepared.captured_at, prepared.payload)?;
+        if matches!(&mutation.outcome, CaptureOutcome::Unchanged { .. }) {
+            return Ok(mutation.outcome);
         }
-
-        let id = take_next_decimal(&mut candidate.next_id)?;
-        let mut payload = prepared.payload;
-        let image_file = if let HistoryEntryPayload::Image { png_file, .. } = &mut payload {
-            let file = format!("{id}.png");
-            *png_file = file.clone();
-            Some(file)
-        } else {
-            None
+        let new_image = match &mutation.outcome {
+            CaptureOutcome::Stored { id, .. } => prepared.image_bytes.map(|bytes| (format!("{id}.png"), bytes)),
+            _ => None,
         };
-        candidate.entries.push(HistoryEntry {
-            id: id.clone(),
-            captured_at: prepared.captured_at,
-            recency_rank: take_next_decimal(&mut candidate.next_recency_rank)?,
-            fingerprint: prepared.fingerprint,
-            payload,
-        });
-        increment_revision(&mut candidate)?;
-        sort_entries(&mut candidate);
-        let obsolete = enforce_capacity(&mut candidate)?;
-        let new_image = image_file.zip(prepared.image_bytes);
-        self.persist_candidate(&mut state, candidate, new_image, obsolete)?;
-        Ok(CaptureOutcome::Stored {
-            id,
-            revision: state.document.revision.clone(),
-        })
+        self.persist_candidate(&mut state, candidate, new_image, mutation.obsolete_images)?;
+        Ok(mutation.outcome)
     }
 
     pub(crate) fn snapshot(&self) -> Result<ClipboardHistorySnapshot, ClipboardHistoryError> {
@@ -471,79 +436,6 @@ fn validate_document(document: &mut HistoryDocument) -> Result<(), ()> {
     }
     sort_entries(document);
     Ok(())
-}
-
-fn parse_decimal(value: &str) -> Result<u64, ()> {
-    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
-        return Err(());
-    }
-    value.parse::<u64>().map_err(|_| ())
-}
-
-fn take_next_decimal(value: &mut String) -> Result<String, ClipboardHistoryError> {
-    let current = parse_decimal(value).map_err(|_| ClipboardHistoryError::Storage)?;
-    let next = current
-        .checked_add(1)
-        .ok_or(ClipboardHistoryError::Storage)?;
-    *value = next.to_string();
-    Ok(current.to_string())
-}
-
-fn increment_revision(document: &mut HistoryDocument) -> Result<(), ClipboardHistoryError> {
-    let revision = parse_decimal(&document.revision).map_err(|_| ClipboardHistoryError::Storage)?;
-    document.revision = revision
-        .checked_add(1)
-        .ok_or(ClipboardHistoryError::Storage)?
-        .to_string();
-    Ok(())
-}
-
-fn sort_entries(document: &mut HistoryDocument) {
-    document.entries.sort_by(|left, right| {
-        let left_rank = parse_decimal(&left.recency_rank).unwrap_or(0);
-        let right_rank = parse_decimal(&right.recency_rank).unwrap_or(0);
-        right_rank.cmp(&left_rank)
-    });
-}
-
-fn enforce_capacity(document: &mut HistoryDocument) -> Result<Vec<String>, ClipboardHistoryError> {
-    let mut obsolete = Vec::new();
-    loop {
-        let total_image_bytes = total_image_bytes(&document.entries)?;
-        if document.entries.len() <= MAX_ENTRIES
-            && total_image_bytes <= MAX_TOTAL_IMAGE_PNG_BYTES as u64
-        {
-            break;
-        }
-        if let Some(entry) = document.entries.pop() {
-            obsolete.extend(image_files(&[entry]));
-        } else {
-            break;
-        }
-    }
-    Ok(obsolete)
-}
-
-fn total_image_bytes(entries: &[HistoryEntry]) -> Result<u64, ClipboardHistoryError> {
-    entries.iter().try_fold(0_u64, |total, entry| {
-        let bytes = match &entry.payload {
-            HistoryEntryPayload::Image { png_bytes, .. } => *png_bytes,
-            _ => 0,
-        };
-        total
-            .checked_add(bytes)
-            .ok_or(ClipboardHistoryError::Storage)
-    })
-}
-
-fn image_files(entries: &[HistoryEntry]) -> Vec<String> {
-    entries
-        .iter()
-        .filter_map(|entry| match &entry.payload {
-            HistoryEntryPayload::Image { png_file, .. } => Some(png_file.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 fn summary(entry: &HistoryEntry) -> ClipboardHistoryEntrySummary {

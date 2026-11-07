@@ -155,6 +155,8 @@
   实现前先完成[共用基础规格](../specs/2026-11-07-macos-clipboard-foundation-design.md)：共享数据模型、格式优先级和预览进入 Mac 编译，保留 Windows 历史指纹，分别验证 Mac 原始路径字节。该基础单元不开放历史服务。随后按以下依赖推进：原生 reader/observer（原生变更序号、停止/重启的代际隔离）→ 私有存储和授权生命周期（撤权完成后零写入，停止后迟到回调不得写入新会话）→ 复制（外部写入 B 后旧事务不得覆盖 B）→ 测试内容的实机验收。每个原生单元先补齐系统 API 和失败合同；不得把当前 Windows-only 粘贴驱动或存储替换为返回成功的空实现。
 
   原生观察首单元遵循[文本观察器规格](../specs/2026-11-07-macos-clipboard-observer-design.md)的「原生读取与范围」「停止、重启与延迟消费」：先支持单项纯文本，保留完整 count，启动只读基线，停止退役旧会话并等待已接纳消费者完成。用 `clipboard_history::macos_observer::tests::` 运行确定性的阻塞读取、并发停止、重入和 panic 用例；唯一合成 pasteboard 的原生用例单列，不混入默认测试。图片、文件与混合格式需补后续读取合同，不能因此将历史能力标为支持。
+
+  私有文本历史遵循[存储与授权规格](../specs/2026-11-07-macos-clipboard-storage-design.md)的「介质与文件边界」「原子提交与错误」「授权、读取批次与撤回」。共享纯变换保留 Windows 行为；Mac 以 FD 相对操作和私有权限保存有界文本历史。分别验证 rename 前失败保留旧态、rename 后不确定状态禁止继续读写、撤权排空及新授权不接收旧批次。运行 `clipboard_history::document::`、`clipboard_history::macos_store::`、`clipboard_history::macos_history::`；读取前批次与原生 observer、宿主权限的最终接线另行验收。
 - [ ] **10.2 选区和粘贴。** 在 selection_capture.rs 及 selection_capture/、result_paste.rs 与 clipboard_history/paste.rs 绑定源窗口、目标与事务身份；取选区和发送前各自复核。等待粘贴时切换前台，要求零输入；已发送部分输入时禁止重试。拒绝辅助功能/失去目标时不发送按键，不覆盖后来用户复制的内容。只对获准的临时编辑器执行真实输入。
 - [ ] **10.3 截图。** 将截图触发、显示器几何、输出与录屏授权接入 screenshot/ 和前端。主动请求时检查授权；拒绝、捕获中撤销要取消输出、释放缓冲和窗口。使用测试屏幕完成多屏不同缩放截图，核对选择区域、图像尺寸及临时资源清理。Provider 的 Windows 语义保持 Windows-only。
 - [ ] **10.4 通知与进程操作。** native_attention/ 连接 macOS 通知授权和真实投递回调，按允许、拒绝、撤销各测一次；拒绝不能记已送达，重复终态回调只消费一次。process_control/ 在执行前重查目标；只对测试进程验证正常操作，再模拟退出或 PID 复用，替代进程不得受影响。Windows 提升 helper 仍走其独立 Windows 链。

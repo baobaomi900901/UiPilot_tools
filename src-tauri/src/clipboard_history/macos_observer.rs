@@ -50,6 +50,12 @@ pub(super) struct ClipboardEvent {
 }
 
 impl ClipboardEvent {
+    #[cfg(test)]
+    pub(super) fn synthetic_text(text: &str) -> Self {
+        Self { session: Arc::new(Session::new()), outcome: ReadOutcome::Text {
+            change_count: ChangeCount(0), text: text.into() } }
+    }
+
     /// The closure runs synchronously. Do not queue side effects outside it.
     pub(super) fn with_current<T>(&self, action: impl FnOnce(&ReadOutcome) -> T) -> Option<T> {
         let _admission = self.session.admit()?;
