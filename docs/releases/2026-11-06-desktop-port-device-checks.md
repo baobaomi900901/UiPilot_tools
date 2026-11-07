@@ -310,3 +310,7 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 纯 C stub 实际红阶段断言退出 134，补齐状态机后三组绿色；Objective-C 使用 arm64/min15.7.4 与 `-Wall -Wextra -Werror` 编译/link，签名 strict、Info.plist、Mach-O/load commands 与 JS 语法检查通过；已有输出拒绝重建退出 2。复审发现截止采样异步完成必被退役丢弃，改为加载准入后 1 秒单次采样，2 秒截止独立 retire/stop，不等采样延长播放。迟到回调与正常 completion 走同一准入方法，逐通道记录分开；终审无严重问题。
 
 日志 `/private/tmp/uipilot-media-lifecycle-red.log` 及构建输出中的 `lifecycle-tests.log`、`signature-check.log`、`macho-check.log`、`load-commands.log` 和源文件 SHA-256。实际 GUI/音频/语音、系统调度延迟与 WebContent 进程恢复仍未验证；本轮没有运行媒体。原生活动状态不是静音开关，探针不颁发 production GuardProof；UiPilot 插件运行仍关闭。
+
+## 2026-11-07 约 70% 候选冻结
+
+主程序 `42a094b` 与独立探针 `b279271` 已构建并核对；固定哈希、完整证据、平台边界和待执行清单见[70% 人工验收交接](2026-11-07-macos-70-percent-checkpoint.md)。DMG 只读挂载核对通过，M1 Pro / macOS 15.7.4 的只读预检通过；没有安装运行新主程序、调用真实登录项或启动媒体探针。Windows 同源码 ZIP 已逐文件核对，新的 Windows 原生构建待执行。旧设备通过记录不自动延伸到本候选。
