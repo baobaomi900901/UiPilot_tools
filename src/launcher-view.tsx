@@ -2097,7 +2097,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 onChange={(value: ThemePreference) => core.setThemePreference(value)}
               />
             </Form.Item>
-            {core.capabilities.builtinFeatures && <Form.Item label="搜索引擎">
+            {core.capabilities.webSearch && <Form.Item label="搜索引擎">
               <Select
                 aria-label="搜索引擎"
                 value={settings.webSearchEngine}

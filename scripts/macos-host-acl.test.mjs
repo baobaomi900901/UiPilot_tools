@@ -12,7 +12,7 @@ test('Mac production enables only a local main capability and its core commands'
   assert.equal(acl.remote, undefined);
   assert.deepEqual(acl.permissions.toSorted(), [
     'allow-get-host-capabilities', 'allow-hide-launcher', 'allow-load-settings', 'allow-set-theme-preference',
-    'allow-search-apps', 'allow-execute-result', 'allow-save-hotkey', 'allow-set-hotkey-recording',
+    'allow-search-apps', 'allow-execute-result', 'allow-set-web-search-engine', 'allow-save-hotkey', 'allow-set-hotkey-recording',
     'core:app:allow-version', 'core:event:allow-listen', 'core:event:allow-unlisten',
   ].toSorted());
   assert.ok(read('capabilities/main.json').permissions.includes('allow-get-host-capabilities'));

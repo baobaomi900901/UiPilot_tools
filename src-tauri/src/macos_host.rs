@@ -233,6 +233,17 @@ fn set_theme_preference(window: WebviewWindow, preference: ThemeUpdate) -> Resul
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSearchUpdate { engine: crate::settings::WebSearchEngine }
+
+#[tauri::command]
+fn set_web_search_engine(window: WebviewWindow, preference: WebSearchUpdate) -> Result<(), &'static str> {
+    require_main(&window)?;
+    window.state::<SettingsStore>().set_web_search_engine(preference.engine)
+        .map_err(|_| "settingsFailed")
+}
+
 #[tauri::command]
 async fn hide_launcher(window: WebviewWindow, invocation_id: String) -> Result<(), &'static str> {
     require_main(&window)?;
@@ -305,7 +316,7 @@ pub fn run() {
         .manage(Mutex::new(Presentation::default()))
         .invoke_handler(tauri::generate_handler![
             crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
-            hide_launcher, hotkey::save_hotkey, hotkey::set_hotkey_recording,
+            hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording,
             crate::macos_apps::search_apps, crate::macos_apps::execute_result,
             #[cfg(feature = "macos-find-preview")] set_builtin_feature_favorite,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_window,
@@ -372,6 +383,25 @@ pub fn run() {
 #[cfg(test)]
 mod platform_bootstrap {
     use super::*;
+    #[test]
+    fn web_engine_update_is_strict_and_preserves_other_settings() {
+        for invalid in [r#"{"engine":"https://other.test"}"#, r#"{"engine":"bing","url":"https://other.test"}"#] {
+            assert!(serde_json::from_str::<WebSearchUpdate>(invalid).is_err());
+        }
+        let dir = std::env::temp_dir().canonicalize().unwrap()
+            .join(format!("uipilot-mac-web-settings-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, br#"{"hotkey":"Alt+Space","autostart":true,"futureSetting":[1,2]}"#).unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+        let update = serde_json::from_str::<WebSearchUpdate>(r#"{"engine":"google"}"#).unwrap();
+        store.set_web_search_engine(update.engine).unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(data["autostart"], true);
+        assert_eq!(data["futureSetting"], serde_json::json!([1,2]));
+        assert_eq!(SettingsStore::load(&dir).unwrap().snapshot().web_search_engine, crate::settings::WebSearchEngine::Google);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn startup_coalesces_early_show_and_quit_refuses_new_invocations() {
         let mut state = Presentation::default();

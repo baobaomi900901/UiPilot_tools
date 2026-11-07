@@ -8,7 +8,7 @@ use crate::{
     apps::{self, macos_backend::{self, BundleTarget, OpenAttempt, OpenOutcome}, AppCache, ApplicationLaunchTarget},
     host_capabilities::require_main,
     model::{search_response, SearchResponse},
-    result_registry::{CopyCompletionOwner, QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
+    result_registry::{MainActionCompletionOwner, MainActionKind, QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
     settings::SettingsStore,
 };
 
@@ -134,6 +134,24 @@ fn quick_query(service: &MacApplications, token: QueryToken, query: &str) -> Opt
     else { Some(crate::macos_quick_evaluation::publish(&service.registry, token, classification)) }
 }
 
+const MAX_WEB_QUERY_BYTES: usize = 4096;
+fn web_entry(settings: &SettingsStore, query: &str) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
+    let query = query.trim();
+    if query.is_empty() || query.starts_with('/') || query.len() > MAX_WEB_QUERY_BYTES || query.contains('\0')
+        || !matches!(crate::quick_evaluation::classify(query), crate::quick_evaluation::QuickClassification::NoMatch) { return None; }
+    let settings = settings.snapshot();
+    if !settings.builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::WebSearch) { return None; }
+    let engine = settings.web_search_engine;
+    let url = crate::web_search::search_url(engine, query)?;
+    if url.len() > crate::macos_browser_open::MAX_URL_BYTES { return None; }
+    Some((crate::model::ResultItem {
+        result_actions: None, result_id: String::new(), activation: crate::model::LauncherResultActivation::ExecuteResult,
+        title: crate::web_search::search_result_title(engine).into(), subtitle: Some(format!("搜索：{query}")),
+        icon: None, plugin_icon_url: None, icon_kind: Some(crate::model::ResultIconKind::WebSearch),
+        detail: None, favorite: None, has_default_action: true,
+    }, Some(ResultAction::OpenWebSearch { engine, query: query.into() })))
+}
+
 fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str) -> Option<SearchResponse> {
     let query = query.trim();
     let preview = crate::host_capabilities::mac_find_enabled();
@@ -157,6 +175,7 @@ fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToke
             entries.push((crate::model::find_item(argument.into(), subtitle, favorite), None));
         }
     }
+    if let Some(entry) = web_entry(settings, query) { entries.push(entry); }
     service.registry.publish_if_latest(token, entries, || true, |id, items| {
         let mut response = search_response(id, items);
         response.replace_local_results = command;
@@ -197,7 +216,7 @@ fn execute_registered(
 fn execute_copy_registered(
     service: &MacApplications, request_id: &str, result_id: &str,
     copy: impl FnOnce(&str, &mut dyn FnMut() -> bool) -> Result<crate::clipboard_history::HostCopyOutcome, crate::clipboard_history::HostCopyError>,
-) -> Result<CopyCompletionOwner, Error> {
+) -> Result<MainActionCompletionOwner, Error> {
     use crate::clipboard_history::HostCopyError;
     let _guard = service.execute.lock().expect("application execution");
     let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
@@ -205,7 +224,7 @@ fn execute_copy_registered(
     let mut completion = None;
     let mut admit = || {
         if completion.is_some() { return false; }
-        completion = service.registry.consume_main_copy(&ticket).ok();
+        completion = service.registry.consume_main_action(&ticket, MainActionKind::CopyText).ok();
         completion.is_some()
     };
     copy(&text, &mut admit).map_err(|error| match error {
@@ -216,6 +235,46 @@ fn execute_copy_registered(
         _ => Error { code: "clipboardWriteFailed", message: "无法复制到剪贴板" },
     })?;
     completion.ok_or_else(Error::stale)
+}
+
+fn execute_web_registered(
+    service: &MacApplications, settings: &SettingsStore, request_id: &str, result_id: &str,
+    open: impl FnOnce(&str, &mut dyn FnMut() -> bool) -> Result<(), crate::macos_browser_open::OpenError>,
+) -> Result<MainActionCompletionOwner, Error> {
+    use crate::{macos_browser_open::OpenError, settings::ManagedBuiltinFeature};
+    let _guard = service.execute.lock().expect("application execution");
+    let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
+    let ResultAction::OpenWebSearch { engine, query } = action else { return Err(Error::unavailable()); };
+    if !settings.snapshot().builtin_feature_enabled(ManagedBuiltinFeature::WebSearch)
+        || query.is_empty() || query.starts_with('/') || query.len() > MAX_WEB_QUERY_BYTES || query.contains('\0') {
+        return Err(Error { code: "webSearchFailed", message: "无法打开搜索页面" });
+    }
+    let url = crate::web_search::search_url(engine, &query).ok_or(Error { code: "webSearchFailed", message: "无法打开搜索页面" })?;
+    let mut completion = None;
+    let mut admit = || {
+        if completion.is_some() { return false; }
+        // Settings -> registry is held only across admission, never native open.
+        completion = settings.with_enabled_builtin(ManagedBuiltinFeature::WebSearch, ||
+            service.registry.consume_main_action(&ticket, MainActionKind::WebSearch).ok()).ok().flatten();
+        completion.is_some()
+    };
+    open(&url, &mut admit).map_err(|error| match error {
+        OpenError::Stale => Error::stale(),
+        OpenError::Unavailable => Error { code: "webSearchFailed", message: "无法打开搜索页面" },
+        OpenError::Unconfirmed => Error { code: "webSearchOpenUnconfirmed", message: "未确认打开搜索页面；请检查浏览器并重新搜索" },
+    })?;
+    completion.ok_or_else(Error::stale)
+}
+
+fn finish_host_action(app: &AppHandle, service: &Arc<MacApplications>, owner: MainActionCompletionOwner) {
+    let handle = app.clone(); let current_service = Arc::clone(service);
+    let _ = app.run_on_main_thread(move || {
+        if let Ok(id) = owner.invocation_id().parse() {
+            if current_service.registry.finish_main_action(&owner) {
+                let _ = crate::macos_host::hide_if_current(&handle, id);
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -237,16 +296,14 @@ async fn execute_main(window: WebviewWindow, request_id: String, result_id: Stri
         if matches!(action, ResultAction::CopyBuiltInText { .. }) {
             let owner = execute_copy_registered(&service, &request_id, &result_id,
                 |text, admit| crate::clipboard_history::copy_host_text(text, admit))?;
-            let handle = app.clone();
-            let current_service = Arc::clone(&service);
-            let _ = app.run_on_main_thread(move || {
-                if let Ok(id) = owner.invocation_id().parse() {
-                    if current_service.registry.finish_main_copy(&owner) {
-                        let _ = crate::macos_host::hide_if_current(&handle, id);
-                    }
-                }
-            });
+            finish_host_action(&app, &service, owner);
             return Ok(serde_json::json!({ "status": "textCopied" }));
+        }
+        if matches!(action, ResultAction::OpenWebSearch { .. }) {
+            let owner = execute_web_registered(&service, app.state::<SettingsStore>().inner(), &request_id, &result_id,
+                |url, admit| crate::macos_browser_open::open_url(url, admit))?;
+            finish_host_action(&app, &service, owner);
+            return Ok(serde_json::json!({ "status": "launchRequested" }));
         }
         let (outcome, app_id, hide_owner) = execute_registered(&service, &request_id, &result_id, |bundle, check|
             objc2::rc::autoreleasepool(|_| macos_backend::open_application(bundle, check)))?;
@@ -382,7 +439,7 @@ mod platform_app_commands {
             Ok(crate::clipboard_history::HostCopyOutcome::Accepted)
         }).unwrap();
         assert!(execute_copy_registered(&service, &r.request_id, &r.items[0].result_id, |_, _| panic!("duplicate copy")).is_err());
-        assert_eq!(owner.invocation_id(), "1"); assert!(service.registry.finish_main_copy(&owner));
+        assert_eq!(owner.invocation_id(), "1"); assert!(service.registry.finish_main_action(&owner));
     }
     #[test]
     fn quick_copy_rejects_query_or_invocation_replacement_before_admission() {
@@ -406,7 +463,7 @@ mod platform_app_commands {
                 else { service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap(); }
                 Ok(crate::clipboard_history::HostCopyOutcome::Accepted)
             }).unwrap();
-            assert!(!service.registry.finish_main_copy(&owner));
+            assert!(!service.registry.finish_main_action(&owner));
         }
     }
     #[test]
@@ -443,6 +500,110 @@ mod platform_app_commands {
         let token = service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap();
         assert!(quick_query(&service, token, "中文").is_none());
         assert_eq!(publish(&service, &settings, token, "中文").unwrap().items[0].title, "中文 App");
+    }
+
+    #[test]
+    fn web_fallback_exists_for_ordinary_query_without_a_reusable_favorite() {
+        let (_f, service, settings) = fixture();
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        let response = publish(&service, &settings, token, "我是 Jack & Jill").unwrap();
+        let row = response.items.last().expect("ordinary unmatched query must offer Web fallback");
+        assert_eq!(row.icon_kind, Some(crate::model::ResultIconKind::WebSearch));
+        assert_eq!(row.title, "Bing 搜索"); assert!(row.favorite.is_none());
+        assert!(matches!(service.registry.resolve(&response.request_id, &row.result_id),
+            Ok(ResultAction::OpenWebSearch { engine: crate::settings::WebSearchEngine::Bing, query }) if query == "我是 Jack & Jill"));
+    }
+    fn web_row(service: &MacApplications, settings: &SettingsStore) -> SearchResponse {
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        publish(service, settings, token, "浏览器 fixture").unwrap()
+    }
+    #[test]
+    fn web_rows_use_saved_engine_and_keep_app_then_find_order_without_favorite() {
+        let (_f, service, settings) = fixture();
+        settings.set_web_search_engine(crate::settings::WebSearchEngine::Google).unwrap();
+        settings.set_builtin_feature_favorite(crate::settings::BuiltinFeature::WebSearch, true).unwrap();
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        let response = publish(&service, &settings, token, "中文").unwrap();
+        assert_eq!(response.items[0].title, "中文 App");
+        let row = response.items.last().unwrap(); assert_eq!(row.title, "Google 搜索"); assert!(row.favorite.is_none());
+        if crate::host_capabilities::mac_find_enabled() { assert_eq!(response.items[response.items.len()-2].icon_kind, Some(crate::model::ResultIconKind::Find)); }
+        settings.set_web_search_engine(crate::settings::WebSearchEngine::Baidu).unwrap();
+        let owner = execute_web_registered(&service, &settings, &response.request_id, &row.result_id, |url, admit| {
+            assert_eq!(url::Url::parse(url).unwrap().host_str(), Some("www.google.com"));
+            assert!(admit()); Ok(())
+        }).unwrap();
+        assert!(service.registry.finish_main_action(&owner));
+    }
+    #[test]
+    fn web_fallback_boundaries_keep_empty_commands_and_quick_values_out() {
+        let (_f, service, settings) = fixture();
+        for query in ["", "  ", "/", "/web-search", "/web-search test", "2+2", "100 USD to CNY", "a\0b"] {
+            assert!(web_entry(&settings, query).is_none(), "{query:?}");
+        }
+        let exact = "🦀".repeat(MAX_WEB_QUERY_BYTES / 4);
+        assert!(web_entry(&settings, &exact).is_some()); assert!(web_entry(&settings, &(exact + "a")).is_none());
+        settings.set_builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::WebSearch, false).unwrap();
+        assert!(web_entry(&settings, "browser").is_none());
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        assert_eq!(publish(&service, &settings, token, "App").unwrap().items[0].title, "中文 App");
+    }
+    #[test]
+    fn web_disable_after_publish_or_during_prepare_blocks_submission() {
+        for during in [false, true] {
+            let (_f, service, settings) = fixture(); let r = web_row(&service, &settings); let row = r.items.last().unwrap();
+            if !during { settings.set_builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::WebSearch, false).unwrap(); }
+            let result = execute_web_registered(&service, &settings, &r.request_id, &row.result_id, |_, admit| {
+                assert!(during, "disabled result must not construct a browser driver");
+                settings.set_builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::WebSearch, false).unwrap();
+                assert!(!admit()); Err(crate::macos_browser_open::OpenError::Stale)
+            });
+            assert_eq!(result.err().unwrap().code, if during { "staleRequest" } else { "webSearchFailed" });
+        }
+    }
+    #[test]
+    fn web_stale_forged_and_wrong_action_never_enter_opener() {
+        let (_f, service, settings) = fixture(); let r = web_row(&service, &settings); let row = r.items.last().unwrap();
+        assert_eq!(execute_web_registered(&service, &settings, &r.request_id, "forged", |_, _| panic!()).err().unwrap().code, "unknownResult");
+        service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap();
+        assert_eq!(execute_web_registered(&service, &settings, &r.request_id, &row.result_id, |_, _| panic!()).err().unwrap().code, "staleRequest");
+        service.registry.on_show("1".into()); let quick = quick_row(&service);
+        assert!(execute_web_registered(&service, &settings, &quick.request_id, &quick.items[0].result_id, |_, _| panic!()).is_err());
+    }
+    #[test]
+    fn web_final_admission_rejects_new_query_or_invocation() {
+        for show in [false, true] {
+            let (_f, service, settings) = fixture(); let r = web_row(&service, &settings);
+            let result = execute_web_registered(&service, &settings, &r.request_id, &r.items.last().unwrap().result_id, |_, admit| {
+                if show { service.registry.on_show("2".into()); } else { service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap(); }
+                assert!(!admit()); Err(crate::macos_browser_open::OpenError::Stale)
+            });
+            assert_eq!(result.err().unwrap().code, "staleRequest");
+        }
+    }
+    #[test]
+    fn web_completion_is_single_use_and_never_hides_replacement_query() {
+        for replace in [0, 1, 2] {
+            let (_f, service, settings) = fixture(); let r = web_row(&service, &settings); let row = r.items.last().unwrap();
+            let owner = execute_web_registered(&service, &settings, &r.request_id, &row.result_id, |_, admit| {
+                assert!(admit()); assert!(!admit());
+                if replace == 1 { service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap(); }
+                if replace == 2 { service.registry.on_show("2".into()); }
+                Ok(())
+            }).unwrap();
+            assert!(execute_web_registered(&service, &settings, &r.request_id, &row.result_id, |_, _| panic!("duplicate open")).is_err());
+            assert_eq!(service.registry.finish_main_action(&owner), replace == 0);
+        }
+    }
+    #[test]
+    fn web_prepare_failure_keeps_ticket_but_submission_error_consumes_it() {
+        let (_f, service, settings) = fixture(); let r = web_row(&service, &settings); let id = &r.items.last().unwrap().result_id;
+        let error = execute_web_registered(&service, &settings, &r.request_id, id, |_, _| Err(crate::macos_browser_open::OpenError::Unavailable)).err().unwrap();
+        assert_eq!(error.code, "webSearchFailed"); assert!(service.registry.resolve(&r.request_id, id).is_ok());
+        let error = execute_web_registered(&service, &settings, &r.request_id, id, |_, admit| {
+            assert!(admit()); Err(crate::macos_browser_open::OpenError::Unconfirmed)
+        }).err().unwrap();
+        assert_eq!(error.code, "webSearchOpenUnconfirmed");
+        assert!(execute_web_registered(&service, &settings, &r.request_id, id, |_, _| panic!("no retry")).is_err());
     }
 
 }

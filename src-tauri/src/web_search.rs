@@ -44,6 +44,7 @@ pub(crate) fn search_url(engine: WebSearchEngine, query: &str) -> Option<String>
     Some(url.to_string())
 }
 
+#[cfg(windows)]
 pub(crate) fn open_search(engine: WebSearchEngine, query: &str) -> Result<(), ()> {
     let url = search_url(engine, query).ok_or(())?;
     crate::browser_open::open_url(Url::parse(&url).map_err(|_| ())?)
@@ -108,4 +109,16 @@ mod tests {
             assert_eq!(search_url(engine, "bad\0query"), None);
         }
     }
+    #[test]
+    fn url_shaped_text_and_delimiters_remain_one_provider_query_not_navigation() {
+        for engine in [WebSearchEngine::Bing, WebSearchEngine::Baidu, WebSearchEngine::Google] {
+            for query in ["https://other.example/path?a=1&b=2#fragment", "中文 🦀 ? # & = + %", "line1\nline2"] {
+                let url = url::Url::parse(&search_url(engine, query).unwrap()).unwrap();
+                let values = url.query_pairs().map(|(_, value)| value.into_owned()).collect::<Vec<_>>();
+                assert_eq!(values, vec![query]); assert!(url.fragment().is_none());
+                assert!(url.username().is_empty()); assert_ne!(url.host_str(), Some("other.example"));
+            }
+        }
+    }
+
 }

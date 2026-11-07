@@ -397,6 +397,7 @@ export type CommandErrorCode =
   | 'fileOpenFailed'
   | 'fileActionUnconfirmed'
   | 'webSearchFailed'
+  | 'webSearchOpenUnconfirmed'
 
 export interface CommandError {
   code: CommandErrorCode

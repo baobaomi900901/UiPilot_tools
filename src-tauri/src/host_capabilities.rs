@@ -15,6 +15,7 @@ pub(crate) struct HostCapabilities {
     command_hotkeys: bool,
     autostart: bool,
     double_tap: bool,
+    web_search: bool,
 }
 
 fn local_webview(label: &str, expected: &str, page: &url::Url, origin: &url::Url) -> bool {
@@ -79,7 +80,7 @@ pub(crate) fn get_host_capabilities(window: WebviewWindow) -> Result<HostCapabil
     Ok(HostCapabilities {
         version: 1, platform: if windows { "windows" } else { "macos" },
         plugins: windows, files: windows || mac_find_enabled(), screenshot: windows, messages: windows, credentials: windows,
-        builtin_features: windows, command_hotkeys: windows, autostart: windows, double_tap: cfg!(any(windows, target_os = "macos")),
+        web_search: true, builtin_features: windows, command_hotkeys: windows, autostart: windows, double_tap: cfg!(any(windows, target_os = "macos")),
     })
 }
 

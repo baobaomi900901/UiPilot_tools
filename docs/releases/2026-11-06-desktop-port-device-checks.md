@@ -256,3 +256,18 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 | `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 354 通过/8 默认忽略 |
 
 日志为 `/private/tmp/uipilot-quick-final-verify.log`、`/private/tmp/uipilot-quick-{check,preview,cap-red,cap-green,collision-red,collision-green,ui-red,ui-stale-red}.log`。完整验证一次因命令环境未包含 Cargo 提前结束，修复 PATH 后完整重跑退出 0；不计为源码失败。所有 native 复制测试使用 fake，没有读取或改写通用剪贴板。用户可见复制/焦点仍在 70% 候选包人工验收，Windows 原生回归未重跑。
+
+## 2026-11-07 Mac Web 查询动作自动验证
+
+[Web 查询规格](../superpowers/specs/2026-11-07-macos-web-search-design.md)已实现：普通查询在应用/Find 后追加无收藏搜索行；固定 provider 与单 query 编码，用户执行才交给 NSWorkspace。已有停用设置被尊重，最终准入持 settings 短锁原子消费精确 Web 动作，原生调用时已释放 settings/registry 锁。不会将正文当 URL 模板，不会在输入阶段联网。空/slash/快速计算不产生 fallback；4,096 字节查询及 16 KiB URL 上限明确拒绝。
+
+复审补上规范化前拒绝空 userinfo 与反斜杠的 helper 边界，query 中 `@` 仍可作为搜索文字。真实 Mac 能力配置测试覆盖结果可见、Enter 只发 ID、独立引擎设置与保存失败回退；新增错误沿用单次消费与晚到查询保护。默认测试只调用 fake opener；没有启动浏览器。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `npm run verify:local` | 退出 0；前端 780 通过/18 跳过，Mac 库 337 通过/5 默认忽略，CLI 186 通过，公开插件 323 通过，schema/SDK/参考包通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 371 通过/8 默认忽略 |
+| `node --test scripts/macos-host-acl.test.mjs` | 4 通过 |
+
+行为红阶段复现普通查询没有 fallback 及前端 Mac 过滤；后端新增 14 项测试，原有应用与复制回归通过。日志 `/private/tmp/uipilot-web-{red,ui-red,ui-green,verify,check,preview,browser,apps,registry,copy,tests,acl}.log`。Windows URL 构造与执行保持既有路径，Windows 原生回归和 Mac 默认浏览器实际跳转留统一节点。本单元不提供可复用 `/web-search` 入口，不能收藏一次查询值。

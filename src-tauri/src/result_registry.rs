@@ -135,9 +135,21 @@ impl ExecutionTicket {
     }
 }
 
-/// A consumed Mac main copy can only close the query that admitted it.
 #[cfg(target_os = "macos")]
-pub(crate) struct CopyCompletionOwner {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MainActionKind { CopyText, WebSearch }
+#[cfg(target_os = "macos")]
+impl MainActionKind {
+    fn matches(self, action: &ResultAction) -> bool {
+        matches!((self, action),
+            (Self::CopyText, ResultAction::CopyBuiltInText { .. }) |
+            (Self::WebSearch, ResultAction::OpenWebSearch { .. }))
+    }
+}
+
+/// A consumed Mac host action can only close the query that admitted it.
+#[cfg(target_os = "macos")]
+pub(crate) struct MainActionCompletionOwner {
     registry: std::sync::Weak<RegistryInner>,
     scope_generation: u64,
     invocation_id: String,
@@ -146,7 +158,7 @@ pub(crate) struct CopyCompletionOwner {
     result_set_generation: u64,
 }
 #[cfg(target_os = "macos")]
-impl CopyCompletionOwner {
+impl MainActionCompletionOwner {
     pub(crate) fn invocation_id(&self) -> &str { &self.invocation_id }
 }
 
@@ -483,23 +495,23 @@ impl ResultRegistry {
         true
     }
 
-    /// Linearization point immediately before a prepared explicit copy. No
-    /// native calls run under this lock. The admitted write may finish after a
+    /// Linearization point immediately before a prepared explicit host action. No
+    /// native calls run under this lock. The admitted action may finish after a
     /// newer query; its completion owner then cannot close the newer query.
     #[cfg(target_os = "macos")]
-    pub(crate) fn consume_main_copy(&self, ticket: &ExecutionTicket) -> Result<CopyCompletionOwner, RegistryError> {
+    pub(crate) fn consume_main_action(&self, ticket: &ExecutionTicket, expected: MainActionKind) -> Result<MainActionCompletionOwner, RegistryError> {
         let mut state = self.inner.state.lock().expect("result registry lock poisoned");
         let index = QueryDomain::Application.index();
         if self.inner.scope != WindowScope::Main || !self.ticket_matches(&state, ticket)
             || state.latest_query_domain != Some(QueryDomain::Application)
             || !state.current.as_ref().is_some_and(|set| set.domain == QueryDomain::Application
-                && matches!(set.actions.get(&ticket.result_id), Some(ResultAction::CopyBuiltInText { .. }))) {
+                && set.actions.get(&ticket.result_id).is_some_and(|action| expected.matches(action))) {
             return Err(RegistryError::StaleRequest);
         }
         let next = state.domain_epochs[index].checked_add(1).ok_or(RegistryError::StaleRequest)?;
         state.domain_epochs[index] = next;
         Self::retire_current(&mut state);
-        Ok(CopyCompletionOwner {
+        Ok(MainActionCompletionOwner {
             registry: Arc::downgrade(&self.inner), scope_generation: state.generation,
             invocation_id: ticket.invocation_id.clone(), query_sequence: state.latest_query_sequence,
             domain_epoch: next, result_set_generation: state.result_set_generation,
@@ -509,7 +521,7 @@ impl ResultRegistry {
     /// On the UI thread, atomically retire only the consumed query before hiding
     /// its presentation. An accepted newer query or invocation is never retired.
     #[cfg(target_os = "macos")]
-    pub(crate) fn finish_main_copy(&self, owner: &CopyCompletionOwner) -> bool {
+    pub(crate) fn finish_main_action(&self, owner: &MainActionCompletionOwner) -> bool {
         if !std::sync::Weak::ptr_eq(&owner.registry, &Arc::downgrade(&self.inner)) { return false; }
         let mut state = self.inner.state.lock().expect("result registry lock poisoned");
         if !state.active || state.generation != owner.scope_generation
@@ -523,6 +535,15 @@ impl ResultRegistry {
         let next = state.generation.checked_add(1);
         Self::clear_state(&mut state);
         if let Some(next) = next { state.generation = next; true } else { false }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn consume_main_copy(&self, ticket: &ExecutionTicket) -> Result<MainActionCompletionOwner, RegistryError> {
+        self.consume_main_action(ticket, MainActionKind::CopyText)
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn finish_main_copy(&self, owner: &MainActionCompletionOwner) -> bool {
+        self.finish_main_action(owner)
     }
 
     pub(crate) fn hide_and_clear(&self) {
@@ -2362,6 +2383,24 @@ mod macos_copy_completion_tests {
         let completion = second.consume_main_copy(&own_ticket).unwrap();
         assert!(!first.finish_main_copy(&completion));
         assert!(second.finish_main_copy(&completion));
+    }
+
+    #[test]
+    fn web_and_copy_admission_require_the_callers_exact_action_type() {
+        for (action, expected, wrong) in [
+            (ResultAction::CopyBuiltInText { text: "4".into() }, MainActionKind::CopyText, MainActionKind::WebSearch),
+            (ResultAction::OpenWebSearch { engine: crate::settings::WebSearchEngine::Bing, query: "fixture".into() }, MainActionKind::WebSearch, MainActionKind::CopyText),
+        ] {
+            let registry = ResultRegistries::default().main().clone(); registry.on_show("1".into());
+            let token = registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+            let (request, id) = registry.publish_if_latest(token, vec![((), Some(action))], || true, |request, rows| (request, rows[0].0.clone())).unwrap();
+            let (_, ticket) = registry.resolve_with_ticket(&request, &id).unwrap();
+            assert!(registry.consume_main_action(&ticket, wrong).is_err());
+            let owner = registry.consume_main_action(&ticket, expected).unwrap();
+            assert!(registry.consume_main_action(&ticket, expected).is_err());
+            assert!(registry.publish_if_latest(token, vec![((), None)], || true, |_, _| ()).is_none());
+            assert!(registry.finish_main_action(&owner));
+        }
     }
 
 }

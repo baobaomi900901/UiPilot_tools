@@ -4983,14 +4983,17 @@ describe('execute and hide ownership', () => {
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private clipboard detail')
   })
 
-  it('retires a quick-copy result after an unconfirmed native write without hiding or retrying', async () => {
+  it.each([
+    ['clipboardWriteUnconfirmed', '复制结果未能确认，请先检查剪贴板，再重新搜索。'],
+    ['webSearchOpenUnconfirmed', '未能确认浏览器已打开，请检查浏览器后重新搜索。'],
+  ])('retires a consumed result on %s without hiding or retrying', async (code, status) => {
     const { core, client, emit } = await startedCore()
     vi.mocked(client.searchApps).mockResolvedValueOnce({
       requestId: 'uncertain-copy',
       items: [{ resultId: 'quick-value', title: '4', iconKind: 'calculator', hasDefaultAction: true, activation: executeActivation }],
       replaceLocalResults: true,
     })
-    vi.mocked(client.executeResult).mockRejectedValueOnce({ code: 'clipboardWriteUnconfirmed', message: 'private native detail' })
+    vi.mocked(client.executeResult).mockRejectedValueOnce({ code, message: 'private native detail' })
     emit(shown('uncertain-copy-window'))
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '2+2', inputType: 'insertText' })
     await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
@@ -4998,7 +5001,7 @@ describe('execute and hide ownership', () => {
     await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({
       view: 'launcher', query: '2+2', results: [],
-      status: '复制结果未能确认，请先检查剪贴板，再重新搜索。',
+      status,
     })
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private native detail')
     core.keyDown('Enter', false)
@@ -5006,7 +5009,7 @@ describe('execute and hide ownership', () => {
     expect(client.hideLauncher).not.toHaveBeenCalled()
   })
 
-  it('does not apply an old unconfirmed copy error to a newer query in the same window', async () => {
+  it.each(['clipboardWriteUnconfirmed', 'webSearchOpenUnconfirmed'])('does not apply old %s to a newer query in the same window', async (code) => {
     const { core, client, emit } = await startedCore()
     const copy = deferred<{ status: 'textCopied' }>()
     const reply = (requestId: string, title: string) => ({ requestId, items: [
@@ -5022,7 +5025,7 @@ describe('execute and hide ownership', () => {
     core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '3*3', inputType: 'insertText' })
     await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('9'))
     const status = core.getSnapshot().status
-    copy.reject({ code: 'clipboardWriteUnconfirmed', message: 'private native detail' })
+    copy.reject({ code, message: 'private native detail' })
     await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
     expect(core.getSnapshot()).toMatchObject({ query: '3*3', results: [{ title: '9' }], status })
     expect(client.hideLauncher).not.toHaveBeenCalled()
@@ -9171,11 +9174,39 @@ describe('React view and accessibility', () => {
 })
 
 describe('real adapter and startup', () => {
+  it('uses the narrow Mac web capability for fallback and engine settings with builtins disabled', async () => {
+    const { client, emit } = fakeClient()
+    const core = createLauncherCore(client, undefined, { ...hostSnapshot('macos'), webSearch: true })
+    vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'web-request', items: [
+      { resultId: 'web-result', title: 'Bing 搜索', subtitle: '搜索：中文 & query', iconKind: 'webSearch', hasDefaultAction: true, activation: executeActivation },
+      { resultId: 'web-entry', title: '/web-search', iconKind: 'webSearch', activation: { kind: 'builtinActivation', feature: 'webSearch', initialArgument: '' } },
+      { resultId: 'web-favorite', title: 'Favorite Web', iconKind: 'webSearch', favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite: true }, activation: executeActivation },
+    ] })
+    await core.start()
+    try {
+      emit(shown('mac-web'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '中文 & query', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+      expect(core.getSnapshot().results.map(row => row.title)).toEqual(['Bing 搜索'])
+      expect(client.executeResult).not.toHaveBeenCalled()
+      core.keyDown('Enter', false)
+      expect(client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'web-request', resultId: 'web-result' })
+      emit(shown('mac-web-settings', 'settings'))
+      await vi.waitFor(() => expect(core.getSnapshot().settings?.loadStatus).toBe('ready'))
+      vi.mocked(client.setWebSearchEngine).mockRejectedValueOnce({ code: 'settingsFailed' })
+      core.setWebSearchEngine('google')
+      expect(client.setWebSearchEngine).toHaveBeenCalledExactlyOnceWith({ preference: { engine: 'google' } })
+      await vi.waitFor(() => expect(core.getSnapshot().settings?.operation).toBeUndefined())
+      expect(core.getSnapshot().settings?.webSearchEngine).toBe('bing')
+      expect(client.saveSettings).not.toHaveBeenCalled()
+    } finally { core.destroy() }
+  })
+
   function hostSnapshot(platform: 'windows' | 'macos'): import('./host-capabilities').HostCapabilities {
     const enabled = platform === 'windows'
     return { version: 1, platform, plugins: enabled, files: enabled, screenshot: enabled,
       messages: enabled, credentials: enabled, builtinFeatures: enabled, commandHotkeys: enabled,
-      autostart: enabled, doubleTap: enabled }
+      autostart: enabled, doubleTap: enabled, webSearch: true }
   }
   function resetAdapterDocument() {
     vi.resetModules()
@@ -9201,7 +9232,7 @@ describe('real adapter and startup', () => {
       { resultId: 'builtin', title: 'Builtin', iconKind: 'calculator', activation: { kind: 'builtinActivation', feature: 'webSearch', initialArgument: '2+2' } },
     ] } as SearchResponse)
     vi.mocked(client.executeResult).mockResolvedValue({ status: 'textCopied' })
-    const core = createLauncherCore(client, undefined, hostSnapshot('macos'))
+    const core = createLauncherCore(client, undefined, { ...hostSnapshot('macos'), webSearch: false })
     await core.start()
     try {
       emit(shown('mac-quick'))
@@ -9255,7 +9286,8 @@ describe('real adapter and startup', () => {
       await act(async () => subscriptions.get('launcher://shown')!.handler({payload: shown('mac-settings', 'settings')}))
       await vi.waitFor(() => expect(document.querySelectorAll('[role="tab"]')).toHaveLength(1))
       expect(document.querySelector('[role="tab"]')?.textContent).toContain('通用')
-      expect(document.body.textContent).not.toMatch(/截图快捷键|开机启动|搜索引擎|恢复初始化/)
+      expect(document.body.textContent).not.toMatch(/截图快捷键|开机启动|恢复初始化/)
+      expect(document.body.textContent).toContain('搜索引擎')
       expect(tauriCapture.invoke.mock.calls.map(([name]) => name).every(name => ['load_settings', 'search_apps', 'execute_result'].includes(name))).toBe(true)
       expect(tauriCapture.listen.mock.calls).toHaveLength(3)
     } finally { await pagehide() }
