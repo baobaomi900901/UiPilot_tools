@@ -127,7 +127,7 @@ pub(crate) fn local_clock_unavailable() -> TimeZoneInvalid {
     TimeZoneInvalid {
         reason: TimeZoneFailureKind::ClockUnavailable,
         title: "无法读取本地时间".into(),
-        explanation: "请检查 Windows 日期和时区设置".into(),
+        explanation: super::clock_settings_explanation().into(),
     }
 }
 
@@ -343,6 +343,6 @@ mod tests {
         let failure = local_clock_unavailable();
         assert_eq!(failure.reason, TimeZoneFailureKind::ClockUnavailable);
         assert_eq!(failure.title, "无法读取本地时间");
-        assert_eq!(failure.explanation, "请检查 Windows 日期和时区设置");
+        assert_eq!(failure.explanation, crate::quick_evaluation::clock_settings_explanation());
     }
 }

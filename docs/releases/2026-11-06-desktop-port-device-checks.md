@@ -242,3 +242,17 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib macos_keychain::` 9 项通过：包含真实 CFDictionary 的精确参数检查和注入 SecItem 控制流，update 失败不 add、duplicate 不重试、错误固定且正文限长。默认测试全部使用合成值，raw SecItem 未调用。日志 `/private/tmp/uipilot-keychain-modern-tests.log`；过程中修正测试的 CFDictionary 长度类型，不记为系统行为回归。
 
 签名/entitlement、原生 CRUD、锁定及跨版本访问仍待独立实测，缺这些证据不开放生产凭据。Rust 缓冲 Drop 清零不等同于系统 CFData 可主动清零。本单元不修改 Windows DPAPI 行为，不计入同包双端插件实测通过数。
+
+## 2026-11-07 Mac 启动器快速计算自动验证
+
+依[快速计算规格](../superpowers/specs/2026-11-07-macos-quick-evaluation-design.md)复用四类本地计算、注册私有复制结果及查询绑定的单次执行。审核补齐了跨 registry 票据身份、旧查询复制失败不污染新结果，以及真实 Mac 能力快照中的前端显示门禁；最终复审通过。汇率仅显示未启用提示，不发送网络请求。
+
+真实回归红绿证据包括 registry 数字相同仍不能交换票据、复制不确定结果退休、晚到复制错误不影响新查询，以及 Mac 能力过滤前四类计算全部消失的复现与修正。默认 Windows 预览测试不足以证明 Mac 主界面可见，新增测试用 builtinFeatures/plugins=false 的 Mac 快照执行 calculator Enter，确认 currency 不执行、其他内置与插件继续关闭。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `npm run verify:local` | 退出 0；前端 777 通过/18 跳过，Mac 库 320 通过/5 默认忽略，CLI 186 通过、公开插件 323 通过，schema/SDK/参考包通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 354 通过/8 默认忽略 |
+
+日志为 `/private/tmp/uipilot-quick-final-verify.log`、`/private/tmp/uipilot-quick-{check,preview,cap-red,cap-green,collision-red,collision-green,ui-red,ui-stale-red}.log`。完整验证一次因命令环境未包含 Cargo 提前结束，修复 PATH 后完整重跑退出 0；不计为源码失败。所有 native 复制测试使用 fake，没有读取或改写通用剪贴板。用户可见复制/焦点仍在 70% 候选包人工验收，Windows 原生回归未重跑。

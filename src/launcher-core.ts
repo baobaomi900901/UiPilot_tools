@@ -337,6 +337,7 @@ const ERROR_TEXT: Record<CommandErrorCode, string> = {
   fileActionUnconfirmed: '已向 macOS 提交请求，请检查结果后再重新搜索。',
   webSearchFailed: '操作不可用，请重试。',
   clipboardWriteFailed: '无法复制到剪贴板。',
+  clipboardWriteUnconfirmed: '复制结果未能确认，请先检查剪贴板，再重新搜索。',
   pluginPermissionDenied: '插件所需权限不可用，请在「设置 → 权限」中检查。',
   pluginListFailed: '无法加载插件清单。',
   pluginInstallFailed: '无法安装插件。',
@@ -3949,6 +3950,14 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       (error: unknown) => {
         if (destroyed || captured.token !== executeToken || captured.epoch !== model.viewEpoch || captured.invocationId !== model.invocationId) return
         model.executePending = false
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'clipboardWriteUnconfirmed') {
+          if (model.requestId !== requestId) {
+            publish(true)
+            return
+          }
+          cancelMinuteRefresh()
+          clearResults()
+        }
         model.status = errorText(error)
         publish(true)
       },

@@ -8,7 +8,7 @@ use crate::{
     apps::{self, macos_backend::{self, BundleTarget, OpenAttempt, OpenOutcome}, AppCache, ApplicationLaunchTarget},
     host_capabilities::require_main,
     model::{search_response, SearchResponse},
-    result_registry::{QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
+    result_registry::{CopyCompletionOwner, QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
     settings::SettingsStore,
 };
 
@@ -83,7 +83,7 @@ pub(crate) struct Error {
 
 impl Error {
     fn caller() -> Self { Self { code: "invalidCaller", message: "调用窗口无权访问应用" } }
-    fn stale() -> Self { Self { code: "staleRequest", message: "应用结果已过期" } }
+    fn stale() -> Self { Self { code: "staleRequest", message: "结果已过期" } }
     fn unavailable() -> Self { Self { code: "applicationEntryUnavailable", message: "应用已移除或无法打开" } }
 }
 
@@ -91,7 +91,7 @@ impl From<RegistryError> for Error {
     fn from(error: RegistryError) -> Self {
         match error {
             RegistryError::StaleRequest => Self::stale(),
-            RegistryError::UnknownResult => Self { code: "unknownResult", message: "找不到此应用结果" },
+            RegistryError::UnknownResult => Self { code: "unknownResult", message: "找不到此结果" },
         }
     }
 }
@@ -115,6 +115,7 @@ pub(crate) async fn search_apps(
     if crate::host_capabilities::mac_find_enabled() && (query.trim().is_empty() || query.trim().starts_with('/')) {
         return Ok(publish(&service, app.state::<SettingsStore>().inner(), token, &query));
     }
+    if let Some(response) = quick_query(&service, token, &query) { return Ok(response); }
     let retrying = *service.ready.borrow() == Some(false);
     if retrying { service.refresh(); }
     let mut ready = service.ready.subscribe();
@@ -123,6 +124,14 @@ pub(crate) async fn search_apps(
         return Err(Error { code: "searchUnavailable", message: "无法读取应用目录" });
     }
     Ok(publish(&service, app.state::<SettingsStore>().inner(), token, &query))
+}
+
+// Outer None means application search should continue; Some(None) means a
+// recognized calculation became stale and must not fall through to app search.
+fn quick_query(service: &MacApplications, token: QueryToken, query: &str) -> Option<Option<SearchResponse>> {
+    let classification = crate::quick_evaluation::classify(query.trim());
+    if matches!(classification, crate::quick_evaluation::QuickClassification::NoMatch) { None }
+    else { Some(crate::macos_quick_evaluation::publish(&service.registry, token, classification)) }
 }
 
 fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str) -> Option<SearchResponse> {
@@ -185,21 +194,60 @@ fn execute_registered(
     }
 }
 
+fn execute_copy_registered(
+    service: &MacApplications, request_id: &str, result_id: &str,
+    copy: impl FnOnce(&str, &mut dyn FnMut() -> bool) -> Result<crate::clipboard_history::HostCopyOutcome, crate::clipboard_history::HostCopyError>,
+) -> Result<CopyCompletionOwner, Error> {
+    use crate::clipboard_history::HostCopyError;
+    let _guard = service.execute.lock().expect("application execution");
+    let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
+    let ResultAction::CopyBuiltInText { text } = action else { return Err(Error::unavailable()); };
+    let mut completion = None;
+    let mut admit = || {
+        if completion.is_some() { return false; }
+        completion = service.registry.consume_main_copy(&ticket).ok();
+        completion.is_some()
+    };
+    copy(&text, &mut admit).map_err(|error| match error {
+        HostCopyError::PermissionDenied => Error::stale(),
+        HostCopyError::OwnershipLost | HostCopyError::WriteUnconfirmed => Error {
+            code: "clipboardWriteUnconfirmed", message: "复制已尝试，尚未确认结果；请重新搜索后再试",
+        },
+        _ => Error { code: "clipboardWriteFailed", message: "无法复制到剪贴板" },
+    })?;
+    completion.ok_or_else(Error::stale)
+}
+
 #[tauri::command]
 pub(crate) async fn execute_result(window: WebviewWindow, request_id: String, result_id: String) -> Result<serde_json::Value, serde_json::Value> {
     #[cfg(feature = "macos-find-preview")]
     if window.label() == "find" {
         return crate::macos_find_host::execute_file(window, request_id, result_id, false).await;
     }
-    execute_app(window, request_id, result_id).await.map(|outcome| serde_json::json!(outcome))
+    execute_main(window, request_id, result_id).await
         .map_err(|error| serde_json::json!(error))
 }
 
-async fn execute_app(window: WebviewWindow, request_id: String, result_id: String) -> Result<OpenOutcome, Error> {
+async fn execute_main(window: WebviewWindow, request_id: String, result_id: String) -> Result<serde_json::Value, Error> {
     require_main(&window).map_err(|_| Error::caller())?;
     let app = window.app_handle().clone();
     let service = Arc::clone(app.state::<Arc<MacApplications>>().inner());
     tauri::async_runtime::spawn_blocking(move || {
+        let (action, _) = service.registry.resolve_with_ticket(&request_id, &result_id)?;
+        if matches!(action, ResultAction::CopyBuiltInText { .. }) {
+            let owner = execute_copy_registered(&service, &request_id, &result_id,
+                |text, admit| crate::clipboard_history::copy_host_text(text, admit))?;
+            let handle = app.clone();
+            let current_service = Arc::clone(&service);
+            let _ = app.run_on_main_thread(move || {
+                if let Ok(id) = owner.invocation_id().parse() {
+                    if current_service.registry.finish_main_copy(&owner) {
+                        let _ = crate::macos_host::hide_if_current(&handle, id);
+                    }
+                }
+            });
+            return Ok(serde_json::json!({ "status": "textCopied" }));
+        }
         let (outcome, app_id, hide_owner) = execute_registered(&service, &request_id, &result_id, |bundle, check|
             objc2::rc::autoreleasepool(|_| macos_backend::open_application(bundle, check)))?;
         if app.state::<SettingsStore>().increment_use_count(&app_id, &service.cache).is_err() {
@@ -209,7 +257,7 @@ async fn execute_app(window: WebviewWindow, request_id: String, result_id: Strin
             let handle = app.clone();
             let _ = app.run_on_main_thread(move || { let _ = crate::macos_host::hide_if_current(&handle, id); });
         }
-        Ok(outcome)
+        Ok(serde_json::json!(outcome))
     }).await.map_err(|_| Error::unavailable())?
 }
 
@@ -322,4 +370,79 @@ mod platform_app_commands {
         assert_eq!(accepted.2, None);
         assert!(service.registry.begin_query(QueryDomain::Application, "2", 1).is_some());
     }
+    fn quick_row(service: &MacApplications) -> SearchResponse {
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        crate::macos_quick_evaluation::publish(&service.registry, token, crate::quick_evaluation::classify("2+2")).unwrap()
+    }
+    #[test]
+    fn quick_copy_uses_registry_text_and_cannot_repeat_after_submission() {
+        let (_f, service, _settings) = fixture(); let r = quick_row(&service);
+        let owner = execute_copy_registered(&service, &r.request_id, &r.items[0].result_id, |text, admit| {
+            assert_eq!(text, "4"); assert!(admit()); assert!(!admit());
+            Ok(crate::clipboard_history::HostCopyOutcome::Accepted)
+        }).unwrap();
+        assert!(execute_copy_registered(&service, &r.request_id, &r.items[0].result_id, |_, _| panic!("duplicate copy")).is_err());
+        assert_eq!(owner.invocation_id(), "1"); assert!(service.registry.finish_main_copy(&owner));
+    }
+    #[test]
+    fn quick_copy_rejects_query_or_invocation_replacement_before_admission() {
+        for show in [false, true] {
+            let (_f, service, _settings) = fixture(); let r = quick_row(&service);
+            let result = execute_copy_registered(&service, &r.request_id, &r.items[0].result_id, |_, admit| {
+                if show { service.registry.on_show("2".into()); }
+                else { service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap(); }
+                assert!(!admit()); Err(crate::clipboard_history::HostCopyError::PermissionDenied)
+            });
+            assert_eq!(result.err().unwrap().code, "staleRequest");
+        }
+    }
+    #[test]
+    fn quick_copy_completion_does_not_hide_new_query_or_window() {
+        for show in [false, true] {
+            let (_f, service, _settings) = fixture(); let r = quick_row(&service);
+            let owner = execute_copy_registered(&service, &r.request_id, &r.items[0].result_id, |_, admit| {
+                assert!(admit());
+                if show { service.registry.on_show("2".into()); }
+                else { service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap(); }
+                Ok(crate::clipboard_history::HostCopyOutcome::Accepted)
+            }).unwrap();
+            assert!(!service.registry.finish_main_copy(&owner));
+        }
+    }
+    #[test]
+    fn quick_copy_nonmutating_failure_can_retry_but_unconfirmed_is_consumed() {
+        let (_f, service, _settings) = fixture(); let r = quick_row(&service); let id = &r.items[0].result_id;
+        let error = execute_copy_registered(&service, &r.request_id, id, |_, _| Err(crate::clipboard_history::HostCopyError::ClipboardChanged)).err().unwrap();
+        assert_eq!(error.code, "clipboardWriteFailed");
+        assert!(service.registry.resolve(&r.request_id, id).is_ok());
+        let error = execute_copy_registered(&service, &r.request_id, id, |_, admit| {
+            assert!(admit()); Err(crate::clipboard_history::HostCopyError::WriteUnconfirmed)
+        }).err().unwrap();
+        assert_eq!(error.code, "clipboardWriteUnconfirmed");
+        assert!(execute_copy_registered(&service, &r.request_id, id, |_, _| panic!("unconfirmed is not retryable")).is_err());
+    }
+    #[test]
+    fn quick_copy_refuses_forged_result_or_application_action_without_driver() {
+        let (_f, service, settings) = fixture(); let r = quick_row(&service);
+        let error = execute_copy_registered(&service, &r.request_id, "forged", |_, _| panic!()).err().unwrap();
+        assert_eq!(error.code, "unknownResult");
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap();
+        let apps = publish(&service, &settings, token, "App").unwrap();
+        assert_eq!(apps.items[0].title, "中文 App");
+        let error = execute_copy_registered(&service, &apps.request_id, &apps.items[0].result_id, |_, _| panic!()).err().unwrap();
+        assert_eq!(error.code, "applicationEntryUnavailable");
+    }
+
+    #[test]
+    fn quick_query_publishes_before_scan_ready_and_no_match_preserves_app_path() {
+        let (_f, service, settings) = fixture();
+        assert!(service.ready.borrow().is_none());
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        assert_eq!(quick_query(&service, token, "2+2").unwrap().unwrap().items[0].title, "4");
+        assert!(service.ready.borrow().is_none());
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap();
+        assert!(quick_query(&service, token, "中文").is_none());
+        assert_eq!(publish(&service, &settings, token, "中文").unwrap().items[0].title, "中文 App");
+    }
+
 }

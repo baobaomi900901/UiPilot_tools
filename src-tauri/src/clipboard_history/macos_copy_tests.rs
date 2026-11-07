@@ -238,3 +238,33 @@ fn read_only_native_failures_never_claim_or_modify_content() {
         assert!(!b.lock().unwrap().trace.contains(&"claim"));
     }
 }
+
+#[test]
+fn trusted_host_copy_admits_after_preparation_and_never_claims_stale_ticket() {
+    use crate::result_registry::{QueryDomain, ResultAction, ResultRegistries};
+    for invalidate in [false, true] {
+        let registry = ResultRegistries::default().main().clone(); registry.on_show("1".into());
+        let token = registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        let (request, result) = registry.publish_if_latest(token, vec![((), Some(ResultAction::CopyBuiltInText { text: "4".into() }))], || true,
+            |request, rows| (request, rows[0].0.clone())).unwrap();
+        let (_, ticket) = registry.resolve_with_ticket(&request, &result).unwrap();
+        let b = board(); let mut driver = Fake::new(&b);
+        if invalidate { let registry = registry.clone(); driver.after_prepare = Some(Box::new(move || { registry.begin_query(QueryDomain::Application, "1", 2).unwrap(); })); }
+        let mut owner = None;
+        let result = copy_host_with("4", || { owner = registry.consume_main_copy(&ticket).ok(); owner.is_some() }, || Ok(driver));
+        if invalidate {
+            assert_eq!(result, Err(CopyError::PermissionDenied)); assert_eq!(b.lock().unwrap().text, "initial");
+            assert_eq!(b.lock().unwrap().trace, ["count", "prepare", "count"]);
+        } else {
+            assert_eq!(result, Ok(CopyOutcome::Accepted)); assert_eq!(b.lock().unwrap().text, "4");
+            assert!(registry.finish_main_copy(&owner.unwrap()));
+        }
+    }
+}
+#[test]
+fn trusted_host_changed_count_does_not_consume_action_or_claim_clipboard() {
+    let b = board(); let mut driver = Fake::new(&b); let external_board = Arc::clone(&b);
+    driver.after_prepare = Some(Box::new(move || external(&external_board, "B")));
+    assert_eq!(copy_host_with("4", || panic!("nonmutating failure must leave ticket live"), || Ok(driver)), Err(CopyError::ClipboardChanged));
+    assert_eq!(b.lock().unwrap().text, "B");
+}

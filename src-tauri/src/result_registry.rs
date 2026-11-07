@@ -100,8 +100,20 @@ pub(crate) enum PluginDomainReservationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PluginDomainReservationMismatch;
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct RegistryIdentity(Arc<()>);
+#[cfg(target_os = "macos")]
+impl PartialEq for RegistryIdentity {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+#[cfg(target_os = "macos")]
+impl Eq for RegistryIdentity {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionTicket {
+    #[cfg(target_os = "macos")]
+    registry_identity: RegistryIdentity,
     scope: WindowScope,
     scope_generation: u64,
     invocation_id: String,
@@ -121,6 +133,21 @@ impl ExecutionTicket {
     pub(crate) const fn scope(&self) -> WindowScope {
         self.scope
     }
+}
+
+/// A consumed Mac main copy can only close the query that admitted it.
+#[cfg(target_os = "macos")]
+pub(crate) struct CopyCompletionOwner {
+    registry: std::sync::Weak<RegistryInner>,
+    scope_generation: u64,
+    invocation_id: String,
+    query_sequence: u64,
+    domain_epoch: u64,
+    result_set_generation: u64,
+}
+#[cfg(target_os = "macos")]
+impl CopyCompletionOwner {
+    pub(crate) fn invocation_id(&self) -> &str { &self.invocation_id }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +200,8 @@ impl OpaqueIdAllocator {
 }
 
 struct RegistryInner {
+    #[cfg(target_os = "macos")]
+    identity: RegistryIdentity,
     allocator: Arc<OpaqueIdAllocator>,
     next_reservation_nonce: AtomicU64,
     state: Mutex<RegistryState>,
@@ -230,6 +259,8 @@ impl ResultRegistry {
     fn new(scope: WindowScope, allocator: Arc<OpaqueIdAllocator>, restrict_domains: bool) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
+                #[cfg(target_os = "macos")]
+                identity: RegistryIdentity(Arc::new(())),
                 allocator,
                 next_reservation_nonce: AtomicU64::new(0),
                 state: Mutex::new(RegistryState::default()),
@@ -418,6 +449,8 @@ impl ResultRegistry {
             .ok_or(RegistryError::StaleRequest)?
             .clone();
         let ticket = ExecutionTicket {
+            #[cfg(target_os = "macos")]
+            registry_identity: self.inner.identity.clone(),
             scope: self.inner.scope,
             scope_generation: state.generation,
             invocation_id,
@@ -448,6 +481,48 @@ impl ResultRegistry {
         }
         Self::retire_current(&mut state);
         true
+    }
+
+    /// Linearization point immediately before a prepared explicit copy. No
+    /// native calls run under this lock. The admitted write may finish after a
+    /// newer query; its completion owner then cannot close the newer query.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn consume_main_copy(&self, ticket: &ExecutionTicket) -> Result<CopyCompletionOwner, RegistryError> {
+        let mut state = self.inner.state.lock().expect("result registry lock poisoned");
+        let index = QueryDomain::Application.index();
+        if self.inner.scope != WindowScope::Main || !self.ticket_matches(&state, ticket)
+            || state.latest_query_domain != Some(QueryDomain::Application)
+            || !state.current.as_ref().is_some_and(|set| set.domain == QueryDomain::Application
+                && matches!(set.actions.get(&ticket.result_id), Some(ResultAction::CopyBuiltInText { .. }))) {
+            return Err(RegistryError::StaleRequest);
+        }
+        let next = state.domain_epochs[index].checked_add(1).ok_or(RegistryError::StaleRequest)?;
+        state.domain_epochs[index] = next;
+        Self::retire_current(&mut state);
+        Ok(CopyCompletionOwner {
+            registry: Arc::downgrade(&self.inner), scope_generation: state.generation,
+            invocation_id: ticket.invocation_id.clone(), query_sequence: state.latest_query_sequence,
+            domain_epoch: next, result_set_generation: state.result_set_generation,
+        })
+    }
+
+    /// On the UI thread, atomically retire only the consumed query before hiding
+    /// its presentation. An accepted newer query or invocation is never retired.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn finish_main_copy(&self, owner: &CopyCompletionOwner) -> bool {
+        if !std::sync::Weak::ptr_eq(&owner.registry, &Arc::downgrade(&self.inner)) { return false; }
+        let mut state = self.inner.state.lock().expect("result registry lock poisoned");
+        if !state.active || state.generation != owner.scope_generation
+            || state.active_invocation_id.as_deref() != Some(&owner.invocation_id)
+            || state.latest_query_sequence != owner.query_sequence
+            || state.latest_query_domain != Some(QueryDomain::Application)
+            || state.domain_epochs[QueryDomain::Application.index()] != owner.domain_epoch
+            || state.result_set_generation != owner.result_set_generation || state.current.is_some() {
+            return false;
+        }
+        let next = state.generation.checked_add(1);
+        Self::clear_state(&mut state);
+        if let Some(next) = next { state.generation = next; true } else { false }
     }
 
     pub(crate) fn hide_and_clear(&self) {
@@ -1030,6 +1105,8 @@ impl ResultRegistry {
     }
 
     fn ticket_matches(&self, state: &RegistryState, ticket: &ExecutionTicket) -> bool {
+        #[cfg(target_os = "macos")]
+        if ticket.registry_identity != self.inner.identity { return false; }
         state.active
             && ticket.scope == self.inner.scope
             && ticket.scope_generation == state.generation
@@ -2238,4 +2315,53 @@ mod result_action_fail_closed_tests {
         ));
         assert!(!registry.retire_result_actions("r"));
     }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_copy_completion_tests {
+    use super::*;
+    fn published(registry: &ResultRegistry) -> (QueryToken, ExecutionTicket) {
+        registry.on_show("1".into());
+        let token = registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        let (request, result) = registry.publish_if_latest(token,
+            vec![((), Some(ResultAction::CopyBuiltInText { text: "4".into() }))], || true,
+            |request, rows| (request, rows[0].0.clone())).unwrap();
+        (token, registry.resolve_with_ticket(&request, &result).unwrap().1)
+    }
+    #[test]
+    fn admitted_copy_is_single_use_and_old_publish_cannot_revive_it() {
+        let registry = ResultRegistries::default().main().clone();
+        let (token, ticket) = published(&registry);
+        let completion = registry.consume_main_copy(&ticket).unwrap();
+        assert!(registry.consume_main_copy(&ticket).is_err());
+        assert!(registry.publish_if_latest(token, vec![((), None)], || true, |_, _| ()).is_none());
+        assert!(registry.finish_main_copy(&completion));
+        assert!(!registry.finish_main_copy(&completion));
+        assert!(registry.begin_query(QueryDomain::Application, "1", 2).is_none());
+    }
+    #[test]
+    fn completion_cannot_hide_new_query_or_new_invocation() {
+        for new_invocation in [false, true] {
+            let registry = ResultRegistries::default().main().clone();
+            let (_, ticket) = published(&registry);
+            let completion = registry.consume_main_copy(&ticket).unwrap();
+            if new_invocation { registry.on_show("2".into()); }
+            let id = if new_invocation { "2" } else { "1" };
+            let token = registry.begin_query(QueryDomain::Application, id, 2).unwrap();
+            assert!(!registry.finish_main_copy(&completion));
+            assert!(registry.publish_if_latest(token, vec![((), None)], || true, |_, _| ()).is_some());
+        }
+    }
+    #[test]
+    fn equal_counter_tickets_from_another_registry_are_not_authority() {
+        let first = ResultRegistries::default().main().clone();
+        let second = ResultRegistries::default().main().clone();
+        let (_, foreign_ticket) = published(&first);
+        let (_, own_ticket) = published(&second);
+        assert!(second.consume_main_copy(&foreign_ticket).is_err());
+        let completion = second.consume_main_copy(&own_ticket).unwrap();
+        assert!(!first.finish_main_copy(&completion));
+        assert!(second.finish_main_copy(&completion));
+    }
+
 }

@@ -15,6 +15,8 @@ mod macos_history;
 mod macos_collector;
 #[cfg(target_os = "macos")]
 mod macos_copy;
+#[cfg(target_os = "macos")]
+pub(crate) use macos_copy::{copy_host_text, CopyError as HostCopyError, CopyOutcome as HostCopyOutcome};
 #[cfg(windows)]
 mod observer;
 #[cfg(windows)]

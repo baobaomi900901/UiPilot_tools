@@ -9,12 +9,12 @@ use super::{macos_history::{CopyToken, MacHistory}, macos_observer::ChangeCount,
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CopyPurpose { ExplicitCopy, TemporaryRestore }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CopyError {
+pub(crate) enum CopyError {
     Unsupported, PermissionDenied, RecordNotFound, RecordUnavailable,
     Unavailable, ClipboardChanged, OwnershipLost, WriteUnconfirmed,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CopyOutcome {
+pub(crate) enum CopyOutcome {
     /// setData accepted this write. Another application may already have replaced it.
     Accepted,
 }
@@ -64,6 +64,29 @@ pub(super) fn copy_to_general(history: Arc<MacHistory>, request: CopyRequest)
             objc2::exception::catch(|| NativeDriver(NSPasteboard::generalPasteboard())).map_err(|_| CopyError::Unavailable)
         })
     })).map_err(|_| CopyError::Unavailable)
+}
+
+/// Trusted host values only: caller obtains text from its registry, never from
+/// an IPC payload, and consumes the current result ticket in final admission.
+/// This synchronous function must run on a worker. No history permission is used.
+pub(crate) fn copy_host_text(text: &str, admit: impl FnOnce() -> bool) -> Result<CopyOutcome, CopyError> {
+    autoreleasepool(|_| copy_host_with(text, admit, || {
+        objc2::exception::catch(|| NativeDriver(NSPasteboard::generalPasteboard())).map_err(|_| CopyError::Unavailable)
+    }))
+}
+
+fn copy_host_with<D: CopyDriver>(text: &str, admit: impl FnOnce() -> bool,
+    factory: impl FnOnce() -> Result<D, CopyError>) -> Result<CopyOutcome, CopyError> {
+    if text.len() > MAX_TEXT { return Err(CopyError::RecordUnavailable); }
+    let mut driver = factory()?;
+    let baseline = driver.change_count()?;
+    let prepared = driver.prepare(text)?;
+    if driver.change_count()? != baseline { return Err(CopyError::ClipboardChanged); }
+    if !admit() { return Err(CopyError::PermissionDenied); }
+    // The accepted host action may finish after a new query. Completion must
+    // separately prove it still owns the presentation. This is not clipboard CAS.
+    driver.publish(prepared)?;
+    Ok(CopyOutcome::Accepted)
 }
 
 struct NativeDriver(Retained<NSPasteboard>);

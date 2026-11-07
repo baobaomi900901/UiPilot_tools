@@ -36,6 +36,13 @@ export function settingsTabAvailable(host: HostCapabilities, tab: string): boole
 
 export function resultAvailable(host: HostCapabilities, activation: LauncherResultActivation, item: ResultItem): boolean {
   if (!host.plugins && (item.actions || item.pluginIconUrl || item.favorite?.target?.kind === 'publicPlugin')) return false
+  // Mac supports query values before the full reusable built-in command system.
+  // Currency is an unavailable informational row until its service is enabled.
+  if (host.platform === 'macos' && !item.favorite && (
+    (['calculator', 'unit', 'date', 'timeZone'].includes(item.iconKind ?? '') &&
+      (activation.kind === 'executeResult' || activation.kind === 'informational')) ||
+    (item.iconKind === 'currency' && activation.kind === 'informational')
+  )) return true
   if (!host.builtinFeatures && (item.iconKind || item.favorite?.target?.kind === 'builtin')) {
     if (activation.kind !== 'openFind' || !host.files || item.iconKind !== 'find' ||
         (item.favorite && (item.favorite.target?.kind !== 'builtin' || item.favorite.target.feature !== 'find'))) return false

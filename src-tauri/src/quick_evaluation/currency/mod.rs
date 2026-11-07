@@ -1,13 +1,17 @@
+#[cfg(windows)]
 pub(crate) mod cache;
+#[cfg(windows)]
 pub(crate) mod provider;
+#[cfg(windows)]
 pub(crate) mod service;
+#[cfg(windows)]
 pub(crate) mod transport;
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod cache_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod service_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod transport_tests;
 
 use rust_decimal::{Decimal, RoundingStrategy};

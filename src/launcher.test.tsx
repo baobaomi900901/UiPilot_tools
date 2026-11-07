@@ -4983,6 +4983,51 @@ describe('execute and hide ownership', () => {
     expect(JSON.stringify(core.getSnapshot())).not.toContain('private clipboard detail')
   })
 
+  it('retires a quick-copy result after an unconfirmed native write without hiding or retrying', async () => {
+    const { core, client, emit } = await startedCore()
+    vi.mocked(client.searchApps).mockResolvedValueOnce({
+      requestId: 'uncertain-copy',
+      items: [{ resultId: 'quick-value', title: '4', iconKind: 'calculator', hasDefaultAction: true, activation: executeActivation }],
+      replaceLocalResults: true,
+    })
+    vi.mocked(client.executeResult).mockRejectedValueOnce({ code: 'clipboardWriteUnconfirmed', message: 'private native detail' })
+    emit(shown('uncertain-copy-window'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '2+2', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    core.keyDown('Enter', false)
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot()).toMatchObject({
+      view: 'launcher', query: '2+2', results: [],
+      status: '复制结果未能确认，请先检查剪贴板，再重新搜索。',
+    })
+    expect(JSON.stringify(core.getSnapshot())).not.toContain('private native detail')
+    core.keyDown('Enter', false)
+    expect(client.executeResult).toHaveBeenCalledTimes(1)
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
+  it('does not apply an old unconfirmed copy error to a newer query in the same window', async () => {
+    const { core, client, emit } = await startedCore()
+    const copy = deferred<{ status: 'textCopied' }>()
+    const reply = (requestId: string, title: string) => ({ requestId, items: [
+      { resultId: requestId, title, iconKind: 'calculator' as const, hasDefaultAction: true, activation: executeActivation },
+    ], replaceLocalResults: true })
+    vi.mocked(client.searchApps).mockResolvedValueOnce(reply('old-copy', '4'))
+    vi.mocked(client.executeResult).mockReturnValueOnce(copy.promise)
+    emit(shown('same-copy-window'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '2+2', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('4'))
+    core.keyDown('Enter', false)
+    vi.mocked(client.searchApps).mockResolvedValueOnce(reply('new-copy', '9'))
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '3*3', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('9'))
+    const status = core.getSnapshot().status
+    copy.reject({ code: 'clipboardWriteUnconfirmed', message: 'private native detail' })
+    await vi.waitFor(() => expect(core.getSnapshot().executePending).toBe(false))
+    expect(core.getSnapshot()).toMatchObject({ query: '3*3', results: [{ title: '9' }], status })
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+  })
+
   it('shares one hide owner, ignores composing Escape, and keeps current state on rejection', async () => {
     const { core, client, emit } = await startedCore()
     const hide = deferred<void>()
@@ -9141,6 +9186,36 @@ describe('real adapter and startup', () => {
     tauriCapture.invoke.mockReset()
     tauriCapture.listen.mockReset()
   }
+
+  it('keeps Mac quick values and unavailable currency visible without enabling other builtins or plugins', async () => {
+    const { client, emit } = fakeClient()
+    const quickKinds = ['calculator', 'unit', 'date', 'timeZone'] as const
+    vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'mac-quick', replaceLocalResults: true, items: [
+      ...quickKinds.map(iconKind => ({ resultId: iconKind, title: iconKind, iconKind, hasDefaultAction: true, activation: executeActivation })),
+      { resultId: 'currency', title: '汇率暂不可用', iconKind: 'currency', hasDefaultAction: false, activation: { kind: 'informational' } },
+      { resultId: 'quicklinks', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' } },
+      { resultId: 'web', title: 'Web', iconKind: 'webSearch', activation: executeActivation },
+      { resultId: 'currency-action', title: 'Currency action', iconKind: 'currency', activation: executeActivation },
+      { resultId: 'favorite', title: 'Favorite', iconKind: 'calculator', favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite: true }, activation: executeActivation },
+      { resultId: 'plugin', title: 'Plugin', iconKind: 'calculator', pluginIconUrl: 'uipilot-public-plugin://localhost/icon.png', activation: executeActivation },
+      { resultId: 'builtin', title: 'Builtin', iconKind: 'calculator', activation: { kind: 'builtinActivation', feature: 'webSearch', initialArgument: '2+2' } },
+    ] } as SearchResponse)
+    vi.mocked(client.executeResult).mockResolvedValue({ status: 'textCopied' })
+    const core = createLauncherCore(client, undefined, hostSnapshot('macos'))
+    await core.start()
+    try {
+      emit(shown('mac-quick'))
+      core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '2+2', inputType: 'insertText' })
+      await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
+      expect(core.getSnapshot().results.map(row => row.title)).toEqual([...quickKinds, '汇率暂不可用'])
+      core.activateResult(4)
+      expect(client.executeResult).not.toHaveBeenCalled()
+      core.selectResult(0)
+      core.keyDown('Enter', false)
+      await vi.waitFor(() => expect(client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'mac-quick', resultId: 'calculator' }))
+      expect(client.hideLauncher).not.toHaveBeenCalled()
+    } finally { core.destroy() }
+  })
 
   async function pagehide() {
     await act(async () => window.dispatchEvent(new Event('pagehide')))

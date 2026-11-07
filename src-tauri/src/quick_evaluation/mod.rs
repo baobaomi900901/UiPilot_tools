@@ -167,6 +167,7 @@ where
     }
 }
 
+#[cfg(windows)]
 pub(crate) async fn evaluate_currency<R, F>(
     intent: currency::CurrencyIntent,
     resolver: R,
@@ -211,15 +212,19 @@ fn currency_unavailable() -> QuickFailure {
     QuickFailure {
         kind: QuickKind::Currency,
         title: "汇率暂不可用".into(),
-        explanation: "请稍后重试".into(),
+        explanation: if cfg!(target_os = "macos") { "此平台尚未启用汇率服务" } else { "请稍后重试" }.into(),
     }
+}
+
+fn clock_settings_explanation() -> &'static str {
+    if cfg!(target_os = "macos") { "请检查系统日期和时区设置" } else { "请检查 Windows 日期和时区设置" }
 }
 
 fn local_date_unavailable() -> QuickFailure {
     QuickFailure {
         kind: QuickKind::Date,
         title: "无法读取本地日期".into(),
-        explanation: "请检查 Windows 日期和时区设置".into(),
+        explanation: clock_settings_explanation().into(),
     }
 }
 
@@ -406,7 +411,7 @@ mod tests {
 
         assert_eq!(failure.kind, QuickKind::Date);
         assert_eq!(failure.title, "无法读取本地日期");
-        assert_eq!(failure.explanation, "请检查 Windows 日期和时区设置");
+        assert_eq!(failure.explanation, super::clock_settings_explanation());
     }
 
     #[test]

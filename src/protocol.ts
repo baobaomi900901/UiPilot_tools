@@ -386,6 +386,7 @@ export type CommandErrorCode =
   | 'fileSearchStarting'
   | 'searchUnavailable'
   | 'clipboardWriteFailed'
+  | 'clipboardWriteUnconfirmed'
   | 'pluginPermissionDenied'
   | 'pluginListFailed'
   | 'pluginInstallFailed'
