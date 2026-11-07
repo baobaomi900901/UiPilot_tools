@@ -26,6 +26,8 @@ mod web_search;
 #[cfg(target_os = "macos")]
 mod macos_browser_open;
 #[cfg(target_os = "macos")]
+mod macos_login_item;
+#[cfg(target_os = "macos")]
 mod webview_reload_guard;
 #[cfg(target_os = "macos")]
 mod apps;

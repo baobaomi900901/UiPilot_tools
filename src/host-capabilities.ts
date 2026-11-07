@@ -1,7 +1,7 @@
 import type { LauncherResultActivation, ResultItem } from './protocol'
 
 const flags = ['plugins', 'files', 'screenshot', 'messages', 'credentials', 'builtinFeatures',
-  'commandHotkeys', 'autostart', 'doubleTap', 'webSearch'] as const
+  'commandHotkeys', 'autostart', 'doubleTap', 'webSearch', 'loginItems'] as const
 
 export type HostCapabilities = Readonly<{
   version: 1
@@ -12,7 +12,7 @@ export type HostCapabilities = Readonly<{
 export const previewCapabilities: HostCapabilities = Object.freeze({
   version: 1, platform: 'windows', plugins: true, files: true, screenshot: true,
   messages: true, credentials: true, builtinFeatures: true, commandHotkeys: true,
-  autostart: true, doubleTap: true, webSearch: true,
+  autostart: true, doubleTap: true, webSearch: true, loginItems: false,
 })
 
 export function parseHostCapabilities(value: unknown): HostCapabilities | null {

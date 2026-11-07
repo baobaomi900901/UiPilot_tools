@@ -271,3 +271,20 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 | `node --test scripts/macos-host-acl.test.mjs` | 4 通过 |
 
 行为红阶段复现普通查询没有 fallback 及前端 Mac 过滤；后端新增 14 项测试，原有应用与复制回归通过。日志 `/private/tmp/uipilot-web-{red,ui-red,ui-green,verify,check,preview,browser,apps,registry,copy,tests,acl}.log`。Windows URL 构造与执行保持既有路径，Windows 原生回归和 Mac 默认浏览器实际跳转留统一节点。本单元不提供可复用 `/web-search` 入口，不能收藏一次查询值。
+
+## 2026-11-07 Mac 登录项预览自动验证
+
+[登录项规格](../superpowers/specs/2026-11-07-macos-login-item-design.md)对应的原生适配、独立 IPC 和设置控件已通过终审。系统四态加 unavailable 是唯一事实；旧 settings.autostart 保留而不对账。默认构建 `loginItems=false`，三条 IPC 在可信 main 检查后、主线程派发前检查非默认 `macos-login-item-preview`；70% 内部候选显式开启，实测前不开放生产默认能力。
+
+7 项原生 fake 测试覆盖 54 种变更后结果/状态组合及所有零写分支。真实红阶段 3 通过/4 失败，修复为 7 通过；另有严格 IPC 输入与 gate 用例。false/异常后仍复读，RequiresApproval 不重复注册且可停止，无自动补偿或重试。绑定已编译/link，但未调用真实 SMAppService，没有改变登录项或打开系统设置。
+
+前端单例 pending 在组件卸载后保留，新界面的 read 等待旧 set settle；组件请求代际丢弃旧响应。9 项新增前端用例包含真实 client+control 跨重建 deferred、实际 main adapter 的预览能力、系统状态覆盖旧 bool、独立停止注册，以及 Windows 路径保持。初始前端红是缺少新模块；中途修正测试字面量类型与 Ant Design 双字按钮空格匹配，不把这些称为原生行为回归。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `npm run verify:local` | 退出 0；前端 789 通过/18 跳过，普通 Mac 库 345 通过/5 默认忽略，CLI 186 通过，公开插件 323 通过；schema/SDK/参考包通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview` | 379 通过/8 默认忽略 |
+| `node --test scripts/macos-host-acl.test.mjs` | 4 通过 |
+
+日志 `/private/tmp/uipilot-login-{red,tests,host,client-red,client-green,ui-red,ui-green,focused,verify,check,preview,acl}.log`。签名、系统通知、外部撤销及真实注销/登录行为在 70% 统一人工节点验收，Task 10.5 不提前勾选完成。

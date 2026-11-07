@@ -9206,7 +9206,7 @@ describe('real adapter and startup', () => {
     const enabled = platform === 'windows'
     return { version: 1, platform, plugins: enabled, files: enabled, screenshot: enabled,
       messages: enabled, credentials: enabled, builtinFeatures: enabled, commandHotkeys: enabled,
-      autostart: enabled, doubleTap: enabled, webSearch: true }
+      autostart: enabled, doubleTap: enabled, webSearch: true, loginItems: false }
   }
   function resetAdapterDocument() {
     vi.resetModules()
@@ -9336,6 +9336,35 @@ describe('real adapter and startup', () => {
       await mounted.unmount()
       core.destroy()
     }
+  })
+
+  it('reads the preview Mac login item only inside settings and keeps it separate from the legacy autostart save', async () => {
+    resetAdapterDocument()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+    tauriCapture.capabilities.mockResolvedValue({ ...hostSnapshot('macos'), loginItems: true })
+    const subscriptions = new Map<string, (event: { payload: unknown }) => void>()
+    tauriCapture.listen.mockImplementation(async (name, handler) => { subscriptions.set(name, handler); return vi.fn() })
+    tauriCapture.invoke.mockImplementation(async name => {
+      if (name === 'load_settings') return { ...emptySettings, autostart: true }
+      if (name === 'search_apps') return { requestId: 'empty', items: [] }
+      if (name === 'get_macos_login_item') return { status: 'requiresApproval' }
+      if (name === 'set_macos_login_item') return { status: 'notRegistered', outcome: 'applied' }
+      throw new Error(name)
+    })
+    try {
+      await act(async () => { await import('./main') })
+      await vi.waitFor(() => expect(tauriCapture.invoke).toHaveBeenCalledWith('load_settings'))
+      expect(tauriCapture.invoke.mock.calls.some(([name]) => name.includes('login_item'))).toBe(false)
+      await act(async () => subscriptions.get('launcher://shown')!({ payload: shown('login-settings', 'settings') }))
+      await vi.waitFor(() => expect(document.body.textContent).toContain('等待系统允许'))
+      const checkbox = document.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+      expect(checkbox.checked).toBe(false)
+      const stop = [...document.querySelectorAll('button')].find(row => row.textContent?.includes('停止注册'))!
+      await act(async () => stop.click())
+      await vi.waitFor(() => expect(document.body.textContent).toContain('未启用'))
+      expect(tauriCapture.invoke).toHaveBeenCalledWith('set_macos_login_item', { input: { enabled: false } })
+      expect(tauriCapture.invoke.mock.calls.some(([name]) => name === 'save_settings')).toBe(false)
+    } finally { await pagehide() }
   })
 
   it('does not start Find when its Mac scope marker is unknown', async () => {

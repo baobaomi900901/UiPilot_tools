@@ -1,3 +1,4 @@
+import type { MacLoginItemClient } from './macos-login-item'
 import { safePublicPluginIconUrl } from './plugin-icon-url'
 import type { CredentialClient } from './credential-protocol'
 
@@ -458,6 +459,7 @@ export type ClassifiedTextRecord =
   | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
+  macosLoginItem?: MacLoginItemClient
   credentials?: CredentialClient
   validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>
   listenShown(handler: (payload: unknown) => void): Promise<() => void>

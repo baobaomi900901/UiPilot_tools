@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-macos-login-item-settings"
+description = "Enables the open_macos_login_item_settings command without any pre-configured scope."
+commands.allow = ["open_macos_login_item_settings"]
+
+[[permission]]
+identifier = "deny-open-macos-login-item-settings"
+description = "Denies the open_macos_login_item_settings command without any pre-configured scope."
+commands.deny = ["open_macos_login_item_settings"]

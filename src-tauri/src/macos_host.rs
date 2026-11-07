@@ -237,6 +237,49 @@ fn set_theme_preference(window: WebviewWindow, preference: ThemeUpdate) -> Resul
 #[serde(deny_unknown_fields)]
 struct WebSearchUpdate { engine: crate::settings::WebSearchEngine }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginItemUpdate { enabled: bool }
+
+fn require_login_main(window: &WebviewWindow) -> Result<(), &'static str> {
+    require_main(window)?;
+    login_item_available(cfg!(feature = "macos-login-item-preview"))
+}
+
+fn login_item_available(enabled: bool) -> Result<(), &'static str> {
+    enabled.then_some(()).ok_or("loginItemUnavailable")
+}
+
+async fn login_main<T: Send + 'static>(window: &WebviewWindow,
+    operation: impl FnOnce(objc2::MainThreadMarker) -> T + Send + 'static,
+) -> Result<T, &'static str> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    window.run_on_main_thread(move || {
+        let result = objc2::MainThreadMarker::new().map(operation).ok_or("loginItemUnavailable");
+        let _ = send.send(result);
+    }).map_err(|_| "loginItemUnavailable")?;
+    receive.await.map_err(|_| "loginItemUnavailable")?
+}
+
+#[tauri::command]
+async fn get_macos_login_item(window: WebviewWindow) -> Result<crate::macos_login_item::Snapshot, &'static str> {
+    require_login_main(&window)?;
+    login_main(&window, crate::macos_login_item::read_native).await
+}
+
+#[tauri::command]
+async fn set_macos_login_item(window: WebviewWindow, input: LoginItemUpdate) -> Result<crate::macos_login_item::Mutation, &'static str> {
+    require_login_main(&window)?;
+    login_main(&window, move |mtm| crate::macos_login_item::set_native(mtm, input.enabled)).await
+}
+
+#[tauri::command]
+async fn open_macos_login_item_settings(window: WebviewWindow) -> Result<(), &'static str> {
+    require_login_main(&window)?;
+    login_main(&window, crate::macos_login_item::open_settings_native).await?
+        .map_err(|_| "loginItemUnavailable")
+}
+
 #[tauri::command]
 fn set_web_search_engine(window: WebviewWindow, preference: WebSearchUpdate) -> Result<(), &'static str> {
     require_main(&window)?;
@@ -317,6 +360,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
             hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording,
+            get_macos_login_item, set_macos_login_item, open_macos_login_item_settings,
             crate::macos_apps::search_apps, crate::macos_apps::execute_result,
             #[cfg(feature = "macos-find-preview")] set_builtin_feature_favorite,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_window,
@@ -383,6 +427,15 @@ pub fn run() {
 #[cfg(test)]
 mod platform_bootstrap {
     use super::*;
+    #[test]
+    fn login_item_gate_and_update_are_explicit() {
+        assert_eq!(login_item_available(false), Err("loginItemUnavailable"));
+        assert_eq!(login_item_available(true), Ok(()));
+        for invalid in [r#"{}"#, r#"{"enabled":"true"}"#, r#"{"enabled":true,"bundle":"other"}"#] {
+            assert!(serde_json::from_str::<LoginItemUpdate>(invalid).is_err());
+        }
+        assert!(serde_json::from_str::<LoginItemUpdate>(r#"{"enabled":true}"#).unwrap().enabled);
+    }
     #[test]
     fn web_engine_update_is_strict_and_preserves_other_settings() {
         for invalid in [r#"{"engine":"https://other.test"}"#, r#"{"engine":"bing","url":"https://other.test"}"#] {

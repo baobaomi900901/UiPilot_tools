@@ -18,6 +18,9 @@
     "allow-execute-result",
     "allow-set-theme-preference",
     "allow-set-web-search-engine",
+    "allow-get-macos-login-item",
+    "allow-set-macos-login-item",
+    "allow-open-macos-login-item-settings",
     "allow-hide-launcher",
     "allow-save-hotkey",
     "allow-set-hotkey-recording"

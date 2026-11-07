@@ -20,7 +20,7 @@ import {
 const previewParameters = new URLSearchParams(window.location.search)
 const capabilities: HostCapabilities = previewParameters.get('platform') === 'macos' ? {
   version: 1, platform: 'macos', plugins: false, files: false, screenshot: false, messages: false,
-  credentials: false, builtinFeatures: false, commandHotkeys: false, autostart: false, doubleTap: false, webSearch: true,
+  credentials: false, builtinFeatures: false, commandHotkeys: false, autostart: false, doubleTap: false, webSearch: true, loginItems: false,
 } : previewCapabilities
 const previewTheme = previewParameters.get('theme') === 'light' ? 'light' : 'dark'
 const settings: SettingsView = {

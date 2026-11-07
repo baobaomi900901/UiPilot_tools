@@ -26,6 +26,7 @@ macos-find-preview = [
     "objc2-app-kit/NSPanel", "objc2-app-kit/NSWindow", "objc2-app-kit/NSApplication",
 ]
 # For an isolated macOS permission-validation account; never implied by a normal build.
+macos-login-item-preview = []
 macos-find-system-qa = ["macos-find-preview"]
 macos-find-qa-probe = ["macos-find-system-qa"]
 fault-injection = []

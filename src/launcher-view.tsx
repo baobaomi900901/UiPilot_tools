@@ -1,3 +1,4 @@
+import { MacLoginItemControl } from './macos-login-item-control'
 import { settingsTabAvailable } from './host-capabilities'
 import { BuiltinFeatureDetail } from './builtin-feature-panel'
 import {
@@ -2081,6 +2082,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 </div>
               </Form.Item>
             </>}
+            {core.capabilities.loginItems && <MacLoginItemControl
+              key={`${snapshot.invocationId}:${snapshot.viewEpoch}`}
+              client={core.client.macosLoginItem} disabled={locked} />}
             {core.capabilities.autostart && <Checkbox
               checked={settings.autostart}
               disabled={locked}

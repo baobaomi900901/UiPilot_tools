@@ -1,3 +1,4 @@
+import { createMacLoginItemClient } from './macos-login-item'
 import { parsePublicPluginDiagnostics } from './protocol'
 import { createCredentialClient } from './credential-client'
 import { invoke } from '@tauri-apps/api/core'
@@ -46,6 +47,7 @@ import {
 } from './protocol'
 
 export const client: LauncherClient = {
+  macosLoginItem: createMacLoginItemClient(invoke),
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
   listenHidden: (handler) => listen('launcher://hidden', () => handler()),
   listenBuiltinFeaturesChanged: (handler) => listen('builtin-features://changed', () => handler()),
