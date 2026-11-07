@@ -1,9 +1,11 @@
 #![allow(dead_code, unused_imports)]
-// macOS compiles shared value/format/preview logic only. Native history remains
-// unavailable until its observer, storage and lifecycle contracts are implemented.
+// macOS compiles shared core logic and an unassembled text observer. Native
+// history remains unavailable until storage, authorization and host wiring land.
 
 mod format;
 mod model;
+#[cfg(target_os = "macos")]
+mod macos_observer;
 #[cfg(windows)]
 mod observer;
 #[cfg(windows)]

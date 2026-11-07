@@ -169,3 +169,22 @@ python -I -c "from pathlib import Path; import hashlib; files=[Path('third-party
 | Windows 原生回归、Mac 原生采集/授权/退出和复制 | 待后续实现与实机验证，未标记通过 |
 
 本机日志为 `/private/tmp/uipilot-clipboard-red.log`、`/private/tmp/uipilot-clipboard-shared-tests.log`、`/private/tmp/uipilot-clipboard-foundation-{verify,check,preview}.log`。原计划 Task 10.1 仍未完成，下一单元为原生 reader/observer 及停止/重启时的代际隔离。人工测试按用户安排延后。
+
+## 2026-11-07 原生文本观察器自动验证
+
+依[观察器规格](../superpowers/specs/2026-11-07-macos-clipboard-observer-design.md)完成原生单项纯文本 reader、worker、停止准入和会话隔离；独立审核通过。初始红阶段为新 API 尚未实现的编译失败，不记作已复现既有系统竞态。完成后，fake 读取和并发测试 20 项、既有共享测试 8 项通过；覆盖阻塞读取、旧事件、新会话、消费者在途、并发停止、回调/消费者/worker 析构重入、初始化失败和 panic 清理。
+
+原生用例 `clipboard_history::macos_observer::tests::native_unique_board_text_and_mixed_format_classification` 默认 ignored。首次在沙箱内执行因 `pasteboardWithUniqueName` 返回 NULL 而失败，未取得测试 board。随后仅对该用例在获准的非隔离环境精确执行 `--ignored --exact`，1 项通过：唯一命名 board 的空文本、中文/emoji、NUL 精确保留，混合格式拒绝，worker 建立基线后收到合成写入，停止后旧事件拒绝。测试只释放自身创建的 board，未调用 general pasteboard，不等同于跨应用、用户授权或历史存储验收。
+
+环境继续为 M1 Pro / macOS 15.7.4、Node 22.22.1、Rust 1.96.1。验证结果：
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib clipboard_history::` | 28 通过、1 默认忽略；该原生用例已另行通过 |
+| `npm run verify:local` | 退出 0；前端 774 通过/18 既有跳过，普通 Mac Rust 180 通过/4 默认忽略，CLI 186 通过、公开插件测试 323 通过，schema/SDK/参考包校验通过 |
+| `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` | 退出 0 |
+| `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview` | 214 通过/7 默认忽略，退出 0 |
+
+普通库与 Find 预览各新增的 1 个默认忽略均为上述原生用例，其余分别是已有 3/6 个忽略，未将它们计为通过。日志：`/private/tmp/uipilot-observer-{red,tests,native,native-unsandboxed,verify,check,preview}.log`。
+
+生产 Mac 宿主没有启动该观察器，SDK 权限和能力开关不变。本单元未修改 Windows 原生 observer/service/store/paste，也未补做 Windows 原生回归。私有存储、插件授权撤回、图片/文件格式、复制及通用剪贴板实机测试仍未完成；人工测试按用户安排延后。
