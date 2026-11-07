@@ -16,6 +16,8 @@ mod settings;
 #[cfg(target_os = "macos")]
 mod clipboard_history;
 #[cfg(target_os = "macos")]
+mod macos_keychain;
+#[cfg(target_os = "macos")]
 mod webview_reload_guard;
 #[cfg(target_os = "macos")]
 mod apps;

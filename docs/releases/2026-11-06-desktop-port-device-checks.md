@@ -232,3 +232,13 @@ Windows store 仅委派提取后的纯历史变换，原格式校验与文件 IO
 `clipboard_history::macos_copy::` 聚焦 15 项通过、1 项原生用例默认忽略；剪贴板整体 79 项通过、2 项默认忽略。新增 fake 用例明确展示 count 检查到 claim 之间不是 CAS，并验证观察到变化时零 claim、claim 后所有权丢失/异常没有第二次写入、之后的外部 B 不被恢复动作覆盖，以及准备期间删除/撤权/重授权的拒绝。原生夹具使用系统唯一命名 board，仅定义、未运行；通用剪贴板未访问。红阶段仅为缺失新 API 的编译失败。
 
 日志：`/private/tmp/uipilot-copy-{red,tests,clipboard}.log`。本单元未装配宿主/SDK、未修改 Windows 行为；自动临时恢复仍为 Unsupported，未虚构原子条件写保证。人工测试继续汇总到整体约 70% 的统一节点。
+
+## 2026-11-07 Keychain 隔离基础自动验证
+
+[Keychain 基础规格](../superpowers/specs/2026-11-07-macos-keychain-foundation-design.md)对应的内部 Vault 和现代 Keychain 后端通过独立审核。宿主/插件 namespace、实例与 generation 授权、身份封装、有界秘密、撤回/关闭排空已实现；生产凭据服务与 SDK 尚未装配。
+
+首个 classic 方案因无法从实现证实无交互参数而被审核否决，未调用真实 Keychain。改为每次 CRUD 强制 Data Protection、禁止同步、仅本机解锁访问及非交互认证，不带 classic search list/use-keychain，不在签名失败时回退。新增依赖仅为 lock 中已有的 security-framework-sys 2.17.0，无版本升级。
+
+`cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib macos_keychain::` 9 项通过：包含真实 CFDictionary 的精确参数检查和注入 SecItem 控制流，update 失败不 add、duplicate 不重试、错误固定且正文限长。默认测试全部使用合成值，raw SecItem 未调用。日志 `/private/tmp/uipilot-keychain-modern-tests.log`；过程中修正测试的 CFDictionary 长度类型，不记为系统行为回归。
+
+签名/entitlement、原生 CRUD、锁定及跨版本访问仍待独立实测，缺这些证据不开放生产凭据。Rust 缓冲 Drop 清零不等同于系统 CFData 可主动清零。本单元不修改 Windows DPAPI 行为，不计入同包双端插件实测通过数。
