@@ -1,3 +1,6 @@
+#[path = "macos_placement.rs"]
+mod placement;
+
 #[path = "macos_hotkey.rs"]
 mod hotkey;
 
@@ -94,41 +97,40 @@ fn schedule_show(app: &AppHandle, id: u64) {
 
 // Position and focus operations are serialized on the application main thread.
 fn position_on_active_display(window: &WebviewWindow) -> tauri::Result<()> {
-    let current = window.outer_position()?;
+    use placement::{changes, cursor_point, logical_rect, place, Change, Rect};
+    let position = window.outer_position()?;
     let size = window.outer_size()?;
-    let pointer_monitor = window.cursor_position().ok()
-        .and_then(|point| window.monitor_from_point(point.x, point.y).ok().flatten());
-    let monitor = match pointer_monitor {
-        Some(monitor) => monitor,
-        None => match window.primary_monitor()? {
-            Some(primary) => primary,
-            None => return Ok(()),
-        }
+    // Tao scales the global window origin by this window's backingScaleFactor.
+    let Some(current) = logical_rect(position.x as f64, position.y as f64,
+        size.width as f64, size.height as f64, window.scale_factor()?) else { return Ok(()); };
+    let logical_area = |monitor: &tauri::Monitor| -> Option<Rect> {
+        let area = monitor.work_area();
+        logical_rect(area.position.x as f64, area.position.y as f64,
+            area.size.width as f64, area.size.height as f64, monitor.scale_factor())
     };
-    let area = monitor.work_area();
-    // Restore the normal logical panel size on a larger display and clamp it
-    // to the available physical work area after display removal or scaling.
+    let areas: Vec<_> = window.available_monitors()?.iter().filter_map(logical_area).collect();
+    let primary = window.primary_monitor()?;
+    // Tao 0.35.3 cursor_position uses PRIMARY scale, while monitor_from_point
+    // passes its input directly to CGDisplayBounds (desktop logical points).
+    let pointer = primary.as_ref().filter(|monitor| monitor.scale_factor().is_finite() && monitor.scale_factor() > 0.0)
+        .and_then(|monitor| window.cursor_position().ok().and_then(|point| {
+            cursor_point(point.x, point.y, monitor.scale_factor()).and_then(|(x, y)| window.monitor_from_point(x, y).ok().flatten())
+        }));
+    let preferred = pointer.as_ref().and_then(logical_area)
+        .or_else(|| primary.as_ref().and_then(logical_area));
+    let fallback = preferred.and_then(|area| areas.iter().position(|candidate| *candidate == area)).unwrap_or(0);
     let desired = window.app_handle().config().app.windows.iter().find(|w| w.label == "main")
-        .map(|config| {
-            let scale = monitor.scale_factor();
-            tauri::PhysicalSize::new((config.width * scale).round() as u32, (config.height * scale).round() as u32)
-        }).unwrap_or(size);
-    let fitted = tauri::PhysicalSize::new(desired.width.min(area.size.width), desired.height.min(area.size.height));
-    if fitted.width == 0 || fitted.height == 0 { return Ok(()); }
-    let position = tauri::PhysicalPosition::new(
-        fit_axis(current.x, fitted.width, area.position.x, area.size.width),
-        fit_axis(current.y, fitted.height, area.position.y, area.size.height),
-    );
-    if current != position { window.set_position(position)?; }
-    if fitted != size { window.set_size(fitted)?; }
+        .map(|config| (config.width, config.height)).unwrap_or((current.width, current.height));
+    let Some(target) = place(current, desired, &areas, fallback) else { return Ok(()); };
+    // Resize can move AppKit's top-left. The shared plan always restores it
+    // AFTER resize, even if the pre-resize position was already correct.
+    for change in changes(current, target) {
+        match change {
+            Change::Resize(width, height) => window.set_size(tauri::LogicalSize::new(width, height))?,
+            Change::Move(x, y) => window.set_position(tauri::LogicalPosition::new(x, y))?,
+        }
+    }
     Ok(())
-}
-
-fn fit_axis(current: i32, size: u32, start: i32, extent: u32) -> i32 {
-    let offset = i64::from(current) - i64::from(start);
-    let spare = i64::from(extent.saturating_sub(size));
-    if offset >= 0 && offset <= spare { current }
-    else { (i64::from(start) + spare / 2).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 }
 }
 
 #[cfg(feature = "macos-find-preview")]
@@ -529,8 +531,13 @@ mod lifecycle_tests {
     }
     #[test]
     fn active_monitor_placement_handles_removed_displays_and_negative_origins() {
-        assert_eq!(fit_axis(2300, 720, -1400, 1400), -1060);
-        assert_eq!(fit_axis(-1300, 720, -1400, 1400), -1300);
-        assert_eq!(fit_axis(200, 720, 0, 640), 0);
+        use placement::{place, Rect};
+        let area = Rect { x: -1400., y: 0., width: 1400., height: 900. };
+        let current = Rect { x: 2300., y: 100., width: 720., height: 480. };
+        assert_eq!(place(current, (720.,480.), &[area], 0).unwrap().x, -1060.);
+        let current = Rect { x: -1300., ..current };
+        assert_eq!(place(current, (720.,480.), &[area], 0).unwrap().x, -1300.);
+        let tiny = Rect { x: 0., width: 640., ..area };
+        assert_eq!(place(current, (720.,480.), &[tiny], 0).unwrap().x, 0.);
     }
 }
