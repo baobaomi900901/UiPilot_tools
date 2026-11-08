@@ -948,38 +948,9 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PluginInvocation {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) command_id: Option<String>,
-    pub(crate) api_version: u32,
-    pub(crate) request_id: String,
-    pub(crate) input: String,
-    pub(crate) context: PluginInvocationEnvironment,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PluginInvocationEnvironment {
-    pub(crate) platform: PluginInvocationPlatform,
-    pub(crate) theme: PluginInvocationTheme,
-    pub(crate) invoked_at: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PluginInvocationPlatform {
-    Windows,
-    Macos,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PluginInvocationTheme {
-    Dark,
-    Light,
-}
+pub(crate) use super::request_contract::{
+    PluginInvocation, PluginInvocationEnvironment, PluginInvocationPlatform, PluginInvocationTheme,
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

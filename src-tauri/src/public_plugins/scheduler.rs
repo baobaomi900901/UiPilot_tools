@@ -4,34 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
-
 use super::manifest::{valid_plugin_id, PublicActivationMode};
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETAINED_CONTEXTS: usize = 4_096;
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PluginRequestContext {
-    pub(crate) plugin_id: String,
-    pub(crate) plugin_generation: u64,
-    pub(crate) request_id: String,
-}
-
-impl PluginRequestContext {
-    fn valid_shape(&self) -> bool {
-        valid_plugin_id(&self.plugin_id)
-            && self.plugin_generation != 0
-            && self
-                .request_id
-                .strip_prefix("public-request-")
-                .is_some_and(|suffix| {
-                    suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-    }
-}
+pub(crate) use super::request_contract::PluginRequestContext;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginSubmissionOwner {

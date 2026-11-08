@@ -4,6 +4,9 @@ mod activation_bundle;
 mod alarm_asset;
 pub(crate) mod content_action;
 mod data_call_gate;
+#[allow(dead_code)]
+mod call_session;
+mod request_contract;
 mod delayed_messages;
 pub(crate) mod diagnostics;
 pub(crate) mod file_open;

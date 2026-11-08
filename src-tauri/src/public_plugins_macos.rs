@@ -5,6 +5,10 @@ pub(crate) use crate::manifest;
 
 #[path = "public_plugins/data_call_gate.rs"]
 mod data_call_gate;
+#[path = "public_plugins/request_contract.rs"]
+mod request_contract;
+#[path = "public_plugins/call_session.rs"]
+mod call_session;
 #[path = "public_plugins/network/mod.rs"]
 mod network;
 #[path = "public_plugins/sensitive_bytes.rs"]

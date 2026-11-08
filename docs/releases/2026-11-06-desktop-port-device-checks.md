@@ -446,3 +446,17 @@ ES Module `export onCommand` 被当前 evaluateScript 路径拒绝，这是明�
 作者冻结产物 `/private/tmp/uipilot-quickjs-probe.I7Fv4o/`，协调者独立重建 `/private/tmp/uipilot-quickjs-probe.HkqWgl/` 均全绿；后者总日志 `/private/tmp/uipilot-quickjs-coordinator.log`。日志、resources、feature tree、Mac 限定 metadata、源码/锁文件/引擎源码与可执行文件哈希随产物保留。独立审核复核 29 条源码哈希及依赖/helper 哈希匹配，终审通过。helper 为 arm64，ad-hoc 签名验证通过，动态链接仅列 libSystem；这些检查不是 OS 沙箱证明。
 
 本轮没有修改或构建产品宿主、SDK、Windows，未运行 GUI、音频、个人数据或权限服务操作。原样模块与引擎预算的实验已通过，但生产包加载/安装事务、Host bridge、撤权调度、OS 沙箱、进程整体资源预算与 Windows 原生验收仍待实现；独立 job 异常精确分类也保留为后续任务。Panel/Window 的 WK 媒体隔离仍独立阻塞，Mac 生产插件关闭，同包双端生产通过数仍为 0。无需人工安装新包，登录启动人工测试仍暂停。
+
+## 2026-11-08 共享请求生命周期与双向子进程通道
+
+依据[请求通道规格](../superpowers/specs/2026-11-08-macos-runtime-call-session-design.md)，新增产品目录共享 `call_session.rs`，复用真实 `data_call_gate`；最小提取插件 ID 校验器和五个请求/调用 DTO，Windows 原导出路径与 serde 合同保持不变。Mac 编译同源核心，尚未装配生产 Runtime 或 SDK 服务。独立 `spikes/macos-runtime-bridge-probe/` 以真实 QuickJS 子进程和明确命名的 `testMemory` 夹具验证双向通信，不把内存夹具当作 settings/storage 服务。
+
+宿主不可序列化的 Arc 身份绑定请求、activation/admission 与截止时间；对端自报 ID 不能创建权限。调用、回复和最终提交分别验证当前身份与 gate。close 先拒新准入，管道适配器取消并回收子进程，再在锁外排空；已准入操作仍可完成，旧 drain 结束才确认它已退出。UI 最终 owner 检查与实际 SDK 授权接线仍待完成。
+
+协调者主程序验证：all-targets check 退出 0，共享核心聚焦 **9 项通过**；双 preview 全库 **461 项通过、8 项默认忽略**，网络 proxy 子进程另 **1 项通过**。日志 `/private/tmp/uipilot-bridge-main-{check,focused,preview}.log`。本轮没有 UI 改动；未重复人工安装或登录启动测试，Windows 原生运行未执行。
+
+独立审查发现并稳定复现完成时的 stderr 竞态：夹具先发 completion 并关闭 stdout，30 ms 后输出 9000 字节 stderr，正常退出，旧适配器错误接受。红证据 `/private/tmp/uipilot-bridge-stderr-red.log`；修复后必须消费两个输出流的结束事件、拒绝任何错误/额外消息，并确认正常退出，才准许最终提交。严格 typed frame 直接反序列化，重复字段与未知字段拒绝；父写入和子输出分别有累计预算，读写受父 deadline 监督。
+
+最终独立实验 **19 项单测 + 5 项进程测试全部通过**：单测为新 session 9、既有 gate 7、DTO 2、严格帧 1；进程测试实际执行 **22 次子进程案例**，包含往返、阻塞撤销、错误身份、重复 call/completion、提前退出、迟到完成、部分 header/body、超大帧、尾字节、stderr 尾超限及失败后恢复，逐次记录 PID 和已回收状态。作者产物 `/private/tmp/uipilot-bridge-probe.wiXzQG`，协调者独立执行构建测试入口的产物 `/private/tmp/uipilot-bridge-probe.ZmE4Ww`，总日志 `/private/tmp/uipilot-bridge-coordinator.log`。实际运行签名后的 helper，SHA-256 为 `333de20eecf62d92da6f007ec44c1046f2bfedb0003e2b9c86b7a496ac309eb3`；原 Cargo target 文件哈希单列，源码清单包含同源核心及产品集成文件。主程序 Cargo 依赖/锁文件未变。证据中的 source-base-commit 是构建时已有 HEAD，新文件由源码哈希识别，不冒称当时已提交。
+
+OS 隔离采用独立的[XPC 后续接入边界](../superpowers/specs/2026-11-08-macos-runtime-xpc-boundary.md)。本轮只核对公开指南和本机 SDK，不启动 XPC 服务；管道回收和 ad-hoc 签名不计为沙箱证明。生产 Mac 插件继续关闭，同包双端生产通过数仍为 0，Mac 分支不并入 main。
