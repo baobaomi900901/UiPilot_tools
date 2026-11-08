@@ -395,3 +395,15 @@ Mac foundation 同源接入 Windows 已有的 `data_call_gate.rs`，生产实现
 `cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` 退出 0；`cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview` 为 450 通过、8 默认忽略，网络 proxy 子进程另 1 通过。日志 `/private/tmp/uipilot-data-gate-{before,after,check,preview}.log`。全库回归中的网络夹具仅绑定本机临时端口，不改系统信任。没有 GUI、登录项、声音或权限变更。
 
 本次没有装配 Mac plugin manager、数据 gateway 或 Runtime，不构建新的人工安装包；Windows 原生验证未执行，生产插件仍关闭，同包双端插件通过数仍为 0。
+
+## 2026-11-08 无窗口 JSC 子进程探针
+
+依据[独立探针规格](../superpowers/specs/2026-11-08-macos-jsc-probe-design.md)，新增 `spikes/macos-jsc-runtime-probe/`，只运行固定合成脚本。公开 JavaScriptCore + Foundation 原生 helper，经严格 clang、arm64/min15.7.4 构建及 ad-hoc 签名检查，最终自动测试 **10 项全部通过**。没有运行用户插件、GUI、音频、个人文件访问、网络或系统权限操作。
+
+实际证据包括：同步与 Promise 返回；列出的 16 个 DOM/媒体/网络/系统全局入口为 undefined；异常不输出合成秘密正文；唯一响应和 generation/requestId 校验；畸形/重复键/额外字段/重复 wire 完成拒绝。初审后补充 stdout/stderr 各 5000 字节、合计超过 8 KiB 的真实拒绝，以及第二次 JS 完成回调从原来接受第一次结果改为固定 scriptFailed（有红→绿证据）。
+
+同步死循环、永不 settle 的 Promise、先回调再死循环均由父进程截止时间触发 kill + wait。测试逐次要求 `os.waitpid` 报 ChildProcessError 确认子进程已回收，再以新 PID 成功运行正常 case；父读取异常也走真实子进程回收。不能把这些结果解释成生产沙箱或内存硬配额已经实现。
+
+最终日志与源码 SHA-256 位于 `/private/tmp/uipilot-jsc-probe.QDglUD/`；重复 JS 完成红阶段为 `/private/tmp/uipilot-jsc-review.V3M2F0/red/tests.log`。独立源码终审通过。构建目录记录的是构建时基线 HEAD，未提交探针文件另有源码哈希，不误称当时已有最终源码提交。
+
+ES Module `export onCommand` 被当前 evaluateScript 路径拒绝，这是明确的不兼容负例。下一步仍需确定真实包模块加载、API bridge 与生产进程隔离方案；Panel/Window 的 WK 音频问题独立存在，Mac 生产插件继续关闭，同包双端通过数仍为 0。本轮不需要安装新 App 或安排人工音频复验。

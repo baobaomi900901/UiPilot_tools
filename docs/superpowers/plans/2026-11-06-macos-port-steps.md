@@ -141,6 +141,8 @@
 
   2026-11-08 补充：按共用基础规格的「共享数据调用准入补充」将 `data_call_gate.rs` 同源纳入 Mac 编译，保持生产逻辑原样；关闭后不复活、旧身份不能撤销新身份、新旧 lease 排空独立是独立验收序列。聚焦 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib data_call_gate::tests`，并运行双 preview 库回归；不将基础编译通过视为 9.2 完成。WK 暂停路径已经实机失败，详见媒体探针规格的同日结论，不能继续按成功前提开放运行时。
 
+  后续实验依[无窗口 JSC 探针规格](../specs/2026-11-08-macos-jsc-probe-design.md)在 `spikes/macos-jsc-runtime-probe/` 单独验证固定脚本。运行 `./spikes/macos-jsc-runtime-probe/build.sh`，实际检查同步/Promise、协议归属和限额、死循环与 pending Promise 的 kill/wait、回收后新 helper 恢复，以及 ESM 不兼容负例；不运行 GUI/音频或用户包。它不接入产品，不能替代生产 Runtime 架构、沙箱和 Panel/Window 媒体隔离，也不勾选 9.2。
+
 - [ ] **9.3 将宿主凭据与插件秘密隔离。** 分别接入 credentials/ 与 public_plugins/secrets.rs 的 Keychain 后端，按 approved 命名与所有者检查。测试创建/读取/更新/删除、Keychain 锁定、写入失败、撤权和插件冒用 ID；验证未授权请求不触及 Keychain，失败保留旧记录、状态不报成功、日志/JSON 不含测试秘密。
 
   内部介质先依[Keychain 基础规格](../specs/2026-11-07-macos-keychain-foundation-design.md)的「身份、授权与介质」「数据与失败」实现 `macos_keychain.rs`、`macos_keychain/{native,tests}.rs`，由 `platform.rs` 编译但不装配。宿主与插件分别使用固定 namespace，当前 token 决定 owner；精确地址、无交互请求、撤回排空、有界秘密缓冲和错误脱敏分别验证。运行 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib macos_keychain::`。原生 Keychain CRUD/锁定及签名访问控制留统一人工节点，不提前称为生产凭据支持。
