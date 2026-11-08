@@ -23,3 +23,17 @@
 主线程读取窗口几何后按窗口 scale 还原；各显示器工作区按各自 scale 还原；鼠标按主屏 scale 还原后才查询所属屏幕。纯策略按窗口和可用工作区的最大交集选择所在屏幕，在需要时约束到可见范围；完全脱屏才使用鼠标屏/主屏/首个有效工作区回退。恢复尺寸时总是先 Resize 再 Move，避免原生调整尺寸改变左上角；位置尺寸均未变时零原生写入。原生异步队列的真实短暂展示与热拔插边界仍需实机验证。
 
 新增纯策略用例先 5 项失败，修复及补充后 `cargo test --lib macos_host::` 共 22 通过；含 7 项新增定位测试。双预览特性集成库测试 **443 通过/8 默认忽略**，all-targets 检查退出 0。日志 `/private/tmp/uipilot-placement-{red,green}.log`、`/private/tmp/uipilot-cross-display-{tests,check}.log`。独立审核 PASS，未运行 GUI 或修改实际显示器。前端及 Windows 代码未变，未重复跑前端全套，不把原生测试忽略项或未执行的设备测试算作通过。
+
+## 固定测试包
+
+源码提交 `51eb1fa157f1dcf213cffa5851643f509e45f101`。产物位于 `artifacts/macos-internal/51eb1fa/`；`UiPilot-cross-display-51eb1fa.zip` 解压后包含 DMG、候选专属预检、manifest、校验记录与本说明。版本仍为 0.19.0，按候选文件名和哈希区分。
+
+- DMG：`UiPilot-Mac-cross-display-0.19.0-arm64-51eb1fa.dmg`
+- DMG SHA-256：`89bc1f37c8981b78d5406cf17bfed3f7ca488f74684062af4edae40ca9cf09ff`
+- 主程序 SHA-256：`954cc396ef0fbb460ac25a00f9fea100d6b3e6cdc63c96e8a721ea1ceb8ba949`
+
+已只读挂载核对 arm64、最低 macOS 15.7.4、签名、书签 entitlement 与资源；未安装或启动新包。仍为内部 ad-hoc 签名、未公证，启用的两个预览特性不变。生产插件关闭。预检命令：
+
+```sh
+sh preflight-macos-51eb1fa.sh ./UiPilot-Mac-cross-display-0.19.0-arm64-51eb1fa.dmg
+```
