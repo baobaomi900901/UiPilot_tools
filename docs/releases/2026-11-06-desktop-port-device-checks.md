@@ -474,3 +474,19 @@ native 预检先核正在运行的代码身份，再查磁盘 host/service，val
 作者冻结产物 `/private/tmp/uipilot-xpc-probe.5818W6`，协调者独立构建 `/private/tmp/uipilot-xpc-probe.S7G9Jn`，总日志 `/private/tmp/uipilot-xpc-coordinator.log`。19 条源码和 20 条产物哈希已逐项核对；实际 host SHA-256 `4087ca98105eabc2f6b0e9b604c91a33ae8b663331b625387a63e3862e555152`，仅静态验证的 service SHA-256 `1d51354dbf652f2f39b119c252f058457dfcff5326ebe2900cd0f5449680c3a9`。两者为 arm64、minOS 15.7.4、ad-hoc 签名；host 无 entitlement，service 最终签名中只有 app-sandbox=true。静态声明不代表沙箱效果通过。
 
 真实签名下的 peer 认证、launchd 启动/重启、连接错误与服务终止、受控文件/网络拒绝，以及跨插件进程隔离仍未验证。新 connection 或取消回调不计为独占进程/进程退出。无需人工安装此探针；登录启动人工测试仍暂停，生产 Mac 插件保持关闭，同包双端生产通过数仍为 0。本轮未重复未修改产品的整库回归，Mac 分支不并入 main。
+
+## 2026-11-08 插件私有数据基础
+
+按[私有存储与设置规则规格](../superpowers/specs/2026-11-08-macos-plugin-data-foundation-design.md)提取同源 `data_scope.rs`、`storage_document.rs` 和 `settings_values.rs`，保留 Windows 原导出及 state/storage 调用行为。普通设置的定义检查、更新校验和升级 reconcile 已由真实 Windows caller 委派共享实现；Mac 编译同一套规则，未伪造持久配置、安装或权限服务。
+
+Mac 新增 FD 相对的私有文件介质和实际 `PluginStorageStore`。根目录须已存在且私有，本单元以稳定锁对整个 root 排他；每次 owner IO 前核 scope 与真实 data gate identity，lease 跨完整磁盘操作。根/owner/current 的替换、符号链接、硬链接、非普通文件或不合权限均拒绝；首次 missing/存在状态绑定，只有本实例成功 rename 才更新 current 身份。rename 前失败保旧，rename 后同步结果不确定则禁止继续使用该 owner 的已打开存储，不能报告回滚成功。
+
+共享 values 配额仍为 5 MiB、schema 1、原错误枚举；Windows 原 IO、backup 和 quarantine 不变。Mac 原始读取另限 5 MiB + 256，拒绝重复 JSON 键（包括嵌套）并保留递归限制；损坏不假装空数据库。已测试最长合法 pluginId 的文档额外编码在余量内。Mac 这些文件输入限制不扩大成 Windows parser 已修改或 SDK 已接通的结论。
+
+验证结果：**14 项 Mac 存储测试、2 项共享文档测试、4 项共享设置测试通过**。覆盖真实 Unicode/JSON 读写、不同 owner 隔离、remove/重开、准确配额边界、损坏/超限/重复键、root/owner/current/lock 替换、current 的 symlink/hardlink/FIFO/mode、stage 安全回收、root 排他、提交前后故障和阻塞写时撤权。关闭 gate 后新写拒绝，实际 drain 观察仍有在途 lease，释放已准入写后才完成排空，新 identity 可读取其结果。
+
+设置红→绿日志为 `/private/tmp/uipilot-settings-values-{red,green}.log`，两个失败分别为缺失升级保留和默认值合并；最终使用原 reconcile 规则通过。重复原始键真实红例 `/private/tmp/uipilot-plugin-storage-duplicate-red.log` 已修复。撤权测试另做**故障注入敏感性检查**：临时提前 drop lease 会失败于 `!drain.is_drained()`，日志 `/private/tmp/uipilot-plugin-storage-lease-injection-red.log`；最终源码已恢复持有 lease，不能将这项注入称为自然发现的生产缺陷。
+
+协调者独立编译检查退出 0，storage 聚焦 **16/16**；双 preview 全库 **481 通过、8 默认忽略**，网络 proxy 子进程另 **1 通过**。证据归档 `/private/tmp/uipilot-plugin-data-evidence.1fai11uu`，包含 11 个变更 Rust 文件的哈希、锁文件哈希与上述红绿/编译/回归日志。baseCommit 记录归档时已有 HEAD，新实现用源码哈希识别。独立审核通过；Windows 原生回归未执行，不用 Mac 测试冒充。
+
+本轮没有接入 Runtime/SDK gateway、持久插件设置事务、UI、卸载清理或同包双端生产验收；未运行 GUI、XPC 服务、个人数据或系统权限操作。无需人工安装新包，生产 Mac 插件仍关闭，同包双端生产通过数仍为 0。证书相关验收和登录启动人工测试继续延期，Mac 分支不并入 main。

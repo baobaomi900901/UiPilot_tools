@@ -2,6 +2,18 @@
 #![allow(dead_code)]
 
 pub(crate) use crate::manifest;
+#[path = "public_plugins/data_scope.rs"]
+mod data_scope;
+pub(crate) use data_scope::PluginDataScope;
+use data_scope::{authorize_plugin_scope, valid_json_value};
+#[path = "public_plugins/settings_values.rs"]
+mod settings_values;
+#[path = "public_plugins/storage_document.rs"]
+mod storage_document;
+#[path = "public_plugins/private_file_macos.rs"]
+mod private_file_macos;
+#[path = "public_plugins/storage_macos.rs"]
+mod storage;
 
 #[path = "public_plugins/data_call_gate.rs"]
 mod data_call_gate;

@@ -15,6 +15,8 @@ pub(super) struct PluginDataCallIdentity {
 }
 
 impl PluginDataCallIdentity {
+    pub(super) fn plugin_id(&self) -> &str { &self.plugin_id }
+
     pub(super) fn new(
         plugin_id: &str,
         generation: u64,
@@ -185,7 +187,7 @@ impl PluginDataCallDrain {
     }
 
     #[cfg(test)]
-    fn is_drained(&self) -> Result<bool, DataCallGateError> {
+    pub(super) fn is_drained(&self) -> Result<bool, DataCallGateError> {
         Ok(self.epoch.lock_state()?.in_flight == 0)
     }
 }

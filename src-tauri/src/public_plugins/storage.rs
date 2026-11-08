@@ -1,55 +1,22 @@
 use std::{
     collections::BTreeMap,
-    fmt, fs,
+    fs,
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::atomic_file::{commit_with_backup, quarantine_invalid, read_optional, AtomicPaths};
 
 use super::{
-    authorize_plugin_scope,
-    manifest::{valid_plugin_id, valid_storage_key},
+    manifest::valid_plugin_id,
     valid_json_value, PluginDataScope,
 };
 
-const STORAGE_QUOTA_BYTES: usize = 5 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PluginStorageError {
-    Storage,
-    InvalidPlugin,
-    InvalidKey,
-    InvalidValue,
-    InvalidScope,
-    QuotaExceeded,
-}
-
-impl fmt::Display for PluginStorageError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Storage => "public plugin private storage failed",
-            Self::InvalidPlugin => "public plugin private storage owner is invalid",
-            Self::InvalidKey => "public plugin private storage key is invalid",
-            Self::InvalidValue => "public plugin private storage value is invalid",
-            Self::InvalidScope => "public plugin private storage scope is invalid",
-            Self::QuotaExceeded => "public plugin private storage quota exceeded",
-        })
-    }
-}
-
-impl std::error::Error for PluginStorageError {}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StorageDocument {
-    schema: u32,
-    plugin_id: String,
-    values: BTreeMap<String, Value>,
-}
+use super::storage_document::{StorageDocument, validate_access, parse_document, encode_document};
+pub(crate) use super::storage_document::PluginStorageError;
+#[cfg(test)] use super::storage_document::STORAGE_QUOTA_BYTES;
 
 struct StoredDocument {
     document: StorageDocument,
@@ -171,12 +138,7 @@ impl PluginStorageStore {
         document: &StorageDocument,
         previous: Option<&StoredDocument>,
     ) -> Result<StoredDocument, PluginStorageError> {
-        let values =
-            serde_json::to_vec(&document.values).map_err(|_| PluginStorageError::InvalidValue)?;
-        if values.len() > STORAGE_QUOTA_BYTES {
-            return Err(PluginStorageError::QuotaExceeded);
-        }
-        let bytes = serde_json::to_vec(document).map_err(|_| PluginStorageError::InvalidValue)?;
+        let bytes = encode_document(document)?;
         let owner = self.root.join(&document.plugin_id);
         fs::create_dir_all(&owner).map_err(|_| PluginStorageError::Storage)?;
         if !ordinary_directory(&owner) {
@@ -203,21 +165,6 @@ impl PluginStorageStore {
     }
 }
 
-fn validate_access(
-    scope: &PluginDataScope,
-    plugin_id: &str,
-    key: &str,
-) -> Result<(), PluginStorageError> {
-    authorize_plugin_scope(scope, plugin_id).map_err(|_| PluginStorageError::InvalidScope)?;
-    if !valid_plugin_id(plugin_id) {
-        return Err(PluginStorageError::InvalidPlugin);
-    }
-    if !valid_storage_key(key) {
-        return Err(PluginStorageError::InvalidKey);
-    }
-    Ok(())
-}
-
 fn load_owner(owner: &Path, plugin_id: &str) -> Result<Option<StoredDocument>, PluginStorageError> {
     let paths = AtomicPaths::new(owner, "storage.json");
     for path in [paths.current(), paths.backup()] {
@@ -233,20 +180,6 @@ fn load_owner(owner: &Path, plugin_id: &str) -> Result<Option<StoredDocument>, P
         quarantine_invalid(path).map_err(|_| PluginStorageError::Storage)?;
     }
     Ok(None)
-}
-
-fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<StorageDocument> {
-    let document = serde_json::from_slice::<StorageDocument>(bytes).ok()?;
-    let values = serde_json::to_vec(&document.values).ok()?;
-    (document.schema == 1
-        && document.plugin_id == plugin_id
-        && valid_plugin_id(&document.plugin_id)
-        && values.len() <= STORAGE_QUOTA_BYTES
-        && document
-            .values
-            .iter()
-            .all(|(key, value)| valid_storage_key(key) && valid_json_value(value)))
-    .then_some(document)
 }
 
 fn ordinary_directory(path: &Path) -> bool {

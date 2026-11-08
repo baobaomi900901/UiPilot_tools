@@ -20,6 +20,7 @@ use super::{
     },
     valid_json_value, PluginDataScope, PublicManifestV1,
 };
+use super::settings_values::{public_definition, reconcile_settings, stored_value, validate_updates};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -501,15 +502,7 @@ impl PluginStateStore {
         definitions: &[PublicSettingV1],
         updates: &BTreeMap<String, Value>,
     ) -> Result<EffectivePluginConfig, PluginStateError> {
-        for (key, value) in updates {
-            let definition = definitions
-                .iter()
-                .find(|definition| definition.key() == key)
-                .ok_or(PluginStateError::InvalidSetting)?;
-            if definition.is_secret() || !definition.accepts_value(value) {
-                return Err(PluginStateError::InvalidSetting);
-            }
-        }
+        validate_updates(definitions, updates).map_err(|_| PluginStateError::InvalidSetting)?;
         let mut state = self.lock()?;
         let previous = state
             .by_plugin
@@ -539,15 +532,7 @@ impl PluginStateStore {
         definitions: &[PublicSettingV1],
         updates: &BTreeMap<String, Value>,
     ) -> Result<PreparedStateCommit, PluginStateError> {
-        for (key, value) in updates {
-            let definition = definitions
-                .iter()
-                .find(|definition| definition.key() == key)
-                .ok_or(PluginStateError::InvalidSetting)?;
-            if definition.is_secret() || !definition.accepts_value(value) {
-                return Err(PluginStateError::InvalidSetting);
-            }
-        }
+        validate_updates(definitions, updates).map_err(|_| PluginStateError::InvalidSetting)?;
         let state = self.lock()?;
         let previous = state
             .by_plugin
@@ -573,24 +558,14 @@ impl PluginStateStore {
         key: &str,
     ) -> Result<Option<Value>, PluginStateError> {
         authorize_plugin_scope(scope, plugin_id).map_err(|_| PluginStateError::InvalidScope)?;
-        let definition = definitions
-            .iter()
-            .find(|definition| definition.key() == key)
-            .ok_or(PluginStateError::InvalidSetting)?;
-        if definition.is_secret() {
-            return Err(PluginStateError::InvalidSetting);
-        }
+        let definition = public_definition(definitions, key)
+            .map_err(|_| PluginStateError::InvalidSetting)?;
         let state = self.lock()?;
         let stored = state
             .by_plugin
             .get(plugin_id)
             .ok_or(PluginStateError::InvalidPlugin)?;
-        Ok(stored
-            .document
-            .settings
-            .get(key)
-            .cloned()
-            .or_else(|| definition.default_value()))
+        Ok(stored_value(&stored.document.settings, definition))
     }
 
     #[cfg(test)]
@@ -1308,27 +1283,6 @@ fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<PluginStateDocument> 
             .iter()
             .all(|(key, value)| valid_setting_key(key) && valid_json_value(value)))
     .then_some(document)
-}
-
-fn reconcile_settings(
-    previous: Option<&BTreeMap<String, Value>>,
-    definitions: &[PublicSettingV1],
-) -> BTreeMap<String, Value> {
-    let mut settings = BTreeMap::new();
-    for definition in definitions {
-        if definition.is_secret() {
-            continue;
-        }
-        let value = previous
-            .and_then(|values| values.get(definition.key()))
-            .filter(|value| definition.accepts_value(value))
-            .cloned()
-            .or_else(|| definition.default_value());
-        if let Some(value) = value {
-            settings.insert(definition.key().into(), value);
-        }
-    }
-    settings
 }
 
 fn next_revision(revision: u64) -> Result<u64, PluginStateError> {

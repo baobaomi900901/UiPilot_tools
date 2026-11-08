@@ -151,6 +151,8 @@
 
   无可用开发签名证书时，按[XPC 构建实验规格](../specs/2026-11-08-macos-xpc-boundary-probe-design.md)先完成 `spikes/macos-xpc-boundary-probe/` 的固定 ping bundle、Security 预检、两端严格 peer 配置和本地消息/回调测试。依赖上述 XPC 边界，不接引擎、SDK 或真实插件；预检失败零连接，setter 失败零业务消息，owned inactive connection 按系统合同取消并释放。分别验证旧 owner 回调、重复回复、超时、未知字段/能力对象、错误最终 entitlement/bundle 元数据；验证入口 `./spikes/macos-xpc-boundary-probe/build.sh`。本轮不启动服务；真实签名、peer 认证、OS 沙箱和进程复用隔离留待证书具备后。用户已确认暂无账号，继续开发其他宿主能力，不因该验收延期而开放生产插件。
 
+  无证书时继续[私有数据基础](../specs/2026-11-08-macos-plugin-data-foundation-design.md)：提取 `public_plugins/{data_scope,storage_document,settings_values}.rs`，Windows 原导出与 state/storage caller 委派不改变规则或 IO。新增 `private_file_macos.rs`、`storage_macos.rs` 与测试，用真实 data gate lease 覆盖 FD 相对私有磁盘操作，拒绝 scope/identity 拼配、关闭 gate 和错误 owner。验证 root 排他锁、链接/权限/替换、5 MiB 配额和有界输入、损坏拒绝、rename 前旧态与 rename 后不确定状态、阻塞写时撤权排空；设置验证默认值、兼容升级、secret 排除及原错误顺序。聚焦 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib public_plugins::settings_values::tests`、同命令 `public_plugins::storage::tests` 和 `public_plugins::storage_document::tests`，并运行双 preview 主库回归。Mac 持久安装/设置事务、SDK gateway、UI 与真实同包双端验收另行接线，本单元不开放插件。
+
 - [ ] **9.3 将宿主凭据与插件秘密隔离。** 分别接入 credentials/ 与 public_plugins/secrets.rs 的 Keychain 后端，按 approved 命名与所有者检查。测试创建/读取/更新/删除、Keychain 锁定、写入失败、撤权和插件冒用 ID；验证未授权请求不触及 Keychain，失败保留旧记录、状态不报成功、日志/JSON 不含测试秘密。
 
   内部介质先依[Keychain 基础规格](../specs/2026-11-07-macos-keychain-foundation-design.md)的「身份、授权与介质」「数据与失败」实现 `macos_keychain.rs`、`macos_keychain/{native,tests}.rs`，由 `platform.rs` 编译但不装配。宿主与插件分别使用固定 namespace，当前 token 决定 owner；精确地址、无交互请求、撤回排空、有界秘密缓冲和错误脱敏分别验证。运行 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib macos_keychain::`。原生 Keychain CRUD/锁定及签名访问控制留统一人工节点，不提前称为生产凭据支持。
