@@ -23,6 +23,8 @@
     "allow-open-macos-login-item-settings",
     "allow-hide-launcher",
     "allow-save-hotkey",
-    "allow-set-hotkey-recording"
+    "allow-set-hotkey-recording",
+    "allow-get-launcher-hotkey-status",
+    "core:window:allow-start-dragging"
   ]
 }

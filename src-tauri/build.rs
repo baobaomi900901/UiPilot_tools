@@ -165,6 +165,7 @@ fn main() {
             "retake_screenshot",
             "close_screenshot",
             "set_web_search_engine",
+            "get_launcher_hotkey_status",
             "get_macos_login_item",
             "set_macos_login_item",
             "open_macos_login_item_settings",

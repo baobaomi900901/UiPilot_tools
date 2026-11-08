@@ -48,6 +48,7 @@ import {
 
 export const client: LauncherClient = {
   macosLoginItem: createMacLoginItemClient(invoke),
+  macosHotkeyStatus: () => invoke('get_launcher_hotkey_status'),
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),
   listenHidden: (handler) => listen('launcher://hidden', () => handler()),
   listenBuiltinFeaturesChanged: (handler) => listen('builtin-features://changed', () => handler()),

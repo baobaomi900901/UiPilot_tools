@@ -22,6 +22,46 @@ pub(super) struct HotkeyValue { hotkey: String }
 
 const DOUBLE_COMMAND: &str = "DoubleMeta";
 
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct HotkeySnapshot {
+    status: &'static str,
+    configured_hotkey: String,
+    effective_hotkey: Option<String>,
+}
+fn hotkey_snapshot(configured: String, active: Option<Gesture>, tap_active: bool, stopping: bool) -> HotkeySnapshot {
+    let effective = if stopping { None } else { match active {
+        Some(Gesture::DoubleCommand) if tap_active => Some(DOUBLE_COMMAND.to_owned()),
+        Some(Gesture::Chord(key)) if gesture(&configured).ok() == Some(Gesture::Chord(key)) => Some(configured.clone()),
+        Some(key) if gesture("Alt+Space").ok() == Some(key) => Some("Alt+Space".into()),
+        _ => None,
+    }};
+    let status = match effective.as_ref() {
+        None => "unavailable",
+        Some(value) if gesture(value).ok() == gesture(&configured).ok() => "active",
+        Some(_) => "fallback",
+    };
+    HotkeySnapshot { status, configured_hotkey: configured, effective_hotkey: effective }
+}
+
+#[tauri::command]
+pub(super) async fn get_launcher_hotkey_status(window: WebviewWindow) -> Result<HotkeySnapshot, HotkeyError> {
+    require_main(&window).map_err(|code| HotkeyError { code })?;
+    let app = window.app_handle().clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    window.run_on_main_thread(move || {
+        let state = app.state::<LauncherHotkey>();
+        let bindings = state.bindings.lock().expect("hotkey bindings");
+        let configured = app.state::<SettingsStore>().snapshot().hotkey;
+        let tap_active = state.tap.lock().expect("command tap").as_ref()
+            .is_some_and(|registration| registration.enabled.load(Ordering::Acquire) && registration.tap.is_active());
+        let snapshot = hotkey_snapshot(configured, bindings.active, tap_active, state.stopping.load(Ordering::Acquire));
+        let _ = send.send(snapshot);
+    }).map_err(|_| FAILED)?;
+    receive.await.map_err(|_| FAILED)
+}
+
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Gesture { Chord(Shortcut), DoubleCommand }
 
@@ -322,6 +362,20 @@ mod tests {
             }
             self.disk = text.to_owned(); Ok(())
         }
+    }
+
+    #[test]
+    fn status_reports_actual_binding_not_the_saved_double_command_preference() {
+        let chord = gesture("Alt+Space").unwrap();
+        assert_eq!(hotkey_snapshot("DoubleMeta".into(), Some(chord), false, false), HotkeySnapshot {
+            status: "fallback", configured_hotkey: "DoubleMeta".into(), effective_hotkey: Some("Alt+Space".into()),
+        });
+        for (active, alive, stopped) in [(None, false, false), (Some(Gesture::DoubleCommand), false, false), (Some(chord), true, true)] {
+            let state = hotkey_snapshot("DoubleMeta".into(), active, alive, stopped);
+            assert_eq!(state.status, "unavailable"); assert_eq!(state.effective_hotkey, None);
+        }
+        assert_eq!(hotkey_snapshot("DoubleMeta".into(), Some(Gesture::DoubleCommand), true, false).status, "active");
+        assert_eq!(hotkey_snapshot("Alt+Space".into(), Some(chord), false, false).status, "active");
     }
 
     #[test]

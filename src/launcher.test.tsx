@@ -1,3 +1,4 @@
+import { previewCapabilities } from './host-capabilities'
 // @vitest-environment jsdom
 
 import { existsSync, readFileSync } from 'node:fs'
@@ -7262,7 +7263,7 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
   it('uses native app regions without invoking Tauri mouse capture', () => {
-    expect(launcherViewSource).not.toContain('data-tauri-drag-region')
+    expect(launcherViewSource).toContain("core.capabilities.platform === 'macos' && <div className=\"launcher-drag-region\"")
     expect(stylesSource).toMatch(
       /\.launcher-surface,[\s\S]*\.status-region\s*\{[^}]*app-region:\s*drag;/,
     )
@@ -7281,6 +7282,7 @@ describe('React view and accessibility', () => {
     const surface = mounted.host.querySelector<HTMLElement>('.launcher-surface')!
     const regions = Array.from(surface.children) as HTMLElement[]
 
+    expect(surface.querySelector('[data-tauri-drag-region]')).toBeNull()
     expect(regions.map((region) => region.tagName)).toEqual(['DIV', 'DIV'])
     expect(regions.map((region) => region.className)).toEqual([
       'launcher-region launcher-section-region',
@@ -9288,7 +9290,7 @@ describe('real adapter and startup', () => {
       expect(document.querySelector('[role="tab"]')?.textContent).toContain('通用')
       expect(document.body.textContent).not.toMatch(/截图快捷键|开机启动|恢复初始化/)
       expect(document.body.textContent).toContain('搜索引擎')
-      expect(tauriCapture.invoke.mock.calls.map(([name]) => name).every(name => ['load_settings', 'search_apps', 'execute_result'].includes(name))).toBe(true)
+      expect(tauriCapture.invoke.mock.calls.map(([name]) => name).every(name => ['load_settings', 'search_apps', 'execute_result', 'get_launcher_hotkey_status'].includes(name))).toBe(true)
       expect(tauriCapture.listen.mock.calls).toHaveLength(3)
     } finally { await pagehide() }
     for (const { stop } of subscriptions.values()) expect(stop).toHaveBeenCalledOnce()
@@ -11628,4 +11630,25 @@ describe('builtin settings query preservation', () => {
       await vi.waitFor(() => expect(fake.client.searchApps).toHaveBeenCalledWith(expect.objectContaining({ query: '/screenshot' })))
     } finally { core.destroy() }
   })
+})
+
+it.each([13, 229])('does not execute a WK IME confirmation after compositionend (code %s), but accepts the next Enter', async (keyCode) => {
+  Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} }) })
+  const fake = fakeClient(); const core = createLauncherCore(fake.client, undefined, { ...previewCapabilities, platform: 'macos' })
+  await core.start(); fake.emit(shown('ime-wk-owner'))
+  const mounted = await mountLauncherView(core)
+  const keyDown = vi.spyOn(core, 'keyDown')
+  try {
+    const input = mounted.host.querySelector<HTMLInputElement>('input[role="combobox"]')!
+    await act(async () => {
+      input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode, bubbles: true }))
+    })
+    expect(keyDown).not.toHaveBeenCalledWith('Enter', false)
+    await act(async () => { input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true })); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true })) })
+    expect(keyDown).toHaveBeenCalledWith('Enter', false)
+    expect(mounted.host.querySelector('.launcher-drag-region[data-tauri-drag-region]')).not.toBeNull()
+    expect(input.hasAttribute('data-tauri-drag-region')).toBe(false)
+  } finally { await mounted.unmount(); core.destroy() }
 })

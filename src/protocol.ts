@@ -459,6 +459,7 @@ export type ClassifiedTextRecord =
   | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
+  macosHotkeyStatus?: () => Promise<unknown>
   macosLoginItem?: MacLoginItemClient
   credentials?: CredentialClient
   validateYoudaoTranslation(input: { appId: string; appKey: string }): Promise<{ valid: boolean; message: string }>

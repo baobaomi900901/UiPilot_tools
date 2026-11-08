@@ -88,3 +88,19 @@ it('waits for the old control mutation before the replacement control reads thro
     expect(invoke.mock.calls.filter(([command]) => command === 'set_macos_login_item')).toHaveLength(1)
   } finally { await current.close() }
 })
+
+it('keeps notFound visible and only attempts one registration after an explicit click', async () => {
+  const client = clientFixture()
+  vi.mocked(client.read).mockResolvedValue({ status: 'notFound' })
+  vi.mocked(client.set).mockResolvedValue({ status: 'notFound', outcome: 'unconfirmed', issue: 'invalidSignature' })
+  const ui = await mount(client)
+  try {
+    expect(client.set).not.toHaveBeenCalled()
+    await act(async () => button(ui.host, '刷新').click())
+    expect(client.set).not.toHaveBeenCalled()
+    await act(async () => button(ui.host, '尝试启用').click())
+    expect(client.set).toHaveBeenCalledExactlyOnceWith(true)
+    expect(ui.host.textContent).toContain('签名不满足系统登录项要求')
+    expect(ui.host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(false)
+  } finally { await ui.close() }
+})

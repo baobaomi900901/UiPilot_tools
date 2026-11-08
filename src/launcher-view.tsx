@@ -1,3 +1,5 @@
+import { MacHotkeyStatusNotice } from './macos-hotkey-status'
+import { bindCompositionKeys, isCompositionKey } from './ime-keyboard'
 import { MacLoginItemControl } from './macos-login-item-control'
 import { settingsTabAvailable } from './host-capabilities'
 import { BuiltinFeatureDetail } from './builtin-feature-panel'
@@ -94,6 +96,7 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
       return () => core.retireControl(control)
     }
     let unbind: (() => void) | undefined
+    let unbindKeys: (() => void) | undefined
     let cleaned = false
     const cleanup = () => {
       if (cleaned) return
@@ -102,6 +105,7 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
         onUnbound?.(input)
       } finally {
         try {
+          unbindKeys?.()
           unbind?.()
         } finally {
           core.retireControl(control)
@@ -109,6 +113,7 @@ function BoundInput({ core, control, value, onBound, onUnbound, onBindingFailed,
       }
     }
     try {
+      unbindKeys = bindCompositionKeys(input)
       unbind = bindNativeTextInput(input, control, core.text)
       onBound?.(input)
       return cleanup
@@ -162,7 +167,7 @@ function CommandTag({
 }
 
 function composing(event: ReactKeyboardEvent): boolean {
-  return event.nativeEvent.isComposing
+  return isCompositionKey(event.nativeEvent)
 }
 
 function preventBrowserFind(event: ReactKeyboardEvent<HTMLElement>): void {
@@ -307,6 +312,7 @@ function scrollFileResultIntoView(container: HTMLElement | null, selected: HTMLE
 
 export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewProps): React.JSX.Element {
   const snapshot = useSyncExternalStore(core.subscribe, core.getSnapshot, core.getSnapshot)
+  const [hotkeyStatusRevision, setHotkeyStatusRevision] = useState(0)
   const [scheme] = useState(() => window.matchMedia('(prefers-color-scheme: dark)'))
   const [systemDark, setSystemDark] = useState(scheme.matches)
   const [publicPluginRemovalOutcome, setPublicPluginRemovalOutcome] = useState<PublicPluginRemovalOutcome | null>(null)
@@ -2044,7 +2050,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 allowSameValue={core.capabilities.platform === 'macos'}
                 allowDoubleTap={core.capabilities.doubleTap}
                 platform={core.capabilities.platform}
-                onCommit={core.saveHotkeyCanonical}
+                onCommit={async (value) => { try { await core.saveHotkeyCanonical(value) } finally { setHotkeyStatusRevision(value => value + 1) } }}
                 onRecordingPhase={handleHotkeyRecordingPhase}
                 value={settings.hotkey.value}
                 id={`settings-hotkey-${settings.hotkey.key}`}
@@ -2052,6 +2058,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 disabled={locked}
               />
             </Form.Item>
+            {core.capabilities.platform === 'macos' && <MacHotkeyStatusNotice read={core.client.macosHotkeyStatus} revision={hotkeyStatusRevision} />}
             {core.capabilities.screenshot && <>
               <Form.Item label="截图快捷键" htmlFor="settings-screenshot-hotkey" help={settings.screenshotHotkeyStatus === 'unavailable' ? '快捷键不可用，请重新录制或清除后重试。' : settings.screenshotHotkeyStatus === 'active' ? '已启用' : '未设置'}>
                 <HotkeyRecorderInput
@@ -2479,6 +2486,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           data-color-scheme={colorScheme}
           onKeyDownCapture={(event) => { preventBrowserFind(event); launcherTabKeyDown(event) }}
         >
+          {core.capabilities.platform === 'macos' && <div className="launcher-drag-region" data-tauri-drag-region title="拖动窗口" />}
           <div className="launcher-region launcher-section-region">
             {snapshot.view === 'launcher' ? (quicklinksPanel ?? panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
           </div>
@@ -2490,7 +2498,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 : launcherResultsActive && snapshot.resultActionRerun
                 ? snapshot.status === '已复制' ? ' is-action-success' : ' is-action-error'
                 : launcherResultsActive && snapshot.executePending && statusResult?.actions ? ' is-action-pending' : ''}`}
-                role="status" aria-live="polite" aria-atomic="true" title={status || undefined}>
+                data-tauri-drag-region={core.capabilities.platform === 'macos' ? true : undefined} role="status" aria-live="polite" aria-atomic="true" title={status || undefined}>
                 {status}
               </div>
               <div className="launcher-status-actions">

@@ -14,7 +14,7 @@ Mac 不把持久化 `settings.autostart` 当成实际登录项状态。保留此
 
 原生操作在 AppKit 主线程执行，所有对象在该线程创建和释放。状态读取和一次变更在宿主统一主线程队列串行，不能只依赖某个前端组件的 busy；同步 register/unregister 之后重读 status。不创建 helper、不写 LaunchAgents、不使用 shell/AppleScript、不申请管理员权限、不改其它登录项。
 
-- enable：enabled 时仅返回 unchanged；requiresApproval 时返回 requiresApproval，不重复 register 或自动打开系统设置；notRegistered 时只调用 register 一次；notFound/unavailable 不发变更。
+- enable：enabled 时仅返回 unchanged；requiresApproval 时返回 requiresApproval，不重复 register 或自动打开系统设置；notRegistered 时只调用 register 一次；2026-11-08 实测修订：notFound 保留系统事实，允许用户明确点击“尝试启用”调用 register 一次，不能由读取、刷新或启动触发；unavailable 不发变更。
 - disable：notRegistered 时仅返回 unchanged；enabled/requiresApproval 时只调用 unregister 一次；notFound/unavailable 不发变更。
 - 每次原生变更后，无论 bool 成功与否，都尝试重新读取 status。仅成功且目标事实匹配时返回 applied；成功注册后 requiresApproval 返回 requiresApproval；其余返回 unconfirmed。不存在自动重试或补偿注册/注销。
 - 通过明确点击“打开系统登录项”才调用 `openSystemSettingsLoginItems`；仅表示请求打开设置，不表示用户批准。不自动导航、不模拟用户允许。返回设置后用户点击“刷新”获得新事实。
@@ -23,9 +23,9 @@ Mac 不把持久化 `settings.autostart` 当成实际登录项状态。保留此
 
 ## 内部 DTO 与界面
 
-读取返回 `{ status }`；变更返回 `{ status, outcome }`，outcome 为 `applied | unchanged | requiresApproval | unconfirmed`。状态与结果独立：例如返回 false 但重读 enabled，界面应展示实际 enabled 同时说明变更未能确认，不能用失败的乐观值覆盖事实。协议解析拒绝未知字段/值与不完整对象，失败不猜测已关闭。
+读取返回 `{ status }`；变更返回 `{ status, outcome, issue? }`，outcome 为 `applied | unchanged | requiresApproval | unconfirmed`。状态与结果独立：例如返回 false 但重读 enabled，界面应展示实际 enabled 同时说明变更未能确认，不能用失败的乐观值覆盖事实。协议解析拒绝未知字段/值与不完整对象，失败不猜测已关闭。
 
-新增窄 `loginItems` 能力，只有 Mac 内部 `macos-login-item-preview` 构建为 true；默认发布构建仍为 false，IPC 在可信来源检查之后复核 feature，未开启时零原生调用。70% 内部候选显式带该 feature 做人工验收，通过后再决定正式开放。Windows autostart 能力保持原样。Mac 设置使用独立、可键盘操作的紧凑控件：仅 enabled 显示勾选；requiresApproval 显示等待系统允许，并提供独立“停止注册”按钮（不可因勾选已为 false 就跳过），以及打开系统设置按钮；notFound/unavailable 显示不可用，可刷新。读/写期间禁用重复操作，不展示旧的可编辑状态。固定提示，使用既有主题、按钮、标签规范，不新增启动器结果或收藏。
+新增窄 `loginItems` 能力，只有 Mac 内部 `macos-login-item-preview` 构建为 true；默认发布构建仍为 false，IPC 在可信来源检查之后复核 feature，未开启时零原生调用。70% 内部候选显式带该 feature 做人工验收，通过后再决定正式开放。Windows autostart 能力保持原样。Mac 设置使用独立、可键盘操作的紧凑控件：仅 enabled 显示勾选；requiresApproval 显示等待系统允许，并提供独立“停止注册”按钮（不可因勾选已为 false 就跳过），以及打开系统设置按钮；notFound 显示系统尚未找到并提供“尝试启用”，unavailable 显示无法读取，可刷新。读/写期间禁用重复操作，不展示旧的可编辑状态。固定提示，使用既有主题、按钮、标签规范，不新增启动器结果或收藏。
 
 首次进入设置/组件重建时只读；刷新只读。前端区分组件生命周期与请求序号，卸载后的响应不更新新界面；一个组件最多一个变更在途，read/refresh 不抢占变更。再次进入设置始终重读系统状态。主窗口隐藏/切换时迟到 UI 完成不恢复旧设置界面；已由用户提交的系统操作允许完成，不自动反向补偿。Web 设置、改键与登录项互不借用保存接口。主页面持久单例 client 在 set 调用时同步登记 pending，跨组件的新 read 循环等待所有已提交 mutation settle 后才读取；重复 set 固定 busy 且零 IPC，unmount 不清 shared pending。原生响应直到变更与 status 复读实际完成才 settle。
 
@@ -36,3 +36,9 @@ Mac 不把持久化 `settings.autostart` 当成实际登录项状态。保留此
 前端测试覆盖严格 DTO、enabled/待批准/不可用三种呈现、显式启停与设置按钮、刷新零变更、操作期间禁用、错误不含原生详情、卸载/重建旧回调隔离及 Windows 原控件保持。ACL 检查三命令只授 main，handler 每次 require_main 在原生之前。
 
 约 70% 时用固定哈希的已签名内部包，在获准测试账户人工验证：启用、系统面板核对、外部撤销、刷新、注销/登录后行为、停用及恢复测试前状态。签名/系统通知/真实登录行为未验证前，不称本项完整验收通过；无需现在操作测试者的系统设置。
+
+## 2026-11-08 实测修订与界限
+
+候选 42a094b 在 M1 Pro / 15.7.4 返回 NotFound，旧实现禁用所有注册操作，不能进一步取得失败原因。新实现不伪装未注册或已启用：显式“尝试启用”只调用一次 mainAppService 注册，完成后仍无条件复读状态。没有实际调用系统注册，因此是否恢复仍待人工测试，不能称原生根因已修复。安装应用只读签名检查为 ad-hoc、无 TeamIdentifier；这只是环境证据，不能仅据此判定 NotFound 的原因。
+
+`issue` 只在失败变更时返回固定枚举 `invalidSignature | permissionDenied | serviceUnavailable | notFound | unknown`，仅 SDK 的 SMAppServiceErrorDomain 中已知 code 做分类；其它域/代码/异常统一 unknown，不读取或输出 localizedDescription、userInfo 或路径。NSError 在原生调用的 autoreleasepool 内立即分类，异常返回不读取 out-pointer。issue 与实际 postread 状态分别呈现，即使 postread enabled 也不能把失败的调用报 Applied。前端严格拒绝非 unconfirmed 携带 issue 及未知枚举。

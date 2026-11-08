@@ -359,7 +359,7 @@ pub fn run() {
         .manage(Mutex::new(Presentation::default()))
         .invoke_handler(tauri::generate_handler![
             crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
-            hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording,
+            hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording, hotkey::get_launcher_hotkey_status,
             get_macos_login_item, set_macos_login_item, open_macos_login_item_settings,
             crate::macos_apps::search_apps, crate::macos_apps::execute_result,
             #[cfg(feature = "macos-find-preview")] set_builtin_feature_favorite,

@@ -3078,3 +3078,7 @@ label,
 @media (max-width: 540px) {
   .public-plugin-detail-list { grid-template-columns: 80px minmax(0, 1fr); gap: 0 12px; }
 }
+
+/* A dedicated native drag strip keeps text selection and buttons interactive. */
+.launcher-surface { position: relative; }
+.launcher-drag-region { position: absolute; inset: 0 0 auto; z-index: 1; height: 8px; cursor: grab; }

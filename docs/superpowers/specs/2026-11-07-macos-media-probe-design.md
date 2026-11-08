@@ -36,3 +36,11 @@ fixture 只用 CSP 明确允许的内联固定脚本、内存 data WAV、合成 
 默认自动检查只编译/link、签名和检查 Mach-O/Info.plist，以及运行纯生命周期核心的确定性测试；不启动 AppKit/WKWebView，不播放音频。源构建禁止覆写已有输出，交付独立 `.app`/zip、源码提交与 SHA-256，附固定顺序人工清单。
 
 先执行正常基线，再执行暂停/新导航/迟到回调。记录每次 case、generation、fixture 是否获准加载、原生原值及脚本观测；无论结果怎样，UiPilot 生产插件保持关闭，待原生合同缺口单独解决。本次不是插件双端实测通过，不能增加其计数。
+
+## 2026-11-08 实机结论：暂停路径未通过
+
+M1 Pro / macOS 15.7.4，探针 b279271：HTMLMedia 与 WebAudio 基线均推进并有短音；“先暂停再加载” completion 已到，HTML play 被拒绝且时钟不动，WebAudio resume 后 running 至约 1.698 秒，用户听到声音；原生活动状态仍为 Suspended。详见设备验收单同日原始关键日志。
+
+这项实测反证了当前暂停路径可作为所有音频出口隔离的假设，不能用 completion 或活动状态签发 GuardProof。生产插件保持关闭。其余 reload、替换、语音、WebContent 进程更换未验，不继续要求用户重复发声来将失败“刷过”。后续方案须提供可验证的原生全音频禁用/隔离，或采用不具备网页媒体能力的独立 runtime 并审查兼容性；页面脚本覆写、CSP、自动播放手势限制及轮询暂停均不能作为当前严格合同的替代。没有在本轮擅自更改插件合同或开放运行。
+
+SDK WKWebView.h 与 [Apple 暂停接口](https://developer.apple.com/documentation/webkit/wkwebview/setallmediaplaybacksuspended(_:completionhandler:))是 API 参照，设备实测决定当前候选能否通过；本轮未找到足以证明此失败已经修复的公开原生替代接口。

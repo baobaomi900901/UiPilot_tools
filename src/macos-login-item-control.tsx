@@ -4,7 +4,14 @@ import type { LoginItemStatus, MacLoginItemClient } from './macos-login-item'
 
 const labels: Record<LoginItemStatus, string> = {
   notRegistered: '未启用', enabled: '已启用', requiresApproval: '等待系统允许',
-  notFound: '当前应用的登录项不可用', unavailable: '无法读取系统登录项状态',
+  notFound: '系统尚未找到当前应用的登录项', unavailable: '无法读取系统登录项状态',
+}
+const issues = {
+  invalidSignature: '当前应用签名不满足系统登录项要求，请使用符合签名要求的安装包。',
+  permissionDenied: '系统未允许此登录项，请核对系统设置后刷新。',
+  serviceUnavailable: '系统登录项服务暂不可用，请稍后刷新。',
+  notFound: '系统仍未找到此应用的登录项，请确认从应用程序目录启动。',
+  unknown: '系统未能完成此次变更，请核对状态后再操作。',
 }
 const uncertain = '变更未能确认，请核对系统登录项后刷新。'
 
@@ -28,7 +35,7 @@ export function MacLoginItemControl({ client, disabled = false }: { client?: Mac
       else {
         const result = await client.set(enabled)
         next = result.status
-        if (result.outcome === 'unconfirmed') notice = uncertain
+        if (result.outcome === 'unconfirmed') notice = result.issue ? issues[result.issue] : uncertain
       }
     } catch {
       if (kind === 'set') {
@@ -58,6 +65,7 @@ export function MacLoginItemControl({ client, disabled = false }: { client?: Mac
       <span role="status">{busy ? '正在确认系统状态…' : labels[status]}</span>
       <Space size={8} wrap>
         <Button disabled={locked} onClick={() => void run('read')}>刷新</Button>
+        {status === 'notFound' && <Button disabled={locked} onClick={() => void run('set', true)}>尝试启用</Button>}
         {status === 'requiresApproval' && <>
           <Button disabled={locked} onClick={() => void run('open')}>打开系统登录项</Button>
           <Button disabled={locked} onClick={() => void run('set', false)}>停止注册</Button>

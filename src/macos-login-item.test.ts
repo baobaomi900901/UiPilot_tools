@@ -22,6 +22,12 @@ describe('Mac login item protocol and cross-view mutation ownership', () => {
     }
   })
 
+  it('accepts only fixed issue classifications on unconfirmed mutations', () => {
+    expect(parseLoginItemMutation({ status: 'notFound', outcome: 'unconfirmed', issue: 'invalidSignature' })).toEqual({ status: 'notFound', outcome: 'unconfirmed', issue: 'invalidSignature' })
+    for (const issue of ['native error text', null, 3]) expect(parseLoginItemMutation({ status: 'notFound', outcome: 'unconfirmed', issue })).toBeNull()
+    expect(parseLoginItemMutation({ status: 'enabled', outcome: 'applied', issue: 'invalidSignature' })).toBeNull()
+  })
+
   it('waits for a previous view mutation before reading and rejects duplicate mutation without IPC', async () => {
     const update = deferred()
     const invoke = vi.fn(async (command: string) => command === 'set_macos_login_item' ? update.promise : { status: 'enabled' })

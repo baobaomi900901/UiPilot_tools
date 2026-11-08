@@ -1,6 +1,7 @@
 export type LoginItemStatus = 'notRegistered' | 'enabled' | 'requiresApproval' | 'notFound' | 'unavailable'
 export type LoginItemSnapshot = Readonly<{ status: LoginItemStatus }>
-export type LoginItemMutation = Readonly<LoginItemSnapshot & { outcome: 'applied' | 'unchanged' | 'requiresApproval' | 'unconfirmed' }>
+export type LoginItemIssue = 'invalidSignature' | 'permissionDenied' | 'serviceUnavailable' | 'notFound' | 'unknown'
+export type LoginItemMutation = Readonly<LoginItemSnapshot & { outcome: 'applied' | 'unchanged' | 'requiresApproval' | 'unconfirmed'; issue?: LoginItemIssue }>
 export interface MacLoginItemClient {
   read(): Promise<LoginItemSnapshot>
   set(enabled: boolean): Promise<LoginItemMutation>
@@ -18,9 +19,10 @@ export function parseLoginItemSnapshot(value: unknown): LoginItemSnapshot | null
   return data && states.includes(data.status as string) ? Object.freeze({ status: data.status as LoginItemStatus }) : null
 }
 export function parseLoginItemMutation(value: unknown): LoginItemMutation | null {
-  const data = record(value, ['status', 'outcome'])
-  return data && states.includes(data.status as string) && ['applied', 'unchanged', 'requiresApproval', 'unconfirmed'].includes(data.outcome as string)
-    ? Object.freeze({ status: data.status, outcome: data.outcome }) as LoginItemMutation : null
+  const data = record(value, ['status', 'outcome']) ?? record(value, ['status', 'outcome', 'issue'])
+  if (!data || !states.includes(data.status as string) || !['applied', 'unchanged', 'requiresApproval', 'unconfirmed'].includes(data.outcome as string)) return null
+  if ('issue' in data && (data.outcome !== 'unconfirmed' || !['invalidSignature', 'permissionDenied', 'serviceUnavailable', 'notFound', 'unknown'].includes(data.issue as string))) return null
+  return Object.freeze({ ...data }) as LoginItemMutation
 }
 const unavailable = () => ({ code: 'loginItemUnavailable' as const })
 const busy = () => ({ code: 'loginItemBusy' as const })
