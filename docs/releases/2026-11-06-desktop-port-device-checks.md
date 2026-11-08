@@ -554,3 +554,9 @@ Storage/CommitUncertain 错误先撤销旧选择和 token、释放控制器与�
 日志与记录：`/private/tmp/uipilot-management-evidence.wlt8x19o`；浏览器截图：`/private/tmp/uipilot-management-visual.lc6qg7f2`。设计与计划分别为 `docs/superpowers/specs/2026-11-08-macos-plugin-management-ui-design.md` 和 `docs/superpowers/plans/2026-11-08-macos-plugin-management-ui.md`。
 
 **尚未实机验证：** Tauri 原生选包/TCC、真实应用窗口焦点、管理包安装后交互。没有启动 UiPilot GUI、修改用户授权或个人安装库。开发者签名/XPC 沙箱、插件生产执行、完整模块图、真实能力服务及双端同包生产验收仍未完成，同包双端生产宿主通过数仍为 **0**。这些待验收项未计入本轮自动通过。
+
+### 管理页键盘与安装确认补充
+
+插件列表补齐上下键及 Home/End 焦点导航，只访问当前筛选后可用行；边界停留，输入法组词（含 keyCode 229）及修饰键不触发导航。进入详情再返回会恢复原行焦点。替换已安装插件时同时显示当前版本与目标版本，按钮明确为「确认替换」；不把同版本重装或较低版本误称为升级，不改变 Host 的安装准入规则。新安装仍为「确认安装」。
+
+管理 UI/client 与实际 Launcher 回归 **416 通过、18 跳过**，生产构建通过。键盘导航和版本展示已确认旧实现测试失败，再修复通过。浅深主题在独立浏览器模拟安装库中检查；仍未操作真实应用或系统授权。本轮仅前端行为和文案，未重复计算上一轮 Rust 测试为新增通过。

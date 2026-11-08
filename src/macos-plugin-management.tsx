@@ -1,6 +1,6 @@
 import { Button, Input, Modal, Select, Switch } from 'antd'
 import { ArrowLeft, FolderOpen, RefreshCw, Upload } from 'lucide-react'
-import { useEffect, useLayoutEffect, useImperativeHandle, useRef, useState, type Ref } from 'react'
+import { useEffect, useLayoutEffect, useImperativeHandle, useRef, useState, type KeyboardEvent, type Ref } from 'react'
 import type { MacPluginManagementClient, MacPluginPreview, MacPluginSnapshot, OrdinarySetting, SettingValues } from './macos-plugin-management-client'
 import './macos-plugin-management.css'
 
@@ -128,6 +128,16 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
   }
   const disabled = busy || needsReview || !snapshot || !client
   const list = snapshot?.plugins.filter(p => `${p.name} ${p.commands.map(c => c.name).join(' ')}`.toLocaleLowerCase().includes(filter.toLocaleLowerCase())) ?? []
+  const installed = prepared ? snapshot?.plugins.find(p => p.pluginId === prepared.plugin.pluginId) : undefined
+  const listKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (busy || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    const rows = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('button[data-plugin-id]:not(:disabled)')]
+    const index = rows.findIndex(row => row === event.target)
+    if (index < 0) return
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? rows.length - 1 : Math.max(0, Math.min(rows.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))
+    event.preventDefault(); event.stopPropagation(); rows[next]?.focus()
+  }
   return <section ref={section} className="mac-plugin-management" aria-label="插件管理" aria-busy={busy}>
     <div className="mac-plugin-toolbar">
       {selected ? <Button aria-label="返回插件列表" icon={<ArrowLeft size={16} />} disabled={busy} onClick={() => requestLeave(() => { setDrafts(new Map()); setSelected(null) })} /> : <h2>插件</h2>}
@@ -139,7 +149,7 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
     <div className="mac-plugin-feedback" aria-live="polite">{busy ? <span role="status">正在处理…</span> : null}{notice ? <span role="status">{notice}</span> : null}{error ? <span role="alert">{error}</span> : null}{!client ? <span role="alert">插件管理暂不可用。</span> : null}</div>
     {!selected ? <>
       <Input aria-label="搜索插件名称或启动命令" placeholder="搜索插件名称或启动命令" value={filter} onChange={e => setFilter(e.target.value)} allowClear />
-      <div className="mac-plugin-list">
+      <div className="mac-plugin-list" onKeyDown={listKeyDown}>
         {list.map(p => <button className="mac-plugin-row" key={p.pluginId} data-plugin-id={p.pluginId} disabled={busy} onClick={() => { setSelected(p.pluginId); setDrafts(new Map()); setNotice('') }}>
           <span><strong>{p.name}</strong><small>{p.commands.map(c => `/${c.name}`).join(' · ')}</small></span><span>{p.version}<small>{p.enabled ? '启用配置已保存' : '已停用'}</small></span>
         </button>)}
@@ -169,8 +179,8 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
       <Button danger disabled={disabled} onClick={() => requestLeave(() => { setDrafts(new Map()); setRemoveOpen(true) })}>移除插件</Button>
     </div> : <p>插件已不在当前安装清单中，请返回列表。</p>}
     <Modal title="放弃未保存修改？" open={!!leave} onCancel={() => setLeave(null)} footer={<><Button onClick={() => setLeave(null)}>取消</Button><Button danger onClick={() => { const action = leave; setLeave(null); setDrafts(new Map()); action?.() }}>放弃修改</Button></>}><p>尚未保存的普通设置将被放弃。</p></Modal>
-    <Modal title={prepared && snapshot?.plugins.some(p => p.pluginId === prepared.plugin.pluginId) ? '升级插件' : '安装插件'} open={!!prepared} onCancel={() => void cancel()} closable={!busy} mask={{ closable: !busy }} keyboard={!busy} footer={<><Button disabled={busy} onClick={() => void cancel()}>取消</Button><Button type="primary" disabled={busy} onClick={() => void commit()}>确认安装</Button></>}>
-      {prepared ? <><p>{prepared.plugin.name} · {prepared.plugin.version}</p><p>当前 Mac 暂不能运行此插件。</p>{prepared.requiredPermissions.length ? <p>本次确认将保存新增授权：写入剪贴板（运行可用后生效）。</p> : <p>本次安装没有新增权限。</p>}</> : null}
+    <Modal title={installed ? '替换已安装插件' : '安装插件'} open={!!prepared} onCancel={() => void cancel()} closable={!busy} mask={{ closable: !busy }} keyboard={!busy} footer={<><Button disabled={busy} onClick={() => void cancel()}>取消</Button><Button type="primary" disabled={busy} onClick={() => void commit()}>{installed ? '确认替换' : '确认安装'}</Button></>}>
+      {prepared ? <><p>{prepared.plugin.name}</p>{installed ? <p>当前版本：{installed.version}</p> : null}<p>目标版本：{prepared.plugin.version}</p><p>当前 Mac 暂不能运行此插件。</p>{prepared.requiredPermissions.length ? <p>本次确认将保存新增授权：写入剪贴板（运行可用后生效）。</p> : <p>本次安装没有新增权限。</p>}</> : null}
     </Modal>
     <Modal title="移除插件" open={removeOpen} onCancel={() => setRemoveOpen(false)} footer={<><Button onClick={() => setRemoveOpen(false)}>取消</Button><Button danger disabled={disabled} onClick={() => { setRemoveOpen(false); if (plugin && snapshot && client) void mutate(() => client.remove({ pluginId: plugin.pluginId, expectedRevision: snapshot.revision }), '安装和普通设置已移除，插件存储数据已保留。') }}>移除安装和设置</Button></>}><p>移除 {plugin?.name} 的安装和普通设置，保留插件存储数据。再次安装时需要重新确认权限。</p></Modal>
   </section>
