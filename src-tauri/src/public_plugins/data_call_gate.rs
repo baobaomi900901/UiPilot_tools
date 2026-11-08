@@ -292,6 +292,74 @@ mod tests {
     }
 
     #[test]
+    fn reactivating_the_same_closed_identity_does_not_restore_authority() {
+        let gate = PluginDataCallGate::default();
+        let current = identity(1, 1, 1);
+        gate.activate(current.clone()).unwrap();
+        let lease = gate.try_acquire(&current).unwrap();
+        let first_drain = gate.close(&current).unwrap();
+        gate.activate(current.clone()).unwrap();
+        let repeated_drain = gate.close(&current).unwrap();
+
+        assert_eq!(
+            gate.try_acquire(&current).unwrap_err(),
+            DataCallGateError::Expired
+        );
+        assert!(!first_drain.is_drained().unwrap());
+        assert!(!repeated_drain.is_drained().unwrap());
+        drop(lease);
+        assert!(first_drain.is_drained().unwrap());
+        assert!(repeated_drain.is_drained().unwrap());
+    }
+
+    #[test]
+    fn stale_close_and_remove_cannot_revoke_a_replacement_identity() {
+        for replacement in [identity(2, 1, 1), identity(1, 2, 1), identity(1, 1, 2)] {
+            let gate = PluginDataCallGate::default();
+            let first = identity(1, 1, 1);
+            gate.activate(first.clone()).unwrap();
+            gate.close(&first).unwrap().wait().unwrap();
+            gate.activate(replacement.clone()).unwrap();
+
+            assert!(matches!(
+                gate.close(&first),
+                Err(DataCallGateError::Expired)
+            ));
+            assert!(!gate.remove(&first).unwrap());
+            assert!(gate.try_acquire(&replacement).is_ok());
+            assert!(gate.remove(&replacement).unwrap());
+            assert!(!gate.remove(&replacement).unwrap());
+            assert_eq!(
+                gate.try_acquire(&replacement).unwrap_err(),
+                DataCallGateError::Expired
+            );
+        }
+    }
+
+    #[test]
+    fn old_drain_tracks_only_old_leases_while_replacement_accepts_calls() {
+        let gate = PluginDataCallGate::default();
+        let first = identity(1, 1, 1);
+        gate.activate(first.clone()).unwrap();
+        let first_lease = gate.try_acquire(&first).unwrap();
+        let other_first_lease = gate.try_acquire(&first).unwrap();
+        let first_drain = gate.close(&first).unwrap();
+        let second = identity(2, 2, 2);
+        gate.activate(second.clone()).unwrap();
+        let second_lease = gate.try_acquire(&second).unwrap();
+        let second_drain = gate.close(&second).unwrap();
+
+        drop(first_lease);
+        assert!(!first_drain.is_drained().unwrap());
+        drop(other_first_lease);
+        assert!(first_drain.is_drained().unwrap());
+        assert!(!second_drain.is_drained().unwrap());
+        assert!(!gate.remove(&first).unwrap());
+        drop(second_lease);
+        assert!(second_drain.is_drained().unwrap());
+    }
+
+    #[test]
     fn malformed_or_zero_identity_is_rejected() {
         for identity in [
             PluginDataCallIdentity::new("", 1, 1, 1),

@@ -3,6 +3,8 @@
 
 pub(crate) use crate::manifest;
 
+#[path = "public_plugins/data_call_gate.rs"]
+mod data_call_gate;
 #[path = "public_plugins/network/mod.rs"]
 mod network;
 #[path = "public_plugins/sensitive_bytes.rs"]

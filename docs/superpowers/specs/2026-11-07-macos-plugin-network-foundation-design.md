@@ -25,3 +25,9 @@ Native TLS 在 Mac 使用锁定依赖的系统后端。任何 Mac 失败先定�
 重点验证提取后的 SensitiveBytes 格式不暴露内容、Windows imports 和静态接口保持原样；不将本次 Mac 测试称为 Windows 原生回归。运行 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib public_plugins::network::`、同命令过滤 `public_plugins::webview_audio_guard::`，并完成全仓协调器及 Find/登录项内部 feature 组合验证。
 
 生产权限 gateway、运行时 bootstrap、WKWebView 原生隔离和同包双端插件实测仍待后续。本单元只是提前验证真实跨平台传输与生命周期底层，70% 节点交付清单必须保持这些边界。
+
+## 2026-11-08 共享数据调用准入补充
+
+Mac foundation 同源编译既有 `public_plugins/data_call_gate.rs`。不复制实现，不改 Windows 生产行为，不实例化数据服务或把该模块接成可调用的 Mac gateway。身份仍为 plugin ID、generation、activation ID、admission epoch；相同身份的重复 activate 不重新打开已经关闭的门。
+
+自动验证除原有身份、关闭与等待调用结束用例外，明确覆盖：关闭后同身份 activate 仍拒绝新调用；旧 generation、activation 或 admission epoch 的 close/remove 不能撤销替代身份；旧实例两个 lease 逐个释放时仅其 drain 完成，新实例 lease 不受影响。测试直接观察各自 drain 的状态，不能用等待时间代替新旧归属断言。没有 manager、scheduler、凭据存储或原生媒体 proof 的装配，也不据此增加同包双端插件通过计数。

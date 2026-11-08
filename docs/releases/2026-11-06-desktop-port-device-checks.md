@@ -387,3 +387,11 @@ g=4 finished：HTML paused=1 t=0.000，WebAudio running t=1.698
 ## 2026-11-08 51eb1fa 跨屏位置人工复验通过
 
 用户确认替换安装并启动跨屏修复候选 `51eb1fa`，随后反馈“多次测试，现在可以按上一次消失的位置再次激活显示”。结合正在执行的外接屏拖动/隐藏/再唤起步骤，跨屏位置保持记为通过。固定候选哈希及边界见[跨屏修复记录](2026-11-08-macos-cross-display-fix.md#2026-11-08-人工复验通过)。这是用户实测证据，不外推拔屏、其它排列/缩放或完整退出后的持久化。当前 Shift + 空格；登录启动人工测试仍暂停，媒体隔离失败仍未解决，生产插件关闭。
+
+## 2026-11-08 Mac 共享数据调用准入验证
+
+Mac foundation 同源接入 Windows 已有的 `data_call_gate.rs`，生产实现不改动。原筛选实际命中 0 项；接线后原有 4 项及新增 3 项共 7 项实际通过。新增覆盖关闭后同身份 activate 不复活、旧 generation/activation/admission epoch 的 close/remove 不影响替代身份，以及新旧实例多个 lease 的独立排空。独立源码复审通过。
+
+`cargo check --locked --offline --manifest-path src-tauri/Cargo.toml --all-targets` 退出 0；`cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview` 为 450 通过、8 默认忽略，网络 proxy 子进程另 1 通过。日志 `/private/tmp/uipilot-data-gate-{before,after,check,preview}.log`。全库回归中的网络夹具仅绑定本机临时端口，不改系统信任。没有 GUI、登录项、声音或权限变更。
+
+本次没有装配 Mac plugin manager、数据 gateway 或 Runtime，不构建新的人工安装包；Windows 原生验证未执行，生产插件仍关闭，同包双端插件通过数仍为 0。
