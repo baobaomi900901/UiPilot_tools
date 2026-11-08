@@ -31,3 +31,22 @@
 2026-11-08，Node 22.22.1 / Rust 1.96.1。全仓 `npm run verify:local` 退出 0：前端 797 通过/18 跳过，Mac 库 402 通过/5 默认忽略，代理子进程另 1 通过；CLI 186、公开插件 323 通过；脚本、SDK/schema/参考包通过。Mac 双预览特性 436 通过/8 默认忽略，all-targets 检查通过。忽略与跳过不算通过。
 
 输入法真实 React 事件回归先复现 keyCode 229 被当普通 Enter，修复后通过；登录项 UI“尝试启用”回归先 4 通过/1 失败，修复后协议与控件共 10 通过。独立审核修正了初版拖拽对 Windows 的影响，保留原有 Windows 不使用 Tauri 拖拽属性的断言。Rust 补充 NotFound 显式注册/失败分类/事实独立及有效快捷键状态回归。日志 `/private/tmp/uipilot-1108-{verify,preview,check}.log`、`/private/tmp/uipilot-login-recovery-{red,green,rust}.log`、`/private/tmp/uipilot-ui-{wk-red,fixes-full-final}.log`。
+
+## 固定候选
+
+源码提交：`ae687c09a874d2560de7b122d4ef98f21b008bca`。
+
+| 文件 | SHA-256 |
+| --- | --- |
+| UiPilot-Mac-fixes-0.19.0-arm64-ae687c0.dmg | `19b5134956b693fb7dd1a028dc331ff09947e745dbe52c111168ca890b59304b` |
+| UiPilot-source-ae687c0.zip | `3c8317b9543f8ef7bd6f054a535444de18ad9066360df3f88b3c8b14b0255018` |
+
+DMG 主程序 SHA-256：`a3ea3f384dcae9d6f16f9e819cab676218ac622e49006b99d5cb4af8acf4aeae`。启用 `macos-find-preview,macos-login-item-preview`，仍为内部 ad-hoc 签名、未公证。打包初次在受限环境失败，获准使用打包工具后成功；只读挂载 verifier 确认签名、arm64、最低 15.7.4、书签 entitlement 及资源，无启动 GUI。
+
+交接目录 `artifacts/macos-internal/ae687c0/`，内含 DMG、同提交源码 ZIP、候选专属预检脚本、manifest 和 SHA256SUMS。Mac 预检命令：
+
+```sh
+sh preflight-macos-ae687c0.sh ./UiPilot-Mac-fixes-0.19.0-arm64-ae687c0.dmg
+```
+
+不要使用旧 42a094b 的预检脚本校验新包。Windows 源码只完成归档校验，原生构建和安装未测；`preflight-windows-ae687c0.py` 已固定新候选源码哈希，不沿用旧 Windows 安装包结论。
