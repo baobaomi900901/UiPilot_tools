@@ -460,3 +460,17 @@ ES Module `export onCommand` 被当前 evaluateScript 路径拒绝，这是明�
 最终独立实验 **19 项单测 + 5 项进程测试全部通过**：单测为新 session 9、既有 gate 7、DTO 2、严格帧 1；进程测试实际执行 **22 次子进程案例**，包含往返、阻塞撤销、错误身份、重复 call/completion、提前退出、迟到完成、部分 header/body、超大帧、尾字节、stderr 尾超限及失败后恢复，逐次记录 PID 和已回收状态。作者产物 `/private/tmp/uipilot-bridge-probe.wiXzQG`，协调者独立执行构建测试入口的产物 `/private/tmp/uipilot-bridge-probe.ZmE4Ww`，总日志 `/private/tmp/uipilot-bridge-coordinator.log`。实际运行签名后的 helper，SHA-256 为 `333de20eecf62d92da6f007ec44c1046f2bfedb0003e2b9c86b7a496ac309eb3`；原 Cargo target 文件哈希单列，源码清单包含同源核心及产品集成文件。主程序 Cargo 依赖/锁文件未变。证据中的 source-base-commit 是构建时已有 HEAD，新文件由源码哈希识别，不冒称当时已提交。
 
 OS 隔离采用独立的[XPC 后续接入边界](../superpowers/specs/2026-11-08-macos-runtime-xpc-boundary.md)。本轮只核对公开指南和本机 SDK，不启动 XPC 服务；管道回收和 ad-hoc 签名不计为沙箱证明。生产 Mac 插件继续关闭，同包双端生产通过数仍为 0，Mac 分支不并入 main。
+
+## 2026-11-08 XPC 连接前边界与固定服务打包
+
+按[专项规格](../superpowers/specs/2026-11-08-macos-xpc-boundary-probe-design.md)新增 `spikes/macos-xpc-boundary-probe/`，仅固定 ping/pong App 与内嵌 service。无 QuickJS、插件源码、SDK port 或共享 CallSession 装配。产品主程序和 Cargo 依赖未改。本机签名查询为 **0 个有效身份**；用户确认暂时没有开发者账号，真实身份和沙箱验收延期，继续其他开发。
+
+实际自动验证均通过：**3 个注入策略场景、8 个本地 XPC 协议案例、7 个 owner 断言、7 个严格 entitlement 断言、7 项打包测试**。策略测试只证明正常配置/owned 失败/borrowed 失败的顺序，不调用实际 connection。协议测试只构造本地 XPC 值。打包测试复制并重新签名临时副本，拒绝额外权限、integer 1 代替 boolean true、错误签名/Info 标识、链接和额外 service，并保留正常包正例。
+
+native 预检先核正在运行的代码身份，再查磁盘 host/service，validity 成功后才信任 team/entitlements，比较 running 与对应磁盘代码的 team 和哈希，显式禁止网络校验。首次实现对 NSDictionary 的相等比较把 NSNumber 1 当作 true，红例 `/private/tmp/uipilot-xpc-entitlements-red.log` 复现；改为精确 CFBoolean 后通过。策略 setter 失败仍返回成功的红例为 `/private/tmp/uipilot-xpc-policy-red.log`。
+
+实际运行了不带沙箱 entitlement 的 host `--preflight` 和无参数入口，两者均输出 `blockedSigningIdentity`、`connectionsCreated:0` 并退出 3。该数字是已审阅无连接分支的固定诊断，并非 OS 追踪计数；该分支不进入连接函数。service 即使自检也未执行，只有编译、签名和静态校验；没有启动 XPC、创建服务容器、GUI、音频、个人数据或权限操作。
+
+作者冻结产物 `/private/tmp/uipilot-xpc-probe.5818W6`，协调者独立构建 `/private/tmp/uipilot-xpc-probe.S7G9Jn`，总日志 `/private/tmp/uipilot-xpc-coordinator.log`。19 条源码和 20 条产物哈希已逐项核对；实际 host SHA-256 `4087ca98105eabc2f6b0e9b604c91a33ae8b663331b625387a63e3862e555152`，仅静态验证的 service SHA-256 `1d51354dbf652f2f39b119c252f058457dfcff5326ebe2900cd0f5449680c3a9`。两者为 arm64、minOS 15.7.4、ad-hoc 签名；host 无 entitlement，service 最终签名中只有 app-sandbox=true。静态声明不代表沙箱效果通过。
+
+真实签名下的 peer 认证、launchd 启动/重启、连接错误与服务终止、受控文件/网络拒绝，以及跨插件进程隔离仍未验证。新 connection 或取消回调不计为独占进程/进程退出。无需人工安装此探针；登录启动人工测试仍暂停，生产 Mac 插件保持关闭，同包双端生产通过数仍为 0。本轮未重复未修改产品的整库回归，Mac 分支不并入 main。
