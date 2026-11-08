@@ -1,6 +1,6 @@
 # Runtime 调用归属与关闭实验
 
-本单元交付同源、transport-neutral 的宿主请求核心，以及真实 QuickJS 子进程的双向管道测试。只有明确命名的 **testMemory 内存测试 port**；它不是 SDK storage/settings，不宣称产品服务已可用。Mac 生产插件仍关闭，Windows 的宿主路径只改纯 DTO/validator 原名 re-export，没有改变运行逻辑。
+本单元交付同源、transport-neutral 的宿主请求核心，以及真实 QuickJS 子进程的双向管道测试。保留明确命名的 **testMemory 内存测试 port**，另将普通 settings.get、storage.get/set/remove 接到实际 Mac 私有文件服务。后者不是成功假服务，但仍是内部受监督传输，未装配生产插件加载器或开放完整 SDK。Mac 生产插件仍关闭，Windows 原运行逻辑不变。
 
 ## 共享核心
 
@@ -21,6 +21,14 @@ close 先退役并阻止新 call/reply/submit，返回 drain 在锁外等待；s
 清理先退役，再断开/kill/wait，释放队列并 join reader/writer，最后 drain。子进程创建后立即由 OwnedChild RAII 持有，线程逐个登记到 Harness；失败路径不等待一个被阻塞的 reply drain 后才杀 child。helper 原生回调同步等待 stdin，不能被引擎 interrupt 打断，退出依赖父 deadline/kill。
 
 集成测试实际执行 JS `onCommand` → testMemory.write → testMemory.read → 返回结果；另覆盖阻塞 backend 时撤回（先确定新调用 Expired，再确认 ack 尚未返回，释放已准入操作后 drain）、错误 owner、重复调用、提前退出、迟到/重复完成、部分 header/body、超量帧、尾字节和 stderr 尾超限。每类失败后新 helper 恢复。已准入 backend 可在撤回开始后结束，但确认排空之后不会继续执行该许可的写入。
+
+## 实际持久数据接线
+
+`runtime_data_macos.rs` 与设置、存储、文件介质和 manifest 均引用产品目录的真实同源实现。可信宿主先保存设置，再创建捕获 scope/settings handle 的 binding；子进程不能提供定义、路径或 activation。每次数据操作经过真实 CallSession，读取 CallPermit 的真实 identity，持有后端 lease；ReplyPermit 覆盖实际 writer。管理切换关闭旧 gate/session、取消传输、排空，然后以新 epoch 原子 reconcile+保存，成功才发布新 binding。取消失败后不重开，Drop 立即撤销但不能替代显式传输清理。排空后已过期则不写配置；若配置已成功持久化、随后请求发布因过期失败，保留已保存配置，不报告回滚。
+
+真实进程执行未修改的 `demo-settings/package/runtime.js`，四次 settings.get 读取落盘值；重建宿主和 helper 后读回同值。另验证 JSON storage 写/读/重开、未知设置拒绝、伪造 owner、设置写操作和重复 call 拒绝。数据完成载荷的原始 requestId 由 helper 和父进程分别核对，外层正确 ID 不能掩盖包结果的错误或缺失 ID。撤销案例在已提交 storage 写后杀死等待回复的 helper，丢弃未发送回复并排空；重开读到已提交值，不虚报回滚。
+
+本探针每帧 4 KiB/累计 8 KiB 仍为诊断预算，不表示完整 SDK 的值传输上限。所有 raw 帧先拒绝重复 JSON 键再 typed 解析。结果只核此探针的请求归属；完整 mainResult schema、UI owner/发布、包安装、权限服务和 XPC 沙箱未在此装配。
 
 ## 构建与证据
 

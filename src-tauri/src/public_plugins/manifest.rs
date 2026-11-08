@@ -433,7 +433,7 @@ impl PublicSettingV1 {
         }
     }
 
-    fn validate(&self) -> bool {
+    pub(super) fn validate(&self) -> bool {
         let valid_label = match self {
             Self::Text { label, .. }
             | Self::Secret { label, .. }

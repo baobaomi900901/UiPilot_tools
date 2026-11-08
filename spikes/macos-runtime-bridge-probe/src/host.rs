@@ -1,8 +1,10 @@
-//! Fixed in-memory TEST PORT adapter. Not a product SDK service or sandbox.
+//! Supervised fixed fixtures: testMemory plus actual private data services.
+//! Internal transport, not the production plugin loader or an OS sandbox.
 use crate::{
     call_session::{CallEndpoint, CallPermit, CallSession, ReplyPermit},
     data_call_gate::{PluginDataCallGate, PluginDataCallIdentity},
     request_contract::PluginRequestContext,
+    runtime_data_macos::{DataCall, RuntimeDataBinding, RuntimeDataHost},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,6 +24,9 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 enum Frame {
+    DataCall {
+        request: DataCall,
+    },
     Call {
         context: PluginRequestContext,
         #[serde(rename = "callId")]
@@ -82,6 +87,7 @@ struct Harness {
     reaped: bool,
     stderr_eof: bool,
     sent: usize,
+    managed_data: bool,
 }
 fn context() -> PluginRequestContext {
     PluginRequestContext {
@@ -92,15 +98,31 @@ fn context() -> PluginRequestContext {
 }
 impl Harness {
     fn new(path: &Path, mode: &str) -> Result<Self, ()> {
-        let context = context();
-        let gate = Arc::new(PluginDataCallGate::default());
-        gate.activate(PluginDataCallIdentity::new(&context.plugin_id, 1, 1, 1).map_err(|_| ())?)
-            .map_err(|_| ())?;
-        let session = Arc::new(CallSession::new(gate));
+        Self::new_bound(path, mode, None)
+    }
+    fn new_bound(
+        path: &Path,
+        mode: &str,
+        binding: Option<&RuntimeDataBinding>,
+    ) -> Result<Self, ()> {
+        let context = binding.map(|b| b.context().clone()).unwrap_or_else(context);
         let deadline = Instant::now() + Duration::from_secs(2);
-        let (endpoint, _) = session
-            .open(context.clone(), 1, 1, deadline)
-            .map_err(|_| ())?;
+        let (session, endpoint) = match binding {
+            Some(b) => (b.session().clone(), b.endpoint().clone()),
+            None => {
+                let gate = Arc::new(PluginDataCallGate::default());
+                gate.activate(
+                    PluginDataCallIdentity::new(&context.plugin_id, 1, 1, 1).map_err(|_| ())?,
+                )
+                .map_err(|_| ())?;
+                let session = Arc::new(CallSession::new(gate));
+                let endpoint = session
+                    .open(context.clone(), 1, 1, deadline)
+                    .map_err(|_| ())?
+                    .0;
+                (session, endpoint)
+            }
+        };
         let mut child = OwnedChild(
             Command::new(path)
                 .env_clear()
@@ -131,6 +153,7 @@ impl Harness {
             reaped: false,
             stderr_eof: false,
             sent: 0,
+            managed_data: binding.is_some(),
         };
         let reader = thread::Builder::new()
             .spawn(move || loop {
@@ -154,6 +177,10 @@ impl Harness {
                 }
                 let mut bytes = vec![0u8; len];
                 if output.read_exact(&mut bytes).is_err() {
+                    let _ = out_tx.send(Event::Error);
+                    break;
+                }
+                if crate::storage_document::validate_mac_json(&bytes).is_none() {
                     let _ = out_tx.send(Event::Error);
                     break;
                 }
@@ -322,7 +349,13 @@ impl Harness {
         if self.reaped {
             return;
         }
-        let drain = self.session.close(&self.endpoint).ok(); // retire BEFORE cancel/drain
+        // Data controller owns gate/session retirement and calls stop as its
+        // cancellation hook. Legacy memory fixture owns its session here.
+        let drain = if self.managed_data {
+            None
+        } else {
+            self.session.close(&self.endpoint).ok()
+        };
         let _ = self.child.kill();
         self.reaped = self.child.wait().is_ok();
         drop(self.writers.take());
@@ -379,6 +412,107 @@ pub fn scenario(path: &Path, mode: &str) -> Report {
         }
     })();
     host.stop();
+    let report = Report {
+        pid: host.child.id(),
+        accepted: result.is_ok(),
+        backend_calls: calls,
+        data: result.ok(),
+        reaped: host.reaped,
+    };
+    println!("BRIDGE_CASE {}", json!({"case":mode,"report":report}));
+    report
+}
+
+/// Actual disk services + captured request authority + real QuickJS calls.
+/// The caller supplies a newly-created private TEST root, never user data.
+pub fn data_scenario(path: &Path, mode: &str, root: &Path, update: bool) -> Report {
+    use crate::manifest::{parse_manifest, PublicPlatform, PublicPluginHost};
+    let manifest = parse_manifest(
+        include_bytes!(
+            "../../../examples/public-plugins/com.uipilot.demo-settings/package/plugin.json"
+        ),
+        &PublicPluginHost {
+            platform: PublicPlatform::Macos,
+            version: [0, 19, 0],
+            api_version: 1,
+        },
+    )
+    .unwrap();
+    let mut data_host =
+        RuntimeDataHost::load(&root.join("storage"), &root.join("settings")).unwrap();
+    let mut context = context();
+    context.plugin_id = manifest.plugin_id;
+    let updates = if update {
+        BTreeMap::from([
+            ("greeting".into(), json!("中文 hello")),
+            ("count".into(), json!(3)),
+            ("uppercase".into(), json!(true)),
+            ("style".into(), json!("boxed")),
+        ])
+    } else {
+        BTreeMap::new()
+    };
+    let binding = data_host
+        .open_request(
+            context,
+            &manifest.settings,
+            &updates,
+            Instant::now() + Duration::from_secs(5),
+            || Ok(()),
+        )
+        .unwrap();
+    let mut host = Harness::new_bound(path, mode, Some(&binding)).unwrap();
+    let mut calls = 0;
+    let result = (|| -> Result<String, ()> {
+        loop {
+            match host.event()? {
+                Event::Frame(Frame::Complete { context, response }) => {
+                    // A child-controlled outer envelope cannot repair or hide
+                    // the plugin result's own request identity.
+                    crate::storage_document::validate_mac_json(response.data.as_bytes())
+                        .ok_or(())?;
+                    let result: Value = serde_json::from_str(&response.data).map_err(|_| ())?;
+                    if result.get("requestId").and_then(Value::as_str)
+                        != Some(host.context.request_id.as_str())
+                    {
+                        return Err(());
+                    }
+                    return host.completion(context, response);
+                }
+                Event::Frame(Frame::DataCall { request }) => {
+                    let id = request.call_id;
+                    let reply = binding.call(request).map_err(|_| ())?;
+                    calls += 1;
+                    if mode == "dataRevoke" {
+                        data_host
+                            .close(|| {
+                                host.stop();
+                                drop(reply);
+                                Ok(())
+                            })
+                            .map_err(|_| ())?;
+                        return Err(());
+                    }
+                    let body = match reply.result {
+                        Ok(value) => json!({"ok":true,"value":value}),
+                        Err(error) => json!({"ok":false,"error":error}),
+                    };
+                    host.write(
+                        json!({"kind":"reply","context":host.context,"callId":id,"value":body}),
+                        Some(reply.permit),
+                    )?;
+                }
+                Event::StderrEof => host.stderr_eof = true,
+                _ => return Err(()),
+            }
+        }
+    })();
+    data_host
+        .close(|| {
+            host.stop();
+            Ok(())
+        })
+        .unwrap();
     let report = Report {
         pid: host.child.id(),
         accepted: result.is_ok(),

@@ -35,6 +35,33 @@ fn run() -> Result<(), ()> {
     if mode == "exit" {
         return Err(());
     }
+    if mode == "dataWrongEnvelope" {
+        send(
+            json!({"kind":"complete","context":context,"response":{"requestId":request,
+            "data":json!({"requestId":"public-request-ffffffffffffffff","results":[]}).to_string()}}),
+        )?;
+        return Ok(());
+    }
+    if matches!(mode.as_str(), "dataForged" | "dataSetter" | "dataDuplicate") {
+        let mut wrong = context.clone();
+        if mode == "dataForged" {
+            wrong["pluginId"] = json!("com.uipilot.other");
+        }
+        let operation = if mode == "dataSetter" {
+            "settingSet"
+        } else {
+            "storageSet"
+        };
+        let frame = json!({"kind":"dataCall","request":{"context":wrong,"callId":1,
+            "request":{"operation":operation,"key":"sample","value":"must-not-overwrite"}}});
+        send(frame.clone())?;
+        if mode == "dataDuplicate" {
+            let _ = read_frame()?;
+            send(frame)?;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        return Err(());
+    }
     if mode == "forged" || mode == "duplicate" {
         let mut wrong = context.clone();
         if mode == "forged" {
@@ -106,23 +133,55 @@ fn run() -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(1);
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let engine = Context::full(&runtime).map_err(|_| ())?;
+    let data_mode = mode.starts_with("data");
     let response=engine.with(|ctx|->rquickjs::Result<String>{
         let next=Cell::new(1u64);let owner=context.clone();
         let bridge=Function::new(ctx.clone(),move |operation:String,key:String,value:String|->rquickjs::Result<String>{
             let call=next.get();next.set(call+1);
-            send(json!({"kind":"call","context":owner,"callId":call,"operation":operation,"key":key,"value":value})).map_err(|_|rquickjs::Error::Exception)?;
+            let frame = if data_mode {
+                let mut request = json!({"operation":operation,"key":key});
+                if operation == "storageSet" {
+                    request["value"] = serde_json::from_str(&value).map_err(|_|rquickjs::Error::Exception)?;
+                }
+                json!({"kind":"dataCall","request":{"context":owner,"callId":call,"request":request}})
+            } else { json!({"kind":"call","context":owner,"callId":call,"operation":operation,"key":key,"value":value}) };
+            send(frame).map_err(|_|rquickjs::Error::Exception)?;
             let reply=read_frame().map_err(|_|rquickjs::Error::Exception)?;
             if reply["context"]!=owner || reply["callId"]!=call || reply["kind"]!="reply" {return Err(rquickjs::Error::Exception);}
             Ok(reply["value"].to_string())
         })?;
-        // The test port is deliberately NOT api.storage or any public SDK API.
-        let factory:Function=ctx.eval(r#"(function(call){const parse=JSON.parse;return Object.freeze({
+        // Memory fixture stays explicitly separate. Data mode implements ONLY
+        // ordinary settings.get and private storage against actual host services.
+        let factory_source = if data_mode { r#"(function(call){
+            const parse=JSON.parse,stringify=JSON.stringify,freeze=Object.freeze;
+            const invoke=async(op,k,v)=>{const reply=parse(call(op,k,v));
+                if(!reply.ok)throw new Error(reply.error);return reply.value;};
+            return freeze({settings:freeze({get:k=>invoke('settingGet',k,'')}),
+                storage:freeze({get:k=>invoke('storageGet',k,''),
+                    set:(k,v)=>invoke('storageSet',k,stringify(v)).then(()=>undefined),
+                    remove:k=>invoke('storageRemove',k,'').then(()=>undefined)})});})"#
+        } else { r#"(function(call){const parse=JSON.parse;return Object.freeze({
             write:async(k,v)=>parse(call('testMemory.write',k,v)),
-            read:async(k)=>parse(call('testMemory.read',k,''))});})"#)?;
+            read:async(k)=>parse(call('testMemory.read',k,''))});})"# };
+        let factory:Function=ctx.eval(factory_source)?;
         let port:rquickjs::Value=factory.call((bridge,))?;
-        let module=Module::declare(ctx.clone(),"fixed-fixture.js",r#"export async function onCommand(inv,testMemory){
+        let source = match mode.as_str() {
+            "dataDemo" => include_str!("../../../examples/public-plugins/com.uipilot.demo-settings/package/runtime.js"),
+            "dataStorageWrite" | "dataRevoke" => r#"export async function onCommand(inv,api){
+                await api.storage.set('sample',{text:'中文 😀',values:[false,0,null]});
+                return {requestId:inv.requestId,data:await api.storage.get('sample')};}"#,
+            "dataStorageRead" => r#"export async function onCommand(inv,api){
+                return {requestId:inv.requestId,data:await api.storage.get('sample')};}"#,
+            "dataDenied" => r#"export async function onCommand(inv,api){
+                try{await api.settings.get('unknown');}catch(e){return {requestId:inv.requestId,data:e.message};}
+                throw new Error('must reject');}"#,
+            "dataWrongResult" => r#"export async function onCommand(){return {requestId:'wrong',results:[]};}"#,
+            "dataMissingResult" => r#"export async function onCommand(){return {results:[]};}"#,
+            _ => r#"export async function onCommand(inv,testMemory){
             await testMemory.write('sample','fixed');const data=await testMemory.read('sample');
-            return {requestId:inv.requestId,data};}"#)?;
+            return {requestId:inv.requestId,data};}"#,
+        };
+        let module=Module::declare(ctx.clone(),"fixed-fixture.js",source)?;
         let(module,evaluated)=module.eval()?;evaluated.finish::<()>()?;
         let handler:Function=module.get("onCommand")?;
         let invocation=ctx.json_parse(json!({"requestId":request}).to_string())?;
@@ -131,6 +190,14 @@ fn run() -> Result<(), ()> {
         Ok(ctx.json_stringify(result)?.ok_or(rquickjs::Error::Exception)?.to_string()?)
     }).map_err(|_|())?;
     let result: Value = serde_json::from_str(&response).map_err(|_| ())?;
+    let result = if data_mode {
+        if result.get("requestId").and_then(Value::as_str) != Some(request.as_str()) {
+            return Err(());
+        }
+        json!({"requestId":request,"data":result.to_string()})
+    } else {
+        result
+    };
     send(json!({"kind":"complete","context":context,"response":result}))
 }
 fn main() {

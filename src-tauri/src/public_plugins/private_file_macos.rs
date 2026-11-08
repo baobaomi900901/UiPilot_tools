@@ -15,8 +15,25 @@ use std::{
 
 pub(super) const MAX_DOCUMENT: usize = super::storage_document::STORAGE_QUOTA_BYTES + 256;
 const LOCK: &str = ".storage.lock";
-const CURRENT: &str = "storage.json";
-const STAGE: &str = "storage.pending";
+#[derive(Clone, Copy)]
+pub(super) enum FileKind {
+    Storage,
+    Settings,
+}
+impl FileKind {
+    fn current(self) -> &'static str {
+        match self {
+            Self::Storage => "storage.json",
+            Self::Settings => "settings.json",
+        }
+    }
+    fn stage(self) -> &'static str {
+        match self {
+            Self::Storage => "storage.pending",
+            Self::Settings => "settings.pending",
+        }
+    }
+}
 const DIR: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -133,6 +150,7 @@ impl Drop for PrivateRoot {
     }
 }
 pub(super) struct PrivateFile {
+    kind: FileKind,
     owner: String,
     directory: OwnedFd,
     poisoned: bool,
@@ -144,6 +162,14 @@ pub(super) struct PrivateFile {
 }
 impl PrivateFile {
     pub(super) fn open(root: &PrivateRoot, owner: &str, create: bool) -> Result<Option<Self>> {
+        Self::open_kind(root, owner, create, FileKind::Storage)
+    }
+    pub(super) fn open_kind(
+        root: &PrivateRoot,
+        owner: &str,
+        create: bool,
+        kind: FileKind,
+    ) -> Result<Option<Self>> {
         if !super::manifest::valid_plugin_id(owner) {
             return Err(FileError::Storage);
         }
@@ -159,6 +185,7 @@ impl PrivateFile {
             Err(_) => return Err(FileError::Storage),
         };
         let file = Self {
+            kind,
             owner: owner.into(),
             directory,
             poisoned: false,
@@ -182,16 +209,20 @@ impl PrivateFile {
     }
     fn discard_orphan(&self, root: &PrivateRoot) -> Result<()> {
         self.validate(root)?;
-        let fd = match fs::openat(&self.directory, STAGE, FILE, Mode::empty()) {
+        let fd = match fs::openat(&self.directory, self.kind.stage(), FILE, Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(()),
             Err(_) => return Err(FileError::Storage),
         };
         let stage = File::from(fd);
         private(&stage, false)?;
-        same(&self.directory, STAGE, &stage)?;
+        same(&self.directory, self.kind.stage(), &stage)?;
         self.validate(root)?;
-        checked(fs::unlinkat(&self.directory, STAGE, AtFlags::empty()))?;
+        checked(fs::unlinkat(
+            &self.directory,
+            self.kind.stage(),
+            AtFlags::empty(),
+        ))?;
         checked(fs::fsync(&self.directory))?;
         self.validate(root)
     }
@@ -204,7 +235,7 @@ impl PrivateFile {
     }
     pub(super) fn read(&self, root: &PrivateRoot) -> Result<Option<Vec<u8>>> {
         self.validate(root)?;
-        let fd = match fs::openat(&self.directory, CURRENT, FILE, Mode::empty()) {
+        let fd = match fs::openat(&self.directory, self.kind.current(), FILE, Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
                 self.validate(root)?;
@@ -246,7 +277,7 @@ impl PrivateFile {
         {
             return Err(FileError::Storage);
         }
-        same(&self.directory, CURRENT, &file)?;
+        same(&self.directory, self.kind.current(), &file)?;
         self.validate(root)?;
         self.bind_current(Some(identity(&file)?))?;
         Ok(Some(bytes))
@@ -265,7 +296,7 @@ impl PrivateFile {
         }
         let fd = checked(fs::openat(
             &self.directory,
-            STAGE,
+            self.kind.stage(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         ))?;
@@ -288,21 +319,21 @@ impl PrivateFile {
                 return Err(FileError::Storage);
             }
             private(&stage, false)?;
-            same(&self.directory, STAGE, &stage)?;
+            same(&self.directory, self.kind.stage(), &stage)?;
             checked(fs::renameat(
                 &self.directory,
-                STAGE,
+                self.kind.stage(),
                 &self.directory,
-                CURRENT,
+                self.kind.current(),
             ))
         })();
         if let Err(error) = before {
             // Never clean an untrusted replacement or a detached root.
             if self.validate(root).is_ok()
                 && private(&stage, false).is_ok()
-                && same(&self.directory, STAGE, &stage).is_ok()
+                && same(&self.directory, self.kind.stage(), &stage).is_ok()
             {
-                let _ = fs::unlinkat(&self.directory, STAGE, AtFlags::empty());
+                let _ = fs::unlinkat(&self.directory, self.kind.stage(), AtFlags::empty());
                 let _ = fs::fsync(&self.directory);
             }
             return Err(error);

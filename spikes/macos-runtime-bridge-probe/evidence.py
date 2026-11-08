@@ -9,9 +9,13 @@ output=Path(sys.argv[1])
 target=Path(sys.argv[2])
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 files=sorted(path for path in source.rglob('*') if path.is_file() and not {'target','__pycache__'}.intersection(path.parts))
-shared=['identity.rs','request_contract.rs','call_session.rs','data_call_gate.rs','manifest.rs','runtime.rs','scheduler.rs']
+shared=['identity.rs','request_contract.rs','call_session.rs','data_call_gate.rs','manifest.rs','runtime.rs','scheduler.rs',
+        'data_scope.rs','storage_document.rs','private_file_macos.rs','storage_macos.rs','storage_macos_tests.rs',
+        'settings_values.rs','settings_macos.rs','settings_macos_tests.rs','runtime_data_macos.rs','runtime_data_macos_tests.rs']
 files += [repo/'src-tauri/src/public_plugins'/name for name in shared]
 files += [repo/'src-tauri/src'/name for name in ['public_plugins.rs','public_plugins_macos.rs']]
+files += [repo/'src-tauri/src/atomic_file_macos.rs']
+files += [repo/'examples/public-plugins/com.uipilot.demo-settings/package'/name for name in ['plugin.json','runtime.js']]
 (output/'source-SHA256SUMS').write_text(''.join(f'{sha(path)}  {path.relative_to(repo)}\n' for path in files))
 records=[]
 for line in (output/'tests.log').read_text().splitlines():

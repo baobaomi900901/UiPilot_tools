@@ -490,3 +490,19 @@ Mac 新增 FD 相对的私有文件介质和实际 `PluginStorageStore`。根目
 协调者独立编译检查退出 0，storage 聚焦 **16/16**；双 preview 全库 **481 通过、8 默认忽略**，网络 proxy 子进程另 **1 通过**。证据归档 `/private/tmp/uipilot-plugin-data-evidence.1fai11uu`，包含 11 个变更 Rust 文件的哈希、锁文件哈希与上述红绿/编译/回归日志。baseCommit 记录归档时已有 HEAD，新实现用源码哈希识别。独立审核通过；Windows 原生回归未执行，不用 Mac 测试冒充。
 
 本轮没有接入 Runtime/SDK gateway、持久插件设置事务、UI、卸载清理或同包双端生产验收；未运行 GUI、XPC 服务、个人数据或系统权限操作。无需人工安装新包，生产 Mac 插件仍关闭，同包双端生产通过数仍为 0。证书相关验收和登录启动人工测试继续延期，Mac 分支不并入 main。
+
+## 2026-11-08 设置持久化与真实 Runtime 数据接线
+
+按[专项规格](../superpowers/specs/2026-11-08-macos-settings-runtime-data-design.md)实现普通设置独立文档与宿主事务。复用私有 FD 介质，以固定 Settings 枚举选取 `settings.json/settings.pending`，storage 原布局不变；共享定义校验、reconcile 与 quota，保留设置 key 与 storage key 的区别。定义升级与批量更新合成一次持久提交，成功后才发布新 revision/句柄；非法更新不部分保存，同值 save 不增加 revision。旧句柄、跨 store/owner/identity、关闭 gate、损坏和提交不确定状态拒绝继续使用。
+
+`RuntimeDataHost` 按关闭 gate/session → 取消传输 → 排空 → 新 epoch 配置事务 → 新请求的顺序切换；排空后已过期不开始保存。保存成功但随后请求发布过期时保留已保存配置，不能将无 endpoint 当作回滚。Runtime 只能调用普通 `settings.get` 和私有 `storage.get/set/remove`，使用宿主捕获 binding 与 CallPermit 的真实身份，不能从 wire 选择 owner、路径或定义；回复持有真实 ReplyPermit 到写入结束。此控制器显式创建新请求，不代替未来设置 UI 的同值保存路径。
+
+设置层 **14 项**、Runtime 控制器 **7 项**通过，原 storage/document **16 项**回归通过。协调者 all-targets 编译检查成功；双 preview 主库 **502 通过、8 默认忽略**，网络 proxy 子进程另 **1 通过**。Windows 只扩大 setting validator 可见性、提取相同 quota helper 和增加只读 CallPermit identity getter，未改变 Windows IO、SDK 或生产启动行为；Windows 原生回归未执行。
+
+冻结 bridge 探针 `/private/tmp/uipilot-bridge-probe.BB9HK9`：**80 项单测 + 5 项数据进程测试 + 5 项既有进程测试全部通过**，实际 **38 次 helper 进程均记录 PID 并回收**。原样 `demo-settings/package/runtime.js` 在真实 QuickJS 内四次读取落盘设置，宿主和 helper 重建后保持自定义值；另覆盖真实 JSON storage 重开、未知设置、伪造 owner、Runtime 设置写、重复 call、错误/缺失结果 ID 和已提交写后撤销。父进程独立检查原结果 ID，正确外层 envelope 不能修复错误内部归属。已提交写在取消后仍读得到；没有将撤销称为回滚。
+
+实际运行的签名 helper SHA-256 为 `0605400920d67ab5d820838fd8de70987daa2839cd183a55ac9bc1ccc587c815`，32 条源码哈希已逐项核对。探针仍用 rquickjs 0.14.0/std+loader，仅独立 Cargo 加入同源数据模块依赖，产品 Cargo.lock 未改。首次完整探针因原探针 Cargo 版本 0.1 与真实 manifest 的 current Host 版本推导不符、schema 包装类型不一致失败；调整探针版本与产品 0.19 一致及同产品 `to_value` 包装后全绿，未跳过 manifest 测试。
+
+红绿证据：`uipilot-settings-revision-red.log` 为缺失持久 revision 的真实红例；`uipilot-settings-combined-red.log` 复现原 configure→save 两步在非法更新时留下部分配置，修为单事务；`uipilot-data-result-owner-red.log` 为移除内层 requestId guard 的故障注入，错误结果原本被接纳、回归确实失败，最终恢复检查。主库、红绿和产物元数据归档 `/private/tmp/uipilot-settings-runtime-evidence.4vyq82g8`。探针 4 KiB 帧/8 KiB 累计预算是诊断限制，不代表完整 SDK 的传输容量。
+
+此轮接通的是内部宿主数据服务与真实引擎，仍未装配完整安装/权限生命周期、UI/结果校验与发布、秘密服务或签名 XPC 沙箱。生产 Mac 插件保持关闭，同包双端生产通过数仍为 0；无需人工安装，证书及登录启动验收继续延期，分支不并入 main。

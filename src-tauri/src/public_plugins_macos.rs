@@ -8,6 +8,10 @@ pub(crate) use data_scope::PluginDataScope;
 use data_scope::{authorize_plugin_scope, valid_json_value};
 #[path = "public_plugins/settings_values.rs"]
 mod settings_values;
+#[path = "public_plugins/settings_macos.rs"]
+mod settings_macos;
+#[path = "public_plugins/runtime_data_macos.rs"]
+mod runtime_data_macos;
 #[path = "public_plugins/storage_document.rs"]
 mod storage_document;
 #[path = "public_plugins/private_file_macos.rs"]

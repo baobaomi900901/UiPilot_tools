@@ -71,12 +71,17 @@ pub(super) fn parse_document(bytes: &[u8], plugin_id: &str) -> Option<StorageDoc
     .then_some(document)
 }
 
-pub(super) fn encode_document(document: &StorageDocument) -> Result<Vec<u8>, PluginStorageError> {
-    let values =
-        serde_json::to_vec(&document.values).map_err(|_| PluginStorageError::InvalidValue)?;
-    if values.len() > STORAGE_QUOTA_BYTES {
+pub(super) fn check_values_quota(
+    values: &BTreeMap<String, Value>,
+) -> Result<(), PluginStorageError> {
+    let bytes = serde_json::to_vec(values).map_err(|_| PluginStorageError::InvalidValue)?;
+    if bytes.len() > STORAGE_QUOTA_BYTES {
         return Err(PluginStorageError::QuotaExceeded);
     }
+    Ok(())
+}
+pub(super) fn encode_document(document: &StorageDocument) -> Result<Vec<u8>, PluginStorageError> {
+    check_values_quota(&document.values)?;
     serde_json::to_vec(document).map_err(|_| PluginStorageError::InvalidValue)
 }
 
@@ -153,6 +158,12 @@ mod tests {
 // discard duplicate keys. serde_json's normal recursion limit remains enabled.
 #[cfg(target_os = "macos")]
 pub(super) fn parse_mac_document(bytes: &[u8], owner: &str) -> Option<StorageDocument> {
+    validate_mac_json(bytes)?;
+    parse_document(bytes, owner)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn validate_mac_json(bytes: &[u8]) -> Option<()> {
     use serde::de::{self, MapAccess, SeqAccess, Visitor};
     struct Unique;
     impl<'de> Deserialize<'de> for Unique {
@@ -205,5 +216,5 @@ pub(super) fn parse_mac_document(bytes: &[u8], owner: &str) -> Option<StorageDoc
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     Unique::deserialize(&mut deserializer).ok()?;
     deserializer.end().ok()?;
-    parse_document(bytes, owner)
+    Some(())
 }

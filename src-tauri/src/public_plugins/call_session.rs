@@ -58,6 +58,12 @@ pub(crate) struct CallPermit {
     epoch: Arc<Epoch>,
     _gate: PluginDataCallLease,
 }
+impl CallPermit {
+    /// Backend authority comes from the admitted host epoch, never wire fields.
+    pub(crate) fn identity(&self) -> &PluginDataCallIdentity {
+        &self.epoch.identity
+    }
+}
 pub(crate) struct ReplyPermit {
     _call: CallPermit,
     _gate: PluginDataCallLease,

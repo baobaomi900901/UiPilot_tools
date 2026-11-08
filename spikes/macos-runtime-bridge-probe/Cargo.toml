@@ -1,6 +1,8 @@
 [package]
 name = "uipilot-runtime-bridge-probe"
-version = "0.1.0"
+# Shared manifest tests derive current Host version from Cargo's package version.
+# Keep the probe aligned with the product; this is not a published package.
+version = "0.19.0"
 edition = "2021"
 publish = false
 
@@ -10,6 +12,10 @@ publish = false
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std", "loader"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
+schemars = "=1.2.1"
+unicode-normalization = "=0.1.23"
+rustix = { version = "=1.1.4", features = ["fs"] }
+libc = "=0.2.186"
 
 [[bin]]
 name = "uipilot-runtime-bridge-probe"
