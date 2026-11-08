@@ -322,6 +322,32 @@ impl Harness {
             .session
             .prepare_completion(&self.endpoint, &context, &response.request_id)
             .map_err(|_| ())?;
+        self.terminal()?;
+        self.session
+            .submit_completion(&self.endpoint, ticket, || response.data)
+            .map_err(|_| ())
+    }
+    fn main_completion(
+        &mut self,
+        binding: &RuntimeDataBinding,
+        context: PluginRequestContext,
+        response: Response,
+    ) -> Result<String, ()> {
+        if context != self.context || response.request_id != self.context.request_id {
+            return Err(());
+        }
+        let prepared = binding
+            .prepare_main_results(response.data.as_bytes())
+            .map_err(|_| ())?;
+        self.terminal()?;
+        binding.submit_main_results(prepared, |rows| {
+            let rows: Vec<Value> = rows.into_iter().map(|row| json!({
+                "id":row.plugin_result_id,"title":row.title,"subtitle":row.subtitle,"detail":row.detail
+            })).collect();
+            json!({"requestId":self.context.request_id,"results":rows}).to_string()
+        }).map_err(|_| ())
+    }
+    fn terminal(&mut self) -> Result<(), ()> {
         // Completion cannot be followed by another frame or an unsuccessful exit.
         let mut stdout_eof = false;
         while !stdout_eof || !self.stderr_eof {
@@ -341,9 +367,7 @@ impl Harness {
             self.remaining()?;
             thread::sleep(Duration::from_millis(2));
         }
-        self.session
-            .submit_completion(&self.endpoint, ticket, || response.data)
-            .map_err(|_| ())
+        Ok(())
     }
     fn stop(&mut self) {
         if self.reaped {
@@ -469,6 +493,9 @@ pub fn data_scenario(path: &Path, mode: &str, root: &Path, update: bool) -> Repo
                 Event::Frame(Frame::Complete { context, response }) => {
                     // A child-controlled outer envelope cannot repair or hide
                     // the plugin result's own request identity.
+                    if mode == "dataDemo" || mode.starts_with("dataMain") {
+                        return host.main_completion(&binding, context, response);
+                    }
                     crate::storage_document::validate_mac_json(response.data.as_bytes())
                         .ok_or(())?;
                     let result: Value = serde_json::from_str(&response.data).map_err(|_| ())?;

@@ -506,3 +506,19 @@ Mac 新增 FD 相对的私有文件介质和实际 `PluginStorageStore`。根目
 红绿证据：`uipilot-settings-revision-red.log` 为缺失持久 revision 的真实红例；`uipilot-settings-combined-red.log` 复现原 configure→save 两步在非法更新时留下部分配置，修为单事务；`uipilot-data-result-owner-red.log` 为移除内层 requestId guard 的故障注入，错误结果原本被接纳、回归确实失败，最终恢复检查。主库、红绿和产物元数据归档 `/private/tmp/uipilot-settings-runtime-evidence.4vyq82g8`。探针 4 KiB 帧/8 KiB 累计预算是诊断限制，不代表完整 SDK 的传输容量。
 
 此轮接通的是内部宿主数据服务与真实引擎，仍未装配完整安装/权限生命周期、UI/结果校验与发布、秘密服务或签名 XPC 沙箱。生产 Mac 插件保持关闭，同包双端生产通过数仍为 0；无需人工安装，证书及登录启动验收继续延期，分支不并入 main。
+
+## 2026-11-08 主结果合同与内部注册表发布
+
+按[主结果专项规格](../superpowers/specs/2026-11-08-macos-main-result-publication-design.md)继续无需开发证书的工作。`main_result_contract.rs` 原样承接 Windows 的 PublicMainResult、wire/limits/parser，`runtime_error.rs` 原样承接完整错误枚举和文本；activation/runtime 保留旧 re-export，Panel/Window 仍使用同一 64 KiB 限额。共享 **6 项合同测试**通过，逐字核对提取前后实现；缺共享 API 的红日志只代表编译接线尚未实现，不称原 Windows parser 存在行为缺陷。
+
+新增 `runtime_result_macos.rs` 将 raw 唯一键检查、同源完整 parser 与真实 prepare/submit completion 票据接通。信息行可以进入内部路径；带 copyText 的响应因尚无真实插件动作授权/执行链而整体拒绝，不默默删动作。新 `main_result_macos.rs` 使用实际 ResultRegistry、现有 ResultItem/SearchResponse 和宿主 opaque IDs，行不携带可执行动作、复制载荷或插件自报 row ID。
+
+publisher 的 opaque owner 绑定实例、query 和 Runtime binding；一次 pending→prepared→terminal 完成，准备失败也消费 owner 并条件清理。迟到错误不能清除成功结果；可信生命周期 retire 单列且仍须匹配原 query。新查询、其他 domain、hide/show、同数字的另一 registry 均不受旧 owner 清理影响。最终同步 publish_if_latest 在检查 query 的同一 registry 锁内写入；runtime completion permit 已获准也不能跳过此检查。
+
+主库 **12 项 runtime result/实际 registry 测试**通过，包括真实提交闭包已准入后暂停、新 plugin query 发布、再释放旧闭包，旧提交返回无结果而新 action 哨兵仍可解析。故障注入临时移除最终 query sequence 检查后，该回归稳定失败（旧提交错误返回 Some），日志 `/private/tmp/uipilot-main-publication-owner-red.log`；检查已恢复，`uipilot-main-publication-green.log` 全绿。这是敏感性证明，不称 Windows 原实现新发现缺陷。
+
+all-targets 检查成功，双 preview 全库 **520 通过、8 默认忽略**，网络 proxy 子进程另 **1 通过**。冻结 probe `/private/tmp/uipilot-bridge-probe.oSGhCn` 为 **91 项单测 + 6 项数据进程测试 + 5 项既有进程测试**全绿，**44 次实际 helper 均记录 PID 并回收**。原样 demo-settings 结果经完整 parser 与 Runtime 完成票据后从 typed rows 生成诊断输出；未知字段、重复 row ID、21 行、不支持 copyText 拒绝，空结果合法。
+
+证据明确分层：真实 QuickJS → parser/完成票据是独立探针；实际 ResultRegistry/显示 DTO 是产品主库测试，未将两者描述为已连通的 GUI 端到端。测试的签名 helper SHA-256 为 `01178990dedeef29dd6f941ea4d2961f826de9964158be602f23cd81f1eee2c9`；42 条源码/夹具哈希已核对。证据生成器补纳外部测试文件后重新生成清单，未改测试代码或产物。日志与元数据归档 `/private/tmp/uipilot-main-result-evidence.gsh9ix5g`，baseCommit 为当时已有 HEAD，新增实现由源码哈希识别。
+
+未装配生产插件安装/升级/权限、主窗口 IPC/真实显示、动作执行、Panel/Window 或签名 XPC；本轮无 GUI、剪贴板、个人数据、系统权限操作。Windows 原生回归未执行，生产 Mac 插件仍关闭，同包双端生产通过数仍为 0。无需人工安装，继续保留用户延期的证书/登录启动验收，分支不合并 main。

@@ -10,6 +10,8 @@ mod storage_document;
 #[allow(dead_code)]
 mod call_session;
 mod request_contract;
+mod main_result_contract;
+mod runtime_error;
 mod delayed_messages;
 pub(crate) mod diagnostics;
 pub(crate) mod file_open;

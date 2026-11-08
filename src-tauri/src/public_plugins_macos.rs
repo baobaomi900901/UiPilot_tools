@@ -23,6 +23,14 @@ mod storage;
 mod data_call_gate;
 #[path = "public_plugins/request_contract.rs"]
 mod request_contract;
+#[path = "public_plugins/main_result_contract.rs"]
+mod main_result_contract;
+#[path = "public_plugins/runtime_result_macos.rs"]
+mod runtime_result_macos;
+#[path = "public_plugins/main_result_macos.rs"]
+mod main_result_macos;
+#[path = "public_plugins/runtime_error.rs"]
+mod runtime_error;
 #[path = "public_plugins/call_session.rs"]
 mod call_session;
 #[path = "public_plugins/network/mod.rs"]

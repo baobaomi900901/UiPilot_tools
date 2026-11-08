@@ -167,6 +167,11 @@ fn run() -> Result<(), ()> {
         let port:rquickjs::Value=factory.call((bridge,))?;
         let source = match mode.as_str() {
             "dataDemo" => include_str!("../../../examples/public-plugins/com.uipilot.demo-settings/package/runtime.js"),
+            "dataMainUnknown" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a',unknown:true}]};}"#,
+            "dataMainDuplicate" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a'},{id:'a',title:'b'}]};}"#,
+            "dataMainTooMany" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:Array.from({length:21},(_,i)=>({id:String(i),title:'a'}))};}"#,
+            "dataMainCopy" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a',defaultAction:{type:'copyText',text:'must-not-copy'}}]};}"#,
+            "dataMainEmpty" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[]};}"#,
             "dataStorageWrite" | "dataRevoke" => r#"export async function onCommand(inv,api){
                 await api.storage.set('sample',{text:'中文 😀',values:[false,0,null]});
                 return {requestId:inv.requestId,data:await api.storage.get('sample')};}"#,

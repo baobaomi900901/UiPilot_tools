@@ -783,6 +783,31 @@ impl ResultRegistry {
         Ok(())
     }
 
+    /// Internal Mac plugin completion cleanup. A late failure may retire only
+    /// its still-current query, never a newer result set or another domain.
+    /// Tokens remain private to the publisher that captured this registry.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retire_plugin_query_if_latest(&self, token: QueryToken) -> bool {
+        let mut state = self.inner.state.lock().expect("result registry lock poisoned");
+        if token.domain != QueryDomain::Plugin
+            || !state.active
+            || token.generation != state.generation
+            || token.query_sequence != state.latest_query_sequence
+            || Some(token.domain) != state.latest_query_domain
+            || state.domain_exhausted[token.domain.index()]
+            || state.plugin_reservation.is_some()
+            || token.domain_epoch != state.domain_epochs[token.domain.index()]
+        {
+            return false;
+        }
+        Self::retire_current(&mut state);
+        match state.domain_epochs[token.domain.index()].checked_add(1) {
+            Some(next) => state.domain_epochs[token.domain.index()] = next,
+            None => state.domain_exhausted[token.domain.index()] = true,
+        }
+        true
+    }
+
     fn retire_current(state: &mut RegistryState) {
         #[cfg(target_os = "macos")]
         { state.current = None; }

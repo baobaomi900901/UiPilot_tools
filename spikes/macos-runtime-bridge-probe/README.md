@@ -28,7 +28,13 @@ close 先退役并阻止新 call/reply/submit，返回 drain 在锁外等待；s
 
 真实进程执行未修改的 `demo-settings/package/runtime.js`，四次 settings.get 读取落盘值；重建宿主和 helper 后读回同值。另验证 JSON storage 写/读/重开、未知设置拒绝、伪造 owner、设置写操作和重复 call 拒绝。数据完成载荷的原始 requestId 由 helper 和父进程分别核对，外层正确 ID 不能掩盖包结果的错误或缺失 ID。撤销案例在已提交 storage 写后杀死等待回复的 helper，丢弃未发送回复并排空；重开读到已提交值，不虚报回滚。
 
-本探针每帧 4 KiB/累计 8 KiB 仍为诊断预算，不表示完整 SDK 的值传输上限。所有 raw 帧先拒绝重复 JSON 键再 typed 解析。结果只核此探针的请求归属；完整 mainResult schema、UI owner/发布、包安装、权限服务和 XPC 沙箱未在此装配。
+本探针每帧 4 KiB/累计 8 KiB 仍为诊断预算，不表示完整 SDK 的值传输上限。所有 raw 帧先拒绝重复 JSON 键再 typed 解析。数据读写夹具保留内部 data 结果格式；`dataDemo` 与 `dataMain*` 则经过产品同源完整 legacy mainResult parser 和 Runtime 完成票据，不把两种格式混作公开 SDK。
+
+## 主结果完成接线
+
+`main_result_contract.rs` 从 Windows activation 逐字提取，原导出、错误、20 行/64 KiB 及字段边界不变；`runtime_result_macos.rs` 先校验原始 JSON、真实请求 ID 和完整 rows，再 prepare completion，双 EOF/正常退出后 submit completion。探针接纳的是解析后的实际 typed rows。未知字段、重复 row ID、21 行和不可用 copyText 动作分别拒绝；空结果保留合法。复制权限/动作执行尚未装配，不能通过删除 defaultAction 假装支持。
+
+产品内部 `main_result_macos.rs` 另外接到真实 ResultRegistry，主库测试验证 publisher 实例/查询 owner、一次完成、迟到错误和旧提交被新查询淘汰；这一层不在独立探针假造 registry。GUI 消息与前端仍未接通，包安装、权限服务和 XPC 沙箱仍待装配。内部发布结果均为无动作的信息行。
 
 ## 构建与证据
 

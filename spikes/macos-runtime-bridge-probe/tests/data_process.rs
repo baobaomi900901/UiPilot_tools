@@ -103,3 +103,24 @@ fn revoke_cancels_waiting_child_before_reply_drain_and_committed_write_is_not_ro
         json!({"text":"中文 😀","values":[false,0,null]})
     );
 }
+
+#[test]
+fn real_main_result_contract_rejects_malformed_rows_and_unavailable_actions() {
+    let temp = Temp::new();
+    for mode in [
+        "dataMainUnknown",
+        "dataMainDuplicate",
+        "dataMainTooMany",
+        "dataMainCopy",
+    ] {
+        let report = data_scenario(&helper(), mode, &temp.0, false);
+        assert!(!report.accepted && report.reaped, "{mode}");
+        assert_eq!(report.backend_calls, 0);
+    }
+    let empty = data_scenario(&helper(), "dataMainEmpty", &temp.0, false);
+    assert!(empty.accepted && empty.reaped);
+    let result: Value = serde_json::from_str(empty.data.as_deref().unwrap()).unwrap();
+    assert_eq!(result["results"], json!([]));
+    let fresh = data_scenario(&helper(), "dataDemo", &temp.0, false);
+    assert!(fresh.accepted && fresh.reaped);
+}
