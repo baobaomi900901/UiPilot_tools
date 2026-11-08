@@ -426,3 +426,23 @@ ES Module `export onCommand` 被当前 evaluateScript 路径拒绝，这是明�
 作者冻结证据 `/private/tmp/uipilot-jsc-esm.ImzPLT/`，协调者独立重建 `/private/tmp/uipilot-jsc-esm.oBL347/` 均为 6+8 全绿。源码清单含复用 supervisor，模块证据含每个输入/依赖、工具版本、锁文件与 bundle SHA-256，生成物清单含 native helper/header/bundle。独立审核核对 21 条源码哈希、34 条产物哈希和 11 个模块图一致，终审通过。真实 `demo-return` 入口 SHA-256 为 `37b16110f51c3be4fd39dbe3f3cd8e7494cb7a6d013c08db55ab1f8384be1812`，这是入口文件哈希，不是插件归档哈希。
 
 本次只新增实验代码与记录，没有主程序变更，未重复整仓 UI/Rust 回归或构建人工安装包。生产模块 loader、权限 bridge、沙箱及资源配额尚未实现；Panel/Window 媒体隔离仍阻塞。当前生产同包双端通过数仍为 0，登录启动人工测试保持暂停，Mac 分支不并入 main。
+
+## 2026-11-08 原样 ESM 与引擎资源限制实验
+
+按[QuickJS 独立实验规格](../superpowers/specs/2026-11-08-macos-quickjs-runtime-probe-design.md)，新增 `spikes/macos-quickjs-runtime-probe/` 独立 Cargo workspace。固定 rquickjs 0.14.0/内置 QuickJS-NG 0.16.2，仅启用 std+loader；core 的 relative-path 为必要依赖 feature，sys 无额外 feature。首次 fetch 取得源码及独立锁文件，审阅 Mac 构建路径后均以 locked/offline 编译。主程序依赖和锁文件没有改动。
+
+实际自动验证：**4 项 Rust 单测、11 项原生进程测试、6 项协议测试全部通过**。真实 demo-return 原样嵌入，不经转译，中文/emoji、内部空格、日期及完整动作数据匹配；未执行复制。合成图覆盖相对导入、重导出、循环/live binding、动态 import、Promise 和顶层 await；先等待模块 Promise 完成才调用命令。静动态越界、系统模块、外部字节码路径和 import attributes（包括已缓存模块）均拒绝；只有固定内存图，不读取插件外文件。
+
+| 实际对照 | 结果 |
+| --- | --- |
+| 同一 4 MiB Uint8Array 分配脚本，堆上限 2/8 MiB | 低档 command 阶段失败，高档完成并保留分配；不是初始化失败，interrupt 未触发 |
+| 同一 100 层非尾递归，栈上限 64 KiB/1 MiB | 低档 command 阶段失败，高档完成，interrupt 未触发 |
+| 固定循环启用引擎 interrupt | 标志实际触发，返回 interrupted 诊断，进程正常退出并回收 |
+| 关闭 interrupt 的循环、命令 pending、模块顶层 pending | 父 deadline 强制 kill/wait，逐次核对 PID 已回收，后续新 helper 正常运行 |
+| 协议故障 | 双流合计限额、重复/畸形/非有限数/旧身份拒绝、完成后仍卡死不得接受、父读取异常回收通过 |
+
+资源诊断外层 `status=ok` 仅指记录有效，测试另核 phase/outcome/限额/interrupt。`resources.json` 的 memory_usage 是 Context 仍存活时的执行后值，不是峰值或进程 RSS。最初 400 层递归在两档均失败，未算通过；改为同一 100 层脚本后才得到低高对照。本次为 debug/arm64 构建证据，不推广为所有构建配置或架构的固定递归阈值。
+
+作者冻结产物 `/private/tmp/uipilot-quickjs-probe.I7Fv4o/`，协调者独立重建 `/private/tmp/uipilot-quickjs-probe.HkqWgl/` 均全绿；后者总日志 `/private/tmp/uipilot-quickjs-coordinator.log`。日志、resources、feature tree、Mac 限定 metadata、源码/锁文件/引擎源码与可执行文件哈希随产物保留。独立审核复核 29 条源码哈希及依赖/helper 哈希匹配，终审通过。helper 为 arm64，ad-hoc 签名验证通过，动态链接仅列 libSystem；这些检查不是 OS 沙箱证明。
+
+本轮没有修改或构建产品宿主、SDK、Windows，未运行 GUI、音频、个人数据或权限服务操作。原样模块与引擎预算的实验已通过，但生产包加载/安装事务、Host bridge、撤权调度、OS 沙箱、进程整体资源预算与 Windows 原生验收仍待实现；独立 job 异常精确分类也保留为后续任务。Panel/Window 的 WK 媒体隔离仍独立阻塞，Mac 生产插件关闭，同包双端生产通过数仍为 0。无需人工安装新包，登录启动人工测试仍暂停。
