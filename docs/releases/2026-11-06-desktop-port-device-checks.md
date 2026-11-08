@@ -407,3 +407,22 @@ Mac foundation 同源接入 Windows 已有的 `data_call_gate.rs`，生产实现
 最终日志与源码 SHA-256 位于 `/private/tmp/uipilot-jsc-probe.QDglUD/`；重复 JS 完成红阶段为 `/private/tmp/uipilot-jsc-review.V3M2F0/red/tests.log`。独立源码终审通过。构建目录记录的是构建时基线 HEAD，未提交探针文件另有源码哈希，不误称当时已有最终源码提交。
 
 ES Module `export onCommand` 被当前 evaluateScript 路径拒绝，这是明确的不兼容负例。下一步仍需确定真实包模块加载、API bridge 与生产进程隔离方案；Panel/Window 的 WK 音频问题独立存在，Mac 生产插件继续关闭，同包双端通过数仍为 0。本轮不需要安装新 App 或安排人工音频复验。
+
+## 2026-11-08 既有插件 ESM 转换实验
+
+在 `spikes/macos-jsc-esm-probe/` 完成[独立模块转换实验](../superpowers/specs/2026-11-08-macos-jsc-esm-probe-design.md)。Node 仅解析和打包受控包内快照，不执行模块；生成代码嵌入固定的独立 JSC helper，在父进程 deadline 下执行。使用现有 Node v22.22.1 及已锁定的 esbuild 0.28.2、rolldown 1.1.5，没有新增依赖或修改实际插件包/SDK/生产宿主。
+
+| 验证 | 实际结果 |
+| --- | --- |
+| 构建测试 | 6 通过，覆盖 AST 拒绝动态模块、包边界/符号链接/资源限额、内存快照、保留 PURE 注解顶层调用以及不执行模块 |
+| 原生测试 | 8 通过；11 个固定 helper 均以 arm64/min15.7.4 编译、ad-hoc 签名及验证 |
+| 真实 `demo-return` | 原始入口未改；中文/emoji、内部空格、固定日期、requestId、完整复制动作数据与预期一致；没有操作剪贴板 |
+| 模块语义 | 相对导入、重导出、live binding、异步返回、冻结输入、严格模式的所列场景通过；未宣称任意 ESM 等价 |
+| 真实 `translate` | 三模块图转换成功；load-only 观测为 completed=false，加载前 TextEncoder 未定义；没有调用 onCommand 或权限 API，不认定插件可用或推断完整异常根因 |
+| 归属与回收 | 私有完成通道、包篡改全局内建、错误 requestId/超大响应/异常拒绝；顶层循环与 pending Promise 真实 kill/wait 后新 PID 成功 |
+
+开发中实际发现 esbuild IIFE 默认产物未保留所需 strict 语义：原生红例中 unbound this、未声明赋值拒绝、全局未污染、冻结输入写入拒绝四项均为 false；独立 bundle 加 strict banner 后通过。runner 的 strict 无法替代包本身的 strict。红日志 `/private/tmp/uipilot-jsc-esm.A42F5u/native-tests.log`，缺 builder 初始红例 `/private/tmp/uipilot-esm-red.log`，占位 helper 红例 `/private/tmp/uipilot-jsc-esm.i3BqJC/native-tests.log`。
+
+作者冻结证据 `/private/tmp/uipilot-jsc-esm.ImzPLT/`，协调者独立重建 `/private/tmp/uipilot-jsc-esm.oBL347/` 均为 6+8 全绿。源码清单含复用 supervisor，模块证据含每个输入/依赖、工具版本、锁文件与 bundle SHA-256，生成物清单含 native helper/header/bundle。独立审核核对 21 条源码哈希、34 条产物哈希和 11 个模块图一致，终审通过。真实 `demo-return` 入口 SHA-256 为 `37b16110f51c3be4fd39dbe3f3cd8e7494cb7a6d013c08db55ab1f8384be1812`，这是入口文件哈希，不是插件归档哈希。
+
+本次只新增实验代码与记录，没有主程序变更，未重复整仓 UI/Rust 回归或构建人工安装包。生产模块 loader、权限 bridge、沙箱及资源配额尚未实现；Panel/Window 媒体隔离仍阻塞。当前生产同包双端通过数仍为 0，登录启动人工测试保持暂停，Mac 分支不并入 main。
