@@ -1,8 +1,13 @@
-//! Trusted management only. No plugin request, source evaluation or OS grant.
+//! Shared installed-inventory authority for trusted management and runtime binding.
+//! No source evaluation or OS grant; transport execution occurs outside its lock.
 use super::{
-    lifecycle_macos::{InstalledView, LifecycleError, MacPluginLifecycle, PreparedInstall},
+    lifecycle_macos::{
+        InstalledRequest, InstalledView, LifecycleError, MacPluginLifecycle, PreparedInstall,
+        Retirement,
+    },
     manifest::{
-        PublicManifestV1, PublicPermission, PublicPlatform, PublicPluginHost, PublicSettingV1,
+        PublicActivationMode, PublicManifestV1, PublicOutputMode, PublicPermission, PublicPlatform,
+        PublicPluginHost, PublicSettingV1,
     },
     package_macos::{read_archive, read_directory},
     private_file_macos::{ensure_management_root, ensure_private_child},
@@ -12,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
@@ -173,11 +178,28 @@ pub(crate) struct Selection {
     revision: u64,
     kind: SourceKind,
 }
-/// One instance belongs to the trusted main WebView. Mutex serializes management
-/// only; no lock is held while a native chooser is visible.
+#[derive(Clone)]
+pub(crate) struct RuntimeCommand {
+    pub(crate) plugin_id: String,
+    pub(crate) command_id: String,
+    pub(crate) name: String,
+    pub(crate) mode: PublicActivationMode,
+    pub(crate) input_required: bool,
+    pub(crate) multi: bool,
+    pub(crate) revision: String,
+}
+pub(crate) trait RuntimeInvalidation: Send + Sync {
+    fn invalidate_runtime(&self, retired: &ManagementEpoch);
+}
+
+/// One authority belongs to the trusted main WebView. Its mutex serializes
+/// inventory mutations and request binding, never transport execution or a chooser.
 pub(crate) struct Management {
     epoch: Arc<()>,
     host: MacPluginLifecycle,
+    appdata: PathBuf,
+    runtime_catalog: Vec<RuntimeCommand>,
+    runtime_owner: Option<Arc<()>>,
     pending: Option<Pending>,
     selection: Option<Selection>,
 }
@@ -190,6 +212,9 @@ impl Management {
         Ok(Self {
             epoch: Arc::new(()),
             host: MacPluginLifecycle::load(&inventory, &storage, &settings)?,
+            appdata: appdata.to_owned(),
+            runtime_catalog: Vec::new(),
+            runtime_owner: None,
             pending: None,
             selection: None,
         })
@@ -203,6 +228,25 @@ impl Management {
             self.pending = None;
         }
         let (revision, rows) = self.host.management_snapshot()?;
+        self.runtime_catalog = rows
+            .iter()
+            .filter(|row| row.enabled)
+            .flat_map(|row| {
+                row.manifest
+                    .normalized_commands()
+                    .filter(|(_, c)| c.output_mode == PublicOutputMode::MainResult)
+                    .map(|(id, c)| RuntimeCommand {
+                        plugin_id: row.manifest.plugin_id.clone(),
+                        command_id: id.into(),
+                        name: c.default_name.clone(),
+                        mode: c.activation_mode,
+                        input_required: c.input_required,
+                        multi: row.manifest.is_multi_command(),
+                        revision: revision.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Ok(Snapshot {
             revision: revision.to_string(),
             plugins: rows.into_iter().map(view).collect(),
@@ -370,11 +414,19 @@ impl Management {
 /// the management command and can be retried; it never prevents application boot.
 #[derive(Clone)]
 pub(crate) struct ManagementEpoch(Arc<()>);
+impl ManagementEpoch {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 #[derive(Default)]
 pub(crate) struct ManagementState {
     inner: Mutex<Option<Management>>,
     // Short ownership lock, never held over the management mutex or any IO.
     epoch: Mutex<Arc<()>>,
+    runtime_hook: Mutex<Option<Weak<dyn RuntimeInvalidation>>>,
+    #[cfg(test)]
+    pub(crate) before_reset_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl ManagementState {
     pub(crate) fn epoch(&self) -> Result<ManagementEpoch> {
@@ -445,9 +497,108 @@ impl ManagementState {
         self.current_epoch(&selection.epoch) && selection.owner.active.load(Ordering::Acquire)
     }
     pub(crate) fn reset(&self) {
-        if let Ok(mut epoch) = self.epoch.lock() {
-            *epoch = Arc::new(());
+        let retired = match self.epoch.lock() {
+            Ok(mut epoch) => ManagementEpoch(std::mem::replace(&mut *epoch, Arc::new(()))),
+            Err(_) => return,
+        };
+        #[cfg(test)]
+        {
+            let hook = self.before_reset_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
+        let hook = self
+            .runtime_hook
+            .lock()
+            .ok()
+            .and_then(|h| h.as_ref().and_then(Weak::upgrade));
+        if let Some(hook) = hook {
+            hook.invalidate_runtime(&retired);
+        }
+    }
+    pub(crate) fn register_runtime(&self, hook: Weak<dyn RuntimeInvalidation>) -> bool {
+        let Ok(mut current) = self.runtime_hook.lock() else {
+            return false;
+        };
+        if current.as_ref().and_then(Weak::upgrade).is_some() {
+            return false;
+        }
+        *current = Some(hook);
+        true
+    }
+    pub(crate) fn runtime_epoch_current(&self, epoch: &ManagementEpoch) -> bool {
+        self.current_epoch(&epoch.0)
+    }
+    /// Only an available, explicitly routed command reaches this lazy inventory
+    /// read. Revalidate persisted snapshots; never follow original source paths.
+    pub(crate) fn runtime_command(
+        &self,
+        appdata: &Path,
+        epoch: &ManagementEpoch,
+        name: &str,
+    ) -> Result<Option<RuntimeCommand>> {
+        self.with_epoch(appdata, epoch.clone(), |manager| {
+            manager.list()?;
+            Ok(manager
+                .runtime_catalog
+                .iter()
+                .find(|c| c.name == name)
+                .cloned())
+        })
+    }
+    pub(crate) fn open_runtime(
+        &self,
+        appdata: &Path,
+        epoch: &ManagementEpoch,
+        command: &RuntimeCommand,
+        owner: Arc<()>,
+        request: &str,
+        deadline: Instant,
+        before_open: impl FnOnce() -> bool,
+        attach: impl FnOnce(&InstalledRequest) -> std::result::Result<Retirement, LifecycleError>,
+    ) -> Result<InstalledRequest> {
+        self.with_epoch(appdata, epoch.clone(), |manager| {
+            if manager.appdata != appdata
+                || !manager.runtime_catalog.iter().any(|c| {
+                    c.plugin_id == command.plugin_id
+                        && c.command_id == command.command_id
+                        && c.revision == command.revision
+                })
+            {
+                return Err(Error::Stale);
+            }
+            // An older query may have waited for this IO lock while a newer
+            // request opened. Check BEFORE lifecycle.open_request closes anyone.
+            if !before_open() {
+                return Err(Error::Stale);
+            }
+            let installed = manager.host.open_request(
+                &command.plugin_id,
+                &command.command_id,
+                request,
+                deadline,
+                attach,
+            )?;
+            manager.runtime_owner = Some(owner);
+            Ok(installed)
+        })
+    }
+    /// Background close touches only an already-loaded, captured request. A late
+    /// cleanup cannot close a newer owner and never lazily creates a directory.
+    pub(crate) fn close_runtime(&self, owner: &Arc<()>) -> Result<()> {
+        let mut state = self.inner.lock().map_err(|_| Error::Storage)?;
+        if let Some(manager) = state.as_mut() {
+            if manager
+                .runtime_owner
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, owner))
+            {
+                manager.host.close()?;
+                manager.runtime_owner = None;
+            }
+        }
+        Ok(())
     }
 }
 #[cfg(test)]

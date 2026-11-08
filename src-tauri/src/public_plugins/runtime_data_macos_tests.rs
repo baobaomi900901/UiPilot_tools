@@ -629,3 +629,61 @@ fn noncanonical_snapshot_is_rejected_before_cancel_and_preserves_active_binding(
         Ok(json!("still active"))
     );
 }
+
+#[test]
+fn immediate_revocation_keeps_original_permits_for_the_later_close_drain() {
+    let temp = Temp::new();
+    let mut host = temp.host();
+    let binding = open(&mut host, "value");
+    let held = binding
+        .call(DataCall {
+            context: binding.context().clone(),
+            call_id: 1,
+            request: DataOperation::SettingGet {
+                key: "title".into(),
+            },
+        })
+        .unwrap();
+    binding.revoke_admission();
+    binding.revoke_admission();
+    assert!(binding.gate.try_acquire(&binding.identity).is_err());
+    assert!(binding
+        .call(DataCall {
+            context: binding.context().clone(),
+            call_id: 2,
+            request: DataOperation::SettingGet {
+                key: "title".into()
+            }
+        })
+        .is_err());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let close = thread::spawn(move || {
+        host.close(|| {
+            entered_tx.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        done_tx.send(()).unwrap();
+        host
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(40)).is_err());
+    drop(held);
+    done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut host = close.join().unwrap();
+    let new = open(&mut host, "new");
+    binding.revoke_admission();
+    assert_eq!(
+        call(
+            &new,
+            1,
+            DataOperation::SettingGet {
+                key: "title".into()
+            }
+        )
+        .unwrap(),
+        json!("new")
+    );
+    host.close(|| Ok(())).unwrap();
+}

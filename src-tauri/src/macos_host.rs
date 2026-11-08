@@ -346,6 +346,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "show" => show(app),
             "quit" => {
                 app.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting = true;
+                crate::macos_apps::end_invocation(app);
                 crate::macos_plugin_management::reset(app);
                 hotkey::stop(app);
                 app.exit(0);
@@ -431,6 +432,7 @@ pub fn run() {
             match event {
                 tauri::RunEvent::Reopen { .. } => show(app),
                 tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    crate::macos_apps::end_invocation(app);
                     #[cfg(not(feature = "macos-find-preview"))]
                     let _ = (code, &api);
                     app.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting = true;

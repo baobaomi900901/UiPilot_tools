@@ -42,6 +42,7 @@ pub(crate) struct DataCall {
 // never authority reconstructed from a child's JSON.
 #[derive(Clone)]
 pub(crate) struct RuntimeDataBinding {
+    gate: Arc<PluginDataCallGate>,
     session: Arc<CallSession>,
     endpoint: CallEndpoint,
     context: PluginRequestContext,
@@ -71,6 +72,13 @@ pub(crate) struct DataReply {
 }
 
 impl RuntimeDataBinding {
+    /// Main-thread-safe admission retirement only. Native transport cancellation
+    /// and the host's actual close/drain happen separately on a worker.
+    pub(crate) fn revoke_admission(&self) {
+        let _ = self.gate.close(&self.identity);
+        let _ = self.session.revoke_admission(&self.endpoint);
+    }
+
     pub(crate) fn session(&self) -> &Arc<CallSession> {
         &self.session
     }
@@ -273,6 +281,7 @@ impl RuntimeDataHost {
                 .open(context.clone(), epoch, epoch, deadline)
                 .map_err(|_| DataRuntimeError::InvalidContext)?;
             Ok(RuntimeDataBinding {
+                gate: self.gate.clone(),
                 session: self.session.clone(),
                 endpoint,
                 context,

@@ -305,6 +305,24 @@ impl ResultRegistry {
         Ok(())
     }
 
+    /// Read-only admission preflight for the Mac runtime coordinator. This is
+    /// not a reservation: begin_query/publish_if_latest remain authoritative.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn can_begin_query(
+        &self,
+        domain: QueryDomain,
+        invocation_id: &str,
+        query_sequence: u64,
+    ) -> bool {
+        if !self.allows_domain(domain) { return false; }
+        let Ok(state) = self.inner.state.lock() else { return false; };
+        state.active
+            && state.active_invocation_id.as_deref() == Some(invocation_id)
+            && query_sequence > state.latest_query_sequence
+            && !state.domain_exhausted[domain.index()]
+            && !(domain == QueryDomain::Plugin && state.plugin_reservation.is_some())
+    }
+
     pub(crate) fn begin_query(
         &self,
         domain: QueryDomain,

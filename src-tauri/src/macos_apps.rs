@@ -10,11 +10,13 @@ use crate::{
     model::{search_response, SearchResponse},
     result_registry::{MainActionCompletionOwner, MainActionKind, QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
     settings::SettingsStore,
+    public_plugins::{launcher_runtime_macos::{LauncherRuntime, Route, InvocationTheme}, management_macos::ManagementState},
 };
 
 struct MacApplications {
     cache: Arc<AppCache>,
     registry: ResultRegistry,
+    runtime: Arc<LauncherRuntime>,
     // Status is None only before the first scan finishes. Refreshes keep serving the last good snapshot.
     ready: watch::Sender<Option<bool>>,
     scan: Mutex<Scan>,
@@ -28,10 +30,12 @@ struct Scan {
 }
 
 impl MacApplications {
-    fn new(cache: AppCache, registry: ResultRegistry) -> Self {
+    fn new(cache: AppCache, registry: ResultRegistry, management: Arc<ManagementState>) -> Self {
+        let runtime = LauncherRuntime::closed(management, registry.clone());
         Self {
             cache: Arc::new(cache),
             registry,
+            runtime,
             ready: watch::channel(None).0,
             scan: Mutex::new(Scan::default()),
             execute: Mutex::new(()),
@@ -59,7 +63,8 @@ impl MacApplications {
 
 pub(crate) fn setup(app: &mut tauri::App) {
     let registries = Arc::new(ResultRegistries::default());
-    let service = Arc::new(MacApplications::new(AppCache::new(), registries.main().clone()));
+    let management = app.state::<Arc<ManagementState>>().inner().clone();
+    let service = Arc::new(MacApplications::new(AppCache::new(), registries.main().clone(), management));
     app.manage(registries);
     app.manage(Arc::clone(&service));
     service.refresh();
@@ -68,11 +73,24 @@ pub(crate) fn setup(app: &mut tauri::App) {
 pub(crate) fn begin_invocation(app: &AppHandle, id: u64) {
     let service = app.state::<Arc<MacApplications>>();
     service.registry.on_show(id.to_string());
+    service.runtime.begin_invocation(id);
     service.refresh();
 }
 
 pub(crate) fn end_invocation(app: &AppHandle) {
-    app.state::<Arc<MacApplications>>().registry.hide_and_clear();
+    let service = app.state::<Arc<MacApplications>>();
+    service.registry.hide_and_clear();
+    service.runtime.invalidate_current();
+}
+
+fn runtime_theme(preference: crate::settings::ThemePreference, system: Option<tauri::Theme>) -> InvocationTheme {
+    use crate::settings::ThemePreference;
+    match preference {
+        ThemePreference::Dark => InvocationTheme::Dark,
+        ThemePreference::Light => InvocationTheme::Light,
+        ThemePreference::System if system == Some(tauri::Theme::Dark) => InvocationTheme::Dark,
+        ThemePreference::System => InvocationTheme::Light,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -98,7 +116,7 @@ impl From<RegistryError> for Error {
 
 #[tauri::command]
 pub(crate) async fn search_apps(
-    window: WebviewWindow, query: String, invocation_id: String, query_sequence: u64,
+    window: WebviewWindow, query: String, invocation_id: String, query_sequence: u64, submit: Option<bool>,
     completion_origin: Option<serde_json::Value>, stable_command_target: Option<serde_json::Value>,
     stable_builtin_target: Option<serde_json::Value>,
 ) -> Result<Option<SearchResponse>, Error> {
@@ -108,6 +126,24 @@ pub(crate) async fn search_apps(
     }
     let app = window.app_handle();
     let service = app.state::<Arc<MacApplications>>();
+    // The production factory is closed until an isolated transport is verified.
+    // Do not even resolve the data path or start a worker in that configuration.
+    if service.runtime.available() {
+        let runtime = service.runtime.clone();
+        let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
+        let id = invocation_id.parse::<u64>().map_err(|_| Error::stale())?;
+        if id.to_string() != invocation_id { return Err(Error::stale()); }
+        let theme = runtime_theme(app.state::<SettingsStore>().snapshot().theme, window.theme().ok());
+        let runtime_query = query.clone();
+        let route = tauri::async_runtime::spawn_blocking(move || runtime.route(&root, id, query_sequence, &runtime_query, theme, submit.unwrap_or(false)))
+            .await.map_err(|_| Error::unavailable())?
+            .map_err(|_| Error { code: "pluginQueryFailed", message: "插件运行未完成，请重新查询" })?;
+        match route {
+            Route::Published(response) => return Ok(Some(response)),
+            Route::Stale => return Ok(None),
+            Route::NotHandled => {},
+        }
+    }
     let Some(token) = service.registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence) else {
         return Ok(None);
     };
@@ -323,11 +359,39 @@ mod platform_app_commands {
     use super::*;
     use crate::apps::macos_backend::tests::Fixture;
 
+    #[test]
+    fn runtime_environment_resolves_the_same_theme_as_the_host() {
+        use crate::settings::ThemePreference::{Dark, Light, System};
+        for (preference, system, expected) in [
+            (Dark, Some(tauri::Theme::Light), InvocationTheme::Dark),
+            (Light, Some(tauri::Theme::Dark), InvocationTheme::Light),
+            (System, Some(tauri::Theme::Dark), InvocationTheme::Dark),
+            (System, Some(tauri::Theme::Light), InvocationTheme::Light),
+            (System, None, InvocationTheme::Light),
+        ] {
+            assert_eq!(runtime_theme(preference, system), expected);
+        }
+    }
+
+    #[test]
+    fn closed_runtime_does_not_consume_the_application_query_or_create_inventory() {
+        let (f, service, settings) = fixture();
+        let unused = f.0.join("must-not-be-created");
+        assert!(!service.runtime.available());
+        service.runtime.begin_invocation(1);
+        assert!(matches!(service.runtime.route(&unused, 1, 1, "/settings-demo", InvocationTheme::Light, true).unwrap(), Route::NotHandled));
+        assert!(!unused.exists());
+        let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        assert!(publish(&service, &settings, token, "中文 App").is_some());
+        service.runtime.invalidate_current();
+        assert!(service.registry.begin_query(QueryDomain::Application, "1", 2).is_some());
+    }
+
     fn fixture() -> (Fixture, MacApplications, SettingsStore) {
         let f = Fixture::new();
         let path = f.bundle("中文 App.app", "com.fixture.registry", "中文 App");
         let app = macos_backend::application(&f.0, &path).unwrap();
-        let service = MacApplications::new(AppCache::from_apps(vec![app]), ResultRegistries::default().main().clone());
+        let service = MacApplications::new(AppCache::from_apps(vec![app]), ResultRegistries::default().main().clone(), Arc::new(ManagementState::default()));
         let settings = SettingsStore::load(&f.0.join("settings")).unwrap();
         service.registry.on_show("1".into());
         (f, service, settings)

@@ -267,6 +267,14 @@ impl CallSession {
         drop(permit);
         Ok(result)
     }
+    /// Immediate host revocation, without consuming the lane or waiting. Keep
+    /// the original epoch available so the lifecycle's later close still drains
+    /// every already-admitted call/reply/submission exactly as before.
+    pub(crate) fn revoke_admission(&self, endpoint: &CallEndpoint) -> Result<()> {
+        let lane = self.lane.lock().map_err(|_| E::Unavailable)?;
+        current(&lane, endpoint)?;
+        retire(&endpoint.epoch).map(drop)
+    }
     pub(crate) fn close(&self, endpoint: &CallEndpoint) -> Result<SessionDrain> {
         let mut lane = self.lane.lock().map_err(|_| E::Unavailable)?;
         current(&lane, endpoint)?;
