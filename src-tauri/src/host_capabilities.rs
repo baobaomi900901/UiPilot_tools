@@ -7,6 +7,7 @@ pub(crate) struct HostCapabilities {
     version: u8,
     platform: &'static str,
     plugins: bool,
+    plugin_management: bool,
     files: bool,
     screenshot: bool,
     messages: bool,
@@ -80,6 +81,7 @@ pub(crate) fn get_host_capabilities(window: WebviewWindow) -> Result<HostCapabil
     let windows = cfg!(windows);
     Ok(HostCapabilities {
         version: 1, platform: if windows { "windows" } else { "macos" },
+        plugin_management: cfg!(target_os = "macos"),
         plugins: windows, files: windows || mac_find_enabled(), screenshot: windows, messages: windows, credentials: windows,
         login_items: cfg!(all(target_os = "macos", feature = "macos-login-item-preview")),
         web_search: true, builtin_features: windows, command_hotkeys: windows, autostart: windows, double_tap: cfg!(any(windows, target_os = "macos")),

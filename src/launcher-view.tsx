@@ -1,3 +1,4 @@
+import { MacPluginManagement, type MacPluginManagementHandle } from './macos-plugin-management'
 import { MacHotkeyStatusNotice } from './macos-hotkey-status'
 import { bindCompositionKeys, isCompositionKey } from './ime-keyboard'
 import { MacLoginItemControl } from './macos-login-item-control'
@@ -370,6 +371,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const panelHostRef = useRef<HTMLDivElement | null>(null)
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
+  const macPluginManagementRef = useRef<MacPluginManagementHandle | null>(null)
   const credentialSettingsRef = useRef<CredentialSettingsHandle | null>(null)
   const [credentialStatus, setCredentialStatus] = useState<CredentialSettingsStatus>({ message: '', tone: 'default', detail: false })
   const [settingsPinned, setSettingsPin] = useState(false)
@@ -889,8 +891,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       if (quicklinksDraftActive) context.push({ id: 'save-link', title: '保存快捷链接', icon: 'save', run: () => core.saveQuicklink() })
     }
     if (file) context.push({ id: 'open-file', title: '打开选中项', shortcut: 'Enter', icon: 'arrow', disabledReason: file.selected ? undefined : '没有选中项', run: () => core.keyDown('Enter', false) })
-    global.push({ id: 'settings', title: snapshot.view === 'settings' ? '返回启动器' : '打开设置', icon: 'settings', run: () => core.navigate(snapshot.view === 'settings' ? 'launcher' : 'settings') },
-      { id: 'hide', title: '隐藏窗口', shortcut: 'Esc', icon: 'close', run: core.requestHide })
+    global.push({ id: 'settings', title: snapshot.view === 'settings' ? '返回启动器' : '打开设置', icon: 'settings', run: () => { const navigate = () => core.navigate(snapshot.view === 'settings' ? 'launcher' : 'settings'); if (snapshot.view === 'settings' && activeSettingsTab === 'plugins' && macPluginManagementRef.current) macPluginManagementRef.current.requestLeave(navigate); else navigate() } },
+      { id: 'hide', title: '隐藏窗口', shortcut: 'Esc', icon: 'close', run: () => { if (snapshot.view === 'settings' && activeSettingsTab === 'plugins' && macPluginManagementRef.current) macPluginManagementRef.current.requestLeave(core.requestHide); else core.requestHide() } })
     setOperationsOpen(true)
     menu.open({ context, global }, { bottom: 44, onClose: () => setOperationsOpen(false) })
   }
@@ -1207,6 +1209,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     }
     if (event.key === 'Escape') {
       if (!isComposing) event.preventDefault()
+      if (!isComposing && activeSettingsTab === 'plugins' && macPluginManagementRef.current?.back()) return
       if (!isComposing && activeSettingsTab === 'credentials' && credentialSettingsRef.current?.back()) return
       core.keyDown('Escape', isComposing)
       return
@@ -2146,6 +2149,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     </OverlayScrollbarsComponent>
   )
   const selectSettingsTab = (key: SettingsTabKey) => {
+    if (activeSettingsTab === 'plugins' && key !== 'plugins' && macPluginManagementRef.current) {
+      macPluginManagementRef.current.requestLeave(() => applySettingsTab(key)); return
+    }
     if (activeSettingsTab === 'credentials' && key !== 'credentials' && credentialSettingsRef.current) {
       credentialSettingsRef.current.requestLeave(() => applySettingsTab(key))
       return
@@ -2154,7 +2160,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }
   const applySettingsTab = (key: SettingsTabKey) => {
     core.selectSettingsTab(key)
-    if (key === 'plugins') {
+    if (key === 'plugins' && core.capabilities.plugins) {
       if (activatedPluginEpoch.current === snapshot.viewEpoch) return
       activatedPluginEpoch.current = snapshot.viewEpoch
       void core.activatePlugins()
@@ -2176,7 +2182,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />
+        {core.capabilities.pluginManagement && !core.capabilities.plugins ? <MacPluginManagement ref={macPluginManagementRef} client={core.client.macPluginManagement} /> : <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />}
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2394,7 +2400,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 disabled={snapshot.hidePending}
                 icon={<ArrowLeft aria-hidden size={17} strokeWidth={1.8} />}
                 onClick={() => {
-                  if (activeSettingsTab === 'credentials' && credentialSettingsRef.current) credentialSettingsRef.current.requestLeave(() => core.navigate('launcher'))
+                  if (activeSettingsTab === 'plugins' && macPluginManagementRef.current) macPluginManagementRef.current.requestLeave(() => core.navigate('launcher'))
+                  else if (activeSettingsTab === 'credentials' && credentialSettingsRef.current) credentialSettingsRef.current.requestLeave(() => core.navigate('launcher'))
                   else core.navigate('launcher')
                 }}
                 size="small"

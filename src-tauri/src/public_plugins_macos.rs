@@ -67,3 +67,6 @@ mod tests {
 #[cfg(test)]
 #[path = "public_plugins/lifecycle_registry_macos_tests.rs"]
 mod lifecycle_registry_macos_tests;
+
+#[path = "public_plugins/management_macos.rs"]
+pub(crate) mod management_macos;

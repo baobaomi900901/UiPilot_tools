@@ -143,10 +143,16 @@ pub(crate) fn hide_if_current(app: &AppHandle, id: u64) -> Result<(), ()> {
     let state = app.state::<Mutex<Presentation>>();
     if !state.lock().expect("presentation state").owns(id) { return Ok(()); }
     let window = app.get_webview_window("main").ok_or(())?;
+    crate::macos_plugin_management::reset(app);
     window.hide().map_err(|_| ())?;
     state.lock().expect("presentation state").retire(id);
     crate::macos_apps::end_invocation(app);
     window.emit("launcher://hidden", ()).map_err(|_| ())
+}
+
+pub(crate) fn after_management_dialog(app: &AppHandle) {
+    let owner = app.state::<Mutex<Presentation>>().lock().expect("presentation state").focused;
+    if let Some(id) = owner { recheck_focus(app, id, Duration::from_millis(70)); }
 }
 
 fn recheck_focus(app: &AppHandle, id: u64, delay: Duration) {
@@ -161,6 +167,7 @@ fn recheck_focus(app: &AppHandle, id: u64, delay: Duration) {
             if window.is_focused().unwrap_or(false) {
                 state.lock().expect("presentation state").observe_focus();
             } else {
+                if crate::macos_plugin_management::dialog_active() { return; }
                 #[cfg(feature = "macos-find-preview")]
                 if crate::macos_find_host::owns_main_blur(&handle) { return; }
                 if hide_if_current(&handle, id).is_err() {
@@ -339,6 +346,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "show" => show(app),
             "quit" => {
                 app.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting = true;
+                crate::macos_plugin_management::reset(app);
                 hotkey::stop(app);
                 app.exit(0);
             }
@@ -359,7 +367,16 @@ pub fn run() {
             .build())
         .manage(hotkey::LauncherHotkey::default())
         .manage(Mutex::new(Presentation::default()))
+        .manage(std::sync::Arc::new(crate::public_plugins::management_macos::ManagementState::default()))
         .invoke_handler(tauri::generate_handler![
+            crate::macos_plugin_management::list_macos_plugins,
+            crate::macos_plugin_management::prepare_macos_plugin_install,
+            crate::macos_plugin_management::commit_macos_plugin_install,
+            crate::macos_plugin_management::cancel_macos_plugin_install,
+            crate::macos_plugin_management::set_macos_plugin_enabled,
+            crate::macos_plugin_management::set_macos_plugin_permission,
+            crate::macos_plugin_management::save_macos_plugin_settings,
+            crate::macos_plugin_management::remove_macos_plugin,
             crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
             hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording, hotkey::get_launcher_hotkey_status,
             get_macos_login_item, set_macos_login_item, open_macos_login_item_settings,
@@ -389,6 +406,7 @@ pub fn run() {
             let state = window.state::<Mutex<Presentation>>();
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
+                    crate::macos_plugin_management::reset(window.app_handle());
                     let guard = state.lock().expect("presentation state");
                     if guard.quitting { return; }
                     let visible = guard.visible;
@@ -418,6 +436,7 @@ pub fn run() {
                     app.state::<Mutex<Presentation>>().lock().expect("presentation state").quitting = true;
                     #[cfg(feature = "macos-find-preview")]
                     crate::macos_find_host::shutdown(app, code, &api);
+                    crate::macos_plugin_management::reset(app);
                     hotkey::stop(app);
                     app.remove_tray_by_id("launcher");
                 }

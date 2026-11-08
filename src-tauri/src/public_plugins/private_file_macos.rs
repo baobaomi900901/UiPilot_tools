@@ -70,6 +70,9 @@ fn no_acl(fd: &impl AsRawFd) -> bool {
     false
 }
 fn private(fd: &impl AsRawFd, directory: bool) -> Result<()> {
+    check_private(fd, directory, false)
+}
+fn check_private(fd: &impl AsRawFd, directory: bool, readable_parent: bool) -> Result<()> {
     // statfs and ACL inspect the held descriptor, never a second pathname.
     let mut volume = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe {
@@ -92,7 +95,11 @@ fn private(fd: &impl AsRawFd, directory: bool) -> Result<()> {
     let mode = if directory { 0o700 } else { 0o600 };
     if stat.st_uid != unsafe { libc::geteuid() }
         || stat.st_mode & libc::S_IFMT != expected
-        || stat.st_mode & 0o7777 != mode
+        || if readable_parent {
+            stat.st_mode & 0o7022 != 0 || stat.st_mode & 0o700 != 0o700
+        } else {
+            stat.st_mode & 0o7777 != mode
+        }
         || (!directory && stat.st_nlink != 1)
     {
         return Err(FileError::Storage);
@@ -366,4 +373,38 @@ impl PrivateFile {
 pub(super) enum Failure {
     BeforeRename,
     AfterRename,
+}
+
+/// Only the trusted manager supplies fixed child names. Validate the existing
+/// parent before creating anything; never chmod or follow an existing object.
+pub(super) fn ensure_private_child(parent: &Path, name: &'static str) -> Result<PathBuf> {
+    ensure_child(parent, name, false)
+}
+pub(super) fn ensure_management_root(appdata: &Path) -> Result<PathBuf> {
+    ensure_child(appdata, "plugin-management-v1", true)
+}
+fn ensure_child(parent: &Path, name: &'static str, readable_parent: bool) -> Result<PathBuf> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(FileError::Storage);
+    }
+    let parent_fd = checked(crate::atomic_file::open_data_directory(parent, false))?;
+    check_private(&parent_fd, true, readable_parent)?;
+    match fs::mkdirat(&parent_fd, name, Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(_) => return Err(FileError::Storage),
+    }
+    let child = checked(fs::openat(&parent_fd, name, DIR, Mode::empty()))?;
+    private(&child, true)?;
+    same(&parent_fd, name, &child)?;
+    let named_parent = checked(crate::atomic_file::open_data_directory(parent, false))?;
+    check_private(&named_parent, true, readable_parent)?;
+    if identity(&named_parent)? != identity(&parent_fd)? {
+        return Err(FileError::Storage);
+    }
+    checked(fs::fsync(&parent_fd))?;
+    Ok(parent.join(name))
 }

@@ -6,6 +6,7 @@ const flags = ['plugins', 'files', 'screenshot', 'messages', 'credentials', 'bui
 export type HostCapabilities = Readonly<{
   version: 1
   platform: 'windows' | 'macos'
+  pluginManagement?: boolean
 } & Record<typeof flags[number], boolean>>
 
 // Standalone clients (browser preview and test fixtures) model the full Windows host.
@@ -20,14 +21,15 @@ export function parseHostCapabilities(value: unknown): HostCapabilities | null {
   const snapshot = value as Record<string, unknown>
   if (snapshot.version !== 1 || (snapshot.platform !== 'macos' && snapshot.platform !== 'windows') ||
       flags.some(key => !Object.prototype.hasOwnProperty.call(snapshot, key) || typeof snapshot[key] !== 'boolean')) return null
+  if (snapshot.pluginManagement !== undefined && typeof snapshot.pluginManagement !== 'boolean') return null
   return Object.freeze({ ...snapshot }) as HostCapabilities
 }
 
 export function settingsTabAvailable(host: HostCapabilities, tab: string): boolean {
   switch (tab) {
     case 'general': return true
-    case 'permissions':
-    case 'plugins': return host.plugins
+    case 'permissions': return host.plugins
+    case 'plugins': return host.plugins || host.pluginManagement === true
     case 'credentials': return host.credentials
     case 'messages': return host.messages
     default: return false

@@ -9254,6 +9254,24 @@ describe('real adapter and startup', () => {
     await act(async () => window.dispatchEvent(new Event('pagehide')))
   }
 
+  it('opens Mac plugin management without mounting executable or legacy plugin services', async () => {
+    const { client: original, emit } = fakeClient()
+    const list = vi.fn(async () => ({ revision: '0', plugins: [] }))
+    const client = { ...original, macPluginManagement: { list } as unknown as import('./macos-plugin-management-client').MacPluginManagementClient }
+    const core = createLauncherCore(client, undefined, { ...hostSnapshot('macos'), pluginManagement: true })
+    const view = await mountLauncherView(core)
+    try {
+      await act(async () => { await core.start(); emit(shown('mac-management', 'settings')) })
+      await activateSettingsTab(view.host, '插件')
+      await vi.waitFor(() => expect(list).toHaveBeenCalledOnce())
+      expect(view.host.textContent).toContain('当前 Mac 插件暂不能运行')
+      expect([...view.host.querySelectorAll('[role="tab"]')].map(t => t.textContent)).not.toContain('权限')
+      expect(client.listPlugins).not.toHaveBeenCalled()
+      expect(client.listPublicPlugins).not.toHaveBeenCalled()
+      expect(client.listBuiltinFeatures).not.toHaveBeenCalled()
+    } finally { await view.unmount(); core.destroy() }
+  })
+
   it('boots the Mac launcher without optional listeners and exposes only supported settings', async () => {
     resetAdapterDocument()
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })

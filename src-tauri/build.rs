@@ -35,6 +35,15 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_host_capabilities",
+            "list_macos_plugins",
+            "prepare_macos_plugin_install",
+            "commit_macos_plugin_install",
+            "cancel_macos_plugin_install",
+            "set_macos_plugin_enabled",
+            "set_macos_plugin_permission",
+            "save_macos_plugin_settings",
+            "remove_macos_plugin",
+
             "open_find_window",
             "cancel_find_query",
             "open_find_document",

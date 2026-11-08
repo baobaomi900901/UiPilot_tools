@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-macos-plugin-settings"
+description = "Enables the save_macos_plugin_settings command without any pre-configured scope."
+commands.allow = ["save_macos_plugin_settings"]
+
+[[permission]]
+identifier = "deny-save-macos-plugin-settings"
+description = "Denies the save_macos_plugin_settings command without any pre-configured scope."
+commands.deny = ["save_macos_plugin_settings"]

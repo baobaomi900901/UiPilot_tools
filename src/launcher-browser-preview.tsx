@@ -1,3 +1,4 @@
+import { createPreviewMacPluginManagementClient } from './macos-plugin-management-preview'
 import { createRoot } from 'react-dom/client'
 import { createPreviewCredentialClient } from './credential-preview'
 
@@ -19,7 +20,7 @@ import {
 
 const previewParameters = new URLSearchParams(window.location.search)
 const capabilities: HostCapabilities = previewParameters.get('platform') === 'macos' ? {
-  version: 1, platform: 'macos', plugins: false, files: false, screenshot: false, messages: false,
+  version: 1, platform: 'macos', plugins: false, pluginManagement: true, files: false, screenshot: false, messages: false,
   credentials: false, builtinFeatures: false, commandHotkeys: false, autostart: false, doubleTap: false, webSearch: true, loginItems: false,
 } : previewCapabilities
 const previewTheme = previewParameters.get('theme') === 'light' ? 'light' : 'dark'
@@ -384,6 +385,7 @@ let previewBuiltinFeatures: readonly BuiltinFeatureView[] = [
 ]
 
 const client: LauncherClient = {
+  macPluginManagement: createPreviewMacPluginManagementClient(),
   credentials: createPreviewCredentialClient(),
   listBuiltinFeatures: async () => previewBuiltinFeatures,
   setBuiltinFeatureEnabled: async ({ feature, enabled }) => {
@@ -660,6 +662,13 @@ const stopPanelContentPreview = mountPanelContentPreview(host)
 
 async function startPreview(): Promise<void> {
   await core.start()
+  if (settingsPreview && capabilities.pluginManagement && previewParameters.get('tab') === 'plugins') {
+    core.selectSettingsTab('plugins')
+    if (previewParameters.get('detail') === '1') {
+      const observer = new MutationObserver(() => { const row = document.querySelector<HTMLButtonElement>('.mac-plugin-row'); if (row) { observer.disconnect(); row.click() } })
+      observer.observe(host!, { childList: true, subtree: true })
+    }
+  }
   if (mainResultPreview) {
     await core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/translate Stay focused', inputType: 'insertText' })
     return

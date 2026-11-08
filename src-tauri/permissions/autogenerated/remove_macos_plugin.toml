@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remove-macos-plugin"
+description = "Enables the remove_macos_plugin command without any pre-configured scope."
+commands.allow = ["remove_macos_plugin"]
+
+[[permission]]
+identifier = "deny-remove-macos-plugin"
+description = "Denies the remove_macos_plugin command without any pre-configured scope."
+commands.deny = ["remove_macos_plugin"]

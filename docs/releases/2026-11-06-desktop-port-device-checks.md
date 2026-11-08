@@ -538,3 +538,19 @@ Retirement 绑定本次真实 request，显式关闭、升级/停用/撤权/设�
 新增真实进程场景执行原样 demo-settings：安装并保存设置 → 删除临时来源 → 从安装快照执行 → 同一测试进程 drop/load 控制器并启动新 helper → 设置与代码恢复 → 升级临时包版本/build 标记并执行新输出；另外在 helper 等待首个设置 reply 时停用/撤权，捕获的清理回调取消并回收它，旧 binding 不再可用。此处“恢复”是控制器重开与新 helper PID，**不是 Host 主进程重启的实机验收**。
 
 **保留限制：** 内部单包编码与整库各限 5 MiB；标准单盘非 Zip64 归档；执行探针仅单入口 2 KiB ESM，不装模块图。生产 launcher 保留命令/用户覆盖配置、卸载/数据清理、管理 UI、真实权限服务、签名 XPC/沙箱、Windows 原生回归与双端同包实测仍待完成。开发者证书缺失不妨碍本轮内部事务测试，但这些结果不能替代公开发布或生产加载验收。未操作 GUI、系统权限、个人文件、剪贴板或凭据。
+
+## 2026-11-08 macOS 插件管理设置页
+
+开发分支新增独立 `pluginManagement` 能力与「设置 → 插件」管理页，`plugins` 执行能力保持 false。可查看/筛选安装清单，使用原生选择器准备归档或开发目录，确认安装/升级，保存普通设置、启用配置和 clipboard.write 配置，以及移除安装。界面明确当前插件不能运行；不接旧插件调用、启动命令改名/快捷键、secret 或真实 OS 权限服务。移除确认明确删除安装和普通设置、保留插件私有存储数据；重新安装需要重新授权。
+
+main-origin ACL 精确增加八个管理命令，前端不获通用路径/dialog 权限。所有变更校验十进制 u64 revision，准备 token 短期单次且绑定当前选择会话；窗口隐藏/退出不等待 IO 锁即可退休旧 owner。读取包时持有原生 NSURL 与成功取得的 scope；不虚报系统授权。主程序启动时不加载管理库，首次访问才在固定私有子根初始化。
+
+Storage/CommitUncertain 错误先撤销旧选择和 token、释放控制器与锁，下次明确请求重新核对磁盘；UI 先要求刷新，不自动重试写入。真实 AfterRename 故障测试验证实际提交被读回且文件字节不被重写，旧 token 拒绝。已准入事务可以完成，关闭只让旧响应变 stale，不声称回滚。
+
+**自动验证：** 前端完整 **811 通过、18 跳过**；Rust 双 preview 完整 **565 通过、8 默认忽略**，网络代理隔离子进程另 **1 通过**。管理/IPC 聚焦 **12 项**、精确 ACL **4 项**通过。TypeScript/Vite 生产构建和 Rust all-targets 检查通过。生产 bundle 不含浏览器预览 fixture 标记。独立审查 PASS。执行能力错误地随管理能力开启、以及失败后继续保留 poisoned 控制器，两条行为变异均留下真实红/绿证据。
+
+前端验收覆盖真实 Launcher 下 Mac 管理 tab 不调用旧 legacy/public/builtin 插件服务；普通设置的合法 constructor 键、多行文本、false/空值；草稿切换/返回/刷新/移除确认；安装和放弃确认的 Escape；同一时刻重复提交；旧客户端迟到回包；跨挂载客户端串行读写。列表、详情、主按钮、输入框和滚动区域以真实 Launcher 组件的独立浏览器 fixture 检查了浅色/深色，另检查 720 像素窗口。预览不连接真实安装库，也不打包到生产入口。
+
+日志与记录：`/private/tmp/uipilot-management-evidence.wlt8x19o`；浏览器截图：`/private/tmp/uipilot-management-visual.lc6qg7f2`。设计与计划分别为 `docs/superpowers/specs/2026-11-08-macos-plugin-management-ui-design.md` 和 `docs/superpowers/plans/2026-11-08-macos-plugin-management-ui.md`。
+
+**尚未实机验证：** Tauri 原生选包/TCC、真实应用窗口焦点、管理包安装后交互。没有启动 UiPilot GUI、修改用户授权或个人安装库。开发者签名/XPC 沙箱、插件生产执行、完整模块图、真实能力服务及双端同包生产验收仍未完成，同包双端生产宿主通过数仍为 **0**。这些待验收项未计入本轮自动通过。

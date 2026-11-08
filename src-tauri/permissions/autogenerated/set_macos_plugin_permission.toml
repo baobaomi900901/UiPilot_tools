@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-macos-plugin-permission"
+description = "Enables the set_macos_plugin_permission command without any pre-configured scope."
+commands.allow = ["set_macos_plugin_permission"]
+
+[[permission]]
+identifier = "deny-set-macos-plugin-permission"
+description = "Denies the set_macos_plugin_permission command without any pre-configured scope."
+commands.deny = ["set_macos_plugin_permission"]

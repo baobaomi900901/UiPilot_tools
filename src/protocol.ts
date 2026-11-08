@@ -459,6 +459,7 @@ export type ClassifiedTextRecord =
   | { kind: 'compositionBoundary'; control: ControlKey }
 
 export interface LauncherClient {
+  readonly macPluginManagement?: import('./macos-plugin-management-client').MacPluginManagementClient
   macosHotkeyStatus?: () => Promise<unknown>
   macosLoginItem?: MacLoginItemClient
   credentials?: CredentialClient
@@ -1119,7 +1120,7 @@ function parsePublicSettingDefinition(value: unknown): PublicSettingDefinition |
   return null
 }
 
-function parsePublicSettingView(value: unknown): PublicSettingView | null {
+export function parsePublicSettingView(value: unknown): PublicSettingView | null {
   const view = plainRecord(value)
   if (!view || !Object.prototype.hasOwnProperty.call(view, 'definition')) return null
   const definition = parsePublicSettingDefinition(view.definition)

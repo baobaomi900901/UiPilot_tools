@@ -1,3 +1,4 @@
+import { createMacPluginManagementClient } from './macos-plugin-management-client'
 import { createMacLoginItemClient } from './macos-login-item'
 import { parsePublicPluginDiagnostics } from './protocol'
 import { createCredentialClient } from './credential-client'
@@ -47,6 +48,7 @@ import {
 } from './protocol'
 
 export const client: LauncherClient = {
+  macPluginManagement: createMacPluginManagementClient(invoke),
   macosLoginItem: createMacLoginItemClient(invoke),
   macosHotkeyStatus: () => invoke('get_launcher_hotkey_status'),
   listenShown: (handler) => listen('launcher://shown', (event) => handler(event.payload)),

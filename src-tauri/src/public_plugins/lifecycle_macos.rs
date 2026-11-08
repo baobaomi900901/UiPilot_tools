@@ -126,6 +126,13 @@ impl InstalledRequest {
     }
 }
 
+pub(crate) struct InstalledView {
+    pub(crate) manifest: super::manifest::PublicManifestV1,
+    pub(crate) enabled: bool,
+    pub(crate) grants: BTreeSet<PublicPermission>,
+    pub(crate) settings: BTreeMap<String, Value>,
+}
+
 pub(crate) struct MacPluginLifecycle {
     root: PrivateRoot,
     file: PrivateFile,
@@ -181,6 +188,39 @@ impl MacPluginLifecycle {
                 Err(LifecycleError::InvalidState)
             }
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_commit_failure(&mut self, failure: super::private_file_macos::Failure) {
+        self.file.failure = Some(failure);
+    }
+    /// Management reads validate the current durable file just like mutations.
+    pub(crate) fn management_snapshot(&mut self) -> Result<(u64, Vec<InstalledView>)> {
+        self.current()?;
+        let rows = self
+            .document
+            .plugins
+            .iter()
+            .map(|(id, entry)| InstalledView {
+                manifest: self.packages[id].manifest().clone(),
+                enabled: entry.enabled,
+                grants: entry.grants.clone(),
+                settings: entry.settings.clone(),
+            })
+            .collect();
+        Ok((self.document.revision, rows))
+    }
+    pub(crate) fn remove_expected(&mut self, id: &str, revision: u64) -> Result<bool> {
+        self.current()?;
+        if revision != self.document.revision {
+            return Err(LifecycleError::Stale);
+        }
+        let mut candidate = self.document.clone();
+        if candidate.plugins.remove(id).is_none() {
+            return Err(LifecycleError::NotInstalled);
+        }
+        // Retain plugin private storage; ordinary configuration belongs to the
+        // removed inventory entry. No filesystem traversal or directory delete.
+        self.commit(candidate, id)
     }
     pub(crate) fn prepare_install(&mut self, package: VerifiedPackage) -> Result<PreparedInstall> {
         self.current()?;
@@ -311,11 +351,9 @@ impl MacPluginLifecycle {
             .next_generation
             .checked_add(1)
             .ok_or(LifecycleError::Capacity)?;
-        candidate
-            .plugins
-            .get_mut(id)
-            .ok_or(LifecycleError::NotInstalled)?
-            .generation = candidate.next_generation;
+        if let Some(entry) = candidate.plugins.get_mut(id) {
+            entry.generation = candidate.next_generation;
+        }
         let packages = validate(&candidate)?;
         let bytes = serde_json::to_vec(&candidate).map_err(|_| LifecycleError::Capacity)?;
         if bytes.len() > STORAGE_QUOTA_BYTES {
@@ -454,7 +492,7 @@ fn policy(package: &VerifiedPackage) -> Result<()> {
 fn validate(document: &Inventory) -> Result<BTreeMap<String, VerifiedPackage>> {
     if document.schema != 1
         || document.revision != document.next_generation
-        || (document.revision == 0) != document.plugins.is_empty()
+        || (document.revision == 0 && !document.plugins.is_empty())
     {
         return Err(LifecycleError::InvalidState);
     }
