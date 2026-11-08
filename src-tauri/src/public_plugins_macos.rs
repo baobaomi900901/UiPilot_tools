@@ -2,6 +2,13 @@
 #![allow(dead_code)]
 
 pub(crate) use crate::manifest;
+pub(crate) use manifest::PublicPackageError;
+#[path = "public_plugins/package_rules.rs"]
+mod package_rules;
+#[path = "public_plugins/icon.rs"]
+mod icon;
+#[path = "public_plugins/package_macos.rs"]
+mod package_macos;
 #[path = "public_plugins/data_scope.rs"]
 mod data_scope;
 pub(crate) use data_scope::PluginDataScope;
@@ -12,6 +19,8 @@ mod settings_values;
 mod settings_macos;
 #[path = "public_plugins/runtime_data_macos.rs"]
 mod runtime_data_macos;
+#[path = "public_plugins/lifecycle_macos.rs"]
+mod lifecycle_macos;
 #[path = "public_plugins/storage_document.rs"]
 mod storage_document;
 #[path = "public_plugins/private_file_macos.rs"]
@@ -54,3 +63,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "public_plugins/lifecycle_registry_macos_tests.rs"]
+mod lifecycle_registry_macos_tests;

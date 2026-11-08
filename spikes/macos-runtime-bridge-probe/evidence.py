@@ -13,7 +13,9 @@ shared=['identity.rs','request_contract.rs','call_session.rs','data_call_gate.rs
         'data_scope.rs','storage_document.rs','private_file_macos.rs','storage_macos.rs','storage_macos_tests.rs',
         'settings_values.rs','settings_macos.rs','settings_macos_tests.rs','runtime_data_macos.rs','runtime_data_macos_tests.rs',
         'main_result_contract.rs','main_result_contract_tests.rs','runtime_error.rs','runtime_result_macos.rs','runtime_result_macos_tests.rs',
-        'main_result_macos.rs','main_result_macos_tests.rs','activation.rs']
+        'main_result_macos.rs','main_result_macos_tests.rs','activation.rs',
+        'package.rs','package_macos.rs','package_macos_tests.rs','package_rules.rs','package_zip_macos.rs','icon.rs',
+        'lifecycle_macos.rs','lifecycle_macos_tests.rs','lifecycle_registry_macos_tests.rs']
 files += [repo/'src-tauri/src/public_plugins'/name for name in shared]
 files += [repo/'src-tauri/src'/name for name in ['public_plugins.rs','public_plugins_macos.rs']]
 files += [repo/'src-tauri/src'/name for name in ['atomic_file_macos.rs','result_registry.rs','model.rs']]

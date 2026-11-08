@@ -16,6 +16,11 @@ schemars = "=1.2.1"
 unicode-normalization = "=0.1.23"
 rustix = { version = "=1.1.4", features = ["fs"] }
 libc = "=0.2.186"
+base64 = "=0.22.1"
+sha2 = "=0.10.9"
+png = "=0.18.1"
+icu_casemap = { version = "=1.5.1", default-features = false, features = ["compiled_data"] }
+zip = { version = "=2.4.2", default-features = false, features = ["flate2", "deflate-flate2"] }
 
 [[bin]]
 name = "uipilot-runtime-bridge-probe"

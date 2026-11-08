@@ -16,7 +16,7 @@ use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -105,6 +105,17 @@ impl Harness {
         mode: &str,
         binding: Option<&RuntimeDataBinding>,
     ) -> Result<Self, ()> {
+        Self::new_source(path, mode, binding, None)
+    }
+    fn new_source(
+        path: &Path,
+        mode: &str,
+        binding: Option<&RuntimeDataBinding>,
+        source: Option<&str>,
+    ) -> Result<Self, ()> {
+        if (mode == "installedDemo") != source.is_some() {
+            return Err(());
+        }
         let context = binding.map(|b| b.context().clone()).unwrap_or_else(context);
         let deadline = Instant::now() + Duration::from_secs(2);
         let (session, endpoint) = match binding {
@@ -238,7 +249,11 @@ impl Harness {
             })
             .map_err(|_| ())?;
         harness.threads.push(writer);
-        harness.write(json!({"mode":mode,"context":harness.context}), None)?;
+        let mut init = json!({"mode":mode,"context":harness.context});
+        if let Some(source) = source {
+            init["source"] = json!(source);
+        }
+        harness.write(init, None)?;
         Ok(harness)
     }
     fn remaining(&self) -> Result<Duration, ()> {
@@ -628,3 +643,7 @@ mod wire_tests {
         }
     }
 }
+
+#[path = "installed_host.rs"]
+mod installed;
+pub use installed::{installed_cancel_scenario, installed_scenario};

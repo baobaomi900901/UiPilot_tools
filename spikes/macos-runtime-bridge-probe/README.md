@@ -34,7 +34,17 @@ close 先退役并阻止新 call/reply/submit，返回 drain 在锁外等待；s
 
 `main_result_contract.rs` 从 Windows activation 逐字提取，原导出、错误、20 行/64 KiB 及字段边界不变；`runtime_result_macos.rs` 先校验原始 JSON、真实请求 ID 和完整 rows，再 prepare completion，双 EOF/正常退出后 submit completion。探针接纳的是解析后的实际 typed rows。未知字段、重复 row ID、21 行和不可用 copyText 动作分别拒绝；空结果保留合法。复制权限/动作执行尚未装配，不能通过删除 defaultAction 假装支持。
 
-产品内部 `main_result_macos.rs` 另外接到真实 ResultRegistry，主库测试验证 publisher 实例/查询 owner、一次完成、迟到错误和旧提交被新查询淘汰；这一层不在独立探针假造 registry。GUI 消息与前端仍未接通，包安装、权限服务和 XPC 沙箱仍待装配。内部发布结果均为无动作的信息行。
+产品内部 `main_result_macos.rs` 另外接到真实 ResultRegistry，主库测试验证 publisher 实例/查询 owner、一次完成、迟到错误和旧提交被新查询淘汰；这一层不在独立探针假造 registry。GUI 消息与前端仍未接通；生产包安装、OS 权限服务和 XPC 沙箱仍待装配。内部发布结果均为无动作的信息行。
+
+## 已安装包快照链路
+
+`installedDemo` 使用产品同源 package_macos/lifecycle_macos：真实开发目录或归档校验后的不可变快照，经独立私有 inventory 提交；持久普通设置、enabled 和声明权限状态由 lifecycle 管理。新测试复制 tracked demo-settings 到私有临时目录，安装并保存设置后删除该临时源文件，首次执行与宿主控制器重开（同一测试进程 drop/load，加新 helper PID，并非宿主进程重启）都仍从 `InstalledRequest.package.resource(runtime.entry)` 取源码，不再回源文件或使用 include_str。升级在临时包中改变版本/固定 build 标记，安装后实际返回新的标记。
+
+源码只在 `installedDemo` 的 typed init 中传输，入口最多 2048 UTF-8 字节，整帧仍最多 4096 字节、方向总预算仍 8192 字节；其他 mode 不接受 source。原样 ESM 由 QuickJS 编译执行，本固定夹具只有单入口，未安装 import loader，不能读外部模块。这不是完整包 runtime 加载器，包自身通过快照验证也不表示能在该诊断入口执行所有模块图。
+
+每个真实 child 由 open_request 的 trusted attachment 创建，lifecycle 持有捕获原 Harness 的 retirement。停用/撤回测试在第一个真实 settings.get 已完成、尚未给 child 回包时丢弃 reply permit，再执行管理变更；lifecycle 先关闭旧调用、运行 cleanup kill/wait/join，再排空。测试核对旧 binding 拒绝，旧 child 已回收，释放所有旧 request/store Arc 后才重开私有目录，新请求恢复。此处 clipboard.write 仅测试声明授权状态，不执行任何剪贴板效果，也不宣称已获得 OS 权限。撤回已经准入的读不作回滚。
+
+包层保持同源路径/数量/解压与快照恢复校验，Mac ZIP 是受限 standard 单盘非 ZIP64 子集。单包编码与整个 inventory 各有独立 5 MiB 上限，完整 SDK 16 MiB 包并未因此全支持。文件系统稳定性复核、协作 flock 和 digest 不等于跨进程文件 CAS、签名或同 UID 恶意篡改防护。Panel/Window/resultActions 仍不支持，生产插件开关仍关闭。
 
 ## 构建与证据
 

@@ -19,18 +19,21 @@ const LOCK: &str = ".storage.lock";
 pub(super) enum FileKind {
     Storage,
     Settings,
+    Lifecycle,
 }
 impl FileKind {
     fn current(self) -> &'static str {
         match self {
             Self::Storage => "storage.json",
             Self::Settings => "settings.json",
+            Self::Lifecycle => "plugins.json",
         }
     }
     fn stage(self) -> &'static str {
         match self {
             Self::Storage => "storage.pending",
             Self::Settings => "settings.pending",
+            Self::Lifecycle => "plugins.pending",
         }
     }
 }

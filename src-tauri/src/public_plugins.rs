@@ -23,6 +23,7 @@ pub(crate) mod window_action;
 mod network;
 mod owner_cleanup;
 mod package;
+mod package_rules;
 pub(crate) mod panel_action;
 pub(crate) mod result_action;
 mod runtime;

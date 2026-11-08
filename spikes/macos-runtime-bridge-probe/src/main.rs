@@ -14,6 +14,7 @@ fn read_frame() -> Result<Value, ()> {
     }
     let mut bytes = vec![0; len];
     std::io::stdin().read_exact(&mut bytes).map_err(|_| ())?;
+    uipilot_runtime_bridge_probe::validate_wire_json(&bytes)?;
     serde_json::from_slice(&bytes).map_err(|_| ())
 }
 fn send(value: Value) -> Result<(), ()> {
@@ -27,11 +28,24 @@ fn send(value: Value) -> Result<(), ()> {
     out.write_all(&bytes).map_err(|_| ())?;
     out.flush().map_err(|_| ())
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Init {
+    context: Value,
+    mode: String,
+    source: Option<String>,
+}
 fn run() -> Result<(), ()> {
-    let init = read_frame()?;
-    let context = init["context"].clone();
+    let init: Init = serde_json::from_value(read_frame()?).map_err(|_| ())?;
+    if (init.mode == "installedDemo") != init.source.is_some() {
+        return Err(());
+    }
+    if init.source.as_ref().is_some_and(|s| s.len() > 2048) {
+        return Err(());
+    }
+    let context = init.context;
     let request = context["requestId"].as_str().ok_or(())?.to_owned();
-    let mode = init["mode"].as_str().ok_or(())?.to_owned();
+    let mode = init.mode;
     if mode == "exit" {
         return Err(());
     }
@@ -133,7 +147,7 @@ fn run() -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(1);
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let engine = Context::full(&runtime).map_err(|_| ())?;
-    let data_mode = mode.starts_with("data");
+    let data_mode = mode.starts_with("data") || mode == "installedDemo";
     let response=engine.with(|ctx|->rquickjs::Result<String>{
         let next=Cell::new(1u64);let owner=context.clone();
         let bridge=Function::new(ctx.clone(),move |operation:String,key:String,value:String|->rquickjs::Result<String>{
@@ -166,6 +180,7 @@ fn run() -> Result<(), ()> {
         let factory:Function=ctx.eval(factory_source)?;
         let port:rquickjs::Value=factory.call((bridge,))?;
         let source = match mode.as_str() {
+            "installedDemo" => init.source.as_deref().ok_or(rquickjs::Error::Exception)?,
             "dataDemo" => include_str!("../../../examples/public-plugins/com.uipilot.demo-settings/package/runtime.js"),
             "dataMainUnknown" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a',unknown:true}]};}"#,
             "dataMainDuplicate" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a'},{id:'a',title:'b'}]};}"#,

@@ -35,3 +35,20 @@ mod data_call_gate;
 pub mod host;
 #[path = "../../../src-tauri/src/public_plugins/request_contract.rs"]
 mod request_contract;
+
+#[path = "../../../src-tauri/src/public_plugins/icon.rs"]
+mod icon;
+#[path = "../../../src-tauri/src/public_plugins/lifecycle_macos.rs"]
+mod lifecycle_macos;
+#[path = "../../../src-tauri/src/public_plugins/package_macos.rs"]
+mod package_macos;
+#[path = "../../../src-tauri/src/public_plugins/package_rules.rs"]
+mod package_rules;
+
+pub(crate) use manifest::PublicPackageError;
+
+/// Strict bounded-frame JSON check shared with the real private data service.
+/// The helper's byte limit is checked before this parser is called.
+pub fn validate_wire_json(bytes: &[u8]) -> Result<(), ()> {
+    storage_document::validate_mac_json(bytes).ok_or(())
+}

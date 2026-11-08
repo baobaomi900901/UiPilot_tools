@@ -7,7 +7,6 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
 use zip::{CompressionMethod, ZipArchive};
 
 use super::{
@@ -24,13 +23,11 @@ type LoadedPublicPackage = (
     Option<PreparedAlarmAsset>,
 );
 
-const MAX_DIRECTORIES: usize = 64;
-const MAX_FILES: usize = 256;
-const MAX_DEPTH: usize = 8;
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_PATH_BYTES: usize = 240;
-const MAX_COMPONENT_BYTES: usize = 100;
+use super::package_rules::{
+    canonical_relative_path, invalid_unix_mode, register_directory, register_parent_directories,
+    validate_css_text, validate_package_resource_path, MAX_DIRECTORIES, MAX_FILES,
+    MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+};
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 
@@ -497,84 +494,7 @@ fn validate_css_references(
         }
         let css = fs::read_to_string(root.join(path_from_canonical(path)))
             .map_err(|_| PublicPackageError::InvalidPackage)?;
-        let mut folded = css.clone();
-        folded.make_ascii_lowercase();
-
-        let mut offset = 0;
-        while let Some(index) = folded[offset..].find("url(") {
-            let start = offset + index + 4;
-            let end = folded[start..]
-                .find(')')
-                .map(|end| start + end)
-                .ok_or(PublicPackageError::InvalidPackage)?;
-            let reference = css[start..end]
-                .trim()
-                .trim_matches(|character| character == '\'' || character == '"');
-            validate_local_css_reference(path, reference, resources)?;
-            offset = end + 1;
-        }
-
-        let mut offset = 0;
-        while let Some(index) = folded[offset..].find("@import") {
-            let start = offset + index + "@import".len();
-            let end = folded[start..]
-                .find(';')
-                .map(|end| start + end)
-                .ok_or(PublicPackageError::InvalidPackage)?;
-            let import = css[start..end].trim();
-            if !import.to_ascii_lowercase().starts_with("url(") {
-                let (reference, remainder) = take_css_string(import)?;
-                if !remainder.trim().is_empty() {
-                    return Err(PublicPackageError::InvalidPackage);
-                }
-                validate_local_css_reference(path, reference, resources)?;
-            }
-            offset = end + 1;
-        }
-    }
-    Ok(())
-}
-
-fn take_css_string(value: &str) -> Result<(&str, &str), PublicPackageError> {
-    let quote = value
-        .chars()
-        .next()
-        .filter(|quote| matches!(quote, '\'' | '"'))
-        .ok_or(PublicPackageError::InvalidPackage)?;
-    let body = &value[quote.len_utf8()..];
-    let end = body.find(quote).ok_or(PublicPackageError::InvalidPackage)?;
-    Ok((&body[..end], &body[end + quote.len_utf8()..]))
-}
-fn validate_local_css_reference(
-    stylesheet: &str,
-    reference: &str,
-    resources: &BTreeMap<String, PublicResource>,
-) -> Result<(), PublicPackageError> {
-    if reference.is_empty()
-        || reference.contains(['?', '#', '\\', ':', '%'])
-        || reference.starts_with('/')
-        || reference.chars().any(char::is_control)
-    {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    let mut components = stylesheet
-        .rsplit_once('/')
-        .map_or_else(Vec::new, |(parent, _)| {
-            parent.split('/').collect::<Vec<_>>()
-        });
-    for component in reference.split('/') {
-        match component {
-            "" => return Err(PublicPackageError::InvalidPackage),
-            "." => {}
-            ".." => {
-                components.pop().ok_or(PublicPackageError::InvalidPackage)?;
-            }
-            component => components.push(component),
-        }
-    }
-    let canonical = canonical_relative_path(&components.join("/"))?;
-    if !resources.contains_key(&canonical) {
-        return Err(PublicPackageError::InvalidPackage);
+        validate_css_text(path, &css, &|candidate| resources.contains_key(candidate))?;
     }
     Ok(())
 }
@@ -651,108 +571,8 @@ pub(super) fn make_file_writable(path: &Path) {
         }
     }
 }
-fn canonical_relative_path(value: &str) -> Result<String, PublicPackageError> {
-    if value.is_empty()
-        || value.starts_with('/')
-        || value.contains('\\')
-        || value.len() > MAX_PATH_BYTES
-    {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    let components = value.split('/').collect::<Vec<_>>();
-    if components.is_empty() || components.len() > MAX_DEPTH {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    if components.iter().any(|component| {
-        component.is_empty()
-            || *component == "."
-            || *component == ".."
-            || component.len() > MAX_COMPONENT_BYTES
-            || component.ends_with(['.', ' '])
-            || component
-                .chars()
-                .any(|character| character.is_control() || "<>:\"|?*".contains(character))
-            || windows_reserved_component(component)
-            || !component.nfc().eq(component.chars())
-    }) {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    Ok(components.join("/"))
-}
-
-fn windows_reserved_component(component: &str) -> bool {
-    let stem = component.split('.').next().unwrap_or_default();
-    let lower = stem.to_ascii_lowercase();
-    matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
-        || lower.get(3..).is_some_and(|suffix| {
-            (lower.starts_with("com") || lower.starts_with("lpt"))
-                && suffix.len() == 1
-                && matches!(suffix.as_bytes()[0], b'1'..=b'9')
-        })
-}
-
-fn register_parent_directories(
-    path: &str,
-    directories: &mut BTreeMap<String, String>,
-) -> Result<(), PublicPackageError> {
-    let components = path.split('/').collect::<Vec<_>>();
-    for end in 1..components.len() {
-        register_directory(&components[..end].join("/"), directories)?;
-    }
-    Ok(())
-}
-
-fn register_directory(
-    path: &str,
-    directories: &mut BTreeMap<String, String>,
-) -> Result<(), PublicPackageError> {
-    let folded = crate::file_index::fold_name(path);
-    if directories
-        .get(&folded)
-        .is_some_and(|existing| existing != path)
-    {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    directories.insert(folded, path.to_owned());
-    if directories.len() > MAX_DIRECTORIES {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    Ok(())
-}
-fn validate_package_resource_path(path: &str) -> Result<&'static str, PublicPackageError> {
-    if path == ALARM_PATH {
-        return Ok(ALARM_MIME);
-    }
-    if path == "plugin.json" {
-        return Ok("application/json");
-    }
-    let basename = path
-        .rsplit('/')
-        .next()
-        .ok_or(PublicPackageError::InvalidPackage)?;
-    let parts = basename.split('.').collect::<Vec<_>>();
-    if parts.len() != 2 || parts[0].is_empty() {
-        return Err(PublicPackageError::InvalidPackage);
-    }
-    match parts[1] {
-        "html" => Ok("text/html"),
-        "js" => Ok("text/javascript"),
-        "css" => Ok("text/css"),
-        "png" => Ok(ICON_MIME),
-        _ => Err(PublicPackageError::InvalidPackage),
-    }
-}
-
 fn path_from_canonical(path: &str) -> PathBuf {
     path.split('/').collect()
-}
-
-fn invalid_unix_mode(mode: Option<u32>, directory: bool) -> bool {
-    let Some(mode) = mode else {
-        return false;
-    };
-    let file_type = mode & 0o170000;
-    file_type != 0 && file_type != if directory { 0o040000 } else { 0o100000 }
 }
 
 fn ordinary_file(path: &Path) -> bool {

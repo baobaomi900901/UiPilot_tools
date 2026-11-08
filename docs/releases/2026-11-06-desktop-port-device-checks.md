@@ -522,3 +522,19 @@ all-targets 检查成功，双 preview 全库 **520 通过、8 默认忽略**，
 证据明确分层：真实 QuickJS → parser/完成票据是独立探针；实际 ResultRegistry/显示 DTO 是产品主库测试，未将两者描述为已连通的 GUI 端到端。测试的签名 helper SHA-256 为 `01178990dedeef29dd6f941ea4d2961f826de9964158be602f23cd81f1eee2c9`；42 条源码/夹具哈希已核对。证据生成器补纳外部测试文件后重新生成清单，未改测试代码或产物。日志与元数据归档 `/private/tmp/uipilot-main-result-evidence.gsh9ix5g`，baseCommit 为当时已有 HEAD，新增实现由源码哈希识别。
 
 未装配生产插件安装/升级/权限、主窗口 IPC/真实显示、动作执行、Panel/Window 或签名 XPC；本轮无 GUI、剪贴板、个人数据、系统权限操作。Windows 原生回归未执行，生产 Mac 插件仍关闭，同包双端生产通过数仍为 0。无需人工安装，继续保留用户延期的证书/登录启动验收，分支不合并 main。
+
+## 2026-11-08 内部插件安装、升级与权限生命周期
+
+**范围：** 在 `codex/macos-port-plan` 接通内部 Host 的真实目录/标准 ZIP 包快照、原子 inventory、升级/普通设置/启停/权限管理与 Runtime。生产公共插件入口仍关闭，未接安装 UI、启动扫描或签名 XPC。相同插件包双平台生产宿主验收通过数仍为 **0**。设计和执行记录见 `docs/superpowers/specs/2026-11-08-macos-plugin-install-lifecycle-design.md`、`docs/superpowers/plans/2026-11-08-macos-plugin-install-lifecycle.md`。
+
+已安装代码来自不可变已验证快照；来源目录后续改写或删除不影响已安装版本。单份固定 owner inventory 原子保存代码快照、设置、enabled、grants 和 generation/revision，管理事务检查批准/冲突/容量/溢出后才关闭旧运行时。升级保留停用状态与旧撤权，移除已删除的权限；过时 consent token 不可复用。普通设置按真实 manifest 规范化，Runtime 直接读取权威快照，不由旧派生设置文件覆盖。
+
+Retirement 绑定本次真实 request，显式关闭、升级/停用/撤权/设置变更和库存损坏会先关准入，再退休结果并取消传输，排空在途调用。Drop 关准入并触发清理，但不当成 drain 成功。rename 前失败保留旧文档但不复活旧 binding；rename 后不确定状态关闭直到重新打开。实际 ResultRegistry 测试证明已发布结果被清理且不误删更新 query。ClipboardWrite 仅内部授权状态与可信测试 effect；未执行系统剪贴板效果，copyText 仍拒绝。网络/凭据等范围权限没有开放。
+
+**验证：** 包/共享规则 **13 项**、生命周期 **14 项**、真实注册表生命周期 **2 项**、Runtime 数据 **10 项**通过。主库双 preview 完整回归 **553 通过、8 默认忽略**，网络代理隔离子进程另 **1 通过**；all-targets 检查通过。升级撤权敏感性测试临时恢复所有声明权限后确实失败，恢复正确实现后全库通过；ZIP 库原始同名条目被去重的风险也有独立红/绿证据，Mac 预检在解压前拒绝重复。Windows 原 ZIP IO 本轮未改，不把 Mac 修复算作 Windows 修复。
+
+冻结探针 `/private/tmp/uipilot-bridge-probe.50VYyo`：**122 项同源单测、6 项数据进程测试、2 项安装进程测试、5 项既有协议进程测试**全绿。**51 个不同 PID 全部回收**，协调者与独立 reviewer 已核对来源/执行证据，最终协调者复核 **53 条来源哈希**一致。实际执行的 ad-hoc 签名 helper SHA-256 为 `67c4593be97b77a0fe6dde6636297753ba443107ed11d3aba0a9bb68c286a7cd`；probe Cargo.lock 为 `630e4b5af5c50add131558401716343635163029faad2e2cf5ed3ed8a2b15043`。主库日志与行为敏感性证据保存在 `/private/tmp/uipilot-install-lifecycle-evidence.agapqp_s`。
+
+新增真实进程场景执行原样 demo-settings：安装并保存设置 → 删除临时来源 → 从安装快照执行 → 同一测试进程 drop/load 控制器并启动新 helper → 设置与代码恢复 → 升级临时包版本/build 标记并执行新输出；另外在 helper 等待首个设置 reply 时停用/撤权，捕获的清理回调取消并回收它，旧 binding 不再可用。此处“恢复”是控制器重开与新 helper PID，**不是 Host 主进程重启的实机验收**。
+
+**保留限制：** 内部单包编码与整库各限 5 MiB；标准单盘非 Zip64 归档；执行探针仅单入口 2 KiB ESM，不装模块图。生产 launcher 保留命令/用户覆盖配置、卸载/数据清理、管理 UI、真实权限服务、签名 XPC/沙箱、Windows 原生回归与双端同包实测仍待完成。开发者证书缺失不妨碍本轮内部事务测试，但这些结果不能替代公开发布或生产加载验收。未操作 GUI、系统权限、个人文件、剪贴板或凭据。

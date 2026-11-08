@@ -5,6 +5,7 @@ use super::{
     manifest::PublicSettingV1,
     request_contract::PluginRequestContext,
     settings_macos::{MacSettingsStore, SettingsError, SettingsHandle},
+    settings_values,
     storage::{PluginStorageError, PluginStorageStore},
     PluginDataScope,
 };
@@ -46,9 +47,22 @@ pub(crate) struct RuntimeDataBinding {
     context: PluginRequestContext,
     identity: PluginDataCallIdentity,
     scope: PluginDataScope,
-    settings_handle: SettingsHandle,
-    settings: Arc<MacSettingsStore>,
+    settings: BoundSettings,
     storage: Arc<PluginStorageStore>,
+}
+
+// A binding owns one immutable source. Installed requests never consult the
+// independently persisted settings cache used by the legacy internal entry.
+#[derive(Clone)]
+enum BoundSettings {
+    Persisted {
+        store: Arc<MacSettingsStore>,
+        handle: SettingsHandle,
+    },
+    Snapshot {
+        definitions: Arc<[PublicSettingV1]>,
+        values: Arc<BTreeMap<String, Value>>,
+    },
 }
 
 pub(crate) struct DataReply {
@@ -90,11 +104,18 @@ impl RuntimeDataBinding {
                 .remove(&self.scope, identity, id, &key)
                 .map(|()| Value::Null)
                 .map_err(storage_error),
-            DataOperation::SettingGet { key } => self
-                .settings
-                .setting(&self.scope, identity, &self.settings_handle, &key)
-                .map(|value| value.unwrap_or(Value::Null))
-                .map_err(settings_error),
+            DataOperation::SettingGet { key } => match &self.settings {
+                BoundSettings::Persisted { store, handle } => store
+                    .setting(&self.scope, identity, handle, &key)
+                    .map(|value| value.unwrap_or(Value::Null))
+                    .map_err(settings_error),
+                BoundSettings::Snapshot {
+                    definitions,
+                    values,
+                } => settings_values::public_definition(definitions, &key)
+                    .map(|_| values.get(&key).cloned().unwrap_or(Value::Null))
+                    .map_err(|_| DataRuntimeError::InvalidOperation),
+            },
         };
         let permit = self
             .session
@@ -170,6 +191,57 @@ impl RuntimeDataHost {
         deadline: Instant,
         cancel_previous: impl FnOnce() -> Result<()>,
     ) -> Result<RuntimeDataBinding> {
+        self.open_with_settings(
+            context,
+            deadline,
+            cancel_previous,
+            |host, scope, identity| {
+                let handle = host
+                    .settings
+                    .configure_with_updates(scope, identity, definitions, updates)
+                    .map_err(settings_error)?;
+                Ok(BoundSettings::Persisted {
+                    store: host.settings.clone(),
+                    handle,
+                })
+            },
+        )
+    }
+
+    /// Trusted inventory entry. Values must already be the complete canonical
+    /// ordinary-setting snapshot. No settings file is read or written here.
+    pub(crate) fn open_installed_request(
+        &mut self,
+        context: PluginRequestContext,
+        definitions: &[PublicSettingV1],
+        values: &BTreeMap<String, Value>,
+        deadline: Instant,
+        cancel_previous: impl FnOnce() -> Result<()>,
+    ) -> Result<RuntimeDataBinding> {
+        // Reject invalid snapshots before retiring an existing request.
+        let mut keys = std::collections::BTreeSet::new();
+        if definitions
+            .iter()
+            .any(|definition| !definition.validate() || !keys.insert(definition.key()))
+            || settings_values::validate_updates(definitions, values).is_err()
+            || settings_values::reconcile_settings(Some(values), definitions) != *values
+        {
+            return Err(DataRuntimeError::InvalidOperation);
+        }
+        let settings = BoundSettings::Snapshot {
+            definitions: Arc::from(definitions),
+            values: Arc::new(values.clone()),
+        };
+        self.open_with_settings(context, deadline, cancel_previous, |_, _, _| Ok(settings))
+    }
+
+    fn open_with_settings(
+        &mut self,
+        context: PluginRequestContext,
+        deadline: Instant,
+        cancel_previous: impl FnOnce() -> Result<()>,
+        prepare: impl FnOnce(&Self, &PluginDataScope, &PluginDataCallIdentity) -> Result<BoundSettings>,
+    ) -> Result<RuntimeDataBinding> {
         if self.failed || !context.valid_shape() || Instant::now() >= deadline {
             return Err(DataRuntimeError::InvalidContext);
         }
@@ -195,10 +267,7 @@ impl RuntimeDataHost {
             .activate(identity.clone())
             .map_err(|_| DataRuntimeError::InvalidContext)?;
         let prepared = (|| {
-            let handle = self
-                .settings
-                .configure_with_updates(&scope, &identity, definitions, updates)
-                .map_err(settings_error)?;
+            let settings = prepare(self, &scope, &identity)?;
             let (endpoint, _) = self
                 .session
                 .open(context.clone(), epoch, epoch, deadline)
@@ -209,8 +278,7 @@ impl RuntimeDataHost {
                 context,
                 identity: identity.clone(),
                 scope,
-                settings_handle: handle,
-                settings: self.settings.clone(),
+                settings,
                 storage: self.storage.clone(),
             })
         })();

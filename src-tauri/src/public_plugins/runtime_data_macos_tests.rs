@@ -427,3 +427,205 @@ fn deadline_spent_draining_does_not_start_a_settings_transaction() {
     worker.join().unwrap();
     assert_eq!(fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn installed_snapshot_is_owned_declared_only_and_does_not_create_settings_file() {
+    let temp = Temp::new();
+    let mut host = temp.host();
+    let mut defs = definitions();
+    let mut values = BTreeMap::from([("title".into(), json!("快照 😀"))]);
+    let binding = host
+        .open_installed_request(
+            context(),
+            &defs,
+            &values,
+            Instant::now() + Duration::from_secs(5),
+            || Ok(()),
+        )
+        .unwrap();
+    values.insert("title".into(), json!("later caller mutation"));
+    defs.clear();
+    assert_eq!(
+        call(
+            &binding,
+            1,
+            DataOperation::SettingGet {
+                key: "title".into()
+            }
+        ),
+        Ok(json!("快照 😀"))
+    );
+    assert_eq!(
+        call(
+            &binding,
+            2,
+            DataOperation::SettingGet {
+                key: "optional".into()
+            }
+        ),
+        Ok(Value::Null)
+    );
+    for (id, key) in [(3, "secret"), (4, "unknown")] {
+        assert_eq!(
+            call(&binding, id, DataOperation::SettingGet { key: key.into() }),
+            Err(DataRuntimeError::InvalidOperation)
+        );
+    }
+    assert!(!temp.0.join("settings/com.uipilot.fixture").exists());
+    // Snapshot requests retain real storage and session authorization.
+    assert_eq!(
+        call(
+            &binding,
+            5,
+            DataOperation::StorageSet {
+                key: "sample".into(),
+                value: json!(1)
+            }
+        ),
+        Ok(Value::Null)
+    );
+    host.close(|| Ok(())).unwrap();
+    assert_eq!(
+        call(
+            &binding,
+            6,
+            DataOperation::SettingGet {
+                key: "title".into()
+            }
+        ),
+        Err(DataRuntimeError::InvalidContext)
+    );
+}
+
+#[test]
+fn installed_snapshot_removal_never_revives_persisted_optional_value() {
+    let temp = Temp::new();
+    let mut host = temp.host();
+    let old = host
+        .open_request(
+            context(),
+            &definitions(),
+            &BTreeMap::from([
+                ("title".into(), json!("cached")),
+                ("optional".into(), json!("old cache")),
+            ]),
+            Instant::now() + Duration::from_secs(5),
+            || Ok(()),
+        )
+        .unwrap();
+    let settings_path = temp.0.join("settings/com.uipilot.fixture/settings.json");
+    let persisted = fs::read(&settings_path).unwrap();
+    let first = host
+        .open_installed_request(
+            context(),
+            &definitions(),
+            &BTreeMap::from([
+                ("title".into(), json!("installed")),
+                ("optional".into(), json!("first snapshot")),
+            ]),
+            Instant::now() + Duration::from_secs(5),
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        call(
+            &first,
+            1,
+            DataOperation::SettingGet {
+                key: "optional".into()
+            }
+        ),
+        Ok(json!("first snapshot"))
+    );
+    let second = host
+        .open_installed_request(
+            context(),
+            &definitions(),
+            &BTreeMap::from([("title".into(), json!("replacement"))]),
+            Instant::now() + Duration::from_secs(5),
+            || Ok(()),
+        )
+        .unwrap();
+    for retired in [&old, &first] {
+        assert_eq!(
+            call(
+                retired,
+                2,
+                DataOperation::SettingGet {
+                    key: "optional".into()
+                }
+            ),
+            Err(DataRuntimeError::InvalidContext)
+        );
+    }
+    assert_eq!(
+        call(
+            &second,
+            1,
+            DataOperation::SettingGet {
+                key: "optional".into()
+            }
+        ),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        call(
+            &second,
+            2,
+            DataOperation::SettingGet {
+                key: "title".into()
+            }
+        ),
+        Ok(json!("replacement"))
+    );
+    assert_eq!(fs::read(settings_path).unwrap(), persisted);
+}
+
+#[test]
+fn noncanonical_snapshot_is_rejected_before_cancel_and_preserves_active_binding() {
+    let temp = Temp::new();
+    let mut host = temp.host();
+    let old = open(&mut host, "still active");
+    let canonical = BTreeMap::from([("title".into(), json!("candidate"))]);
+    let mut bad_definitions = definitions();
+    bad_definitions.push(bad_definitions[0].clone());
+    let mut invalid_definition = definitions();
+    invalid_definition[0] = serde_json::from_value(json!({
+        "type":"text", "key":"", "label":"Invalid"
+    }))
+    .unwrap();
+    let mut cases = vec![
+        (bad_definitions, canonical.clone()),
+        (invalid_definition, canonical.clone()),
+    ];
+    for bad in [
+        json!({}),
+        json!({"title":3}),
+        json!({"title":"ok", "unknown":true}),
+        json!({"title":"ok", "secret":"forbidden"}),
+    ] {
+        cases.push((definitions(), serde_json::from_value(bad).unwrap()));
+    }
+    for (defs, values) in cases {
+        assert!(matches!(
+            host.open_installed_request(
+                context(),
+                &defs,
+                &values,
+                Instant::now() + Duration::from_secs(5),
+                || panic!("invalid snapshot must not cancel"),
+            ),
+            Err(DataRuntimeError::InvalidOperation)
+        ));
+    }
+    assert_eq!(
+        call(
+            &old,
+            1,
+            DataOperation::SettingGet {
+                key: "title".into()
+            }
+        ),
+        Ok(json!("still active"))
+    );
+}
