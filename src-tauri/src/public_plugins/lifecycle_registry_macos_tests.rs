@@ -13,7 +13,7 @@ fn actual_result_registry_owner_is_retired_on_disable_and_prepared_result_cannot
     let owner_slot=Arc::new(Mutex::new(None));
     let p=publisher.clone(); let slot=owner_slot.clone();
     host.open_request(ID,"default",REQUEST,Instant::now()+Duration::from_secs(10), move |request| {
-        let owner=Arc::new(p.begin(request.binding().clone(),"invocation",1).unwrap());
+        let owner=Arc::new(p.begin(request.binding().clone(),"invocation",1,None).unwrap());
         *slot.lock().unwrap()=Some(owner.clone());
         Ok(Box::new(move||{assert!(p.retire(&owner));Ok(())}))
     }).unwrap();
@@ -52,7 +52,7 @@ fn published_rows_retire_on_disable_corruption_and_drop_without_clearing_newer_q
                 Instant::now() + Duration::from_secs(10),
                 move |request| {
                     let owner =
-                        Arc::new(p.begin(request.binding().clone(), "invocation", 1).unwrap());
+                        Arc::new(p.begin(request.binding().clone(), "invocation", 1, None).unwrap());
                     *slot.lock().unwrap() = Some(owner.clone());
                     Ok(Box::new(move || {
                         assert_eq!(p.retire(&owner), !newer_query);

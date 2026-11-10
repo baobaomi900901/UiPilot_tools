@@ -600,6 +600,33 @@ impl ManagementState {
         }
         Ok(())
     }
+
+    /// Final admission runs under the same authority as permission changes.
+    /// The caller performs the actual clipboard write after this returns.
+    pub(crate) fn admit_clipboard_write<T>(
+        &self,
+        appdata: &Path,
+        epoch: ManagementEpoch,
+        owner: &Arc<()>,
+        plugin_id: &str,
+        generation: u64,
+        admit: impl FnOnce() -> Option<T>,
+    ) -> Result<T> {
+        self.with_epoch(appdata, epoch, |manager| {
+            if manager.appdata != appdata
+                || !manager
+                    .runtime_owner
+                    .as_ref()
+                    .is_some_and(|id| Arc::ptr_eq(id, owner))
+                || !manager
+                    .host
+                    .clipboard_write_current(plugin_id, generation)?
+            {
+                return Err(Error::Stale);
+            }
+            admit().ok_or(Error::Stale)
+        })
+    }
 }
 #[cfg(test)]
 #[path = "management_macos_tests.rs"]

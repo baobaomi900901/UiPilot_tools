@@ -1,5 +1,4 @@
-//! Internal informational MainResult adapter using the real launcher registry.
-//! No production IPC, clipboard grants, action execution or UI emission here.
+//! MainResult adapter using the real launcher registry.
 use super::{
     runtime_data_macos::RuntimeDataBinding,
     runtime_result_macos::{MainCompletionError, PreparedMainResults},
@@ -27,6 +26,7 @@ pub(crate) struct MainResultOwner {
     identity: Arc<()>,
     query: QueryToken,
     binding: RuntimeDataBinding,
+    copy_command_id: Option<String>,
     state: Mutex<CompletionState>,
 }
 pub(crate) struct MainResultPublication {
@@ -49,6 +49,7 @@ impl MainResultPublisher {
         binding: RuntimeDataBinding,
         invocation: &str,
         sequence: u64,
+        copy_command_id: Option<&str>,
     ) -> Option<MainResultOwner> {
         let query = self
             .registry
@@ -58,6 +59,7 @@ impl MainResultPublisher {
             identity: Arc::new(()),
             query,
             binding,
+            copy_command_id: copy_command_id.map(str::to_owned),
             state: Mutex::new(CompletionState::Pending),
         })
     }
@@ -80,7 +82,10 @@ impl MainResultPublisher {
         if *state != CompletionState::Pending {
             return Err(MainCompletionError::Expired);
         }
-        let prepared = match owner.binding.prepare_main_results(raw) {
+        let prepared = match owner
+            .binding
+            .prepare_main_results_with_copy(raw, owner.copy_command_id.is_some())
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 *state = CompletionState::Terminal;
@@ -123,11 +128,22 @@ impl MainResultPublisher {
                 let entries = rows
                     .into_iter()
                     .map(|row| {
+                        let context = owner.binding.context();
+                        let action = row.copy_text.map(|text| ResultAction::CopyText {
+                            command_id: owner.copy_command_id.clone(),
+                            plugin_id: context.plugin_id.clone(),
+                            generation: context.plugin_generation,
+                            text,
+                        });
                         (
                             ResultItem {
                                 result_actions: None,
                                 result_id: String::new(),
-                                activation: LauncherResultActivation::Informational,
+                                activation: if action.is_some() {
+                                    LauncherResultActivation::ExecuteResult
+                                } else {
+                                    LauncherResultActivation::Informational
+                                },
                                 title: row.title,
                                 subtitle: row.subtitle,
                                 detail: row.detail,
@@ -135,14 +151,12 @@ impl MainResultPublisher {
                                 plugin_icon_url: None,
                                 icon_kind: None,
                                 favorite: None,
-                                has_default_action: false,
+                                has_default_action: action.is_some(),
                             },
-                            None::<ResultAction>,
+                            action,
                         )
                     })
                     .collect();
-                // CallSession supplies request authority; these rows have no native
-                // actions and require no fabricated clipboard/permission grant.
                 self.registry
                     .publish_if_latest(owner.query, entries, || true, search_response)
             });

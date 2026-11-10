@@ -1,5 +1,4 @@
-//! Fixed legacy MainResult completion path. Actions await actual permission and
-//! execution wiring; this internal path accepts informational results only.
+//! Fixed legacy MainResult completion path.
 use super::{
     call_session::{CallSessionError, CompletionTicket},
     main_result_contract::{parse_main_result_response, PublicMainResult, MAX_MAIN_RESPONSE_BYTES},
@@ -25,14 +24,27 @@ pub(crate) struct PreparedMainResults {
 }
 impl RuntimeDataBinding {
     pub(crate) fn prepare_main_results(&self, raw: &[u8]) -> Result<PreparedMainResults> {
+        self.prepare_main_results_with_copy(raw, false)
+    }
+
+    pub(super) fn prepare_main_results_with_copy(
+        &self,
+        raw: &[u8],
+        clipboard_write: bool,
+    ) -> Result<PreparedMainResults> {
         if raw.len() > MAX_MAIN_RESPONSE_BYTES || validate_mac_json(raw).is_none() {
             return Err(MainCompletionError::InvalidResult);
         }
         let value = serde_json::from_slice(raw).map_err(|_| MainCompletionError::InvalidResult)?;
         let rows = parse_main_result_response(self.context(), value)
             .map_err(|_| MainCompletionError::InvalidResult)?;
-        if rows.iter().any(|row| row.copy_text.is_some()) {
-            return Err(MainCompletionError::UnsupportedAction);
+        for text in rows.iter().filter_map(|row| row.copy_text.as_deref()) {
+            if !clipboard_write {
+                return Err(MainCompletionError::UnsupportedAction);
+            }
+            if text.len() > 16 * 1024 || text.contains('\0') {
+                return Err(MainCompletionError::InvalidResult);
+            }
         }
         let ticket = self
             .session()

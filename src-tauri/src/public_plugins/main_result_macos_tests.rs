@@ -6,7 +6,7 @@ fn setup(registry: &ResultRegistry, fixture: &Fixture) -> (MainResultPublisher, 
     registry.on_show("invocation".into());
     let publisher = MainResultPublisher::new(registry.clone());
     let owner = publisher
-        .begin(fixture.binding.clone(), "invocation", 1)
+        .begin(fixture.binding.clone(), "invocation", 1, None)
         .unwrap();
     (publisher, owner)
 }
@@ -142,7 +142,7 @@ fn find_scope_and_invalid_results_have_no_informational_fallback() {
     let registries = ResultRegistries::default();
     registries.find().on_show("find".into());
     assert!(MainResultPublisher::new(registries.find().clone())
-        .begin(f.binding.clone(), "find", 1)
+        .begin(f.binding.clone(), "find", 1, None)
         .is_none());
     let (publisher, owner) = setup(registries.main(), &f);
     let mut value: serde_json::Value = serde_json::from_slice(&raw()).unwrap();

@@ -241,6 +241,110 @@ fn missing_and_outside_modules_fail_before_data_calls_or_publication() {
 
 #[test]
 #[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn demo_return_copy_checks_grant_at_publication_and_at_single_use_admission() {
+    use crate::public_plugins::manifest::PublicPermission;
+    const COPY_PLUGIN: &str = "com.uipilot.demo-return";
+    for case in ["denied", "revoked", "copied"] {
+        let temp = Temp::new();
+        let package = temp.0.join("package");
+        fs::remove_file(package.join("runtime.js")).unwrap();
+        fs::create_dir(package.join("dist")).unwrap();
+        fs::write(
+            package.join("plugin.json"),
+            include_bytes!(
+                "../../../examples/public-plugins/com.uipilot.demo-return/package/plugin.json"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            package.join("dist/runtime.js"),
+            include_bytes!(
+                "../../../examples/public-plugins/com.uipilot.demo-return/package/dist/runtime.js"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(ManagementState::default());
+        temp.install(&state);
+        let revoke = || {
+            state
+                .with(&temp.0, |manager| {
+                    let revision = manager.list()?.revision;
+                    manager.permission(
+                        COPY_PLUGIN,
+                        PublicPermission::ClipboardWrite,
+                        false,
+                        &revision,
+                    )?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        if case == "denied" {
+            revoke();
+        }
+        let registry = registry();
+        let probe = QuickJsProbe::new(None);
+        let runtime = LauncherRuntime::with_transport(
+            state.clone(),
+            registry.clone(),
+            probe.clone(),
+            Duration::from_secs(5),
+        );
+        start(&runtime, &registry);
+        let route = launch(&runtime, &temp.0, 1, "/demo-return 中文", true);
+        let report = probe.take_report();
+        assert_eq!(report.data_calls, 0);
+        if case == "denied" {
+            assert!(matches!(route, Err(Error::UnsupportedAction)));
+        } else {
+            let Route::Published(response) = route.unwrap() else {
+                panic!("expected copy result")
+            };
+            let item = &response.items[0];
+            assert!(item.has_default_action);
+            let mut writes = 0;
+            let result = runtime.copy_result(
+                &temp.0,
+                &response.request_id,
+                &item.result_id,
+                |text, admit| {
+                    assert!(text.starts_with("中文 "));
+                    assert_eq!(text, item.title);
+                    if case == "revoked" {
+                        revoke();
+                    }
+                    if !admit() {
+                        return Err(HostCopyError::PermissionDenied);
+                    }
+                    writes += 1;
+                    assert!(!admit());
+                    Ok(HostCopyOutcome::Accepted)
+                },
+            );
+            if case == "revoked" {
+                assert!(matches!(result, Err(HostCopyError::PermissionDenied)));
+                assert_eq!(writes, 0);
+            } else {
+                let owner = result.unwrap();
+                assert_eq!(writes, 1);
+                assert!(registry
+                    .begin_query(QueryDomain::Application, "1", 2)
+                    .is_some());
+                assert!(!registry.finish_main_action(&owner));
+            }
+            assert!(matches!(
+                runtime.copy_result(&temp.0, &response.request_id, &item.result_id, |_, _| {
+                    panic!("retired ticket must not enter the driver")
+                }),
+                Err(HostCopyError::PermissionDenied)
+            ));
+        }
+        drain(&runtime, &state);
+    }
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
 fn installed_javascript_reads_saved_settings_and_publishes_through_launcher() {
     let temp = Temp::new();
     {

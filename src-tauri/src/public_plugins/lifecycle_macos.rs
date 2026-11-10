@@ -96,6 +96,14 @@ impl InstalledRequest {
     pub(crate) fn command_id(&self) -> &str {
         &self.command_id
     }
+    pub(crate) fn clipboard_write_allowed(&self) -> bool {
+        self.grants.contains(&PublicPermission::ClipboardWrite)
+            && self
+                .package
+                .manifest()
+                .permissions
+                .contains(&PublicPermission::ClipboardWrite)
+    }
     /// Internal Host admission only. The trusted effect is never supplied by a
     /// child. This does not implement a clipboard service or enable copy rows.
     pub(crate) fn permission_call(
@@ -188,6 +196,18 @@ impl MacPluginLifecycle {
                 Err(LifecycleError::InvalidState)
             }
         }
+    }
+    pub(crate) fn clipboard_write_current(&mut self, id: &str, generation: u64) -> Result<bool> {
+        self.current()?;
+        Ok(self.document.plugins.get(id).is_some_and(|entry| {
+            entry.enabled
+                && entry.generation == generation
+                && entry.grants.contains(&PublicPermission::ClipboardWrite)
+                && self.packages[id]
+                    .manifest()
+                    .permissions
+                    .contains(&PublicPermission::ClipboardWrite)
+        }))
     }
     #[cfg(test)]
     pub(crate) fn inject_commit_failure(&mut self, failure: super::private_file_macos::Failure) {

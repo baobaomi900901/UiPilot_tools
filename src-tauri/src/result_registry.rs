@@ -137,12 +137,19 @@ impl ExecutionTicket {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MainActionKind { CopyText, WebSearch }
+pub(crate) enum MainActionKind { CopyText, PluginCopyText, WebSearch }
 #[cfg(target_os = "macos")]
 impl MainActionKind {
+    fn domain(self) -> QueryDomain {
+        match self {
+            Self::PluginCopyText => QueryDomain::Plugin,
+            Self::CopyText | Self::WebSearch => QueryDomain::Application,
+        }
+    }
     fn matches(self, action: &ResultAction) -> bool {
         matches!((self, action),
             (Self::CopyText, ResultAction::CopyBuiltInText { .. }) |
+            (Self::PluginCopyText, ResultAction::CopyText { .. }) |
             (Self::WebSearch, ResultAction::OpenWebSearch { .. }))
     }
 }
@@ -154,6 +161,7 @@ pub(crate) struct MainActionCompletionOwner {
     scope_generation: u64,
     invocation_id: String,
     query_sequence: u64,
+    domain: QueryDomain,
     domain_epoch: u64,
     result_set_generation: u64,
 }
@@ -519,10 +527,11 @@ impl ResultRegistry {
     #[cfg(target_os = "macos")]
     pub(crate) fn consume_main_action(&self, ticket: &ExecutionTicket, expected: MainActionKind) -> Result<MainActionCompletionOwner, RegistryError> {
         let mut state = self.inner.state.lock().expect("result registry lock poisoned");
-        let index = QueryDomain::Application.index();
+        let domain = expected.domain();
+        let index = domain.index();
         if self.inner.scope != WindowScope::Main || !self.ticket_matches(&state, ticket)
-            || state.latest_query_domain != Some(QueryDomain::Application)
-            || !state.current.as_ref().is_some_and(|set| set.domain == QueryDomain::Application
+            || state.latest_query_domain != Some(domain)
+            || !state.current.as_ref().is_some_and(|set| set.domain == domain
                 && set.actions.get(&ticket.result_id).is_some_and(|action| expected.matches(action))) {
             return Err(RegistryError::StaleRequest);
         }
@@ -532,7 +541,7 @@ impl ResultRegistry {
         Ok(MainActionCompletionOwner {
             registry: Arc::downgrade(&self.inner), scope_generation: state.generation,
             invocation_id: ticket.invocation_id.clone(), query_sequence: state.latest_query_sequence,
-            domain_epoch: next, result_set_generation: state.result_set_generation,
+            domain, domain_epoch: next, result_set_generation: state.result_set_generation,
         })
     }
 
@@ -545,8 +554,8 @@ impl ResultRegistry {
         if !state.active || state.generation != owner.scope_generation
             || state.active_invocation_id.as_deref() != Some(&owner.invocation_id)
             || state.latest_query_sequence != owner.query_sequence
-            || state.latest_query_domain != Some(QueryDomain::Application)
-            || state.domain_epochs[QueryDomain::Application.index()] != owner.domain_epoch
+            || state.latest_query_domain != Some(owner.domain)
+            || state.domain_epochs[owner.domain.index()] != owner.domain_epoch
             || state.result_set_generation != owner.result_set_generation || state.current.is_some() {
             return false;
         }

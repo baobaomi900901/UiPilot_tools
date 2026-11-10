@@ -253,7 +253,6 @@ fn execute_copy_registered(
     service: &MacApplications, request_id: &str, result_id: &str,
     copy: impl FnOnce(&str, &mut dyn FnMut() -> bool) -> Result<crate::clipboard_history::HostCopyOutcome, crate::clipboard_history::HostCopyError>,
 ) -> Result<MainActionCompletionOwner, Error> {
-    use crate::clipboard_history::HostCopyError;
     let _guard = service.execute.lock().expect("application execution");
     let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
     let ResultAction::CopyBuiltInText { text } = action else { return Err(Error::unavailable()); };
@@ -263,14 +262,19 @@ fn execute_copy_registered(
         completion = service.registry.consume_main_action(&ticket, MainActionKind::CopyText).ok();
         completion.is_some()
     };
-    copy(&text, &mut admit).map_err(|error| match error {
+    copy(&text, &mut admit).map_err(copy_error)?;
+    completion.ok_or_else(Error::stale)
+}
+
+fn copy_error(error: crate::clipboard_history::HostCopyError) -> Error {
+    use crate::clipboard_history::HostCopyError;
+    match error {
         HostCopyError::PermissionDenied => Error::stale(),
         HostCopyError::OwnershipLost | HostCopyError::WriteUnconfirmed => Error {
             code: "clipboardWriteUnconfirmed", message: "复制已尝试，尚未确认结果；请重新搜索后再试",
         },
         _ => Error { code: "clipboardWriteFailed", message: "无法复制到剪贴板" },
-    })?;
-    completion.ok_or_else(Error::stale)
+    }
 }
 
 fn execute_web_registered(
@@ -332,6 +336,17 @@ async fn execute_main(window: WebviewWindow, request_id: String, result_id: Stri
         if matches!(action, ResultAction::CopyBuiltInText { .. }) {
             let owner = execute_copy_registered(&service, &request_id, &result_id,
                 |text, admit| crate::clipboard_history::copy_host_text(text, admit))?;
+            finish_host_action(&app, &service, owner);
+            return Ok(serde_json::json!({ "status": "textCopied" }));
+        }
+        if matches!(action, ResultAction::CopyText { .. }) {
+            let appdata = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
+            let owner = {
+                let _guard = service.execute.lock().expect("application execution");
+                service.runtime.copy_result(&appdata, &request_id, &result_id,
+                    |text, admit| crate::clipboard_history::copy_host_text(text, admit))
+                    .map_err(copy_error)?
+            };
             finish_host_action(&app, &service, owner);
             return Ok(serde_json::json!({ "status": "textCopied" }));
         }

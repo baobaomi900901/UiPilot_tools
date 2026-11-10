@@ -13,8 +13,11 @@ use super::{
     runtime_result_macos::MainCompletionError,
 };
 use crate::{
+    clipboard_history::{HostCopyError, HostCopyOutcome},
     model::SearchResponse,
-    result_registry::{QueryDomain, ResultRegistry},
+    result_registry::{
+        MainActionCompletionOwner, MainActionKind, QueryDomain, ResultAction, ResultRegistry,
+    },
 };
 use std::{
     path::Path,
@@ -278,6 +281,79 @@ impl LauncherRuntime {
         let lane = self.lane.lock().unwrap();
         Arc::ptr_eq(&lane.admission, admission) && self.management.runtime_epoch_current(epoch)
     }
+
+    pub(crate) fn copy_result(
+        &self,
+        appdata: &Path,
+        request_id: &str,
+        result_id: &str,
+        copy: impl FnOnce(&str, &mut dyn FnMut() -> bool) -> Result<HostCopyOutcome, HostCopyError>,
+    ) -> Result<MainActionCompletionOwner, HostCopyError> {
+        let denied = HostCopyError::PermissionDenied;
+        if !self.available() {
+            return Err(denied);
+        }
+        let (action, ticket) = self
+            .registry
+            .resolve_with_ticket(request_id, result_id)
+            .map_err(|_| denied)?;
+        let ResultAction::CopyText {
+            command_id: Some(_),
+            plugin_id,
+            generation,
+            text,
+        } = action
+        else {
+            return Err(denied);
+        };
+        let run = self
+            .lane
+            .lock()
+            .map_err(|_| denied)?
+            .active
+            .clone()
+            .ok_or(denied)?;
+        let context = run.binding.context();
+        if context.plugin_id != plugin_id || context.plugin_generation != generation {
+            return Err(denied);
+        }
+
+        let mut completion = None;
+        let mut admit = || {
+            if completion.is_some() {
+                return false;
+            }
+            completion = self
+                .management
+                .admit_clipboard_write(
+                    appdata,
+                    run.management_epoch.clone(),
+                    &run.identity,
+                    &plugin_id,
+                    generation,
+                    || {
+                        let lane = self.lane.lock().ok()?;
+                        let _control = run.control.state.lock().ok()?;
+                        if run.control.cancelled.load(Ordering::Acquire)
+                            || !lane
+                                .active
+                                .as_ref()
+                                .is_some_and(|active| Arc::ptr_eq(active, &run))
+                        {
+                            return None;
+                        }
+                        self.registry
+                            .consume_main_action(&ticket, MainActionKind::PluginCopyText)
+                            .ok()
+                    },
+                )
+                .ok();
+            completion.is_some()
+        };
+        copy(&text, &mut admit)?;
+        completion.ok_or(denied)
+    }
+
     /// Blocking worker only. No management lock is held while transport.run or
     /// callbacks execute. Non-plugin queries still retire an old active run,
     /// without consuming the registry sequence needed by normal app search.
@@ -351,6 +427,9 @@ impl LauncherRuntime {
                         installed.binding().clone(),
                         &invocation.to_string(),
                         sequence,
+                        installed
+                            .clipboard_write_allowed()
+                            .then_some(installed.command_id()),
                     )
                     .ok_or(LifecycleError::Stale)?;
                 let run = Arc::new(ActiveRun {
