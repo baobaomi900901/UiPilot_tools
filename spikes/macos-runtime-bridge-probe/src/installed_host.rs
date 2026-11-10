@@ -94,7 +94,7 @@ fn execute(host: &mut MacPluginLifecycle, helper: &Path, label: &str) -> Report 
     host.close().unwrap();
     let harness = transport.lock().unwrap();
     let report = Report {
-        pid: harness.child.id(),
+        pid: harness.pipe.pid(),
         accepted: result.is_ok(),
         backend_calls: calls,
         data: result.ok(),
@@ -175,7 +175,7 @@ pub fn installed_cancel_scenario(helper: &Path, root: &Path, revoke: bool) -> Ve
     let report = {
         let harness = transport.lock().unwrap();
         Report {
-            pid: harness.child.id(),
+            pid: harness.pipe.pid(),
             accepted: false,
             backend_calls: 1,
             data: None,

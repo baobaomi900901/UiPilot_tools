@@ -34,10 +34,14 @@ struct Init {
     context: Value,
     mode: String,
     source: Option<String>,
+    invocation: Option<Value>,
 }
 fn run() -> Result<(), ()> {
     let init: Init = serde_json::from_value(read_frame()?).map_err(|_| ())?;
-    if (init.mode == "installedDemo") != init.source.is_some() {
+    let launcher = init.mode == "launcherDemo";
+    if matches!(init.mode.as_str(), "installedDemo" | "launcherDemo") != init.source.is_some()
+        || launcher != init.invocation.is_some()
+    {
         return Err(());
     }
     if init.source.as_ref().is_some_and(|s| s.len() > 2048) {
@@ -45,6 +49,9 @@ fn run() -> Result<(), ()> {
     }
     let context = init.context;
     let request = context["requestId"].as_str().ok_or(())?.to_owned();
+    if let Some(invocation) = &init.invocation {
+        uipilot_runtime_bridge_probe::validate_launcher_invocation(invocation, &request)?;
+    }
     let mode = init.mode;
     if mode == "exit" {
         return Err(());
@@ -147,7 +154,7 @@ fn run() -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(1);
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let engine = Context::full(&runtime).map_err(|_| ())?;
-    let data_mode = mode.starts_with("data") || mode == "installedDemo";
+    let data_mode = mode.starts_with("data") || matches!(mode.as_str(), "installedDemo" | "launcherDemo");
     let response=engine.with(|ctx|->rquickjs::Result<String>{
         let next=Cell::new(1u64);let owner=context.clone();
         let bridge=Function::new(ctx.clone(),move |operation:String,key:String,value:String|->rquickjs::Result<String>{
@@ -180,7 +187,7 @@ fn run() -> Result<(), ()> {
         let factory:Function=ctx.eval(factory_source)?;
         let port:rquickjs::Value=factory.call((bridge,))?;
         let source = match mode.as_str() {
-            "installedDemo" => init.source.as_deref().ok_or(rquickjs::Error::Exception)?,
+            "installedDemo" | "launcherDemo" => init.source.as_deref().ok_or(rquickjs::Error::Exception)?,
             "dataDemo" => include_str!("../../../examples/public-plugins/com.uipilot.demo-settings/package/runtime.js"),
             "dataMainUnknown" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a',unknown:true}]};}"#,
             "dataMainDuplicate" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a'},{id:'a',title:'b'}]};}"#,
@@ -204,7 +211,7 @@ fn run() -> Result<(), ()> {
         let module=Module::declare(ctx.clone(),"fixed-fixture.js",source)?;
         let(module,evaluated)=module.eval()?;evaluated.finish::<()>()?;
         let handler:Function=module.get("onCommand")?;
-        let invocation=ctx.json_parse(json!({"requestId":request}).to_string())?;
+        let invocation=ctx.json_parse(init.invocation.unwrap_or_else(|| json!({"requestId":request})).to_string())?;
         let promise:Promise=handler.call((invocation,port))?;
         let result:rquickjs::Value=promise.finish()?;
         Ok(ctx.json_stringify(result)?.ok_or(rquickjs::Error::Exception)?.to_string()?)

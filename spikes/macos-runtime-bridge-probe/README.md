@@ -58,4 +58,19 @@ spikes/macos-runtime-bridge-probe/build.sh
 
 只 offline/locked，独立 Cargo workspace/lock；不改产品 Cargo。默认输出 `/private/tmp/uipilot-bridge-probe.XXXXXX`，也可传尚不存在的绝对目录。真实进程测试明确运行输出目录中 **签名后的 helper**；artifact-evidence.json 分别记其哈希与 Cargo target 原文件哈希，不能把只签名但没执行的文件称为已测试。bridge-cases.json 记录实际 PID、回收、接纳与 backend 次数，源码哈希包含同源 core/DTO/gate/validator 和旧路径集成文件。
 
+## 宿主协调器进程测试
+
+在仓库根目录运行下列命令，将 helper 路径替换为上一步生成的绝对路径。
+
+```sh
+UIPILOT_LAUNCHER_TEST_HELPER=/private/tmp/uipilot-bridge-probe.XXXXXX/helper \
+  cargo test --offline --locked --manifest-path src-tauri/Cargo.toml --lib \
+  --features macos-find-preview,macos-login-item-preview \
+  launcher_runtime_macos::tests::process -- --ignored --nocapture
+```
+
+两项测试从临时安装库调用正式宿主协调器。第一项删除导入来源后执行快照中的原样示例，核对四项设置和真实注册表结果。第二项在真实子进程等待首条回复时停用插件，核对管理操作返回前已回收子进程、未发送回复且旧查询失效。两项测试共用探针的帧预算、终结校验和进程清理代码。
+
+这个适配器仅编译进宿主测试。普通构建仍关闭插件执行。签名 XPC、系统沙箱及 GUI 交互另行验收。
+
 没有 GUI、音频、个人数据、系统权限或网络服务操作。管道 adapter 只证明当前实验的协议/回收，不是生产进程架构或 OS 沙箱证明。现有 App 签名不证明独立收窄权限；未来 bundled XPC 服务的签名、peer 校验、失效与独立沙箱仍需分别设计验收。Panel/Window 的 WK 媒体隔离也没有因本单元解除。

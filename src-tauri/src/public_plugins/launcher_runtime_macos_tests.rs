@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "launcher_runtime_macos_process_tests.rs"]
+mod process;
 #[test]
 fn exact_route_does_not_match_prefix_builtins_or_empty_commands() {
     assert_eq!(split_query("/demo  中文  😀 "), Some(("demo", "中文  😀")));

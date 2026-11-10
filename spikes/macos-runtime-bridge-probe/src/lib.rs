@@ -52,3 +52,16 @@ pub(crate) use manifest::PublicPackageError;
 pub fn validate_wire_json(bytes: &[u8]) -> Result<(), ()> {
     storage_document::validate_mac_json(bytes).ok_or(())
 }
+
+pub fn validate_launcher_invocation(value: &serde_json::Value, request_id: &str) -> Result<(), ()> {
+    use request_contract::{PluginInvocation, PluginInvocationPlatform};
+    use serde::Deserialize;
+    let invocation = PluginInvocation::deserialize(value).map_err(|_| ())?;
+    if invocation.api_version != 1
+        || invocation.context.platform != PluginInvocationPlatform::Macos
+        || invocation.request_id != request_id
+    {
+        return Err(());
+    }
+    Ok(())
+}
