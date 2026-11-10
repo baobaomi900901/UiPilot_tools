@@ -345,6 +345,116 @@ fn demo_return_copy_checks_grant_at_publication_and_at_single_use_admission() {
 
 #[test]
 #[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn installed_command_suggestion_previews_without_running_then_dispatches_its_identity() {
+    let temp = Temp::new();
+    temp.edit(|manifest| {
+        manifest["command"]["defaultName"] = json!("find-settings");
+        manifest["command"]["inputRequired"] = json!(true);
+        manifest["command"]["inputPlaceholder"] = json!("请输入内容");
+    });
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    let registry = registry();
+    let probe = QuickJsProbe::new(None);
+    let runtime = LauncherRuntime::with_transport(
+        state.clone(),
+        registry.clone(),
+        probe.clone(),
+        Duration::from_secs(5),
+    );
+    start(&runtime, &registry);
+    assert!(matches!(
+        launch(&runtime, &temp.0, 1, "/fi", false),
+        Ok(Route::NotHandled)
+    ));
+    let Route::Published(suggestions) = launch(&runtime, &temp.0, 2, "/find-set", false).unwrap()
+    else {
+        panic!("expected a command candidate")
+    };
+    assert_eq!(suggestions.items.len(), 1);
+    let LauncherResultActivation::MainResultActivation {
+        plugin_id,
+        command_id,
+        command_label,
+        ..
+    } = &suggestions.items[0].activation
+    else {
+        panic!("expected a stable command identity")
+    };
+    assert_eq!(command_label, "find-settings");
+    let origin = |phase, command_id| {
+        Some(CompletionOrigin {
+            phase,
+            plugin_id: plugin_id.clone(),
+            command_id: Some(command_id),
+        })
+    };
+    let Route::Published(preview) = runtime
+        .route(
+            &temp.0,
+            1,
+            3,
+            "/find-settings",
+            InvocationTheme::Dark,
+            false,
+            origin(CompletionPhase::Preview, command_id.clone()),
+        )
+        .unwrap()
+    else {
+        panic!("expected preview")
+    };
+    assert_eq!(preview.command_hint.as_deref(), Some("请输入内容"));
+    assert!(preview.items.is_empty());
+    assert!(matches!(
+        runtime.route(
+            &temp.0,
+            1,
+            4,
+            "/find-settings 中文",
+            InvocationTheme::Dark,
+            true,
+            origin(CompletionPhase::Commit, "different-command".into()),
+        ),
+        Ok(Route::Stale)
+    ));
+    assert!(matches!(
+        runtime.route(
+            &temp.0,
+            1,
+            5,
+            "/find-settings 中文",
+            InvocationTheme::Dark,
+            true,
+            origin(CompletionPhase::Preview, command_id.clone()),
+        ),
+        Ok(Route::Stale)
+    ));
+    assert!(probe.report.lock().unwrap().is_none());
+    let Route::Published(result) = runtime
+        .route(
+            &temp.0,
+            1,
+            6,
+            "/find-settings 中文",
+            InvocationTheme::Dark,
+            true,
+            origin(CompletionPhase::Commit, command_id.clone()),
+        )
+        .unwrap()
+    else {
+        panic!("expected committed command result")
+    };
+    let command = result.main_result_command.unwrap();
+    assert_eq!(command.plugin_id, *plugin_id);
+    assert_eq!(command.command_id, *command_id);
+    assert_eq!(command.argument, "中文");
+    assert_eq!(result.items[0].title, "你好 × 2");
+    assert_eq!(probe.take_report().data_calls, 4);
+    drain(&runtime, &state);
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
 fn installed_javascript_reads_saved_settings_and_publishes_through_launcher() {
     let temp = Temp::new();
     {

@@ -117,7 +117,15 @@ fn launch(
     query: &str,
     submit: bool,
 ) -> Result<Route, Error> {
-    runtime.route(root, 1, sequence, query, InvocationTheme::Dark, submit)
+    runtime.route(
+        root,
+        1,
+        sequence,
+        query,
+        InvocationTheme::Dark,
+        submit,
+        None,
+    )
 }
 fn start(runtime: &LauncherRuntime, registry: &ResultRegistry) {
     registry.on_show("1".into());
@@ -163,7 +171,7 @@ fn closed_factory_and_available_noncommands_do_not_load_inventory_or_consume_app
     available.begin_invocation(2);
     for (seq, query) in [(1, "plain app"), (2, "/find x"), (3, "/web-search x")] {
         assert!(matches!(
-            available.route(&temp.0, 2, seq, query, InvocationTheme::Light, true),
+            available.route(&temp.0, 2, seq, query, InvocationTheme::Light, true, None),
             Ok(Route::NotHandled)
         ));
         assert!(registry
@@ -178,7 +186,8 @@ fn closed_factory_and_available_noncommands_do_not_load_inventory_or_consume_app
                 seq,
                 &format!("/settings-demo {input}"),
                 InvocationTheme::Light,
-                true
+                true,
+                None,
             ),
             Ok(Route::NotHandled)
         ));
@@ -311,12 +320,15 @@ fn submit_input_required_disabled_exact_case_and_multi_command_contracts() {
         Duration::from_secs(2),
     );
     start(&runtime, &registry);
-    for (seq, q, submit) in [
-        (1, "/settings-demo", true),
-        (2, "/settings-demo x", false),
-        (3, "/settings-dem x", true),
-        (4, "/SETTINGS-DEMO x", true),
-    ] {
+    for (seq, query, submit) in [(1, "/settings-demo", true), (2, "/settings-demo x", false)] {
+        let Route::Published(response) = launch(&runtime, &temp.0, seq, query, submit).unwrap()
+        else {
+            panic!("expected the input hint")
+        };
+        assert_eq!(response.command_hint.as_deref(), Some("请输入文本"));
+        assert!(response.items.is_empty());
+    }
+    for (seq, q, submit) in [(3, "/settings-dem x", true), (4, "/SETTINGS-DEMO x", true)] {
         assert!(matches!(
             launch(&runtime, &temp.0, seq, q, submit),
             Ok(Route::NotHandled)
@@ -459,7 +471,7 @@ fn lower_sequence_and_old_invocation_do_not_cancel_new_active_request() {
         Ok(Route::Stale)
     ));
     assert!(matches!(
-        runtime.route(&temp.0, 0, 99, "app", InvocationTheme::Light, false),
+        runtime.route(&temp.0, 0, 99, "app", InvocationTheme::Light, false, None),
         Ok(Route::Stale)
     ));
     assert!(!cancel.is_cancelled());
@@ -663,7 +675,8 @@ fn hide_and_management_reset_revoke_immediately_without_waiting_for_transport() 
                 2,
                 "/settings-demo",
                 InvocationTheme::Light,
-                true
+                true,
+                None,
             ),
             Ok(Route::Published(_))
         ));

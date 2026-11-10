@@ -183,6 +183,8 @@ pub(crate) struct RuntimeCommand {
     pub(crate) plugin_id: String,
     pub(crate) command_id: String,
     pub(crate) name: String,
+    pub(crate) summary: Option<String>,
+    pub(crate) input_placeholder: Option<String>,
     pub(crate) mode: PublicActivationMode,
     pub(crate) input_required: bool,
     pub(crate) multi: bool,
@@ -239,6 +241,8 @@ impl Management {
                         plugin_id: row.manifest.plugin_id.clone(),
                         command_id: id.into(),
                         name: c.default_name.clone(),
+                        summary: c.summary.clone(),
+                        input_placeholder: c.input_placeholder.clone(),
                         mode: c.activation_mode,
                         input_required: c.input_required,
                         multi: row.manifest.is_multi_command(),
@@ -532,19 +536,29 @@ impl ManagementState {
     }
     /// Only an available, explicitly routed command reaches this lazy inventory
     /// read. Revalidate persisted snapshots; never follow original source paths.
-    pub(crate) fn runtime_command(
+    pub(crate) fn runtime_commands(
         &self,
         appdata: &Path,
         epoch: &ManagementEpoch,
         name: &str,
-    ) -> Result<Option<RuntimeCommand>> {
+        include_prefix: bool,
+    ) -> Result<Vec<RuntimeCommand>> {
         self.with_epoch(appdata, epoch.clone(), |manager| {
             manager.list()?;
-            Ok(manager
-                .runtime_catalog
-                .iter()
-                .find(|c| c.name == name)
-                .cloned())
+            if let Some(command) = manager.runtime_catalog.iter().find(|c| c.name == name) {
+                return Ok(vec![command.clone()]);
+            }
+            Ok(if include_prefix {
+                manager
+                    .runtime_catalog
+                    .iter()
+                    .filter(|command| command.name.starts_with(name))
+                    .take(20)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            })
         })
     }
     pub(crate) fn open_runtime(

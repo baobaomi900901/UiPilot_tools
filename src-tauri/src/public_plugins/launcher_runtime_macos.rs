@@ -14,7 +14,10 @@ use super::{
 };
 use crate::{
     clipboard_history::{HostCopyError, HostCopyOutcome},
-    model::SearchResponse,
+    model::{
+        search_response, LauncherResultActivation, MainResultCommandContext, ResultItem,
+        SearchResponse,
+    },
     result_registry::{
         MainActionCompletionOwner, MainActionKind, QueryDomain, ResultAction, ResultRegistry,
     },
@@ -27,6 +30,21 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CompletionPhase {
+    Preview,
+    Commit,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CompletionOrigin {
+    phase: CompletionPhase,
+    plugin_id: String,
+    command_id: Option<String>,
+}
 
 #[derive(Debug)]
 pub(crate) enum Route {
@@ -365,6 +383,7 @@ impl LauncherRuntime {
         query: &str,
         theme: InvocationTheme,
         submit: bool,
+        origin: Option<CompletionOrigin>,
     ) -> Result<Route, Error> {
         if !self.available() {
             return Ok(Route::NotHandled);
@@ -374,18 +393,89 @@ impl LauncherRuntime {
             return Ok(Route::Stale);
         };
         let Some((name, input)) = split_query(query) else {
-            return Ok(Route::NotHandled);
+            return Ok(if origin.is_some() {
+                Route::Stale
+            } else {
+                Route::NotHandled
+            });
         };
 
-        let command = match self.management.runtime_command(appdata, &epoch, name) {
-            Ok(Some(command)) => command,
-            Ok(None) => return Ok(Route::NotHandled),
+        let commands = match self.management.runtime_commands(
+            appdata,
+            &epoch,
+            name,
+            origin.is_none()
+                && input.is_empty()
+                && !submit
+                && !host_command_names().any(|command| command.starts_with(name)),
+        ) {
+            Ok(commands) => commands,
             Err(super::management_macos::Error::Stale) => return Ok(Route::Stale),
             Err(_) => return Err(Error::Storage),
         };
-        if (command.mode == PublicActivationMode::Submit && !submit)
+        let Some(first) = commands.first() else {
+            return Ok(if origin.is_some() {
+                Route::Stale
+            } else {
+                Route::NotHandled
+            });
+        };
+        if first.name != name {
+            let items = commands
+                .into_iter()
+                .filter_map(|command| {
+                    let title = format!("/{}", command.name);
+                    let activation = LauncherResultActivation::main_result_activation(
+                        command.plugin_id,
+                        command.command_id,
+                        command.name,
+                        String::new(),
+                        false,
+                    )?;
+                    Some(ResultItem {
+                        result_actions: None,
+                        result_id: String::new(),
+                        activation,
+                        title,
+                        subtitle: command.summary,
+                        detail: None,
+                        icon: None,
+                        plugin_icon_url: None,
+                        icon_kind: None,
+                        favorite: None,
+                        has_default_action: false,
+                    })
+                })
+                .collect();
+            return Ok(self.publish_catalog(&admission, &epoch, invocation, sequence, items, None));
+        }
+        let command = commands.into_iter().next().expect("nonempty catalog");
+        if let Some(origin) = &origin {
+            if origin.plugin_id != command.plugin_id
+                || origin.command_id.as_deref().unwrap_or("default") != command.command_id
+                || (origin.phase == CompletionPhase::Commit) != submit
+            {
+                return Ok(Route::Stale);
+            }
+        }
+        if origin
+            .as_ref()
+            .is_some_and(|origin| origin.phase == CompletionPhase::Preview)
             || (command.input_required && input.is_empty())
+            || (command.mode == PublicActivationMode::Submit
+                && !submit
+                && command.input_placeholder.is_some())
         {
+            return Ok(self.publish_catalog(
+                &admission,
+                &epoch,
+                invocation,
+                sequence,
+                Vec::new(),
+                command.input_placeholder,
+            ));
+        }
+        if command.mode == PublicActivationMode::Submit && !submit {
             return Ok(Route::NotHandled);
         }
         if !self.current(&admission, &epoch) {
@@ -476,6 +566,12 @@ impl LauncherRuntime {
             close_later(self.management.clone(), identity);
             return Err(Error::Unavailable);
         }
+        let command_context = submit.then(|| MainResultCommandContext {
+            plugin_id: command.plugin_id.clone(),
+            command_id: command.command_id.clone(),
+            command_label: command.name.clone(),
+            argument: input.into(),
+        });
         let wire = PluginInvocation {
             api_version: 1,
             command_id: command.multi.then_some(command.command_id),
@@ -528,11 +624,52 @@ impl LauncherRuntime {
         match self.publisher.publish(&run.publication_owner, prepared) {
             Ok(Some(mut response)) => {
                 response.replace_local_results = true;
+                response.main_result_command = command_context;
                 Ok(Route::Published(response))
             }
             Ok(None) => Ok(Route::Stale),
             Err(error) => completion_error(error),
         }
+    }
+
+    fn publish_catalog(
+        &self,
+        admission: &Arc<()>,
+        epoch: &ManagementEpoch,
+        invocation: u64,
+        sequence: u64,
+        items: Vec<ResultItem>,
+        hint: Option<String>,
+    ) -> Route {
+        let Ok(lane) = self.lane.lock() else {
+            return Route::Stale;
+        };
+        if !Arc::ptr_eq(&lane.admission, admission) || !self.management.runtime_epoch_current(epoch)
+        {
+            return Route::Stale;
+        }
+        let Some(query) =
+            self.registry
+                .begin_query(QueryDomain::Plugin, &invocation.to_string(), sequence)
+        else {
+            return Route::Stale;
+        };
+        self.registry
+            .publish_if_latest(
+                query,
+                items
+                    .into_iter()
+                    .map(|item| (item, None::<ResultAction>))
+                    .collect(),
+                || true,
+                |id, items| {
+                    let mut response = search_response(id, items);
+                    response.replace_local_results = true;
+                    response.command_hint = hint;
+                    response
+                },
+            )
+            .map_or(Route::Stale, Route::Published)
     }
 }
 impl RuntimeInvalidation for LauncherRuntime {
@@ -610,6 +747,14 @@ fn watch_deadline(
         })
         .is_ok()
 }
+fn host_command_names() -> impl Iterator<Item = &'static str> {
+    ["find", "settings", "plugins"].into_iter().chain(
+        crate::settings::ManagedBuiltinFeature::ALL
+            .into_iter()
+            .map(crate::settings::ManagedBuiltinFeature::default_name),
+    )
+}
+
 fn split_query(query: &str) -> Option<(&str, &str)> {
     let command = query.trim().strip_prefix('/')?;
     let (name, input) = command
@@ -619,10 +764,7 @@ fn split_query(query: &str) -> Option<(&str, &str)> {
     if input.len() > 64 * 1024
         || query.contains('\0')
         || name.is_empty()
-        || (matches!(name, "find" | "settings" | "plugins")
-            || crate::settings::ManagedBuiltinFeature::ALL
-                .iter()
-                .any(|feature| feature.default_name() == name))
+        || host_command_names().any(|command| command == name)
     {
         return None;
     }

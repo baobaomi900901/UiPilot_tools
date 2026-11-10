@@ -10,7 +10,7 @@ use crate::{
     model::{search_response, SearchResponse},
     result_registry::{MainActionCompletionOwner, MainActionKind, QueryDomain, QueryToken, RegistryError, ResultAction, ResultRegistries, ResultRegistry},
     settings::SettingsStore,
-    public_plugins::{launcher_runtime_macos::{LauncherRuntime, Route, InvocationTheme}, management_macos::ManagementState},
+    public_plugins::{launcher_runtime_macos::{CompletionOrigin, LauncherRuntime, Route, InvocationTheme}, management_macos::ManagementState},
 };
 
 struct MacApplications {
@@ -117,15 +117,18 @@ impl From<RegistryError> for Error {
 #[tauri::command]
 pub(crate) async fn search_apps(
     window: WebviewWindow, query: String, invocation_id: String, query_sequence: u64, submit: Option<bool>,
-    completion_origin: Option<serde_json::Value>, stable_command_target: Option<serde_json::Value>,
+    completion_origin: Option<CompletionOrigin>, stable_command_target: Option<serde_json::Value>,
     stable_builtin_target: Option<serde_json::Value>,
 ) -> Result<Option<SearchResponse>, Error> {
     require_main(&window).map_err(|_| Error::caller())?;
-    if completion_origin.is_some() || stable_command_target.is_some() || stable_builtin_target.is_some() {
+    if stable_command_target.is_some() || stable_builtin_target.is_some() {
         return Err(Error { code: "searchUnavailable", message: "此平台未启用命令搜索" });
     }
     let app = window.app_handle();
     let service = app.state::<Arc<MacApplications>>();
+    if completion_origin.is_some() && !service.runtime.available() {
+        return Err(Error { code: "searchUnavailable", message: "此平台未启用命令搜索" });
+    }
     // The production factory is closed until an isolated transport is verified.
     // Do not even resolve the data path or start a worker in that configuration.
     if service.runtime.available() {
@@ -135,7 +138,7 @@ pub(crate) async fn search_apps(
         if id.to_string() != invocation_id { return Err(Error::stale()); }
         let theme = runtime_theme(app.state::<SettingsStore>().snapshot().theme, window.theme().ok());
         let runtime_query = query.clone();
-        let route = tauri::async_runtime::spawn_blocking(move || runtime.route(&root, id, query_sequence, &runtime_query, theme, submit.unwrap_or(false)))
+        let route = tauri::async_runtime::spawn_blocking(move || runtime.route(&root, id, query_sequence, &runtime_query, theme, submit.unwrap_or(false), completion_origin))
             .await.map_err(|_| Error::unavailable())?
             .map_err(|_| Error { code: "pluginQueryFailed", message: "插件运行未完成，请重新查询" })?;
         match route {
@@ -394,7 +397,7 @@ mod platform_app_commands {
         let unused = f.0.join("must-not-be-created");
         assert!(!service.runtime.available());
         service.runtime.begin_invocation(1);
-        assert!(matches!(service.runtime.route(&unused, 1, 1, "/settings-demo", InvocationTheme::Light, true).unwrap(), Route::NotHandled));
+        assert!(matches!(service.runtime.route(&unused, 1, 1, "/settings-demo", InvocationTheme::Light, true, None).unwrap(), Route::NotHandled));
         assert!(!unused.exists());
         let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
         assert!(publish(&service, &settings, token, "中文 App").is_some());
