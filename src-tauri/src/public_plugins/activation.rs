@@ -6463,6 +6463,140 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    #[ignore = "requires the exact archives from scripts/verify-macos-plugin-archives.mjs"]
+    fn archive_management_matches_macos_fixtures() {
+        let archives = PathBuf::from(
+            std::env::var_os("UIPILOT_ARCHIVE_TEST_INPUT")
+                .expect("run the archive verification script"),
+        );
+        assert!(archives.is_absolute());
+        let dir = TestDir::new("shared-plugin-archives");
+        let install = |host: &PublicPluginManager,
+                       file: &str,
+                       id: &str,
+                       version: &str,
+                       operation: PrepareOperation,
+                       permissions: &[PublicPermission]| {
+            let now = Instant::now();
+            let preview = host
+                .prepare(
+                    "main",
+                    PublicPluginInstallSource::Archive {
+                        path: archives.join(file),
+                    },
+                    now,
+                )
+                .unwrap();
+            assert_eq!(preview.plugin_id, id);
+            assert_eq!(preview.version, version);
+            assert_eq!(preview.operation, operation);
+            assert_eq!(preview.permissions, permissions);
+            host.commit_with_readiness(
+                "main",
+                &preview.token,
+                permissions.iter().copied().collect(),
+                now,
+                |_| true,
+            )
+            .unwrap();
+        };
+        let settings = "com.uipilot.demo-settings";
+        let saved = BTreeMap::from([
+            ("greeting".into(), json!("中文 hello")),
+            ("count".into(), json!(3)),
+            ("uppercase".into(), json!(true)),
+            ("style".into(), json!("boxed")),
+        ]);
+        {
+            let host = manager(&dir);
+            install(
+                &host,
+                "demo-settings.uipilot-plugin",
+                settings,
+                "1.0.0",
+                PrepareOperation::Install,
+                &[],
+            );
+            host.save_settings(settings, &saved).unwrap();
+        }
+
+        let host = manager(&dir);
+        let assert_settings = |version: &str| {
+            let inventory = host.inventory().unwrap();
+            let [item] = inventory.items.as_slice() else {
+                panic!("expected only the settings fixture");
+            };
+            assert_eq!(item.plugin_id, settings);
+            assert_eq!(item.version, version);
+            let values = item
+                .settings
+                .iter()
+                .map(|setting| {
+                    (
+                        setting.definition.key().to_owned(),
+                        setting.value.clone().unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(values, saved);
+        };
+        assert_settings("1.0.0");
+        install(
+            &host,
+            "demo-settings-upgrade.uipilot-plugin",
+            settings,
+            "1.0.1",
+            PrepareOperation::Replace,
+            &[],
+        );
+        assert_settings("1.0.1");
+
+        let multi = "com.uipilot.demo-multi";
+        let copy = PublicPermission::ClipboardWrite;
+        install(
+            &host,
+            "demo-multi.uipilot-plugin",
+            multi,
+            "1.0.0",
+            PrepareOperation::Install,
+            &[copy],
+        );
+        for (id, mode) in [
+            ("upper", PublicActivationMode::Live),
+            ("lower", PublicActivationMode::Submit),
+        ] {
+            let route = host.route_by_id(multi, id, "MiXeD").unwrap().unwrap();
+            assert_eq!(route.activation_mode, mode);
+            assert_eq!(route.output_mode, PublicOutputMode::MainResult);
+        }
+
+        let return_plugin = "com.uipilot.demo-return";
+        install(
+            &host,
+            "demo-return.uipilot-plugin",
+            return_plugin,
+            "1.0.2",
+            PrepareOperation::Install,
+            &[copy],
+        );
+        let return_route = || host.route("/demo-return 中文").unwrap().unwrap();
+        let route = return_route();
+        assert_eq!(route.plugin_id, return_plugin);
+        assert!(host.can_copy_text(return_plugin, &route.command_id, route.generation));
+        host.set_permission_access_with_effects(
+            return_plugin,
+            copy,
+            false,
+            &host.inventory().unwrap().revision,
+            &mut ManagementEffects::default(),
+        )
+        .unwrap();
+        assert!(!host.can_copy_text(return_plugin, &route.command_id, route.generation));
+        let current = return_route();
+        assert!(!host.can_copy_text(return_plugin, &current.command_id, current.generation));
+    }
+
     fn change_permission(
         manager: &PublicPluginManager,
         permission: PublicPermission,

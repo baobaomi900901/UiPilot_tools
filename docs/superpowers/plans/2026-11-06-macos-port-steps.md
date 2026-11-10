@@ -163,6 +163,8 @@
 - [ ] **9.4 分别开放可见界面。** 仅在 9.2 通过后，对 Panel 和 Window 各运行生产 origin、导航/下载/音频边界、销毁重建、崩溃恢复、旧 RPC 重放与跨插件访问。新实例只接受自己的 RPC；达不到边界的 surface 继续关闭。用匹配权限的 tracked reference 验证 host/CLI/schema/types 一致（例如 demo-return 声明 clipboard.write，须先取得 Task 10 对应证据）。对 Windows-only 示例仍要求 Mac 校验拒绝。
 
 - [ ] **9.5 用同一插件包在两个生产宿主验收。** 每个版本只打包一次，记录包 SHA-256、两端 UiPilot 版本、主要操作和结果。先用 `demo-settings` 安装、改设置、执行并显示主结果，重启和兼容升级后核对设置；升级版本的新包也在两端使用同一哈希。再用 `demo-return` 验主结果与授权复制、`demo-multi` 验实时/提交两种命令、`note` 验打开独立窗口、写笔记并重开读回。需要授权的操作分别走允许/拒绝路径。Mac 上对声明仅 Windows 的包在安装或恢复阶段拒绝，保留 Windows 的正向验证。
+  使用 `node scripts/verify-macos-plugin-archives.mjs` 生成四个主结果归档和诊断报告。一起传输 `verification.json` 与同级 `archives/`。在准备好 Tauri 构建输入的 Windows x64 MSVC 终端执行 `node scripts/verify-windows-plugin-archives.mjs <verification.json>`，检查同一批归档的哈希、安装、设置恢复与升级、命令路由及复制撤权。加 `--check` 可在任意平台只核对哈希。Windows 测试在隔离目录使用真实管理器，Runtime 就绪由测试注入。生产宿主执行、窗口和真实系统效果另计。
+
 - [ ] **9.6 给出可复核的覆盖结果。** 以 17 个参考包为起点，列出逐包状态、未通过的能力及真实平台限制。对仅声明 Windows 但主要用途可移植的包列出宿主待补能力，在开发候选中验证能力与平台声明，通过后才发布扩大的 manifest。面板优先用 demo-panel 验证焦点与键盘，再以 notes 或 templates 验证一项完整用户流程（例如保存模板、退出重开、调用模板）；同时核对宿主实际提供的平台值、CLI、schema 和 SDK 类型。分别统计声明双平台数、实机双端通过数和平台专属数。旧插件单列，不计入公开 SDK 包分母。
 
 **Distinct test coverage:** 导航前失败、导航后失去静音与旧回调迟到是三条不同序列，分别留 guard 状态/包代码执行次数/实例销毁日志。另查升级新增权限、跨 ID 与两套 Keychain 存储。
