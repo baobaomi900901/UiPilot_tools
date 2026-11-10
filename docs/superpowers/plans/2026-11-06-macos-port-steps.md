@@ -167,6 +167,8 @@
 
 - [ ] **9.6 给出可复核的覆盖结果。** 以 17 个参考包为起点，列出逐包状态、未通过的能力及真实平台限制。对仅声明 Windows 但主要用途可移植的包列出宿主待补能力，在开发候选中验证能力与平台声明，通过后才发布扩大的 manifest。面板优先用 demo-panel 验证焦点与键盘，再以 notes 或 templates 验证一项完整用户流程（例如保存模板、退出重开、调用模板）；同时核对宿主实际提供的平台值、CLI、schema 和 SDK 类型。分别统计声明双平台数、实机双端通过数和平台专属数。旧插件单列，不计入公开 SDK 包分母。
 
+  [参考插件覆盖记录](../../testing/macos-public-plugin-coverage.md)分别跟踪 CLI 目标校验、macOS 安装预览与生产验收。
+
 **Distinct test coverage:** 导航前失败、导航后失去静音与旧回调迟到是三条不同序列，分别留 guard 状态/包代码执行次数/实例销毁日志。另查升级新增权限、跨 ID 与两套 Keychain 存储。
 **Verify:** `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib public_plugins::webview_audio_guard::`；同命令分别过滤 `public_plugins::`、`credentials::`；`npm run verify --workspace @uipilot/plugin-cli`、`npm test -- src/public-plugin-recovery.test.tsx src/public-plugin-diagnostics-acl.test.ts`。保留真实 WKWebView 时序、隔离 Keychain CRUD/拒绝记录及各 surface 的开放决定。
 

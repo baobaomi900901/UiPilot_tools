@@ -67,6 +67,60 @@ impl Drop for Temp {
     }
 }
 const ID: &str = "com.uipilot.demo-settings";
+
+#[test]
+fn tracked_reference_packages_respect_the_current_management_boundary() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("examples/public-plugins");
+    let temp = Temp::new();
+    let mut manager = Management::load(&temp.0).unwrap();
+    let mut previewed = BTreeSet::new();
+    let mut rejected = BTreeSet::new();
+    for entry in fs::read_dir(examples).unwrap() {
+        let package = entry.unwrap().path().join("package");
+        if !package.join("plugin.json").is_file() {
+            continue;
+        }
+        let name = package
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let revision = manager.list().unwrap().revision;
+        let selection = manager.reserve(SourceKind::Directory, &revision).unwrap();
+        match manager.selected(selection, Some(&package)) {
+            Ok(Some(preview)) => {
+                assert_eq!(preview.plugin.plugin_id, name);
+                manager.cancel(&preview.token).unwrap();
+                previewed.insert(name.to_owned());
+            }
+            Err(Error::Unsupported) => {
+                assert!(manager.pending.is_none());
+                rejected.insert(name.to_owned());
+            }
+            other => panic!("unexpected preview for {name}: {:?}", other.err()),
+        }
+    }
+    assert_eq!(
+        previewed,
+        BTreeSet::from([
+            "com.uipilot.demo-multi".into(),
+            "com.uipilot.demo-return".into(),
+            "com.uipilot.demo-settings".into(),
+        ])
+    );
+    assert_eq!(rejected.len(), 14);
+    assert!(rejected.contains("com.uipilot.note"));
+    assert!(rejected.contains("com.uipilot.demo-recovery"));
+    let inventory = manager.list().unwrap();
+    assert_eq!(inventory.revision, "0");
+    assert!(inventory.plugins.is_empty());
+}
+
 #[test]
 fn lazy_load_has_no_startup_io_and_private_roots_reject_links_and_permissions() {
     let temp = Temp::new();
