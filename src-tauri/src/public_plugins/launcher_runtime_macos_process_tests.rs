@@ -9,6 +9,9 @@ use crate::public_plugins::{
 mod pipe;
 use pipe::{Event, Frame, Pipe};
 
+#[path = "launcher_runtime_macos_archive_tests.rs"]
+mod archive;
+
 struct Report {
     pid: u32,
     data_calls: usize,

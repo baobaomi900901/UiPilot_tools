@@ -75,6 +75,12 @@ UIPILOT_LAUNCHER_TEST_HELPER=/private/tmp/uipilot-bridge-probe.XXXXXX/helper \
 
 命令候选测试覆盖前缀搜索、参数提示和带身份的提交。预览与不匹配的提交不启动引擎，合法提交执行已安装的脚本并返回当前命令和参数。
 
+### 正式归档验证
+
+在 Apple Silicon Mac 上准备仓库的 npm 依赖和离线 Cargo 缓存，然后从仓库根目录运行 `node scripts/verify-macos-plugin-archives.mjs`。脚本调用正式 CLI 为三个参考插件及设置示例的升级版分别打包一次，让 Windows 和 macOS 目标的静态校验读取同一份归档，再运行 macOS 宿主进程测试。
+
+两个独立的宿主测试进程验证设置重启恢复和兼容升级。归档测试还覆盖双命令共享存储，以及复制授权和撤权。输出目录包含可复用的插件包、SHA-256 清单、逐平台 CLI 报告和宿主测试日志。`verification.json` 分别记录 CLI 与 macOS 诊断宿主的结果，正式宿主验收单独登记。
+
 模块快照仅含已验证安装包中的 UTF-8 JavaScript。诊断预算为最多 32 个模块、源码合计 2048 字节、每帧 4096 字节、每方向合计 8192 字节。复用 QuickJS 探针的 ASCII 虚拟路径解析器，静态和动态导入均在同一快照中解析。
 
 这个适配器仅编译进宿主测试。普通构建仍关闭插件执行。签名 XPC、系统沙箱及 GUI 交互另行验收。
