@@ -5,10 +5,10 @@ use rquickjs::{
 use std::{collections::BTreeMap, rc::Rc};
 
 #[derive(Clone)]
-pub struct Graph(Rc<BTreeMap<&'static str, &'static str>>);
+pub struct Graph(Rc<BTreeMap<String, String>>);
 
 impl Graph {
-    pub fn new(entries: &[(&'static str, &'static str)]) -> std::result::Result<Self, ()> {
+    pub fn new(entries: &[(&str, &str)]) -> std::result::Result<Self, ()> {
         if entries.is_empty() || entries.len() > 32 {
             return Err(());
         }
@@ -18,7 +18,7 @@ impl Graph {
             if !canonical(name)
                 || source.len() > 128 * 1024
                 || source.contains('\0')
-                || files.insert(name, source).is_some()
+                || files.insert(name.to_owned(), source.to_owned()).is_some()
             {
                 return Err(());
             }
@@ -29,8 +29,8 @@ impl Graph {
         }
         Ok(Self(Rc::new(files)))
     }
-    pub fn source(&self, name: &str) -> Option<&'static str> {
-        self.0.get(name).copied()
+    pub fn source(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
     }
 }
 

@@ -50,12 +50,21 @@ impl QuickJsProbe {
 
 impl RuntimeTransport for QuickJsProbe {
     fn run(&self, input: RuntimeInput, cancel: Cancellation) -> Result<TerminalResult, Error> {
-        let source = input
+        let mut modules = std::collections::BTreeMap::new();
+        let mut source_bytes = 0;
+        for (path, bytes) in input
             .package
-            .resource(&input.package.manifest().runtime.entry)
-            .filter(|bytes| bytes.len() <= 2048)
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .ok_or(Error::Unavailable)?;
+            .resources()
+            .filter(|(path, _)| path.ends_with(".js"))
+        {
+            source_bytes += bytes.len();
+            if modules.len() >= 32 || source_bytes > 2048 {
+                return Err(Error::Unavailable);
+            }
+            let source = std::str::from_utf8(bytes).map_err(|_| Error::Unavailable)?;
+            modules.insert(format!("pkg/{path}"), source);
+        }
+        let entry = format!("pkg/{}", input.package.manifest().runtime.entry);
         let context = input.binding.context();
         let cancelled = cancel.clone();
         let mut pipe = Pipe::new(&self.helper, input.deadline, move || {
@@ -72,7 +81,7 @@ impl RuntimeTransport for QuickJsProbe {
         let result = (|| {
             pipe.write(
                 json!({"mode":"launcherDemo","context":context,
-                    "invocation":input.invocation,"source":source}),
+                    "invocation":input.invocation,"graph":{"entry":entry,"modules":modules}}),
                 None,
             )?;
             let mut stderr_eof = false;
@@ -122,6 +131,111 @@ impl RuntimeTransport for QuickJsProbe {
             return Err(Error::Unavailable);
         }
         result.map_err(|_| Error::Unavailable)
+    }
+}
+
+fn nested_entry(temp: &Temp, source: &str) -> PathBuf {
+    let package = temp.0.join("package");
+    fs::create_dir(package.join("entry")).unwrap();
+    fs::remove_file(package.join("runtime.js")).unwrap();
+    fs::write(package.join("entry/run.js"), source).unwrap();
+    temp.edit(|manifest| manifest["runtime"]["entry"] = json!("entry/run.js"));
+    package
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn module_imports_use_the_installed_snapshot_and_real_data_service() {
+    let temp = Temp::new();
+    let package = nested_entry(
+        &temp,
+        r#"
+        import { next, count } from './reexport.js';
+        const state = await import('../state.js');
+        export async function onCommand(inv, api) {
+            if (!Object.isFrozen(inv) || !Object.isFrozen(inv.context)) throw Error('mutable input');
+            next();
+            const greeting = await api.settings.get('greeting');
+            return {requestId: inv.requestId, results: [
+                {id: 'modules', title: greeting + ':' + count + ':' + state.count}
+            ]};
+        }
+    "#,
+    );
+    fs::write(
+        package.join("entry/reexport.js"),
+        "export { next, count } from '../state.js';",
+    )
+    .unwrap();
+    fs::write(
+        package.join("state.js"),
+        "export let count = 1; export function next() { count++; }",
+    )
+    .unwrap();
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    fs::remove_dir_all(package).unwrap();
+    let registry = registry();
+    let probe = QuickJsProbe::new(None);
+    let runtime = LauncherRuntime::with_transport(
+        state.clone(),
+        registry.clone(),
+        probe.clone(),
+        Duration::from_secs(5),
+    );
+    start(&runtime, &registry);
+    let Route::Published(response) = launch(&runtime, &temp.0, 1, "/settings-demo", true).unwrap()
+    else {
+        panic!("expected the installed module graph to publish")
+    };
+    assert_eq!(response.items[0].title, "你好:2:2");
+    let report = probe.take_report();
+    assert_eq!((report.data_calls, report.replies), (1, 1));
+    drain(&runtime, &state);
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn missing_and_outside_modules_fail_before_data_calls_or_publication() {
+    for import in [
+        "import './missing.js';",
+        "await import('../../outside.js');",
+    ] {
+        let temp = Temp::new();
+        nested_entry(
+            &temp,
+            &format!(
+                r#"
+            {import}
+            export async function onCommand(inv, api) {{
+                await api.settings.get('greeting');
+                return {{requestId: inv.requestId, results: [{{id: 'unexpected', title: 'unexpected'}}]}};
+            }}
+        "#
+            ),
+        );
+        fs::write(temp.0.join("outside.js"), "export const outside = true;").unwrap();
+        let state = Arc::new(ManagementState::default());
+        temp.install(&state);
+        let registry = registry();
+        let probe = QuickJsProbe::new(None);
+        let runtime = LauncherRuntime::with_transport(
+            state.clone(),
+            registry.clone(),
+            probe.clone(),
+            Duration::from_secs(5),
+        );
+        start(&runtime, &registry);
+        assert!(
+            matches!(
+                launch(&runtime, &temp.0, 1, "/settings-demo", true),
+                Err(Error::Unavailable)
+            ),
+            "{import}"
+        );
+        let report = probe.take_report();
+        assert_eq!((report.data_calls, report.replies), (0, 0));
+        drain(&runtime, &state);
     }
 }
 

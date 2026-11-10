@@ -1,7 +1,11 @@
+#[path = "../../macos-quickjs-runtime-probe/src/loader.rs"]
+mod loader;
+
 use rquickjs::{Context, Function, Module, Promise, Runtime};
 use serde_json::{json, Value};
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     io::{Read, Write},
     time::{Duration, Instant},
 };
@@ -35,12 +39,38 @@ struct Init {
     mode: String,
     source: Option<String>,
     invocation: Option<Value>,
+    graph: Option<ModuleSnapshot>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleSnapshot {
+    entry: String,
+    modules: BTreeMap<String, String>,
+}
+
+impl ModuleSnapshot {
+    fn into_graph(self) -> Result<(String, loader::Graph), ()> {
+        if self.modules.values().map(String::len).sum::<usize>() > 2048 {
+            return Err(());
+        }
+        let entries: Vec<_> = self.modules.iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+        let graph = loader::Graph::new(&entries)?;
+        if graph.source(&self.entry).is_none() {
+            return Err(());
+        }
+        Ok((self.entry, graph))
+    }
+}
+
 fn run() -> Result<(), ()> {
     let init: Init = serde_json::from_value(read_frame()?).map_err(|_| ())?;
     let launcher = init.mode == "launcherDemo";
-    if matches!(init.mode.as_str(), "installedDemo" | "launcherDemo") != init.source.is_some()
+    if (init.mode == "installedDemo") != init.source.is_some()
         || launcher != init.invocation.is_some()
+        || launcher != init.graph.is_some()
     {
         return Err(());
     }
@@ -153,6 +183,10 @@ fn run() -> Result<(), ()> {
     runtime.set_max_stack_size(1024 * 1024);
     let deadline = Instant::now() + Duration::from_secs(1);
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let module_graph = init.graph.map(ModuleSnapshot::into_graph).transpose()?;
+    if let Some((_, graph)) = &module_graph {
+        runtime.set_loader(graph.clone(), graph.clone());
+    }
     let engine = Context::full(&runtime).map_err(|_| ())?;
     let data_mode = mode.starts_with("data") || matches!(mode.as_str(), "installedDemo" | "launcherDemo");
     let response=engine.with(|ctx|->rquickjs::Result<String>{
@@ -187,7 +221,11 @@ fn run() -> Result<(), ()> {
         let factory:Function=ctx.eval(factory_source)?;
         let port:rquickjs::Value=factory.call((bridge,))?;
         let source = match mode.as_str() {
-            "installedDemo" | "launcherDemo" => init.source.as_deref().ok_or(rquickjs::Error::Exception)?,
+            "launcherDemo" => {
+                let (entry, graph) = module_graph.as_ref().ok_or(rquickjs::Error::Exception)?;
+                graph.source(entry).ok_or(rquickjs::Error::Exception)?
+            }
+            "installedDemo" => init.source.as_deref().ok_or(rquickjs::Error::Exception)?,
             "dataDemo" => include_str!("../../../examples/public-plugins/com.uipilot.demo-settings/package/runtime.js"),
             "dataMainUnknown" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a',unknown:true}]};}"#,
             "dataMainDuplicate" => r#"export async function onCommand(inv){return {requestId:inv.requestId,results:[{id:'a',title:'a'},{id:'a',title:'b'}]};}"#,
@@ -208,10 +246,15 @@ fn run() -> Result<(), ()> {
             await testMemory.write('sample','fixed');const data=await testMemory.read('sample');
             return {requestId:inv.requestId,data};}"#,
         };
-        let module=Module::declare(ctx.clone(),"fixed-fixture.js",source)?;
+        let entry = module_graph.as_ref().map_or("fixed-fixture.js", |(name, _)| name.as_str());
+        let invocation=ctx.json_parse(init.invocation.unwrap_or_else(|| json!({"requestId":request})).to_string())?;
+        let invocation = if launcher {
+            let freeze: Function = ctx.eval("(input) => { Object.freeze(input.context); return Object.freeze(input); }")?;
+            freeze.call((invocation,))?
+        } else { invocation };
+        let module=Module::declare(ctx.clone(),entry,source)?;
         let(module,evaluated)=module.eval()?;evaluated.finish::<()>()?;
         let handler:Function=module.get("onCommand")?;
-        let invocation=ctx.json_parse(init.invocation.unwrap_or_else(|| json!({"requestId":request})).to_string())?;
         let promise:Promise=handler.call((invocation,port))?;
         let result:rquickjs::Value=promise.finish()?;
         Ok(ctx.json_stringify(result)?.ok_or(rquickjs::Error::Exception)?.to_string()?)

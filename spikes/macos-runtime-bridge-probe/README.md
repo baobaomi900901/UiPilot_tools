@@ -40,7 +40,7 @@ close 先退役并阻止新 call/reply/submit，返回 drain 在锁外等待；s
 
 `installedDemo` 使用产品同源 package_macos/lifecycle_macos：真实开发目录或归档校验后的不可变快照，经独立私有 inventory 提交；持久普通设置、enabled 和声明权限状态由 lifecycle 管理。新测试复制 tracked demo-settings 到私有临时目录，安装并保存设置后删除该临时源文件，首次执行与宿主控制器重开（同一测试进程 drop/load，加新 helper PID，并非宿主进程重启）都仍从 `InstalledRequest.package.resource(runtime.entry)` 取源码，不再回源文件或使用 include_str。升级在临时包中改变版本/固定 build 标记，安装后实际返回新的标记。
 
-源码只在 `installedDemo` 的 typed init 中传输，入口最多 2048 UTF-8 字节，整帧仍最多 4096 字节、方向总预算仍 8192 字节；其他 mode 不接受 source。原样 ESM 由 QuickJS 编译执行，本固定夹具只有单入口，未安装 import loader，不能读外部模块。这不是完整包 runtime 加载器，包自身通过快照验证也不表示能在该诊断入口执行所有模块图。
+`installedDemo` 在初始化消息中传输一个入口，最多 2048 UTF-8 字节，由 QuickJS 编译执行。该模式只运行单文件夹具。`launcherDemo` 通过独立的模块快照字段接收入口和包内源码。
 
 每个真实 child 由 open_request 的 trusted attachment 创建，lifecycle 持有捕获原 Harness 的 retirement。停用/撤回测试在第一个真实 settings.get 已完成、尚未给 child 回包时丢弃 reply permit，再执行管理变更；lifecycle 先关闭旧调用、运行 cleanup kill/wait/join，再排空。测试核对旧 binding 拒绝，旧 child 已回收，释放所有旧 request/store Arc 后才重开私有目录，新请求恢复。此处 clipboard.write 仅测试声明授权状态，不执行任何剪贴板效果，也不宣称已获得 OS 权限。撤回已经准入的读不作回滚。
 
@@ -69,7 +69,9 @@ UIPILOT_LAUNCHER_TEST_HELPER=/private/tmp/uipilot-bridge-probe.XXXXXX/helper \
   launcher_runtime_macos::tests::process -- --ignored --nocapture
 ```
 
-两项测试从临时安装库调用正式宿主协调器。第一项删除导入来源后执行快照中的原样示例，核对四项设置和真实注册表结果。第二项在真实子进程等待首条回复时停用插件，核对管理操作返回前已回收子进程、未发送回复且旧查询失效。两项测试共用探针的帧预算、终结校验和进程清理代码。
+四项测试从临时安装库调用正式宿主协调器。原样示例核对四项设置和真实注册表结果，停用场景核对等待首条回复的子进程在管理操作返回前已回收。多文件场景删除导入来源后执行快照中的嵌套入口，验证静态导入、重导出、动态导入、绑定更新及真实设置读取。缺失模块和越界导入在调用宿主数据服务和发布结果前失败。
+
+模块快照仅含已验证安装包中的 UTF-8 JavaScript。诊断预算为最多 32 个模块、源码合计 2048 字节、每帧 4096 字节、每方向合计 8192 字节。复用 QuickJS 探针的 ASCII 虚拟路径解析器，静态和动态导入均在同一快照中解析。
 
 这个适配器仅编译进宿主测试。普通构建仍关闭插件执行。签名 XPC、系统沙箱及 GUI 交互另行验收。
 

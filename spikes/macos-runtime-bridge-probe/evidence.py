@@ -9,6 +9,7 @@ output=Path(sys.argv[1])
 target=Path(sys.argv[2])
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 files=sorted(path for path in source.rglob('*') if path.is_file() and not {'target','__pycache__'}.intersection(path.parts))
+files += [source.parent/'macos-quickjs-runtime-probe/src/loader.rs']
 shared=['identity.rs','request_contract.rs','call_session.rs','data_call_gate.rs','manifest.rs','runtime.rs','scheduler.rs',
         'data_scope.rs','storage_document.rs','private_file_macos.rs','storage_macos.rs','storage_macos_tests.rs',
         'settings_values.rs','settings_macos.rs','settings_macos_tests.rs','runtime_data_macos.rs','runtime_data_macos_tests.rs',
