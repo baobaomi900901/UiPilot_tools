@@ -2,7 +2,10 @@ param(
     [ValidateSet('Release')]
     [string]$Configuration = 'Release',
     [ValidateSet('ProductionHelper', 'VmInstrumentedSetup', 'ProductionBundleInput', 'VmInstrumentedBundleInput')]
-    [string]$Mode = 'ProductionHelper'
+    [string]$Mode = 'ProductionHelper',
+    # Custom Cargo target directories / explicit --target builds must identify
+    # the final application directory; a target triple alone is ambiguous.
+    [string]$BundleReleaseDirectory = $env:UIPILOT_NSIS_RELEASE_DIR
 )
 
 $ErrorActionPreference = 'Stop'
@@ -112,6 +115,12 @@ $helper = Join-Path $artifactTargetRoot "$targetTriple\release\uipilot-everythin
 $bundleInput = Join-Path $bundleTargetRoot 'release\uipilot-everything-installer.exe'
 
 if ($bundleInputMode) {
+    if (-not [string]::IsNullOrWhiteSpace($BundleReleaseDirectory)) {
+        Assert-Condition ([IO.Path]::IsPathRooted($BundleReleaseDirectory)) 'NSIS release directory must be absolute'
+        $releaseDirectory = [IO.Path]::GetFullPath($BundleReleaseDirectory)
+        Assert-Condition (Test-Path -LiteralPath (Join-Path $releaseDirectory 'UiPilot_tools.exe') -PathType Leaf) 'NSIS release directory must contain the built application'
+        $bundleInput = Join-Path $releaseDirectory 'uipilot-everything-installer.exe'
+    }
     Copy-HelperBundleInput $helper $bundleInput $vmInstrumented
     Write-Output "MANAGED_EVERYTHING_BUNDLE_INPUT_PASS $bundleInput"
     exit 0

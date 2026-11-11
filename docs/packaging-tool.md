@@ -58,6 +58,10 @@ node --test scripts/test-preserve-build-output.mjs
 
 ## Everything 助手构建边界
 
+自定义 Windows 构建目录时，在调用构建或打包入口前设置进程环境变量 `UIPILOT_NSIS_RELEASE_DIR`，值为主程序 `UiPilot_tools.exe` 所在目录的绝对路径。例如同时使用 `CARGO_TARGET_DIR=C:\Build\target` 和 `--target x86_64-pc-windows-msvc` 时，设置为 `C:\Build\target\x86_64-pc-windows-msvc\release`。打包前钩子会检查主程序存在，并将经过架构、manifest、生产模式与哈希检查的助手暂存到同一目录，供 NSIS 消费。未设置时保留默认目录行为；助手自身的隔离编译目录不变。
+
+若主程序已成功编译，仅 NSIS 打包失败，可以保留相同源码、前端产物、target 与配置，使用 `python scripts/provider_build.py build-session -- bundle --target x86_64-pc-windows-msvc --bundles nsis` 重试。此入口仍会准备并校验 Provider、执行打包前钩子；它不会重新编译主程序。
+
 `installer-helper-build` 仅用于显式构建独立安装助手。该模式不编译宿主库的业务模块，避免为助手重复优化截图、插件运行时及启动器代码。普通主程序与 Setup 的主程序阶段不启用该特性。首次构建助手仍可能需要编译 Cargo 包所声明的依赖；随后构建复用独立目标目录的依赖缓存。
 
 ## Windows 插件校验
