@@ -36,8 +36,9 @@ select {
 
 body { font-size: var(--uipilot-ui-font-body); line-height: 1.5; }
 
-.launcher-surface,
-.launcher-view,
+/* Keep native drag rectangles outside the scrolling result surface. WebView2
+   must deliver wheel, scrollbar and context-menu input to the client area. */
+.launcher-query-region,
 .file-workspace,
 .panel-launcher,
 .quicklinks-workspace,
@@ -51,6 +52,7 @@ body { font-size: var(--uipilot-ui-font-body); line-height: 1.5; }
 button,
 input,
 label,
+.launcher-results-region,
 .result-list,
 .panel-input-row,
 .quicklinks-body,

@@ -7265,12 +7265,16 @@ describe('React view and accessibility', () => {
   it('uses native app regions without invoking Tauri mouse capture', () => {
     expect(launcherViewSource).toContain("core.capabilities.platform === 'macos' && <div className=\"launcher-drag-region\"")
     expect(stylesSource).toMatch(
-      /\.launcher-surface,[\s\S]*\.status-region\s*\{[^}]*app-region:\s*drag;/,
+      /\.launcher-query-region,[\s\S]*\.status-region\s*\{[^}]*app-region:\s*drag;/,
     )
     expect(stylesSource).toMatch(
       /button,[\s\S]*\.settings-tabs,[\s\S]*\.settings-tab-panel\s*\{[^}]*app-region:\s*no-drag;/,
     )
-    const dragRule = stylesSource.match(/\.launcher-surface,[\s\S]*?app-region:\s*drag;/)?.[0]
+    const dragRule = stylesSource.match(/\.launcher-query-region,[\s\S]*?app-region:\s*drag;/)?.[0]
+    expect(dragRule).not.toContain('.launcher-surface')
+    expect(dragRule).not.toContain('.launcher-view')
+    expect(dragRule).not.toContain('.launcher-results-region')
+    expect(stylesSource).toMatch(/\.launcher-results-region,[^}]*app-region:\s*no-drag;/)
     expect(dragRule).not.toContain('.settings-loading')
     expect(stylesSource).toMatch(/\.result-list:empty\s*\{[^}]*app-region:\s*drag;/)
   })
