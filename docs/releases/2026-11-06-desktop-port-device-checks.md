@@ -592,3 +592,12 @@ Storage/CommitUncertain 错误先撤销旧选择和 token、释放控制器与�
 用户收藏 upper 后，切换插件详情到 lower 时星标不亮，切回 upper 点亮，确认收藏按命令独立。upper 改名为 `/win-upper` 后新入口正常返回 `[shared] HELLO WIN`，旧 `/demo-upper` 不再可搜索，lower 名称不变；新入口星标保留，退出并重启后用户确认收藏仍生效。
 
 撤权问题的源码原因已定位：Windows legacy mainResult 响应的复制权限检查把当前授权缺失返回为 InvalidOperation，并计入 Runtime 连续失败。候选修复区分声明缺失与当前授权缺失；后者返回 PermissionDenied，不计入故障次数，在启动器映射为现有 pluginPermissionDenied 提示；前者仍按协议故障拒绝。没有放宽未授权结果的发布/复制。新增服务级回归覆盖连续六次拒绝、配置保持启用且无故障、恢复权限后新的响应成功，以及未声明复制动作三次仍停用；命令错误映射另有用例。已完成 Rust 语法解析与 diff 检查，Windows 原生编译和这些回归尚待共享脚本执行，不标记为已通过。
+
+
+## 2026-11-13 Windows 撤权修复验收通过
+
+候选修复提交 `73ab26a1d8a1fcd8f74597efb330cbaa0866b457` 的 Windows 原生三项回归及插件归档管理测试全部通过。实际 setup SHA-256 为 `8fdfe9a75230cf03de05d6a8f7ea23114aee6574fdfa02d0c83e25f8ab37408a`，与共享构建记录 `build-result-permission-fix.json` 和哈希文件核对一致。
+
+用户重新安装并重启后确认：关闭 demo-return 写入权限时插件仍启用；首次请求显示明确的“插件所需权限不可用，请在『设置 → 权限』中检查。”；随后再连续请求五次，每次均为权限提示，插件没有自动关闭；恢复权限后结果输出和复制均正常。此次回归关闭“权限提示不明确”和“撤权后的连续请求导致自动停用”两项已复现缺陷。
+
+这些结果仅覆盖本次 Windows ARM64 虚拟机中的 x64 应用及上述插件路径，不代表所有插件能力、macOS 生产运行时或双平台总目标验收完成。
