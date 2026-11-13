@@ -441,6 +441,94 @@ fn multi_service(
 }
 
 #[test]
+fn revoked_copy_permission_rejects_repeated_submissions_without_disabling_runtime() {
+    let root = TestRoot::new("copy-permission-recovery");
+    let (service, manager) = multi_service(&root, false);
+    let plugin_id = "com.uipilot.demo";
+    service.set_permission_access_outcome(
+        plugin_id, PublicPermission::ClipboardWrite, false,
+        &manager.inventory().unwrap().revision,
+    ).result.unwrap();
+    let now = Instant::now();
+    // More than the three-failure threshold, using actual scheduling,
+    // response parsing, authorization, completion and persisted state.
+    for sequence in 1..=6 {
+        let submission = service.schedule_command(
+            manager.route("/lower value").unwrap().unwrap(), sequence,
+            "/lower value".into(), now,
+        ).unwrap();
+        let dispatch = submission.dispatch.as_ref().unwrap();
+        let completion = PluginCommandCompletion {
+            context: dispatch.context.clone(), failed: false,
+            response: Some(json!({"requestId": dispatch.context.request_id,
+                "results": [{"id":"copy", "title":"value",
+                    "defaultAction":{"type":"copyText", "text":"value"}}]})),
+        };
+        let outcome = manager.scheduler().complete(&completion.context, now).unwrap();
+        assert!(outcome.accepted);
+        service.complete_submission_with(&completion, outcome, now,
+            || panic!("permission denial must not disable the Runtime")).unwrap();
+        assert!(matches!(submission.receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(Err(PluginRuntimeError::PermissionDenied))));
+        let config = manager.state().config(plugin_id).unwrap().unwrap();
+        assert!(config.enabled);
+        assert!(config.fault.is_none());
+        assert!(!config.permission_grants.contains(&PublicPermission::ClipboardWrite));
+    }
+    service.set_permission_access_outcome(
+        plugin_id, PublicPermission::ClipboardWrite, true,
+        &manager.inventory().unwrap().revision,
+    ).result.unwrap();
+    let submission = service.schedule_command(
+        manager.route("/lower recovered").unwrap().unwrap(), 7,
+        "/lower recovered".into(), now,
+    ).unwrap();
+    let dispatch = submission.dispatch.as_ref().unwrap();
+    let completion = PluginCommandCompletion {
+        context: dispatch.context.clone(), failed: false,
+        response: Some(json!({"requestId":dispatch.context.request_id,
+            "results":[{"id":"copy", "title":"recovered",
+                "defaultAction":{"type":"copyText", "text":"recovered"}}]})),
+    };
+    let outcome = manager.scheduler().complete(&completion.context, now).unwrap();
+    service.complete_submission_with(&completion, outcome, now,
+        || panic!("regrant must allow a fresh submission")).unwrap();
+    let Some(Ok(PublicPluginResponse::MainResults(rows))) =
+        submission.receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+    else { panic!("expected authorized results after regrant") };
+    assert_eq!(rows[0].copy_text.as_deref(), Some("recovered"));
+}
+
+#[test]
+fn undeclared_copy_action_remains_a_runtime_fault() {
+    let root = TestRoot::new("undeclared-copy-fault");
+    let (service, manager) = settings_service(&root); // Declares HTTPS, not clipboard.write.
+    let now = Instant::now();
+    let mut disabled = false;
+    for sequence in 1..=3 {
+        let submission = service.schedule_command(
+            manager.route("/demo value").unwrap().unwrap(), sequence,
+            "/demo value".into(), now,
+        ).unwrap();
+        let dispatch = submission.dispatch.as_ref().unwrap();
+        let completion = PluginCommandCompletion {
+            context: dispatch.context.clone(), failed: false,
+            response: Some(json!({"requestId":dispatch.context.request_id,
+                "results":[{"id":"copy", "title":"value",
+                    "defaultAction":{"type":"copyText", "text":"value"}}]})),
+        };
+        let outcome = manager.scheduler().complete(&completion.context, now).unwrap();
+        service.complete_submission_with(&completion, outcome, now, || disabled = true).unwrap();
+        assert!(matches!(submission.receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(Err(PluginRuntimeError::InvalidOperation))));
+        assert_eq!(disabled, sequence == 3);
+    }
+    let config = manager.state().config("com.uipilot.demo").unwrap().unwrap();
+    assert!(!config.enabled);
+    assert!(config.fault.is_some());
+}
+
+#[test]
 fn favorite_and_exact_override_noops_preserve_business_work_and_stored_choices() {
     for clear in [false, true] {
         let root = TestRoot::new("rename-stored-choice");

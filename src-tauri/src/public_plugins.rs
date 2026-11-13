@@ -1550,19 +1550,17 @@ impl PublicPluginService {
                             })
                             .and_then(|results| {
                                 if matches!(&results,PublicPluginResponse::MainResults(rows) if rows.iter().any(|result|result.copy_text.is_some()))
-                                    && !self
+                                {
+                                    self
                                         .manager()
                                         .map_err(|_| PluginRuntimeError::Unavailable)?
-                                        .can_copy_text(
+                                        .check_copy_text_response(
                                             &pending.route.plugin_id,
                                             &pending.route.command_id,
                                             pending.route.generation,
-                                        )
-                                {
-                                    Err(PluginRuntimeError::InvalidOperation)
-                                } else {
-                                    Ok(results)
+                                        )?;
                                 }
+                                Ok(results)
                             }),
                         PublicOutputMode::Window => value
                             .and_then(|value| parse_window_response(&completion.context, value))
@@ -1573,7 +1571,9 @@ impl PublicPluginService {
                     };
                     Some(result)
                 };
-                runtime_success = result.as_ref().map(|result| {
+                runtime_success = result.as_ref()
+                    .filter(|result| !matches!(result, Err(PluginRuntimeError::PermissionDenied)))
+                    .map(|result| {
                     (
                         result.is_ok(),
                         pending.route.generation,

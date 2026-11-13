@@ -4533,6 +4533,32 @@ impl PublicPluginManager {
                         .contains(&PublicPermission::ClipboardWrite)
             })
     }
+    pub(crate) fn check_copy_text_response(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
+        generation: u64,
+    ) -> Result<(), PluginRuntimeError> {
+        let bundle = self.bundles.confirmed_bundle(plugin_id)
+            .map_err(|_| PluginRuntimeError::Unavailable)?
+            .ok_or(PluginRuntimeError::ExpiredRequest)?;
+        let config = &bundle.config;
+        if config.command(command_id).is_none() || !config.installed || !config.enabled
+            || config.fault.is_some() || config.active_generation != generation
+            || bundle.runtime.generation != generation
+        {
+            return Err(PluginRuntimeError::ExpiredRequest);
+        }
+        // Returning an undeclared action is a protocol fault. A user revoking a
+        // declared capability is an authorization denial, not a Runtime fault.
+        if !bundle.runtime.manifest.permissions.contains(&PublicPermission::ClipboardWrite) {
+            return Err(PluginRuntimeError::InvalidOperation);
+        }
+        if !config.permission_grants.contains(&PublicPermission::ClipboardWrite) {
+            return Err(PluginRuntimeError::PermissionDenied);
+        }
+        Ok(())
+    }
     pub(crate) fn execute_api(
         &self,
         caller_label: &str,

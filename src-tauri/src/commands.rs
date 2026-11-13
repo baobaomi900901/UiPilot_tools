@@ -492,6 +492,13 @@ impl CommandError {
         }
     }
 
+    fn plugin_submission_failed(error: PluginRuntimeError) -> Self {
+        match error {
+            PluginRuntimeError::PermissionDenied => Self::plugin_permission_denied(),
+            other => other.into(),
+        }
+    }
+
     fn file_not_found() -> Self {
         Self {
             code: "fileNotFound",
@@ -5150,7 +5157,7 @@ pub(crate) async fn search_apps(
         let Some(response) = received else {
             return Ok(None);
         };
-        return match response.map_err(CommandError::from)? {
+        return match response.map_err(CommandError::plugin_submission_failed)? {
             PublicPluginResponse::MainActionResults { route, results } => {
                 let requirements =
                     crate::public_plugins::result_action::ResultActionRequirements::rows(&results);
@@ -7820,6 +7827,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_submission_permission_denial_uses_launcher_permission_error() {
+        assert_eq!(super::CommandError::plugin_submission_failed(
+            super::PluginRuntimeError::PermissionDenied).code, "pluginPermissionDenied");
+        // Runtime bridge callers retain their existing wire error code.
+        assert_eq!(super::CommandError::from(
+            super::PluginRuntimeError::PermissionDenied).code, "permissionDenied");
+    }
     #[test]
     fn selection_stable_route_preserves_exact_argument_whitespace() {
         assert_eq!(
