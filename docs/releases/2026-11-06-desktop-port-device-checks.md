@@ -601,3 +601,12 @@ Storage/CommitUncertain 错误先撤销旧选择和 token、释放控制器与�
 用户重新安装并重启后确认：关闭 demo-return 写入权限时插件仍启用；首次请求显示明确的“插件所需权限不可用，请在『设置 → 权限』中检查。”；随后再连续请求五次，每次均为权限提示，插件没有自动关闭；恢复权限后结果输出和复制均正常。此次回归关闭“权限提示不明确”和“撤权后的连续请求导致自动停用”两项已复现缺陷。
 
 这些结果仅覆盖本次 Windows ARM64 虚拟机中的 x64 应用及上述插件路径，不代表所有插件能力、macOS 生产运行时或双平台总目标验收完成。
+
+
+## 2026-11-13 macOS 撤权语义与同包诊断回归
+
+Mac 主结果发布区分“已声明、但当前被撤销”的复制权限与未声明动作：前者保留 `pluginPermissionDenied` 至启动器提示，后者仍拒绝为不支持的动作。连续六次拒绝不改变启用配置；重新授权后只接受新请求的单次复制。显式停用后重新授权仍保持停用，重新加载安装库也一致。生产执行开关保持关闭。
+
+自动验证：Mac 双 preview 主库 **583 通过、18 默认忽略**；真实 QuickJS helper 自身 **123 单元、6 数据进程、2 安装进程、5 进程测试通过**。使用 Windows 人工验收的原始共享归档（ZIP SHA-256 `f5c0c465fa7e4ba2f98f887decc7a375ed826c4c3761e7edb227c007fe6484dc`），设置 seed 与重开/升级、multi、return 共 **4 项通过**；复制准入进程专项另 **1 项通过**。return 归档覆盖连续撤权拒绝、保持启用及重新授权后新的结果可复制。
+
+证据：`/private/tmp/uipilot-macos-permission-full.log`、`/private/tmp/uipilot-permission-probe-build.log`、`/private/tmp/uipilot-permission-archive-seed.log`、`/private/tmp/uipilot-permission-archive-tests.log`、`/private/tmp/uipilot-permission-process.log`。所有安装库、Runtime 数据和复制接收器为隔离测试对象，没有操作用户剪贴板或个人安装库。诊断 helper 是临时 ad-hoc 签名的 QuickJS 进程；不代表签名 XPC 沙箱、Mac 生产插件运行或双端生产同包验收通过。

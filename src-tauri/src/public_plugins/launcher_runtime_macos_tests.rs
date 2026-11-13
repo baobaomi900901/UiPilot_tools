@@ -733,6 +733,83 @@ fn timeout_failed_terminal_malformed_result_and_copy_action_never_publish() {
         drain(&runtime, &state);
     }
 }
+
+#[test]
+fn revoked_copy_permission_keeps_plugin_enabled_and_regrant_allows_fresh_copy() {
+    use super::super::manifest::PublicPermission;
+    let temp = Temp::new();
+    temp.edit(|m| m["permissions"] = json!(["clipboard.write"]));
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    let set_grant = |granted| {
+        state.with(&temp.0, |manager| {
+            let revision = manager.list()?.revision;
+            manager.permission(ID, PublicPermission::ClipboardWrite, granted, &revision)?;
+            Ok(())
+        }).unwrap();
+    };
+    let fake = Arc::new(Fake(|input: RuntimeInput, _: Cancellation| Ok(TerminalResult {
+        raw: serde_json::to_vec(&json!({
+            "requestId":input.invocation.request_id,
+            "results":[{"id":"copy", "title":"recovered",
+                "defaultAction":{"type":"copyText", "text":"recovered"}}]
+        })).unwrap(),
+    })));
+    let registry = registry();
+    let runtime = LauncherRuntime::with_transport(state.clone(), registry.clone(), fake, Duration::from_secs(5));
+    start(&runtime, &registry);
+    set_grant(false);
+    for sequence in 1..=6 {
+        let error = launch(&runtime, &temp.0, sequence, "/settings-demo", true).unwrap_err();
+        assert_eq!(error.code(), "pluginPermissionDenied");
+        state.with(&temp.0, |manager| {
+            let snapshot = manager.list()?;
+            let plugin = snapshot.plugins.iter().find(|p| p.plugin_id == ID).unwrap();
+            assert!(plugin.enabled);
+            assert!(plugin.permissions.iter().all(|p| !p.granted));
+            Ok(())
+        }).unwrap();
+    }
+    set_grant(true);
+    let Route::Published(response) = launch(&runtime, &temp.0, 7, "/settings-demo", true).unwrap()
+    else { panic!("fresh query after regrant must publish") };
+    assert!(response.items[0].has_default_action);
+    let mut writes = 0;
+    runtime.copy_result(&temp.0, &response.request_id, &response.items[0].result_id, |text, admit| {
+        assert_eq!(text, "recovered");
+        assert!(admit());
+        writes += 1;
+        assert!(!admit());
+        Ok(HostCopyOutcome::Accepted)
+    }).unwrap();
+    assert_eq!(writes, 1);
+    drain(&runtime, &state);
+}
+
+#[test]
+fn permission_regrant_preserves_explicit_disable_across_reload() {
+    use super::super::manifest::PublicPermission;
+    let temp = Temp::new();
+    temp.edit(|m| m["permissions"] = json!(["clipboard.write"]));
+    let state = ManagementState::default();
+    temp.install(&state);
+    state.with(&temp.0, |manager| {
+        let revision = manager.list()?.revision;
+        let snapshot = manager.permission(ID, PublicPermission::ClipboardWrite, false, &revision)?;
+        let snapshot = manager.enabled(ID, false, &snapshot.revision)?;
+        let snapshot = manager.permission(ID, PublicPermission::ClipboardWrite, true, &snapshot.revision)?;
+        assert!(!snapshot.plugins[0].enabled);
+        assert!(snapshot.plugins[0].permissions[0].granted);
+        Ok(())
+    }).unwrap();
+    drop(state);
+    ManagementState::default().with(&temp.0, |manager| {
+        let snapshot = manager.list()?;
+        assert!(!snapshot.plugins[0].enabled);
+        assert!(snapshot.plugins[0].permissions[0].granted);
+        Ok(())
+    }).unwrap();
+}
 #[test]
 fn stale_query_waiting_before_open_cannot_close_a_newly_attached_request() {
     let temp = Temp::new();

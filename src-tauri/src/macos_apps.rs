@@ -140,7 +140,7 @@ pub(crate) async fn search_apps(
         let runtime_query = query.clone();
         let route = tauri::async_runtime::spawn_blocking(move || runtime.route(&root, id, query_sequence, &runtime_query, theme, submit.unwrap_or(false), completion_origin))
             .await.map_err(|_| Error::unavailable())?
-            .map_err(|_| Error { code: "pluginQueryFailed", message: "插件运行未完成，请重新查询" })?;
+            .map_err(plugin_query_error)?;
         match route {
             Route::Published(response) => return Ok(Some(response)),
             Route::Stale => return Ok(None),
@@ -220,6 +220,14 @@ fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToke
         response.replace_local_results = command;
         response
     })
+}
+
+fn plugin_query_error(error: crate::public_plugins::launcher_runtime_macos::Error) -> Error {
+    if matches!(error, crate::public_plugins::launcher_runtime_macos::Error::PermissionDenied) {
+        Error { code: "pluginPermissionDenied", message: "插件所需权限不可用，请在设置中检查" }
+    } else {
+        Error { code: "pluginQueryFailed", message: "插件运行未完成，请重新查询" }
+    }
 }
 
 fn execute_registered(
@@ -376,6 +384,15 @@ async fn execute_main(window: WebviewWindow, request_id: String, result_id: Stri
 mod platform_app_commands {
     use super::*;
     use crate::apps::macos_backend::tests::Fixture;
+
+    #[test]
+    fn plugin_permission_error_reaches_the_shared_launcher_message() {
+        use crate::public_plugins::launcher_runtime_macos::Error as RuntimeError;
+        assert_eq!(plugin_query_error(RuntimeError::PermissionDenied).code, "pluginPermissionDenied");
+        for error in [RuntimeError::InvalidResult, RuntimeError::UnsupportedAction, RuntimeError::Unavailable, RuntimeError::Storage] {
+            assert_eq!(plugin_query_error(error).code, "pluginQueryFailed");
+        }
+    }
 
     #[test]
     fn runtime_environment_resolves_the_same_theme_as_the_host() {

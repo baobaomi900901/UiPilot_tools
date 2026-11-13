@@ -58,6 +58,7 @@ pub(crate) enum Error {
     Storage,
     InvalidResult,
     UnsupportedAction,
+    PermissionDenied,
 }
 impl Error {
     pub(crate) fn code(self) -> &'static str {
@@ -66,6 +67,7 @@ impl Error {
             Self::Storage => "pluginRuntimeStorage",
             Self::InvalidResult => "pluginRuntimeInvalidResult",
             Self::UnsupportedAction => "pluginRuntimeUnsupportedAction",
+            Self::PermissionDenied => "pluginPermissionDenied",
         }
     }
 }
@@ -618,6 +620,14 @@ impl LauncherRuntime {
             Err(error) => {
                 run.signal();
                 close_later(self.management.clone(), identity);
+                if error == MainCompletionError::UnsupportedAction
+                    && installed.package().manifest().permissions.contains(
+                        &super::manifest::PublicPermission::ClipboardWrite,
+                    )
+                    && !installed.clipboard_write_allowed()
+                {
+                    return Err(Error::PermissionDenied);
+                }
                 return completion_error(error);
             }
         };

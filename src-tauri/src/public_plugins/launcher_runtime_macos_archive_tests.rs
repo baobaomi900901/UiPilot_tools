@@ -202,10 +202,33 @@ fn return_archive_copies_with_grant_and_rejects_after_revocation() {
             Ok(())
         })
         .unwrap();
-    assert!(matches!(
-        host.query(2, "/demo-return 中文", true),
-        Err(Error::UnsupportedAction)
-    ));
-    assert_eq!(host.probe.take_report().data_calls, 0);
+    for sequence in 2..=7 {
+        assert!(matches!(
+            host.query(sequence, "/demo-return 中文", true),
+            Err(Error::PermissionDenied)
+        ));
+        assert_eq!(host.probe.take_report().data_calls, 0);
+        host.state.with(&host.root, |manager| {
+            assert!(manager.list()?.plugins.iter().find(|p| p.plugin_id == plugin).unwrap().enabled);
+            Ok(())
+        }).unwrap();
+    }
+    host.state.with(&host.root, |manager| {
+        let revision = manager.list()?.revision;
+        manager.permission(plugin, PublicPermission::ClipboardWrite, true, &revision)?;
+        Ok(())
+    }).unwrap();
+    let response = host.run(8, "/demo-return recovered", true, 0);
+    let item = &response.items[0];
+    assert!(item.title.starts_with("recovered "));
+    let mut writes = 0;
+    host.runtime.copy_result(&host.root, &response.request_id, &item.result_id, |text, admit| {
+        assert!(admit());
+        assert!(!admit());
+        assert_eq!(text, item.title);
+        writes += 1;
+        Ok(HostCopyOutcome::Accepted)
+    }).unwrap();
+    assert_eq!(writes, 1);
     host.close();
 }

@@ -298,7 +298,7 @@ fn demo_return_copy_checks_grant_at_publication_and_at_single_use_admission() {
         let report = probe.take_report();
         assert_eq!(report.data_calls, 0);
         if case == "denied" {
-            assert!(matches!(route, Err(Error::UnsupportedAction)));
+            assert!(matches!(route, Err(Error::PermissionDenied)));
         } else {
             let Route::Published(response) = route.unwrap() else {
                 panic!("expected copy result")
