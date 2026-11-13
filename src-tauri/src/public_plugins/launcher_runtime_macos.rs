@@ -427,6 +427,7 @@ impl LauncherRuntime {
                 .into_iter()
                 .filter_map(|command| {
                     let title = format!("/{}", command.name);
+                    let favorite = crate::model::ResultFavorite::public_plugin(command.plugin_id.clone(), command.command_id.clone(), command.favorite);
                     let activation = LauncherResultActivation::main_result_activation(
                         command.plugin_id,
                         command.command_id,
@@ -444,7 +445,7 @@ impl LauncherRuntime {
                         icon: None,
                         plugin_icon_url: None,
                         icon_kind: None,
-                        favorite: None,
+                        favorite,
                         has_default_action: false,
                     })
                 })
@@ -757,7 +758,7 @@ fn watch_deadline(
         })
         .is_ok()
 }
-fn host_command_names() -> impl Iterator<Item = &'static str> {
+pub(super) fn host_command_names() -> impl Iterator<Item = &'static str> {
     ["find", "settings", "plugins"].into_iter().chain(
         crate::settings::ManagedBuiltinFeature::ALL
             .into_iter()

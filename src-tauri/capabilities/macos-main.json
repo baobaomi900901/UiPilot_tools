@@ -33,6 +33,8 @@
     "allow-set-macos-plugin-enabled",
     "allow-set-macos-plugin-permission",
     "allow-save-macos-plugin-settings",
+    "allow-save-macos-plugin-command",
+    "allow-set-plugin-favorite",
     "allow-remove-macos-plugin"
   ]
 }

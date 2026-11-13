@@ -1,5 +1,6 @@
 //! Shared installed-inventory authority for trusted management and runtime binding.
 //! No source evaluation or OS grant; transport execution occurs outside its lock.
+pub(crate) use super::lifecycle_macos::CommandPreference;
 use super::{
     lifecycle_macos::{
         InstalledRequest, InstalledView, LifecycleError, MacPluginLifecycle, PreparedInstall,
@@ -33,6 +34,7 @@ pub(crate) enum Error {
     Unsupported,
     ConsentRequired,
     InvalidSetting,
+    InvalidCommand,
     Conflict,
     Capacity,
     CommitUncertain,
@@ -46,6 +48,7 @@ impl Error {
             Self::InvalidPackage => "pluginManagementInvalidPackage",
             Self::Unsupported => "pluginManagementUnsupported",
             Self::ConsentRequired => "pluginManagementConsentRequired",
+            Self::InvalidCommand => "pluginManagementInvalidCommand",
             Self::InvalidSetting => "pluginManagementInvalidSetting",
             Self::Conflict => "pluginManagementConflict",
             Self::Capacity => "pluginManagementCapacity",
@@ -60,6 +63,7 @@ impl From<LifecycleError> for Error {
             LifecycleError::Stale | LifecycleError::NotInstalled => Self::Stale,
             LifecycleError::InvalidPackage => Self::InvalidPackage,
             LifecycleError::ConsentRequired => Self::ConsentRequired,
+            LifecycleError::InvalidCommand => Self::InvalidCommand,
             LifecycleError::InvalidSetting => Self::InvalidSetting,
             LifecycleError::CommandConflict => Self::Conflict,
             LifecycleError::Capacity => Self::Capacity,
@@ -80,6 +84,9 @@ pub(crate) struct PermissionRow {
 pub(crate) struct CommandRow {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) default_name: String,
+    pub(crate) name_override: Option<String>,
+    pub(crate) favorite: bool,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,12 +163,23 @@ fn row(
             .map(|(id, cmd)| CommandRow {
                 id: id.into(),
                 name: cmd.default_name.clone(),
+                default_name: cmd.default_name.clone(),
+                name_override: None,
+                favorite: false,
             })
             .collect(),
     }
 }
 fn view(view: InstalledView) -> PluginRow {
-    row(&view.manifest, view.enabled, &view.grants, view.settings)
+    let mut row = row(&view.manifest, view.enabled, &view.grants, view.settings);
+    for command in &mut row.commands {
+        if let Some(preference) = view.commands.get(&command.id) {
+            command.name = preference.name(&command.default_name).into();
+            command.name_override = preference.name_override.clone();
+            command.favorite = preference.favorite;
+        }
+    }
+    row
 }
 struct Pending {
     token: String,
@@ -188,6 +206,7 @@ pub(crate) struct RuntimeCommand {
     pub(crate) mode: PublicActivationMode,
     pub(crate) input_required: bool,
     pub(crate) multi: bool,
+    pub(crate) favorite: bool,
     pub(crate) revision: String,
 }
 pub(crate) trait RuntimeInvalidation: Send + Sync {
@@ -240,7 +259,12 @@ impl Management {
                     .map(|(id, c)| RuntimeCommand {
                         plugin_id: row.manifest.plugin_id.clone(),
                         command_id: id.into(),
-                        name: c.default_name.clone(),
+                        name: row
+                            .commands
+                            .get(id)
+                            .and_then(|p| p.name_override.clone())
+                            .unwrap_or_else(|| c.default_name.clone()),
+                        favorite: row.commands.get(id).is_some_and(|p| p.favorite),
                         summary: c.summary.clone(),
                         input_placeholder: c.input_placeholder.clone(),
                         mode: c.activation_mode,
@@ -324,7 +348,18 @@ impl Management {
             })
             .unwrap_or_default();
         let values = reconcile_settings(old.map(|p| &p.values), &manifest.settings);
-        let plugin = row(manifest, old.is_none_or(|p| p.enabled), &grants, values);
+        let mut plugin = row(manifest, old.is_none_or(|p| p.enabled), &grants, values);
+        for command in &mut plugin.commands {
+            if let Some(previous) = old.and_then(|p| p.commands.iter().find(|c| c.id == command.id))
+            {
+                command.name_override = previous.name_override.clone();
+                command.name = command
+                    .name_override
+                    .clone()
+                    .unwrap_or_else(|| command.default_name.clone());
+                command.favorite = previous.favorite;
+            }
+        }
         let mut random = [0u8; 32];
         // macOS public libc CSPRNG, no file path or user state access.
         if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
@@ -402,6 +437,38 @@ impl Management {
         self.expected(expected)?;
         self.host.save_settings(id, updates)?;
         self.list()
+    }
+    pub(crate) fn command_preference(
+        &mut self,
+        id: &str,
+        command_id: &str,
+        preference: CommandPreference,
+        expected: &str,
+    ) -> Result<Snapshot> {
+        self.expected(expected)?;
+        self.host
+            .set_command_preference(id, command_id, preference)?;
+        self.list()
+    }
+    /// Shared launcher favorite IPC only changes the named stable command.
+    pub(crate) fn favorite(&mut self, id: &str, command_id: &str, favorite: bool) -> Result<()> {
+        let current = self.list()?;
+        let command = current
+            .plugins
+            .iter()
+            .find(|p| p.plugin_id == id)
+            .and_then(|p| p.commands.iter().find(|c| c.id == command_id))
+            .ok_or(Error::Stale)?;
+        self.command_preference(
+            id,
+            command_id,
+            CommandPreference {
+                name_override: command.name_override.clone(),
+                favorite,
+            },
+            &current.revision,
+        )?;
+        Ok(())
     }
     pub(crate) fn remove(&mut self, id: &str, expected: &str) -> Result<Snapshot> {
         self.host.remove_expected(id, revision(expected)?)?;

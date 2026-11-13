@@ -4,9 +4,9 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { MacPluginManagement, type MacPluginManagementHandle } from './macos-plugin-management'
 import type { MacPluginManagementClient, MacPluginRow, MacPluginSnapshot } from './macos-plugin-management-client'
-const row: MacPluginRow = { pluginId: 'com.test.settings', name: '设置示例', description: '普通设置', version: '1.0.0', enabled: false, commands: [{ id: 'default', name: 'settings-demo' }], permissions: [{ permission: 'clipboard.write', granted: false }], settings: [{ type: 'text', key: 'greeting', label: '问候', default: '你好' }, { type: 'number', key: 'count', label: '数量', min: 1, max: 5 }], values: { greeting: '你好', count: 2 } }
+const row: MacPluginRow = { pluginId: 'com.test.settings', name: '设置示例', description: '普通设置', version: '1.0.0', enabled: false, commands: [{ id: 'default', name: 'settings-demo', defaultName: 'settings-demo', nameOverride: null, favorite: false }], permissions: [{ permission: 'clipboard.write', granted: false }], settings: [{ type: 'text', key: 'greeting', label: '问候', default: '你好' }, { type: 'number', key: 'count', label: '数量', min: 1, max: 5 }], values: { greeting: '你好', count: 2 } }
 const snapshot: MacPluginSnapshot = { revision: '12', plugins: [row] }
-function fixture() { return { list: vi.fn(async () => snapshot), prepare: vi.fn(async () => ({ token: 'token-1', expectedRevision: '12', plugin: { ...row, version: '1.0.1' }, requiredPermissions: ['clipboard.write' as const] })), commit: vi.fn(async () => ({ ...snapshot, revision: '13' })), cancel: vi.fn(async () => {}), enabled: vi.fn(async () => snapshot), permission: vi.fn(async () => snapshot), settings: vi.fn(async () => ({ ...snapshot, revision: '13' })), remove: vi.fn(async () => ({ revision: '13', plugins: [] })) } satisfies MacPluginManagementClient }
+function fixture() { return { list: vi.fn(async () => snapshot), prepare: vi.fn(async () => ({ token: 'token-1', expectedRevision: '12', plugin: { ...row, version: '1.0.1' }, requiredPermissions: ['clipboard.write' as const] })), commit: vi.fn(async () => ({ ...snapshot, revision: '13' })), cancel: vi.fn(async () => {}), enabled: vi.fn(async () => snapshot), permission: vi.fn(async () => snapshot), settings: vi.fn(async () => ({ ...snapshot, revision: '13' })), command: vi.fn<MacPluginManagementClient['command']>(async () => snapshot), remove: vi.fn(async () => ({ revision: '13', plugins: [] })) } satisfies MacPluginManagementClient }
 let root: Root, host: HTMLDivElement
 beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true, ResizeObserver: class { observe() {} unobserve() {} disconnect() {} } }); window.matchMedia = vi.fn().mockImplementation(() => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} })); host = document.createElement('div'); document.body.append(host); root = createRoot(host) })
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); document.body.innerHTML = '' })
@@ -132,4 +132,53 @@ it('Escape cancels install confirmation and preserves a dirty draft when cancell
   await select(); await input('问候', '草稿'); const leave = vi.fn()
   await act(async () => ref.current!.requestLeave(leave)); await escape()
   expect(leave).not.toHaveBeenCalled(); expect(host.querySelector<HTMLTextAreaElement>('[aria-label="问候"]')!.value).toBe('草稿')
+})
+
+async function chooseCommand(id: string) {
+  await act(async () => host.querySelector('[aria-label="选择命令"]')!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })))
+  const option = [...document.querySelectorAll<HTMLElement>('.ant-select-item-option')].find(o => o.textContent?.startsWith(`${id} ·`))!
+  expect(option).toBeDefined()
+  await act(async () => option.click())
+}
+it('keeps command favorites independent and saves rename by stable ID with the current revision', async () => {
+  const client = fixture()
+  let current = { ...snapshot, plugins: [{ ...row, commands: [
+    { id: 'lower', name: 'demo-lower', defaultName: 'demo-lower', nameOverride: null as string | null, favorite: false },
+    { id: 'upper', name: 'demo-upper', defaultName: 'demo-upper', nameOverride: null as string | null, favorite: true },
+  ] }] }
+  client.list.mockImplementation(async () => current)
+  client.command.mockImplementation(async input => {
+    current = { ...current, revision: String(Number(current.revision) + 1), plugins: current.plugins.map(p => ({ ...p, commands: p.commands.map(c => c.id === input.commandId ? { ...c, name: input.nameOverride ?? c.defaultName, nameOverride: input.nameOverride, favorite: input.favorite } : c) })) }
+    return current
+  })
+  await render(client); await select()
+  expect(button('设为常用').getAttribute('aria-pressed')).toBe('false')
+  await chooseCommand('upper')
+  expect(button('取消常用').getAttribute('aria-pressed')).toBe('true')
+  await input('启动名称', '/mac-upper'); await click('保存启动名称')
+  expect(client.command).toHaveBeenLastCalledWith({ pluginId: row.pluginId, commandId: 'upper', nameOverride: 'mac-upper', favorite: true, expectedRevision: '12' })
+  expect(button('取消常用').getAttribute('aria-pressed')).toBe('true')
+  await click('取消常用')
+  expect(client.command).toHaveBeenLastCalledWith({ pluginId: row.pluginId, commandId: 'upper', nameOverride: 'mac-upper', favorite: false, expectedRevision: '13' })
+  await chooseCommand('lower')
+  expect(host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!.value).toBe('demo-lower')
+  expect(button('设为常用').getAttribute('aria-pressed')).toBe('false')
+  await chooseCommand('upper'); await click('恢复默认名称'); await click('保存启动名称')
+  expect(client.command).toHaveBeenLastCalledWith({ pluginId: row.pluginId, commandId: 'upper', nameOverride: null, favorite: false, expectedRevision: '14' })
+})
+it('guards unsaved names and invalid input, and never retries a conflicting name automatically', async () => {
+  const client = fixture(); await render(client); await select()
+  await input('启动名称', 'Two Words'); expect(button('保存启动名称').disabled).toBe(true)
+  expect(button('设为常用').disabled).toBe(true)
+  await click('返回插件列表'); await click('取消')
+  expect(host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!.value).toBe('Two Words')
+  await input('启动名称', 'find')
+  client.command.mockRejectedValueOnce('pluginManagementConflict')
+  await click('保存启动名称')
+  expect(host.textContent).toContain('启动命令与内置命令或已安装插件冲突')
+  expect(button('保存启动名称').disabled).toBe(true)
+  expect(host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!.value).toBe('find')
+  expect(client.command).toHaveBeenCalledOnce()
+  await click('刷新插件列表'); await click('放弃修改')
+  expect(host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!.value).toBe('settings-demo')
 })

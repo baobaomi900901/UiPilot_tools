@@ -94,6 +94,47 @@ pub(crate) struct SettingsInput {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CommandInput {
+    plugin_id: String,
+    command_id: String,
+    name_override: Option<String>,
+    favorite: bool,
+    expected_revision: String,
+}
+#[tauri::command]
+pub(crate) async fn save_macos_plugin_command(
+    window: WebviewWindow,
+    input: CommandInput,
+) -> Result<Snapshot, &'static str> {
+    require_main(&window)?;
+    work(&window, move |m| {
+        m.command_preference(
+            &input.plugin_id,
+            &input.command_id,
+            crate::public_plugins::management_macos::CommandPreference {
+                name_override: input.name_override,
+                favorite: input.favorite,
+            },
+            &input.expected_revision,
+        )
+    })
+    .await
+}
+#[tauri::command]
+pub(crate) async fn set_plugin_favorite(
+    window: WebviewWindow,
+    plugin_id: String,
+    command_id: String,
+    favorite: bool,
+) -> Result<(), &'static str> {
+    require_main(&window)?;
+    work(&window, move |m| {
+        m.favorite(&plugin_id, &command_id, favorite)
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RemoveInput {
     plugin_id: String,
     expected_revision: String,

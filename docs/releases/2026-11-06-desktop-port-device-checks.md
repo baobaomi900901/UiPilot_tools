@@ -610,3 +610,14 @@ Mac 主结果发布区分“已声明、但当前被撤销”的复制权限与�
 自动验证：Mac 双 preview 主库 **583 通过、18 默认忽略**；真实 QuickJS helper 自身 **123 单元、6 数据进程、2 安装进程、5 进程测试通过**。使用 Windows 人工验收的原始共享归档（ZIP SHA-256 `f5c0c465fa7e4ba2f98f887decc7a375ed826c4c3761e7edb227c007fe6484dc`），设置 seed 与重开/升级、multi、return 共 **4 项通过**；复制准入进程专项另 **1 项通过**。return 归档覆盖连续撤权拒绝、保持启用及重新授权后新的结果可复制。
 
 证据：`/private/tmp/uipilot-macos-permission-full.log`、`/private/tmp/uipilot-permission-probe-build.log`、`/private/tmp/uipilot-permission-archive-seed.log`、`/private/tmp/uipilot-permission-archive-tests.log`、`/private/tmp/uipilot-permission-process.log`。所有安装库、Runtime 数据和复制接收器为隔离测试对象，没有操作用户剪贴板或个人安装库。诊断 helper 是临时 ad-hoc 签名的 QuickJS 进程；不代表签名 XPC 沙箱、Mac 生产插件运行或双端生产同包验收通过。
+
+
+## 2026-11-13 macOS 按命令收藏与改名
+
+管理清单和设置页已接通稳定 commandId 下的独立收藏、启动名称覆盖及恢复默认。升级只保留仍存在的命令配置，卸载删除配置；旧清单不含 commands 字段也能加载。Host 拒绝无效名称、内置命令和其他已安装命令冲突，失败不改变清单；变更沿用 revision 与生命周期退休机制。内部启动器目录按有效名称补全并带收藏身份，改名不改变 Runtime commandId。
+
+验证：Mac 主库双 preview **588 通过、18 忽略**；相关前端与真实 Launcher **419 通过、18 跳过**；TypeScript/Vite 构建、Rust all-targets、精确 Mac ACL 四项通过。新增行为覆盖旧清单重开、独立命令、升级默认名变化、移除命令与卸载重装、名称冲突无副作用、旧 Runtime 权限失效、按新名称路由及收藏元数据。浅色/深色真实管理组件在独立浏览器 fixture 中检查了 720 像素宽度；未读取用户安装库。
+
+证据：`/private/tmp/uipilot-command-full.log`、`/private/tmp/uipilot-command-ui-all.log`、`/private/tmp/uipilot-command-check.log`、`/private/tmp/uipilot-command-acl.log`。生产 Runtime 仍关闭；管理 UI 的原生安装、收藏改名及重启恢复需下一节点人工验收。
+
+同一份原始 demo-multi 归档的真实 QuickJS 诊断还验证了改名后新入口仍调用 upper、旧入口不再路由、lower 不变，以及销毁并重建 Host 后收藏与名称保留。专项 1 项通过，日志 `/private/tmp/uipilot-command-real-archive.log`；仍不替代生产 GUI 运行验收。

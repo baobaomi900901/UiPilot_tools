@@ -377,6 +377,8 @@ pub fn run() {
             crate::macos_plugin_management::set_macos_plugin_enabled,
             crate::macos_plugin_management::set_macos_plugin_permission,
             crate::macos_plugin_management::save_macos_plugin_settings,
+            crate::macos_plugin_management::save_macos_plugin_command,
+            crate::macos_plugin_management::set_plugin_favorite,
             crate::macos_plugin_management::remove_macos_plugin,
             crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
             hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording, hotkey::get_launcher_hotkey_status,

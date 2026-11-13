@@ -167,7 +167,29 @@ fn multi_archive_dispatches_live_and_submit_with_shared_storage() {
         Some("Shared invocation 2")
     );
     assert_eq!(lower.main_result_command.unwrap().command_id, "lower");
+    host.state.with(&host.root, |manager| {
+        let revision = manager.list()?.revision;
+        manager.command_preference("com.uipilot.demo-multi", "upper",
+            crate::public_plugins::management_macos::CommandPreference {
+                name_override: Some("mac-upper".into()), favorite: true,
+            }, &revision)?;
+        Ok(())
+    }).unwrap();
+    assert!(matches!(host.query(4, "/demo-upper MiXeD", false), Ok(Route::NotHandled)));
+    let upper = host.run(5, "/mac-upper MiXeD", false, 4);
+    assert_eq!(upper.items[0].title, "[验收] MIXED");
+    assert!(upper.main_result_command.is_none(), "live commands do not publish submit-only context");
     host.close();
+    let reopened = ArchiveHost::new(temp.0.clone());
+    reopened.state.with(&reopened.root, |manager| {
+        let snapshot = manager.list()?;
+        let commands = &snapshot.plugins[0].commands;
+        assert!(commands.iter().any(|c| c.id == "upper" && c.name == "mac-upper" && c.favorite));
+        assert!(commands.iter().any(|c| c.id == "lower" && c.name == "demo-lower" && !c.favorite));
+        Ok(())
+    }).unwrap();
+    assert_eq!(reopened.run(1, "/mac-upper MiXeD", false, 4).items[0].title, "[验收] MIXED");
+    reopened.close();
 }
 
 #[test]

@@ -28,6 +28,7 @@ pub(crate) enum LifecycleError {
     NotInstalled,
     Disabled,
     InvalidSetting,
+    InvalidCommand,
     CommandConflict,
     Capacity,
     Storage,
@@ -36,6 +37,18 @@ pub(crate) enum LifecycleError {
 }
 pub(crate) type Retirement = Box<dyn FnOnce() -> std::result::Result<(), DataRuntimeError> + Send>;
 type Result<T> = std::result::Result<T, LifecycleError>;
+/// Host preferences are keyed by immutable command ID, never display name.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CommandPreference {
+    pub(crate) name_override: Option<String>,
+    pub(crate) favorite: bool,
+}
+impl CommandPreference {
+    pub(crate) fn name<'a>(&'a self, default: &'a str) -> &'a str {
+        self.name_override.as_deref().unwrap_or(default)
+    }
+}
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InstalledDocument {
@@ -44,6 +57,8 @@ struct InstalledDocument {
     grants: BTreeSet<PublicPermission>,
     generation: u64,
     settings: BTreeMap<String, Value>,
+    #[serde(default)]
+    commands: BTreeMap<String, CommandPreference>,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -139,6 +154,7 @@ pub(crate) struct InstalledView {
     pub(crate) enabled: bool,
     pub(crate) grants: BTreeSet<PublicPermission>,
     pub(crate) settings: BTreeMap<String, Value>,
+    pub(crate) commands: BTreeMap<String, CommandPreference>,
 }
 
 pub(crate) struct MacPluginLifecycle {
@@ -225,6 +241,7 @@ impl MacPluginLifecycle {
                 enabled: entry.enabled,
                 grants: entry.grants.clone(),
                 settings: entry.settings.clone(),
+                commands: entry.commands.clone(),
             })
             .collect();
         Ok((self.document.revision, rows))
@@ -302,6 +319,15 @@ impl MacPluginLifecycle {
                 grants,
                 generation: old.map_or(0, |p| p.generation),
                 settings,
+                commands: prepared
+                    .package
+                    .manifest()
+                    .normalized_commands()
+                    .filter_map(|(key, _)| {
+                        old.and_then(|p| p.commands.get(key))
+                            .map(|p| (key.into(), p.clone()))
+                    })
+                    .collect(),
             },
         );
         self.commit(candidate, &id)
@@ -357,6 +383,37 @@ impl MacPluginLifecycle {
             .ok_or(LifecycleError::NotInstalled)?
             .settings
             .extend(updates.clone());
+        self.commit(candidate, id)
+    }
+    pub(crate) fn set_command_preference(
+        &mut self,
+        id: &str,
+        command_id: &str,
+        preference: CommandPreference,
+    ) -> Result<bool> {
+        self.current()?;
+        let package = self.packages.get(id).ok_or(LifecycleError::NotInstalled)?;
+        if !package
+            .manifest()
+            .normalized_commands()
+            .any(|(key, _)| key == command_id)
+            || preference
+                .name_override
+                .as_deref()
+                .is_some_and(|name| !super::manifest::valid_command_name(name))
+        {
+            return Err(LifecycleError::InvalidCommand);
+        }
+        let mut candidate = self.document.clone();
+        let entry = candidate
+            .plugins
+            .get_mut(id)
+            .ok_or(LifecycleError::NotInstalled)?;
+        if preference == CommandPreference::default() {
+            entry.commands.remove(command_id);
+        } else {
+            entry.commands.insert(command_id.into(), preference);
+        }
         self.commit(candidate, id)
     }
     fn commit(&mut self, mut candidate: Inventory, id: &str) -> Result<bool> {
@@ -534,8 +591,27 @@ fn validate(document: &Inventory) -> Result<BTreeMap<String, VerifiedPackage>> {
         {
             return Err(LifecycleError::InvalidState);
         }
-        for (_, command) in package.manifest().normalized_commands() {
-            if !names.insert(command.default_name.to_lowercase()) {
+        if entry.commands.iter().any(|(id, preference)| {
+            !package
+                .manifest()
+                .normalized_commands()
+                .any(|(key, _)| key == id)
+                || preference
+                    .name_override
+                    .as_deref()
+                    .is_some_and(|name| !super::manifest::valid_command_name(name))
+        }) {
+            return Err(LifecycleError::InvalidCommand);
+        }
+        for (key, command) in package.manifest().normalized_commands() {
+            let name = entry
+                .commands
+                .get(key)
+                .and_then(|p| p.name_override.as_deref())
+                .unwrap_or(&command.default_name);
+            if super::launcher_runtime_macos::host_command_names().any(|reserved| reserved == name)
+                || !names.insert(name.to_lowercase())
+            {
                 return Err(LifecycleError::CommandConflict);
             }
         }

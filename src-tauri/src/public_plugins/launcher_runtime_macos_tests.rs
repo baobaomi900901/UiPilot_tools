@@ -924,3 +924,33 @@ fn delayed_reset_notification_only_retires_its_captured_management_epoch() {
     assert!(matches!(new.join().unwrap(), Ok(Route::Published(_))));
     drain(&runtime, &state);
 }
+
+#[test]
+fn renamed_favorite_catalog_and_dispatch_keep_the_original_command_identity() {
+    let temp = Temp::new();
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    state.with(&temp.0, |m| {
+        let revision = m.list()?.revision;
+        m.command_preference(ID, "default", super::super::management_macos::CommandPreference {
+            name_override: Some("mac-settings".into()), favorite: true,
+        }, &revision)?;
+        Ok(())
+    }).unwrap();
+    let registry = registry();
+    let fake = Arc::new(Fake(|input: RuntimeInput, _: Cancellation| {
+        assert_eq!(input.package.manifest().plugin_id, ID);
+        assert!(input.invocation.command_id.is_none());
+        Ok(completion(&input, "renamed result"))
+    }));
+    let runtime = LauncherRuntime::with_transport(state.clone(), registry.clone(), fake, Duration::from_secs(5));
+    start(&runtime, &registry);
+    let Route::Published(catalog) = launch(&runtime, &temp.0, 1, "/mac", false).unwrap() else { panic!("catalog missing") };
+    assert_eq!(catalog.items.len(), 1);
+    assert_eq!(catalog.items[0].title, "/mac-settings");
+    assert_eq!(catalog.items[0].favorite, crate::model::ResultFavorite::public_plugin(ID.into(), "default".into(), true));
+    assert!(matches!(launch(&runtime, &temp.0, 2, "/settings-demo", true), Ok(Route::NotHandled)));
+    let Route::Published(result) = launch(&runtime, &temp.0, 3, "/mac-settings", true).unwrap() else { panic!("dispatch missing") };
+    assert_eq!(result.items[0].title, "renamed result");
+    drain(&runtime, &state);
+}

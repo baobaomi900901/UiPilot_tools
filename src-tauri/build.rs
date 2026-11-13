@@ -42,6 +42,7 @@ fn main() {
             "set_macos_plugin_enabled",
             "set_macos_plugin_permission",
             "save_macos_plugin_settings",
+            "save_macos_plugin_command",
             "remove_macos_plugin",
 
             "open_find_window",

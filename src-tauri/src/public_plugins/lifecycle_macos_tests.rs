@@ -602,3 +602,37 @@ impl Temp {
         .unwrap();
     }
 }
+
+#[test]
+fn old_inventory_without_preferences_loads_and_upgrade_removes_orphaned_command_preferences() {
+    let temp = Temp::new();
+    let mut host = temp.host();
+    install(&mut host, temp.package("1.0.0", false));
+    let mut old: Value = serde_json::from_slice(host.raw.as_ref().unwrap()).unwrap();
+    old["plugins"][ID].as_object_mut().unwrap().remove("commands");
+    let old_bytes = serde_json::to_vec(&old).unwrap();
+    host.file.commit(&host.root, host.raw.as_deref(), &old_bytes).unwrap();
+    drop(host);
+    let mut host = temp.host();
+    assert!(host.management_snapshot().unwrap().1[0].commands.is_empty());
+    host.set_command_preference(ID, "default", CommandPreference { name_override: Some("custom".into()), favorite: true }).unwrap();
+    install(&mut host, temp.modified("1.0.1", false, |manifest| {
+        let mut command = manifest.as_object_mut().unwrap().remove("command").unwrap();
+        command["id"] = json!("replacement");
+        manifest["commands"] = json!([command]);
+        manifest["minimumHostVersion"] = json!("0.5.0");
+    }));
+    assert!(host.management_snapshot().unwrap().1[0].commands.is_empty());
+}
+
+#[test]
+fn changing_command_preference_retires_old_runtime_authority() {
+    let temp = Temp::new();
+    let mut host = temp.host();
+    install(&mut host, temp.package("1.0.0", false));
+    let old = open(&mut host);
+    assert!(get(&old, 1, "greeting").is_ok());
+    host.set_command_preference(ID, "default", CommandPreference { name_override: Some("renamed".into()), favorite: true }).unwrap();
+    assert_eq!(get(&old, 2, "greeting"), Err(DataRuntimeError::InvalidContext));
+    assert!(get(&open(&mut host), 1, "greeting").is_ok());
+}

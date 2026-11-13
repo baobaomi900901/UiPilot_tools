@@ -455,3 +455,70 @@ fn storage_failure_retires_queued_commands_and_outstanding_native_selection() {
         ))
         .is_err());
 }
+
+#[test]
+fn command_preferences_follow_ids_across_rename_reopen_upgrade_and_removal() {
+    let temp = Temp::new();
+    let path = temp.0.join("package/plugin.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut upper = manifest.as_object_mut().unwrap().remove("command").unwrap();
+    upper["id"] = json!("upper"); upper["defaultName"] = json!("demo-upper");
+    let mut lower = upper.clone(); lower["id"] = json!("lower"); lower["defaultName"] = json!("demo-lower");
+    manifest["commands"] = json!([upper, lower]);
+    manifest["minimumHostVersion"] = json!("0.5.0");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut m = Management::load(&temp.0).unwrap();
+    let first = temp.install(&mut m);
+    let saved = m.command_preference(ID, "upper", CommandPreference { name_override: Some("mac-upper".into()), favorite: true }, &first.revision).unwrap();
+    assert_eq!(saved.plugins[0].commands[0].name, "mac-upper");
+    assert!(saved.plugins[0].commands[0].favorite);
+    assert_eq!(saved.plugins[0].commands[1].name, "demo-lower");
+    assert!(!saved.plugins[0].commands[1].favorite);
+    assert!(m.runtime_catalog.iter().any(|c| c.command_id == "upper" && c.name == "mac-upper" && c.favorite));
+    assert!(!m.runtime_catalog.iter().any(|c| c.name == "demo-upper"));
+    assert!(matches!(m.command_preference(ID, "upper", CommandPreference::default(), &first.revision), Err(Error::Stale)));
+    drop(m);
+    let mut m = Management::load(&temp.0).unwrap();
+    assert_eq!(m.list().unwrap().plugins[0].commands[0].name, "mac-upper");
+    manifest["version"] = json!("1.0.1");
+    manifest["commands"][0]["defaultName"] = json!("new-upper");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let preview = temp.preview(&mut m);
+    assert_eq!(preview.plugin.commands[0].name, "mac-upper");
+    assert!(preview.plugin.commands[0].favorite);
+    let upgraded = m.commit(&preview.token, &preview.expected_revision, preview.required_permissions).unwrap();
+    let command = &upgraded.plugins[0].commands[0];
+    assert_eq!(command.default_name, "new-upper"); assert_eq!(command.name, "mac-upper"); assert!(command.favorite);
+    m.favorite(ID, "upper", false).unwrap();
+    let current = m.list().unwrap();
+    assert_eq!(current.plugins[0].commands[0].name, "mac-upper");
+    let reset = m.command_preference(ID, "upper", CommandPreference::default(), &current.revision).unwrap();
+    assert_eq!(reset.plugins[0].commands[0].name, "new-upper");
+    m.remove(ID, &reset.revision).unwrap();
+    let reinstalled = temp.install(&mut m);
+    assert!(!reinstalled.plugins[0].commands[0].favorite);
+    assert!(reinstalled.plugins[0].commands[0].name_override.is_none());
+}
+
+#[test]
+fn invalid_or_conflicting_command_changes_never_mutate_the_inventory() {
+    let temp = Temp::new();
+    let mut m = Management::load(&temp.0).unwrap();
+    let installed = temp.install(&mut m);
+    for name in ["", "Bad", "/test", "two words", "find", "web-search"] {
+        let error = m.command_preference(ID, "default", CommandPreference { name_override: Some(name.into()), favorite: true }, &installed.revision).err().unwrap();
+        assert!(matches!(error, Error::InvalidCommand | Error::Conflict));
+        let unchanged = m.list().unwrap();
+        assert_eq!(unchanged.revision, installed.revision);
+        assert_eq!(unchanged.plugins[0].commands[0].name, "settings-demo");
+        assert!(!unchanged.plugins[0].commands[0].favorite);
+    }
+    assert!(matches!(m.command_preference(ID, "missing", CommandPreference::default(), &installed.revision), Err(Error::InvalidCommand)));
+    let path = temp.0.join("package/plugin.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["pluginId"] = json!("com.test.second"); manifest["command"]["defaultName"] = json!("second");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let current = temp.install(&mut m);
+    assert!(matches!(m.command_preference(ID, "default", CommandPreference { name_override: Some("second".into()), favorite: false }, &current.revision), Err(Error::Conflict)));
+    assert_eq!(m.list().unwrap().revision, current.revision);
+}
