@@ -643,3 +643,14 @@ ZIP 包含 DMG、固定哈希 preflight、Windows 已测的四份原始插件归
 自动验证：Mac 双 preview 主库 **590 通过、18 默认忽略**；Launcher 与 Mac 管理前端 **421 通过、18 跳过**；TypeScript/Vite 和 Rust all-targets 检查通过。覆盖磁盘重开、独立命令收藏/改名、停用与移除、过期查询和隐藏窗口不发布、无法执行的结果无注册目标、前端严格身份校验与收藏刷新。前端首轮曾因超时连带 mock 清理失败及两处新增测试断言问题失败；修正测试等待与无效 ID 样本后完整重跑通过。
 
 证据：`/private/tmp/uipilot-catalog-lib.log`、`/private/tmp/uipilot-catalog-ui-rerun.log`、`/private/tmp/uipilot-catalog-check.log`、`/private/tmp/uipilot-catalog-build.log`。本次未操作 GUI，未安装或启动候选应用；主界面原生展示、收藏联动与保存提示仍需用户在新包上继续验收。Mac 生产 Runtime 仍未开放，不计为插件执行通过。
+
+### 插件目录修复候选 a26eacd
+
+源码 `a26eacd` 已推送至 `codex/macos-port-plan`，未合并 main。修复包通过 arm64、最低系统版本、共享资源、ad-hoc 签名及 Documents entitlement 校验，本机只读 preflight 通过。原生交互等待用户复测，没有使用 computer use 或自动操作 GUI。
+
+- 交付 ZIP：`/Users/mobytang/Documents/UiPilot-Mac-plugin-catalog-a26eacd.zip`。
+- ZIP SHA-256：`36247f35a2b5d00ec0976987be2f9a636e2a93e5cbce38afacea009bbe5a5782`。
+- DMG SHA-256：`f5308ea8e4ddb78d0b71247705d8f24924f74c2c24d91ecc486b8533efbd8197`。
+- 主程序 SHA-256：`29623069f9fe53087b7294287ab7e32689f904a9a62e93cfee9f0993f5d72b36`。
+
+ZIP CRC 及 manifest 的 16 个文件哈希全部验证通过，包含新 DMG、固定哈希 preflight、原始四份共享插件归档、说明及测试日志。无需重新导入已有插件；下一步由用户完整退出旧应用，再按单步指引替换并继续验收。
