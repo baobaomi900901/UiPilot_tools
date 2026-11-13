@@ -621,3 +621,14 @@ Mac 主结果发布区分“已声明、但当前被撤销”的复制权限与�
 证据：`/private/tmp/uipilot-command-full.log`、`/private/tmp/uipilot-command-ui-all.log`、`/private/tmp/uipilot-command-check.log`、`/private/tmp/uipilot-command-acl.log`。生产 Runtime 仍关闭；管理 UI 的原生安装、收藏改名及重启恢复需下一节点人工验收。
 
 同一份原始 demo-multi 归档的真实 QuickJS 诊断还验证了改名后新入口仍调用 upper、旧入口不再路由、lower 不变，以及销毁并重建 Host 后收藏与名称保留。专项 1 项通过，日志 `/private/tmp/uipilot-command-real-archive.log`；仍不替代生产 GUI 运行验收。
+
+
+### macOS 插件管理人工验收候选已生成
+
+候选源码 `1bf5994` 已推送到 `codex/macos-port-plan`，未合并 main。安装包通过 arm64、最低 macOS 15.7.4、共享资源、签名与 Documents entitlement 校验；本机 preflight 通过。release 构建保留符号表（`CARGO_PROFILE_RELEASE_STRIP=none`），解决临时工具链缺少 rust-objcopy 的打包问题；不改变应用权限或运行开关。
+
+- DMG SHA-256：`0302be8bbdfa554e1bac7fa6f9c2b63e98e214bd1a8bc29651e570c372d715ca`。
+- 主程序 SHA-256：`800abedc99d8d2b53458afd012418137d7eafe5b7303071aa1295e7ecf88c570`。
+- 交付 ZIP：`/Users/mobytang/Documents/UiPilot-Mac-plugin-management-1bf5994.zip`，SHA-256 `6fd549d6bbb17f390e5054c0832e3df34df9fdc4d43106af07bf6c32e4754398`。
+
+ZIP 包含 DMG、固定哈希 preflight、Windows 已测的四份原始插件归档、校验日志、候选 manifest 和操作说明。ZIP CRC 与 manifest 中 15 个文件哈希逐项验证通过。只完成命令行构建和静态包校验，没有安装或启动候选应用；原生导入、设置持久化、升级、独立命令收藏/改名和重启恢复均待用户人工验收。生产 Runtime 仍关闭，本节点不要求运行 Mac 插件。用户明确要求之后不使用 computer use，全部 GUI 操作通知用户并由用户执行。
