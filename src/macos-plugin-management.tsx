@@ -154,7 +154,7 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
       <Button type="primary" icon={<Upload size={16} />} disabled={disabled} onClick={() => requestLeave(() => void choose('archive'))}>导入插件包</Button>
     </div>
     <p className="mac-plugin-runtime-note">可管理插件安装、设置和权限配置。当前 Mac 插件暂不能运行，启用及授权配置会保存。</p>
-    <div className="mac-plugin-feedback" aria-live="polite">{busy ? <span role="status">正在处理…</span> : null}{notice ? <span role="status">{notice}</span> : null}{error ? <span role="alert">{error}</span> : null}{!client ? <span role="alert">插件管理暂不可用。</span> : null}</div>
+    <div className="mac-plugin-feedback" aria-live="polite">{busy ? <span role="status">正在处理…</span> : null}{notice && notice !== '设置已保存。' ? <span role="status">{notice}</span> : null}{error ? <span role="alert">{error}</span> : null}{!client ? <span role="alert">插件管理暂不可用。</span> : null}</div>
     {!selected ? <>
       <Input aria-label="搜索插件名称或启动命令" placeholder="搜索插件名称或启动命令" value={filter} onChange={e => setFilter(e.target.value)} allowClear />
       <div className="mac-plugin-list" onKeyDown={listKeyDown}>
@@ -193,7 +193,7 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
             {bad ? <span role="alert">请检查此设置的类型、范围或选项。</span> : null}
           </div>
         })}
-        <div className="mac-plugin-form-actions"><Button htmlType="submit" type="primary" disabled={disabled || !drafts.size || invalid || commandDraft !== null}>保存设置</Button><Button disabled={busy || !drafts.size} onClick={() => { clearDrafts(); setNotice('已取消修改') }}>取消修改</Button></div>
+        <div className="mac-plugin-form-actions"><Button htmlType="submit" type="primary" disabled={disabled || !drafts.size || invalid || commandDraft !== null}>保存设置</Button><Button disabled={busy || !drafts.size} onClick={() => { clearDrafts(); setNotice('已取消修改') }}>取消修改</Button><span role="status" className="mac-plugin-save-status">{notice === '设置已保存。' ? notice : ''}</span></div>
       </form> : null}
       <Button danger disabled={disabled} onClick={() => requestLeave(() => { clearDrafts(); setRemoveOpen(true) })}>移除插件</Button>
     </div> : <p>插件已不在当前安装清单中，请返回列表。</p>}

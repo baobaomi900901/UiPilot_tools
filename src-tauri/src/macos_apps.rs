@@ -17,6 +17,7 @@ struct MacApplications {
     cache: Arc<AppCache>,
     registry: ResultRegistry,
     runtime: Arc<LauncherRuntime>,
+    management: Arc<ManagementState>,
     // Status is None only before the first scan finishes. Refreshes keep serving the last good snapshot.
     ready: watch::Sender<Option<bool>>,
     scan: Mutex<Scan>,
@@ -31,11 +32,12 @@ struct Scan {
 
 impl MacApplications {
     fn new(cache: AppCache, registry: ResultRegistry, management: Arc<ManagementState>) -> Self {
-        let runtime = LauncherRuntime::closed(management, registry.clone());
+        let runtime = LauncherRuntime::closed(management.clone(), registry.clone());
         Self {
             cache: Arc::new(cache),
             registry,
             runtime,
+            management,
             ready: watch::channel(None).0,
             scan: Mutex::new(Scan::default()),
             execute: Mutex::new(()),
@@ -130,7 +132,7 @@ pub(crate) async fn search_apps(
         return Err(Error { code: "searchUnavailable", message: "此平台未启用命令搜索" });
     }
     // The production factory is closed until an isolated transport is verified.
-    // Do not even resolve the data path or start a worker in that configuration.
+    // Only the installed metadata catalog is read in that configuration; no Runtime worker starts.
     if service.runtime.available() {
         let runtime = service.runtime.clone();
         let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
@@ -150,11 +152,19 @@ pub(crate) async fn search_apps(
     let Some(token) = service.registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence) else {
         return Ok(None);
     };
+    if let Some(response) = quick_query(&service, token, &query) { return Ok(response); }
+    let plugins = if !service.runtime.available() {
+        let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
+        let management = service.management.clone();
+        let catalog_query = query.clone();
+        tauri::async_runtime::spawn_blocking(move || management.unavailable_launcher_entries(&root, &catalog_query))
+            .await.map_err(|_| Error::unavailable())?
+            .map_err(|_| Error { code: "searchUnavailable", message: "无法读取插件命令，请在设置中刷新插件列表" })?
+    } else { Vec::new() };
     #[cfg(feature = "macos-find-preview")]
     if crate::host_capabilities::mac_find_enabled() && (query.trim().is_empty() || query.trim().starts_with('/')) {
-        return Ok(publish(&service, app.state::<SettingsStore>().inner(), token, &query));
+        return Ok(publish_with_plugins(&service, app.state::<SettingsStore>().inner(), token, &query, plugins));
     }
-    if let Some(response) = quick_query(&service, token, &query) { return Ok(response); }
     let retrying = *service.ready.borrow() == Some(false);
     if retrying { service.refresh(); }
     let mut ready = service.ready.subscribe();
@@ -162,7 +172,7 @@ pub(crate) async fn search_apps(
     if usable != Some(true) {
         return Err(Error { code: "searchUnavailable", message: "无法读取应用目录" });
     }
-    Ok(publish(&service, app.state::<SettingsStore>().inner(), token, &query))
+    Ok(publish_with_plugins(&service, app.state::<SettingsStore>().inner(), token, &query, plugins))
 }
 
 // Outer None means application search should continue; Some(None) means a
@@ -191,7 +201,11 @@ fn web_entry(settings: &SettingsStore, query: &str) -> Option<(crate::model::Res
     }, Some(ResultAction::OpenWebSearch { engine, query: query.into() })))
 }
 
+#[cfg(test)]
 fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str) -> Option<SearchResponse> {
+    publish_with_plugins(service, settings, token, query, Vec::new())
+}
+fn publish_with_plugins(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str, plugins: Vec<crate::model::ResultItem>) -> Option<SearchResponse> {
     let query = query.trim();
     let preview = crate::host_capabilities::mac_find_enabled();
     let command = preview && (query.starts_with('/') || query.is_empty());
@@ -214,6 +228,7 @@ fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToke
             entries.push((crate::model::find_item(argument.into(), subtitle, favorite), None));
         }
     }
+    entries.extend(plugins.into_iter().map(|item| (item, None)));
     if let Some(entry) = web_entry(settings, query) { entries.push(entry); }
     service.registry.publish_if_latest(token, entries, || true, |id, items| {
         let mut response = search_response(id, items);
@@ -452,6 +467,34 @@ mod platform_app_commands {
                 assert!(item.is_none());
             }
         }
+    }
+
+    #[test]
+    fn unavailable_plugin_catalog_publishes_favorites_without_executable_registry_targets() {
+        use crate::model::{LauncherResultActivation, ResultFavorite, ResultItem};
+        let (_f, service, settings) = fixture();
+        let rows = || vec![ResultItem {
+            result_id: String::new(), title: "/demo-upper".into(),
+            subtitle: Some("当前 Mac 版本暂不可运行".into()),
+            activation: LauncherResultActivation::UnavailablePlugin {
+                plugin_id: "com.uipilot.demo-multi".into(), command_id: "upper".into(), favorite: true,
+            },
+            favorite: ResultFavorite::public_plugin("com.uipilot.demo-multi".into(), "upper".into(), true),
+            has_default_action: false, result_actions: None, detail: None,
+            icon: None, plugin_icon_url: None, icon_kind: None,
+        }];
+        let stale = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();
+        let current = service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap();
+        let response = publish_with_plugins(&service, &settings, current, "/demo", rows()).unwrap();
+        let row = response.items.iter().find(|r| r.title == "/demo-upper").unwrap();
+        assert!(row.favorite.as_ref().unwrap().favorite);
+        assert!(!row.has_default_action);
+        assert_eq!(service.registry.resolve(&response.request_id, &row.result_id), Err(RegistryError::UnknownResult));
+        assert_eq!(execute_registered(&service, &response.request_id, &row.result_id, |_, _| panic!("must not execute")).unwrap_err().code, "unknownResult");
+        assert!(publish_with_plugins(&service, &settings, stale, "", rows()).is_none());
+        let current = service.registry.begin_query(QueryDomain::Application, "1", 3).unwrap();
+        service.registry.hide_and_clear();
+        assert!(publish_with_plugins(&service, &settings, current, "", rows()).is_none());
     }
 
     #[test]

@@ -628,6 +628,19 @@ impl ManagementState {
             })
         })
     }
+    /// Installed metadata only. Never selects a Runtime adapter or opens a request.
+    /// An empty launcher must not create an installation store on first launch.
+    pub(crate) fn unavailable_launcher_entries(
+        &self, appdata: &Path, query: &str,
+    ) -> Result<Vec<crate::model::ResultItem>> {
+        if !appdata.join("plugin-management-v1").try_exists().map_err(|_| Error::Storage)? {
+            return Ok(Vec::new());
+        }
+        self.with(appdata, |manager| {
+            let snapshot = manager.list()?;
+            Ok(unavailable_command_entries(&snapshot, query))
+        })
+    }
     pub(crate) fn open_runtime(
         &self,
         appdata: &Path,
@@ -712,3 +725,34 @@ impl ManagementState {
 #[cfg(test)]
 #[path = "management_macos_tests.rs"]
 mod tests;
+
+fn unavailable_command_entries(snapshot: &Snapshot, query: &str) -> Vec<crate::model::ResultItem> {
+    use crate::model::{LauncherResultActivation, ResultFavorite, ResultItem};
+    let query = query.trim();
+    if query.len() > 65_536 || query.contains('\0') { return Vec::new(); }
+    let slash = query.strip_prefix('/');
+    let (needle, argument) = slash.unwrap_or(query).split_once(char::is_whitespace).unwrap_or((slash.unwrap_or(query), ""));
+    let mut rows = Vec::new();
+    for plugin in snapshot.plugins.iter().filter(|p| p.enabled) {
+        for command in &plugin.commands {
+            let matches = if slash.is_some() {
+                if argument.is_empty() { command.name.starts_with(needle) } else { command.name == needle }
+            } else {
+                query.is_empty() || command.name.contains(&query.to_lowercase()) || plugin.name.to_lowercase().contains(&query.to_lowercase())
+            };
+            if !matches { continue; }
+            rows.push(ResultItem {
+                result_id: String::new(), result_actions: None,
+                activation: LauncherResultActivation::UnavailablePlugin { plugin_id: plugin.plugin_id.clone(), command_id: command.id.clone(), favorite: command.favorite },
+                title: format!("/{}", command.name),
+                subtitle: Some(format!("{} · 当前 Mac 版本暂不可运行", plugin.name)),
+                detail: None, icon: None, plugin_icon_url: None, icon_kind: None,
+                favorite: ResultFavorite::public_plugin(plugin.plugin_id.clone(), command.id.clone(), command.favorite),
+                has_default_action: false,
+            });
+        }
+    }
+    rows.sort_by(|a, b| b.favorite.as_ref().is_some_and(|f| f.favorite).cmp(&a.favorite.as_ref().is_some_and(|f| f.favorite)).then_with(|| a.title.cmp(&b.title)));
+    rows.truncate(100);
+    rows
+}

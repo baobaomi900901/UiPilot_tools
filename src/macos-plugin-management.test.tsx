@@ -19,7 +19,7 @@ it('lists inactive installed packages without executing them and saves ordinary 
   const { client } = await render(); expect(host.textContent).toContain('当前 Mac 插件暂不能运行'); await select()
   await input('问候', '中文 😀'); await click('保存设置')
   expect(client.settings).toHaveBeenCalledWith({ pluginId: row.pluginId, expectedRevision: '12', updates: { greeting: '中文 😀' } })
-  expect(host.textContent).toContain('设置已保存')
+  expect(host.querySelector('form[aria-label="普通设置"] [role="status"]')?.textContent).toBe('设置已保存。')
   expect(client.enabled).not.toHaveBeenCalled()
 })
 it('requires explicit installation confirmation with exactly the prepared permission set and revision', async () => {

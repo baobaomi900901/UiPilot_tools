@@ -126,6 +126,13 @@ pub(crate) enum LauncherResultActivation {
     OpenFind {
         query: String,
     },
+    UnavailablePlugin {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        #[serde(rename = "commandId")]
+        command_id: String,
+        favorite: bool,
+    },
     Informational,
     ExecuteResult,
 }

@@ -67,6 +67,7 @@ export type LauncherResultActivation =
   | { kind: 'openScreenshot' }
   | { kind: 'builtinActivation'; feature: 'webSearch'; initialArgument: string }
   | { kind: 'executeResult' }
+  | { kind: 'unavailablePlugin'; pluginId: string; commandId: string; favorite: boolean }
   | { kind: 'informational' }
 
 export type CompletionOrigin = Readonly<{

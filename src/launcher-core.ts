@@ -564,6 +564,12 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
   if (candidate?.kind === 'executeResult') {
     return exactPlainRecord(value, ['kind']) ? { kind: 'executeResult' } : undefined
   }
+  if (candidate?.kind === 'unavailablePlugin') {
+    const record = exactPlainRecord(value, ['kind', 'pluginId', 'commandId', 'favorite'])
+    return record && typeof record.pluginId === 'string' && record.pluginId.length <= 64 && PUBLIC_PLUGIN_ID.test(record.pluginId) &&
+      typeof record.commandId === 'string' && LAUNCHER_COMMAND.test(record.commandId) && typeof record.favorite === 'boolean'
+      ? { kind: 'unavailablePlugin', pluginId: record.pluginId, commandId: record.commandId, favorite: record.favorite } : undefined
+  }
   if (candidate?.kind === 'informational') {
     return exactPlainRecord(value, ['kind']) ? { kind: 'informational' } : undefined
   }
@@ -685,7 +691,7 @@ export function safeLauncherActivation(value: unknown): LauncherResultActivation
 
 function pluginFavoriteActivation(activation: LauncherResultActivation) {
   return activation.kind === 'pluginCompletion' || activation.kind === 'windowActivation' ||
-      activation.kind === 'mainResultActivation' || activation.kind === 'panelActivation'
+      activation.kind === 'mainResultActivation' || activation.kind === 'panelActivation' || activation.kind === 'unavailablePlugin'
     ? activation
     : undefined
 }
@@ -2166,7 +2172,7 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
         if (activation === undefined || !resultAvailable(capabilities, activation, item) || typeof item.resultId !== 'string' ||
             (actionMetadata !== undefined && activation.kind !== 'executeResult') ||
             (activation.kind === 'executeResult' && item.resultId.length === 0) ||
-            (activation.kind === 'informational' && item.hasDefaultAction !== false)) return []
+            ((activation.kind === 'informational' || activation.kind === 'unavailablePlugin') && item.hasDefaultAction !== false)) return []
         const icon = safeApplicationIcon(item.icon)
         const pluginIconUrl = safePublicPluginIconUrl(item.pluginIconUrl)
         const iconKind = safeResultIconKind(item.iconKind)
@@ -3919,6 +3925,11 @@ export function createLauncherCore(client: LauncherClient, maximumQuerySequence 
       }
       if (selected.activation.kind === 'openQuicklinks') {
         openQuicklinks()
+        return
+      }
+      if (selected.activation.kind === 'unavailablePlugin') {
+        model.status = '此 Mac 版本尚未开放插件运行；收藏和命令配置已保留。'
+        publish(true)
         return
       }
       if (selected.activation.kind === 'informational') return

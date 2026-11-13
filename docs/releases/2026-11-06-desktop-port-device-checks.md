@@ -632,3 +632,14 @@ Mac 主结果发布区分“已声明、但当前被撤销”的复制权限与�
 - 交付 ZIP：`/Users/mobytang/Documents/UiPilot-Mac-plugin-management-1bf5994.zip`，SHA-256 `6fd549d6bbb17f390e5054c0832e3df34df9fdc4d43106af07bf6c32e4754398`。
 
 ZIP 包含 DMG、固定哈希 preflight、Windows 已测的四份原始插件归档、校验日志、候选 manifest 和操作说明。ZIP CRC 与 manifest 中 15 个文件哈希逐项验证通过。只完成命令行构建和静态包校验，没有安装或启动候选应用；原生导入、设置持久化、升级、独立命令收藏/改名和重启恢复均待用户人工验收。生产 Runtime 仍关闭，本节点不要求运行 Mac 插件。用户明确要求之后不使用 computer use，全部 GUI 操作通知用户并由用户执行。
+
+
+## 2026-11-13 macOS 插件目录人工反馈与修复
+
+用户在 `1bf5994` 候选上确认：demo-settings 安装成功，问候文本保存为 `Mac test` 后完整退出再启动仍保留；升级到 1.0.1 后版本和问候文本正确。demo-multi 安装及 upper/lower 详情可见，但分别收藏后，主界面空查询、`/demo` 和带参数的完整命令都没有相应条目。保存普通设置也没有在当前可见区域提示成功。这是主界面接线缺陷，不能将收藏验收记为通过。
+
+修复将已安装命令元数据展示与 Runtime 执行分开：启用的插件命令按已保存名称参与空查询、前缀、完整命令及带参数查询；每个 commandId 的收藏独立显示并可从主界面取消或设置常用，收藏项优先。停用或移除不再展示，改名后旧名称不再匹配。当前 Mac 版本不能运行的条目明确标注状态，回车显示原因；这些条目无原生执行目标、无插件动作或资源加载，不启动 Runtime。普通设置成功提示移到保存按钮旁的状态区。
+
+自动验证：Mac 双 preview 主库 **590 通过、18 默认忽略**；Launcher 与 Mac 管理前端 **421 通过、18 跳过**；TypeScript/Vite 和 Rust all-targets 检查通过。覆盖磁盘重开、独立命令收藏/改名、停用与移除、过期查询和隐藏窗口不发布、无法执行的结果无注册目标、前端严格身份校验与收藏刷新。前端首轮曾因超时连带 mock 清理失败及两处新增测试断言问题失败；修正测试等待与无效 ID 样本后完整重跑通过。
+
+证据：`/private/tmp/uipilot-catalog-lib.log`、`/private/tmp/uipilot-catalog-ui-rerun.log`、`/private/tmp/uipilot-catalog-check.log`、`/private/tmp/uipilot-catalog-build.log`。本次未操作 GUI，未安装或启动候选应用；主界面原生展示、收藏联动与保存提示仍需用户在新包上继续验收。Mac 生产 Runtime 仍未开放，不计为插件执行通过。

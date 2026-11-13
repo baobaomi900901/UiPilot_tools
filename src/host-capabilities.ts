@@ -37,6 +37,7 @@ export function settingsTabAvailable(host: HostCapabilities, tab: string): boole
 }
 
 export function resultAvailable(host: HostCapabilities, activation: LauncherResultActivation, item: ResultItem): boolean {
+  if (activation.kind === 'unavailablePlugin') return host.platform === 'macos' && host.pluginManagement === true && !host.plugins && !item.actions && !item.pluginIconUrl && !item.iconKind && item.hasDefaultAction === false
   if (!host.plugins && (item.actions || item.pluginIconUrl || item.favorite?.target?.kind === 'publicPlugin')) return false
   if (host.webSearch && !item.favorite && item.iconKind === 'webSearch' && activation.kind === 'executeResult') return true
   // Mac supports query values before the full reusable built-in command system.

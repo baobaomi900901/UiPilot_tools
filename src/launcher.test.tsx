@@ -11674,3 +11674,49 @@ it.each([13, 229])('does not execute a WK IME confirmation after compositionend 
     expect(input.hasAttribute('data-tauri-drag-region')).toBe(false)
   } finally { await mounted.unmount(); core.destroy() }
 })
+
+it('shows Mac installed command favorites with execution closed and refreshes their persisted favorite state', async () => {
+  const { client, emit } = fakeClient()
+  let favorite = true
+  vi.mocked(client.searchApps).mockImplementation(async () => ({ requestId: 'mac-catalog', replaceLocalResults: true, items: [{
+    resultId: 'catalog-upper', title: '/demo-upper', subtitle: 'Demo Multi · 当前 Mac 版本暂不可运行', hasDefaultAction: false,
+    activation: { kind: 'unavailablePlugin', pluginId: 'com.uipilot.demo-multi', commandId: 'upper', favorite },
+    favorite: { target: { kind: 'publicPlugin', pluginId: 'com.uipilot.demo-multi', commandId: 'upper' }, favorite },
+  }] }))
+  vi.mocked(client.setPublicPluginFavorite).mockImplementation(async input => { favorite = input.favorite })
+  const core = createLauncherCore(client, undefined, { ...previewCapabilities, platform: 'macos', plugins: false, pluginManagement: true, builtinFeatures: false })
+  await core.start()
+  try {
+    emit(shown('mac-catalog'))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    expect(core.getSnapshot().results[0].favorite?.favorite).toBe(true)
+    core.activateResult(0)
+    expect(core.getSnapshot().status).toContain('尚未开放插件运行')
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.keyDown('Enter', false)
+    expect(client.executeResult).not.toHaveBeenCalled()
+    core.openPluginContextMenu(0); core.setPluginFavorite(0, false); core.closePluginContextMenu()
+    await vi.waitFor(() => expect(core.getSnapshot().results[0].favorite?.favorite).toBe(false))
+    expect(client.setPublicPluginFavorite).toHaveBeenCalledExactlyOnceWith({ pluginId: 'com.uipilot.demo-multi', commandId: 'upper', favorite: false })
+    core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/demo-upper hello', inputType: 'insertText' })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('/demo-upper'))
+    expect(client.listPlugins).not.toHaveBeenCalled()
+    expect(client.listPublicPlugins).not.toHaveBeenCalled()
+  } finally { core.destroy() }
+})
+it('validates closed Mac catalog identity and never accepts executable rows through the management capability', async () => {
+  const activation = { kind: 'unavailablePlugin' as const, pluginId: 'com.uipilot.demo-multi', commandId: 'upper', favorite: true }
+  expect(safeLauncherActivation(activation)).toEqual(activation)
+  for (const value of [{ ...activation, commandId: '../upper' }, { ...activation, pluginId: 'Invalid/id' }, { ...activation, favorite: 'yes' }, { ...activation, initialArgument: 'x' }]) expect(safeLauncherActivation(value)).toBeUndefined()
+  const { client, emit } = fakeClient()
+  const item = { resultId: 'upper', title: '/demo-upper', activation, hasDefaultAction: false, favorite: { target: { kind: 'publicPlugin' as const, pluginId: activation.pluginId, commandId: activation.commandId }, favorite: true } }
+  vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'catalog-strict', replaceLocalResults: true, items: [
+    item, { ...item, hasDefaultAction: true }, { ...item, activation: { kind: 'executeResult' } },
+    { ...item, favorite: { ...item.favorite, target: { ...item.favorite.target, commandId: 'lower' } } },
+    { ...item, pluginIconUrl: 'uipilot-public-plugin://localhost/icon.png' },
+  ] })
+  const core = createLauncherCore(client, undefined, { ...previewCapabilities, platform: 'macos', plugins: false, pluginManagement: true, builtinFeatures: false })
+  await core.start()
+  try { emit(shown('mac-catalog-strict')); await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1)); expect(core.getSnapshot().results[0].title).toBe('/demo-upper') }
+  finally { core.destroy() }
+})

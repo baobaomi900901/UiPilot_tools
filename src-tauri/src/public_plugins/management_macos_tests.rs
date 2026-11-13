@@ -474,6 +474,16 @@ fn command_preferences_follow_ids_across_rename_reopen_upgrade_and_removal() {
     assert!(saved.plugins[0].commands[0].favorite);
     assert_eq!(saved.plugins[0].commands[1].name, "demo-lower");
     assert!(!saved.plugins[0].commands[1].favorite);
+    let rows = unavailable_command_entries(&saved, "");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].title, "/mac-upper");
+    assert!(rows[0].favorite.as_ref().unwrap().favorite);
+    assert_eq!(rows[1].title, "/demo-lower");
+    assert!(!rows[1].favorite.as_ref().unwrap().favorite);
+    let lower = unavailable_command_entries(&saved, "/demo-lower hello");
+    assert_eq!(lower.len(), 1);
+    assert!(!lower[0].favorite.as_ref().unwrap().favorite);
+
     assert!(m.runtime_catalog.iter().any(|c| c.command_id == "upper" && c.name == "mac-upper" && c.favorite));
     assert!(!m.runtime_catalog.iter().any(|c| c.name == "demo-upper"));
     assert!(matches!(m.command_preference(ID, "upper", CommandPreference::default(), &first.revision), Err(Error::Stale)));
@@ -521,4 +531,40 @@ fn invalid_or_conflicting_command_changes_never_mutate_the_inventory() {
     let current = temp.install(&mut m);
     assert!(matches!(m.command_preference(ID, "default", CommandPreference { name_override: Some("second".into()), favorite: false }, &current.revision), Err(Error::Conflict)));
     assert_eq!(m.list().unwrap().revision, current.revision);
+}
+
+#[test]
+fn closed_runtime_catalog_reflects_installed_command_favorites_renames_and_disable_on_reopen() {
+    let temp = Temp::new();
+    let state = ManagementState::default();
+    assert!(state.unavailable_launcher_entries(&temp.0, "").unwrap().is_empty());
+    assert!(!temp.0.join("plugin-management-v1").exists());
+    {
+        let mut manager = Management::load(&temp.0).unwrap();
+        let installed = temp.install(&mut manager);
+        manager.command_preference(ID, "default", CommandPreference {
+            name_override: Some("mac-demo".into()), favorite: true,
+        }, &installed.revision).unwrap();
+    }
+    for query in ["", "/", "/mac", "/mac-demo", "/mac-demo hello", "普通设置"] {
+        let rows = state.unavailable_launcher_entries(&temp.0, query).unwrap();
+        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(rows[0].title, "/mac-demo");
+        assert!(rows[0].favorite.as_ref().unwrap().favorite);
+        assert!(!rows[0].has_default_action);
+        assert!(rows[0].result_actions.is_none());
+        assert!(rows[0].subtitle.as_ref().unwrap().contains("暂不可运行"));
+        assert!(matches!(&rows[0].activation, crate::model::LauncherResultActivation::UnavailablePlugin { plugin_id, command_id, favorite: true } if plugin_id == ID && command_id == "default"));
+    }
+    for query in ["/settings-demo", "/mac hello", "/find", "unknown"] {
+        assert!(state.unavailable_launcher_entries(&temp.0, query).unwrap().is_empty(), "{query}");
+    }
+    state.with(&temp.0, |m| m.favorite(ID, "default", false)).unwrap();
+    assert!(!state.unavailable_launcher_entries(&temp.0, "").unwrap()[0].favorite.as_ref().unwrap().favorite);
+    state.with(&temp.0, |m| { let revision = m.list()?.revision; m.enabled(ID, false, &revision)?; Ok(()) }).unwrap();
+    assert!(state.unavailable_launcher_entries(&temp.0, "").unwrap().is_empty());
+    state.with(&temp.0, |m| { let revision = m.list()?.revision; m.enabled(ID, true, &revision)?; Ok(()) }).unwrap();
+    assert_eq!(state.unavailable_launcher_entries(&temp.0, "").unwrap().len(), 1);
+    state.with(&temp.0, |m| { let revision = m.list()?.revision; m.remove(ID, &revision)?; Ok(()) }).unwrap();
+    assert!(state.unavailable_launcher_entries(&temp.0, "").unwrap().is_empty());
 }
