@@ -730,3 +730,12 @@ Mac 设置页复用 Windows 的右上图钉、Ctrl+T、忙碌态、失败重试�
 没有运行 GUI 自动化；真实跨应用失焦、置顶层级和取消固定需新包人工确认。此改动不开放插件执行或其他未完成能力。
 
 验证：Mac 双 preview 库 **592 通过、18 默认忽略**；Rust all-targets、TypeScript/Vite 和 4 项 Mac ACL 检查通过。Windows/Mac 图钉行为与 Mac 真实适配器专项 **3 项通过**；涵盖点击、Ctrl+T、重复按键、失败重试、退出设置释放和会话参数传递。原生模型测试覆盖失焦保留、取消、离开设置、新会话及过期请求。
+
+
+设置图钉候选 `5557de0` 完成无 GUI 的 App/DMG 构建，通过签名、架构、最低系统和 Documents entitlement 检查，只读 preflight 通过。最后一轮完整 Launcher 前端回归 **405 通过、18 跳过**。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-settings-pin-5557de0.zip`，SHA-256 `b522d2de299c218340d885f8855c966e88fae69fcb9c27719841b5a41e61f0c7`。
+- DMG SHA-256：`e4db27c61019aff5458507e2ebd221859afbcc7b9fd2bdb7a160ad62d7518a26`。
+- 主程序 SHA-256：`f6ac59d6d4efd6cb0a4d9b4077a4e98147d5dcc8ec9265cc7908b704af2d4db5`。
+
+ZIP CRC 与 manifest 中 12 个文件哈希验证通过。真实固定后跨应用保留与取消固定仍待用户手动验收；没有使用 computer use。
