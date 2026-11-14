@@ -6,7 +6,7 @@ import { MacPluginManagement, type MacPluginManagementHandle } from './macos-plu
 import type { MacPluginManagementClient, MacPluginRow, MacPluginSnapshot } from './macos-plugin-management-client'
 const row: MacPluginRow = { pluginId: 'com.test.settings', name: '设置示例', description: '普通设置', version: '1.0.0', enabled: false, commands: [{ id: 'default', name: 'settings-demo', defaultName: 'settings-demo', nameOverride: null, favorite: false }], permissions: [{ permission: 'clipboard.write', granted: false }], settings: [{ type: 'text', key: 'greeting', label: '问候', default: '你好' }, { type: 'number', key: 'count', label: '数量', min: 1, max: 5 }], values: { greeting: '你好', count: 2 } }
 const snapshot: MacPluginSnapshot = { revision: '12', plugins: [row] }
-function fixture() { return { list: vi.fn(async () => snapshot), prepare: vi.fn(async () => ({ token: 'token-1', expectedRevision: '12', plugin: { ...row, version: '1.0.1' }, requiredPermissions: ['clipboard.write' as const] })), commit: vi.fn(async () => ({ ...snapshot, revision: '13' })), cancel: vi.fn(async () => {}), enabled: vi.fn(async () => snapshot), permission: vi.fn(async () => snapshot), settings: vi.fn(async () => ({ ...snapshot, revision: '13' })), command: vi.fn<MacPluginManagementClient['command']>(async () => snapshot), remove: vi.fn(async () => ({ revision: '13', plugins: [] })) } satisfies MacPluginManagementClient }
+function fixture() { return { list: vi.fn(async () => snapshot), prepare: vi.fn(async () => ({ token: 'token-1', expectedRevision: '12', plugin: { ...row, version: '1.0.1' }, requiredPermissions: ['clipboard.write' as const] })), commit: vi.fn(async () => ({ ...snapshot, revision: '13' })), cancel: vi.fn(async () => {}), enabled: vi.fn<MacPluginManagementClient['enabled']>(async () => snapshot), permission: vi.fn<MacPluginManagementClient['permission']>(async () => snapshot), settings: vi.fn(async () => ({ ...snapshot, revision: '13' })), command: vi.fn<MacPluginManagementClient['command']>(async () => snapshot), remove: vi.fn(async () => ({ revision: '13', plugins: [] })) } satisfies MacPluginManagementClient }
 let root: Root, host: HTMLDivElement
 beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true, ResizeObserver: class { observe() {} unobserve() {} disconnect() {} } }); window.matchMedia = vi.fn().mockImplementation(() => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} })); host = document.createElement('div'); document.body.append(host); root = createRoot(host) })
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); document.body.innerHTML = '' })
@@ -250,7 +250,9 @@ it('toggles a whole package from the list without opening details or rewriting c
   await act(async () => { toggle.click(); toggle.click() })
   expect(client.enabled).toHaveBeenCalledExactlyOnceWith({ pluginId: row.pluginId, enabled: false, expectedRevision: '12' })
   expect(toggle.getAttribute('aria-checked')).toBe('true')
-  expect(toggle.disabled).toBe(true)
+  expect(toggle.disabled).toBe(false)
+  expect(toggle.getAttribute('aria-disabled')).toBe('true')
+  expect(document.activeElement).toBe(toggle)
   current = { revision: '13', plugins: [{ ...configured, enabled: false }] }
   await act(async () => resolve(current))
   expect(toggle.getAttribute('aria-checked')).toBe('false')
@@ -290,4 +292,57 @@ it('does not optimistically disable a package or repeat a stale list toggle befo
   expect(toggle.getAttribute('aria-checked')).toBe('false')
   expect(toggle.disabled).toBe(false)
   expect(client.enabled).toHaveBeenCalledOnce()
+})
+
+
+it.each(['list', 'detail', 'permission'] as const)('keeps the %s switch focusable during saving, then accepts a second activation', async mode => {
+  const client = fixture()
+  let current: MacPluginSnapshot = snapshot
+  let complete!: () => void
+  client.list.mockImplementation(async () => current)
+  client.enabled.mockImplementation(input => new Promise(resolve => {
+    complete = () => {
+      current = { revision: String(Number(current.revision) + 1), plugins: current.plugins.map(p => ({ ...p, enabled: input.enabled })) }
+      resolve(current)
+    }
+  }))
+  client.permission.mockImplementation(input => new Promise(resolve => {
+    complete = () => {
+      current = { revision: String(Number(current.revision) + 1), plugins: current.plugins.map(p => ({ ...p, permissions: [{ permission: input.permission, granted: input.granted }] })) }
+      resolve(current)
+    }
+  }))
+  await render(client)
+  if (mode !== 'list') await select()
+  const toggle = button(mode === 'list' ? '启用插件：设置示例' : mode === 'detail' ? '保存启用配置' : '允许写入剪贴板')
+  const operation = mode === 'permission' ? client.permission : client.enabled
+  toggle.focus()
+  for (const checked of ['true', 'false']) {
+    await act(async () => { toggle.click(); toggle.click() })
+    // jsdom does not blur newly disabled buttons like WKWebView. Check the
+    // native disabled property too, so the real-browser regression is covered.
+    expect(toggle.disabled).toBe(false)
+    expect(toggle.getAttribute('aria-disabled')).toBe('true')
+    expect(document.activeElement).toBe(toggle)
+    expect(operation).toHaveBeenCalledTimes(checked === 'true' ? 1 : 2)
+    await act(async () => complete())
+    expect(toggle.getAttribute('aria-disabled')).toBe('false')
+    expect(toggle.getAttribute('aria-checked')).toBe(checked)
+    expect(document.activeElement).toBe(toggle)
+  }
+})
+
+it('does not move focus back to a saved list switch after the user moves to the filter', async () => {
+  const client = fixture()
+  let resolve!: (value: MacPluginSnapshot) => void
+  client.enabled.mockImplementationOnce(() => new Promise(r => { resolve = r }))
+  await render(client)
+  const toggle = button('启用插件：设置示例')
+  toggle.focus()
+  await act(async () => toggle.click())
+  const filter = host.querySelector<HTMLInputElement>('input[aria-label="搜索插件名称或启动命令"]')!
+  filter.focus()
+  await act(async () => resolve({ revision: '13', plugins: [{ ...row, enabled: true }] }))
+  expect(document.activeElement).toBe(filter)
+  expect(toggle.getAttribute('aria-checked')).toBe('true')
 })

@@ -1,4 +1,4 @@
-import { Button, Input, Modal, Select, Switch } from 'antd'
+import { Button, Input, Modal, Select, Switch, type SwitchProps } from 'antd'
 import { ArrowLeft, FolderOpen, RefreshCw, Star, Upload } from 'lucide-react'
 import { useEffect, useLayoutEffect, useImperativeHandle, useRef, useState, type KeyboardEvent, type Ref } from 'react'
 import type { MacPluginManagementClient, MacPluginPreview, MacPluginSnapshot, OrdinarySetting, SettingValues } from './macos-plugin-management-client'
@@ -36,6 +36,13 @@ function parseValue(d: OrdinarySetting, v: string | boolean): string | number | 
     if (Number.isFinite(n) && (d.min === undefined || n >= d.min) && (d.max === undefined || n <= d.max)) return n
   }
   throw new Error()
+}
+// A transient native `disabled` blurs a focused button in WKWebView. Keep the
+// same control focusable while saving, but reject every new mutation. No later
+// focus() is needed, so moving focus elsewhere during the write is respected.
+function ConfigurationSwitch({ busy, disabled, onChange, ...props }: SwitchProps & { busy: boolean }) {
+  return <Switch {...props} disabled={disabled} aria-disabled={!!disabled || busy} aria-busy={busy}
+    onChange={(checked, event) => { if (!disabled && !busy) onChange?.(checked, event) }} />
 }
 export function MacPluginManagement({ client, ref, onStatusChange, initialTarget, onTargetHandled }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (status: MacPluginManagementStatus) => void; initialTarget?: MacPluginCommandTarget; onTargetHandled?: () => void }) {
   const [snapshot, setSnapshot] = useState<MacPluginSnapshot | null>(null)
@@ -180,7 +187,8 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     input?.focus()
     input?.setSelectionRange(input.value.length, input.value.length)
   }, [filterFocusRequest, selected])
-  const disabled = busy || needsReview || !snapshot || !client
+  const configurationBlocked = needsReview || !snapshot || !client
+  const disabled = busy || configurationBlocked
   const setPluginEnabled = (pluginId: string, enabled: boolean) => {
     if (!snapshot || !client || disabled || dirty) return
     void mutate(() => client.enabled({ pluginId, enabled, expectedRevision: snapshot.revision }),
@@ -212,7 +220,7 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
           <button className="mac-plugin-row" data-plugin-id={p.pluginId} disabled={busy} onClick={() => { setSelected(p.pluginId); setSelectedCommand(null); clearDrafts(); setNotice('') }}>
           <span><strong>{p.name}</strong><small>{p.commands.map(c => `/${c.name}`).join(' · ')}</small></span><span>{p.version}<small>{p.enabled ? '启用配置已保存' : '已停用'}</small></span>
           </button>
-          <Switch aria-label={`启用插件：${p.name}`} checked={p.enabled} disabled={disabled} onChange={enabled => setPluginEnabled(p.pluginId, enabled)} />
+          <ConfigurationSwitch aria-label={`启用插件：${p.name}`} checked={p.enabled} busy={busy} disabled={configurationBlocked} onChange={enabled => setPluginEnabled(p.pluginId, enabled)} />
         </div>)}
         {!list.length && snapshot ? <p className="mac-plugin-empty">{snapshot.plugins.length ? '没有匹配的插件。' : '尚未安装插件，请导入插件包或开发目录。'}</p> : null}
       </div>
@@ -228,8 +236,8 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
         </div>
         <div className="mac-plugin-form-actions"><Button type="primary" htmlType="submit" disabled={disabled || drafts.size > 0 || commandDraft === null || invalidCommand}>保存启动名称</Button><Button disabled={disabled || drafts.size > 0 || (commandDraft ?? command.name) === command.defaultName} onClick={() => setCommandDraft(command.defaultName)}>恢复默认名称</Button><Button disabled={busy || commandDraft === null} onClick={() => setCommandDraft(null)}>取消名称修改</Button></div>
       </form> : null}
-      <label className="mac-plugin-switch"><span>保存启用配置</span><Switch aria-label="保存启用配置" checked={plugin.enabled} disabled={disabled || dirty} onChange={enabled => setPluginEnabled(plugin.pluginId, enabled)} /></label>
-      {plugin.permissions.length ? <section aria-label="插件权限"><h3>权限配置</h3>{plugin.permissions.map(p => <label key={p.permission} className="mac-plugin-switch"><span>允许写入剪贴板（运行可用后生效）</span><Switch aria-label="允许写入剪贴板" checked={p.granted} disabled={disabled || dirty} onChange={granted => void mutate(() => client.permission({ pluginId: plugin.pluginId, permission: p.permission, granted, expectedRevision: snapshot.revision }), '权限配置已保存。')} /></label>)}</section> : null}
+      <label className="mac-plugin-switch"><span>保存启用配置</span><ConfigurationSwitch aria-label="保存启用配置" checked={plugin.enabled} busy={busy} disabled={configurationBlocked || dirty} onChange={enabled => setPluginEnabled(plugin.pluginId, enabled)} /></label>
+      {plugin.permissions.length ? <section aria-label="插件权限"><h3>权限配置</h3>{plugin.permissions.map(p => <label key={p.permission} className="mac-plugin-switch"><span>允许写入剪贴板（运行可用后生效）</span><ConfigurationSwitch aria-label="允许写入剪贴板" checked={p.granted} busy={busy} disabled={configurationBlocked || dirty} onChange={granted => void mutate(() => client.permission({ pluginId: plugin.pluginId, permission: p.permission, granted, expectedRevision: snapshot.revision }), '权限配置已保存。')} /></label>)}</section> : null}
       {plugin.settings.length ? <form className="mac-plugin-settings" aria-label="普通设置" noValidate onSubmit={e => { e.preventDefault(); if (!invalid && drafts.size && !disabled && commandDraft === null) void mutate(() => client.settings({ pluginId: plugin.pluginId, expectedRevision: snapshot.revision, updates }), '设置已保存。') }}>
         <h3>普通设置</h3>
         {plugin.settings.map((d, index) => {
