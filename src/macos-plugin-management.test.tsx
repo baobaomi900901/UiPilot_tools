@@ -14,12 +14,15 @@ function button(name: string) { return [...document.querySelectorAll<HTMLButtonE
 async function click(name: string) { await act(async () => button(name).click()) }
 async function select() { await act(async () => host.querySelector<HTMLButtonElement>('.mac-plugin-row')!.click()) }
 async function input(label: string, value: string) { await act(async () => { const e = host.querySelector<HTMLInputElement | HTMLTextAreaElement>(`input[aria-label="${label}"],textarea[aria-label="${label}"]`)!; Object.getOwnPropertyDescriptor(e instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')!.set!.call(e, value); e.dispatchEvent(new Event('input', { bubbles: true })) }) }
-async function render(client = fixture(), ref = createRef<MacPluginManagementHandle>()) { await act(async () => root.render(<MacPluginManagement client={client} ref={ref} />)); return { client, ref } }
+async function render(client = fixture(), ref = createRef<MacPluginManagementHandle>()) { const onStatusChange = vi.fn(); await act(async () => root.render(<MacPluginManagement client={client} ref={ref} onStatusChange={onStatusChange} />)); return { client, ref, onStatusChange } }
 it('lists inactive installed packages without executing them and saves ordinary settings while disabled', async () => {
-  const { client } = await render(); expect(host.textContent).toContain('当前 Mac 插件暂不能运行'); await select()
+  const { client, onStatusChange } = await render(); expect(host.textContent).toContain('当前 Mac 插件暂不能运行'); await select()
   await input('问候', '中文 😀'); await click('保存设置')
   expect(client.settings).toHaveBeenCalledWith({ pluginId: row.pluginId, expectedRevision: '12', updates: { greeting: '中文 😀' } })
-  expect(host.querySelector('form[aria-label="普通设置"] [role="status"]')?.textContent).toBe('设置已保存。')
+  expect(onStatusChange).toHaveBeenLastCalledWith('设置已保存。')
+  expect(host.textContent).not.toContain('设置已保存。')
+  await input('问候', '新的草稿')
+  expect(onStatusChange).toHaveBeenLastCalledWith('')
   expect(client.enabled).not.toHaveBeenCalled()
 })
 it('requires explicit installation confirmation with exactly the prepared permission set and revision', async () => {

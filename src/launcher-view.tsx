@@ -372,6 +372,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const macPluginManagementRef = useRef<MacPluginManagementHandle | null>(null)
+  const [macPluginStatus, setMacPluginStatus] = useState('')
   const credentialSettingsRef = useRef<CredentialSettingsHandle | null>(null)
   const [credentialStatus, setCredentialStatus] = useState<CredentialSettingsStatus>({ message: '', tone: 'default', detail: false })
   const [settingsPinned, setSettingsPin] = useState(false)
@@ -834,8 +835,10 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       ? statusResult.defaultActionTitle ?? (statusResult.actions.length ? '选择动作' : '')
       : statusResult.hasDefaultAction === false ? '' : snapshot.mainResultCommand ? '复制' : '执行'
     : ''
+  const macPluginSaveStatus = snapshot.view === 'settings' && activeSettingsTab === 'plugins' && core.capabilities.pluginManagement && !core.capabilities.plugins ? macPluginStatus : ''
   const status =
     operationsError ||
+    macPluginSaveStatus ||
     (snapshot.view === 'settings' && activeSettingsTab === 'credentials'
       ? credentialStatus.message : '') ||
     snapshot.shownNotice ||
@@ -2182,7 +2185,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        {core.capabilities.pluginManagement && !core.capabilities.plugins ? <MacPluginManagement ref={macPluginManagementRef} client={core.client.macPluginManagement} /> : <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />}
+        {core.capabilities.pluginManagement && !core.capabilities.plugins ? <MacPluginManagement ref={macPluginManagementRef} client={core.client.macPluginManagement} onStatusChange={setMacPluginStatus} /> : <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />}
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">
@@ -2498,7 +2501,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             {snapshot.view === 'launcher' ? (quicklinksPanel ?? panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
           </div>
             <div className={`launcher-region launcher-status-region${snapshot.view === 'settings' ? ' settings-status-region' : ''}`}>
-              <div className={`status-region${snapshot.view === 'settings' && activeSettingsTab === 'credentials' && credentialStatus.message
+              <div className={`status-region${macPluginSaveStatus && !operationsError ? ' is-action-success' : snapshot.view === 'settings' && activeSettingsTab === 'credentials' && credentialStatus.message
                 ? credentialStatus.tone === 'error' ? ' is-action-error' : credentialStatus.tone === 'success' ? ' is-action-success' : ''
                 : snapshot.view === 'launcher' && !snapshot.shownNotice && !snapshot.status && panel?.feedback?.status.message
                 ? panel.feedback.status.tone === 'error' ? ' is-action-error' : panel.feedback.status.tone === 'success' ? ' is-action-success' : ''

@@ -33,7 +33,7 @@ function parseValue(d: OrdinarySetting, v: string | boolean): string | number | 
   }
   throw new Error()
 }
-export function MacPluginManagement({ client, ref }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle> }) {
+export function MacPluginManagement({ client, ref, onStatusChange }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (message: string) => void }) {
   const [snapshot, setSnapshot] = useState<MacPluginSnapshot | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [selectedCommand, setSelectedCommand] = useState<string | null>(null)
@@ -42,6 +42,10 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
   const [drafts, setDrafts] = useState<Map<string, string | boolean>>(new Map())
   const [busy, setBusy] = useState(false); const pending = useRef(false)
   const [notice, setNotice] = useState(''); const [error, setError] = useState('')
+  useEffect(() => {
+    onStatusChange?.(selected && notice === '设置已保存。' ? notice : '')
+    return () => onStatusChange?.('')
+  }, [notice, selected, onStatusChange])
   const [needsReview, setNeedsReview] = useState(false)
   const [prepared, setPrepared] = useState<MacPluginPreview | null>(null)
   const preparedRef = useRef<MacPluginPreview | null>(null)
@@ -193,7 +197,7 @@ export function MacPluginManagement({ client, ref }: { client?: MacPluginManagem
             {bad ? <span role="alert">请检查此设置的类型、范围或选项。</span> : null}
           </div>
         })}
-        <div className="mac-plugin-form-actions"><Button htmlType="submit" type="primary" disabled={disabled || !drafts.size || invalid || commandDraft !== null}>保存设置</Button><Button disabled={busy || !drafts.size} onClick={() => { clearDrafts(); setNotice('已取消修改') }}>取消修改</Button><span role="status" className="mac-plugin-save-status">{notice === '设置已保存。' ? notice : ''}</span></div>
+        <div className="mac-plugin-form-actions"><Button htmlType="submit" type="primary" disabled={disabled || !drafts.size || invalid || commandDraft !== null}>保存设置</Button><Button disabled={busy || !drafts.size} onClick={() => { clearDrafts(); setNotice('已取消修改') }}>取消修改</Button></div>
       </form> : null}
       <Button danger disabled={disabled} onClick={() => requestLeave(() => { clearDrafts(); setRemoveOpen(true) })}>移除插件</Button>
     </div> : <p>插件已不在当前安装清单中，请返回列表。</p>}
