@@ -1078,7 +1078,7 @@ function installMatchMedia(initial: boolean) {
   }
 }
 
-async function mountLauncherView(core: ReturnType<typeof createLauncherCore>, setSettingsPinned?: (active: boolean, pinned: boolean) => Promise<void>) {
+async function mountLauncherView(core: ReturnType<typeof createLauncherCore>, setSettingsPinned?: (active: boolean, pinned: boolean, invocationId?: string) => Promise<void>) {
   const host = document.createElement('div')
   document.body.append(host)
   const root = createRoot(host)
@@ -1114,10 +1114,10 @@ async function activateSettingsTab(host: HTMLElement, label: '通用' | '消息'
   return tab
 }
 
-async function startedCore(settings: SettingsView = emptySettings) {
+async function startedCore(settings: SettingsView = emptySettings, capabilities = previewCapabilities) {
   const fake = fakeClient()
   vi.mocked(fake.client.loadSettings).mockResolvedValueOnce(settings)
-  const core = createLauncherCore(fake.client)
+  const core = createLauncherCore(fake.client, undefined, capabilities)
   await core.start()
   return { core, ...fake }
 }
@@ -8040,10 +8040,11 @@ describe('React view and accessibility', () => {
     await mounted.unmount()
   })
 
-  it('pins settings, retries failed native updates, and releases the pin on exit', async () => {
+  it.each(['windows', 'macos'] as const)('pins settings, retries failed updates, and releases the pin on exit: %s', async (platform) => {
     installMatchMedia(false)
-    const { core, emit } = await startedCore(settingsFixture)
-    const setPinned = vi.fn<(active: boolean, pinned: boolean) => Promise<void>>().mockResolvedValue(undefined)
+    const { core, emit } = await startedCore(settingsFixture, { ...previewCapabilities, platform })
+    const setPinned = vi.fn<(active: boolean, pinned: boolean, invocationId?: string) => Promise<void>>().mockResolvedValue(undefined)
+    const expectPin = (active: boolean, pinned: boolean) => expect(setPinned).toHaveBeenLastCalledWith(active, pinned, ...(platform === 'macos' ? ['settings-pin'] : []))
     const mounted = await mountLauncherView(core, setPinned)
     await act(async () => emit(shown('settings-pin', 'settings')))
     const button = () => mounted.host.querySelector<HTMLButtonElement>('.settings-header button[aria-pressed]')!
@@ -8055,17 +8056,17 @@ describe('React view and accessibility', () => {
     expect(button().getAttribute('aria-keyshortcuts')).toBe('Control+t')
     const shortcut = (repeat = false) => button().dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, repeat, bubbles: true, cancelable: true }))
     await act(async () => { shortcut() })
-    expect(setPinned).toHaveBeenLastCalledWith(true, true)
+    expectPin(true, true)
     expect(button().getAttribute('aria-pressed')).toBe('true')
     const calls = setPinned.mock.calls.length
     await act(async () => { shortcut(true) })
     expect(setPinned).toHaveBeenCalledTimes(calls)
     await act(async () => { shortcut() })
-    expect(setPinned).toHaveBeenLastCalledWith(true, false)
+    expectPin(true, false)
     expect(button().getAttribute('aria-pressed')).toBe('false')
     await act(async () => button().click())
     await act(async () => core.navigate('launcher'))
-    expect(setPinned).toHaveBeenLastCalledWith(false, false)
+    expectPin(false, false)
     await mounted.unmount()
     core.destroy()
   })
@@ -9320,6 +9321,7 @@ describe('real adapter and startup', () => {
       return stop
     })
     tauriCapture.invoke.mockImplementation(async (name) => {
+      if (name === 'set_settings_pinned') return undefined
       if (name === 'load_settings') return emptySettings
       if (name === 'execute_result') return { status: 'launchRequested' }
       if (name === 'search_apps') return { requestId: 'current', items: [
@@ -9343,7 +9345,13 @@ describe('real adapter and startup', () => {
       expect(document.querySelector('[role="tab"]')?.textContent).toContain('通用')
       expect(document.body.textContent).not.toMatch(/截图快捷键|开机启动|恢复初始化/)
       expect(document.body.textContent).toContain('搜索引擎')
-      expect(tauriCapture.invoke.mock.calls.map(([name]) => name).every(name => ['load_settings', 'search_apps', 'execute_result', 'get_launcher_hotkey_status'].includes(name))).toBe(true)
+      expect(tauriCapture.invoke.mock.calls.map(([name]) => name).every(name => ['load_settings', 'search_apps', 'execute_result', 'get_launcher_hotkey_status', 'set_settings_pinned'].includes(name))).toBe(true)
+      expect(tauriCapture.invoke).toHaveBeenCalledWith('set_settings_pinned', { active: true, pinned: false, invocationId: 'mac-settings' })
+      const pin = document.querySelector<HTMLButtonElement>('.settings-header button[aria-pressed]')!
+      await vi.waitFor(() => expect(pin.disabled).toBe(false))
+      await act(async () => pin.click())
+      expect(tauriCapture.invoke).toHaveBeenLastCalledWith('set_settings_pinned', { active: true, pinned: true, invocationId: 'mac-settings' })
+      await vi.waitFor(() => expect(document.querySelector('.settings-header button[aria-pressed]')?.getAttribute('aria-pressed')).toBe('true'))
       expect(tauriCapture.listen.mock.calls).toHaveLength(3)
     } finally { await pagehide() }
     for (const { stop } of subscriptions.values()) expect(stop).toHaveBeenCalledOnce()

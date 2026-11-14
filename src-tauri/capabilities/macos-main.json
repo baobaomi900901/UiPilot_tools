@@ -22,6 +22,7 @@
     "allow-set-macos-login-item",
     "allow-open-macos-login-item-settings",
     "allow-hide-launcher",
+    "allow-set-settings-pinned",
     "allow-save-hotkey",
     "allow-set-hotkey-recording",
     "allow-get-launcher-hotkey-status",

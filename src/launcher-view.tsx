@@ -64,7 +64,7 @@ import { formatHotkeyDisplay } from './hotkey-recorder'
 export interface LauncherViewProps {
   core: LauncherCore
   onReady: (result: 'ready' | 'failed') => void
-  setSettingsPinned?: (active: boolean, pinned: boolean) => Promise<void>
+  setSettingsPinned?: (active: boolean, pinned: boolean, invocationId?: string) => Promise<void>
 }
 
 interface BoundInputProps extends Omit<InputProps, 'onChange' | 'value'> {
@@ -382,13 +382,18 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const [pinError, setPinError] = useState(false)
   const pinQueue = useRef(Promise.resolve())
   const pinSessionActive = useRef(false)
+  const pinInvocation = useRef<string | undefined>(undefined)
+  const sendSettingsPin = (active: boolean, pinned: boolean, invocationId?: string) =>
+    core.capabilities.platform === 'macos'
+      ? setSettingsPinned?.(active, pinned, invocationId)
+      : setSettingsPinned?.(active, pinned)
   const hotkeyRecordingActive = useRef(false)
   const handleHotkeyRecordingPhase = useCallback((phase: HotkeyRecordingPhase) => {
     hotkeyRecordingActive.current = phase === 'recording'
     return core.setHotkeyRecordingPhase(phase)
   }, [core])
   useEffect(() => {
-    if (snapshot.view !== 'settings' || core.capabilities.platform !== 'windows') return
+    if (snapshot.view !== 'settings' || !['windows', 'macos'].includes(core.capabilities.platform)) return
     const onKeyDown = (event: KeyboardEvent) => {
       if (operationsMenu.current?.isOpen || hotkeyRecordingActive.current || !isWindowPinShortcut(event)) return
       event.preventDefault()
@@ -406,18 +411,21 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     let current = true
     const active = snapshot.view === 'settings'
     if (!active && !pinSessionActive.current) return
+    const invocationId = active ? snapshot.invocationId : pinInvocation.current
+    pinInvocation.current = invocationId
     pinSessionActive.current = active
     setPinPending(true)
     setPinError(false)
     pinQueue.current = pinQueue.current
-      .then(() => setSettingsPinned?.(active, active && settingsPinned))
+      .then(() => sendSettingsPin(active, active && settingsPinned, invocationId))
       .then(() => { if (current) { setAppliedPin(active && settingsPinned); setPinPending(false) } })
       .catch(() => { if (current) { setPinPending(false); setPinError(true) } })
     return () => { current = false }
   }, [snapshot.view, snapshot.viewEpoch, settingsPinned, pinAttempt])
   useEffect(() => () => {
     if (!pinSessionActive.current) return
-    pinQueue.current = pinQueue.current.then(() => setSettingsPinned?.(false, false)).catch(() => {})
+    const invocationId = pinInvocation.current
+    pinQueue.current = pinQueue.current.then(() => sendSettingsPin(false, false, invocationId)).catch(() => {})
   }, [])
   const activatedPluginEpoch = useRef<number | undefined>(undefined)
   const restoreSettingsTabFocus = useRef(false)
@@ -2413,7 +2421,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             </Tooltip>
             <h1>设置</h1>
           </div>
-          {core.capabilities.platform === 'windows' && <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
+          {['windows', 'macos'].includes(core.capabilities.platform) && <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
             <Button
               aria-label={pinError ? '重试置顶设置' : appliedPin ? '取消置顶' : '置顶设置窗口'}
               aria-pressed={appliedPin}

@@ -26,6 +26,7 @@ struct Presentation {
     visible: Option<u64>,
     focused: Option<u64>,
     recording: Option<u64>,
+    settings_pin: Option<u64>,
 }
 
 impl Presentation {
@@ -46,6 +47,7 @@ impl Presentation {
     }
     fn begin_present(&mut self, id: u64) -> bool {
         if self.quitting || self.invocation != id { return false; }
+        self.settings_pin = None;
         self.visible = Some(id);
         self.focused = None;
         self.recording = None;
@@ -66,6 +68,16 @@ impl Presentation {
         self.recording.filter(|id| self.owns(*id))
     }
 
+    fn set_settings_pin(&mut self, id: u64, active: bool, pinned: bool) -> bool {
+        if !self.owns(id) { return false; }
+        self.settings_pin = (active && pinned).then_some(id);
+        true
+    }
+
+    fn should_hide_on_blur(&self, id: u64) -> bool {
+        self.owns(id) && self.settings_pin != Some(id)
+    }
+
     fn observe_focus(&mut self) {
         if let Some(id) = self.visible.filter(|id| self.owns(*id)) {
             self.focused = Some(id);
@@ -74,6 +86,7 @@ impl Presentation {
 
     fn retire(&mut self, id: u64) {
         if self.visible == Some(id) {
+            self.settings_pin = None;
             self.visible = None;
             self.focused = None;
             self.recording = None;
@@ -167,6 +180,7 @@ fn recheck_focus(app: &AppHandle, id: u64, delay: Duration) {
             if window.is_focused().unwrap_or(false) {
                 state.lock().expect("presentation state").observe_focus();
             } else {
+                if !state.lock().expect("presentation state").should_hide_on_blur(id) { return; }
                 if crate::macos_plugin_management::dialog_active() { return; }
                 #[cfg(feature = "macos-find-preview")]
                 if crate::macos_find_host::owns_main_blur(&handle) { return; }
@@ -185,7 +199,7 @@ fn present(app: &AppHandle, id: u64) {
     if let Err(error) = position_on_active_display(&window) {
         eprintln!("UiPilot: could not position launcher: {error}");
     }
-    let result = window.unminimize().and_then(|_| window.show()).and_then(|_| window.set_focus()).and_then(|_| {
+    let result = window.set_always_on_top(true).and_then(|_| window.unminimize()).and_then(|_| window.show()).and_then(|_| window.set_focus()).and_then(|_| {
         crate::macos_apps::begin_invocation(app, id);
         window.emit("launcher://shown", serde_json::json!({
             "invocationId": id.to_string(), "target": "launcher", "notice": null
@@ -296,6 +310,29 @@ fn set_web_search_engine(window: WebviewWindow, preference: WebSearchUpdate) -> 
         .map_err(|_| "settingsFailed")
 }
 
+// Settings pins belong to the current presentation; late IPC cannot pin a later show.
+#[tauri::command]
+async fn set_settings_pinned(window: WebviewWindow, active: bool, pinned: bool, invocation_id: String) -> Result<(), &'static str> {
+    require_main(&window)?;
+    let id = invocation_id.parse::<u64>().map_err(|_| "staleRequest")?;
+    if id.to_string() != invocation_id { return Err("staleRequest"); }
+    let app = window.app_handle().clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    window.run_on_main_thread(move || {
+        let result = (|| {
+            let state = app.state::<Mutex<Presentation>>();
+            if !state.lock().expect("presentation state").owns(id) { return Err("staleRequest"); }
+            let window = app.get_webview_window("main").ok_or("windowFailed")?;
+            window.set_always_on_top(!active || pinned).map_err(|_| "windowFailed")?;
+            if !state.lock().expect("presentation state").set_settings_pin(id, active, pinned) { return Err("staleRequest"); }
+            if !active || !pinned { recheck_focus(&app, id, Duration::from_millis(70)); }
+            Ok(())
+        })();
+        let _ = send.send(result);
+    }).map_err(|_| "windowFailed")?;
+    receive.await.map_err(|_| "windowFailed")?
+}
+
 #[tauri::command]
 async fn hide_launcher(window: WebviewWindow, invocation_id: String) -> Result<(), &'static str> {
     require_main(&window)?;
@@ -381,7 +418,7 @@ pub fn run() {
             crate::macos_plugin_management::set_plugin_favorite,
             crate::macos_plugin_management::remove_macos_plugin,
             crate::host_capabilities::get_host_capabilities, load_settings, set_theme_preference,
-            hide_launcher, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording, hotkey::get_launcher_hotkey_status,
+            hide_launcher, set_settings_pinned, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording, hotkey::get_launcher_hotkey_status,
             get_macos_login_item, set_macos_login_item, open_macos_login_item_settings,
             crate::macos_apps::search_apps, crate::macos_apps::execute_result,
             #[cfg(feature = "macos-find-preview")] set_builtin_feature_favorite,
@@ -514,6 +551,47 @@ mod platform_bootstrap {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    #[test]
+    fn settings_pin_blocks_blur_until_unpinned_or_leaving_settings() {
+        let mut state = Presentation { ready: true, ..Presentation::default() };
+        let id = state.request_show().unwrap();
+        assert!(state.begin_present(id));
+        state.observe_focus();
+        assert!(state.should_hide_on_blur(id));
+        assert!(state.set_settings_pin(id, true, true));
+        assert!(!state.should_hide_on_blur(id));
+        assert!(state.owns(id));
+        assert!(state.set_settings_pin(id, true, false));
+        assert!(state.should_hide_on_blur(id));
+        assert!(state.set_settings_pin(id, true, true));
+        assert!(state.set_settings_pin(id, false, true));
+        assert!(state.should_hide_on_blur(id));
+    }
+
+    #[test]
+    fn settings_pin_is_retired_and_old_updates_cannot_change_a_new_presentation() {
+        let mut state = Presentation { ready: true, ..Presentation::default() };
+        let old = state.request_show().unwrap();
+        assert!(state.begin_present(old));
+        assert!(state.set_settings_pin(old, true, true));
+        state.retire(old);
+        assert_eq!(state.settings_pin, None);
+        let new = state.request_show().unwrap();
+        assert!(state.begin_present(new));
+        assert!(!state.set_settings_pin(old, true, true));
+        assert!(state.should_hide_on_blur(new));
+        assert!(state.set_settings_pin(new, true, true));
+        assert!(!state.set_settings_pin(old, false, false));
+        assert!(!state.should_hide_on_blur(new));
+        let next = state.request_show().unwrap();
+        assert!(state.begin_present(next));
+        assert_eq!(state.settings_pin, None);
+        assert!(state.should_hide_on_blur(next));
+        state.quitting = true;
+        assert!(!state.set_settings_pin(next, true, true));
+        assert!(!state.should_hide_on_blur(next));
+    }
+
     #[test]
     fn older_blur_and_completion_cannot_hide_new_or_pending_invocation() {
         let mut state = Presentation { ready: true, ..Presentation::default() };

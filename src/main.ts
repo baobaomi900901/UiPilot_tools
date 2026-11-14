@@ -333,7 +333,9 @@ function mountMain(host: HTMLElement, capabilities: HostCapabilities) {
       core, onReady,
       setSettingsPinned: capabilities.platform === 'windows'
         ? (active: boolean, pinned: boolean) => invoke<void>('set_settings_pinned', { active, pinned })
-        : undefined,
+        : capabilities.platform === 'macos'
+          ? (active: boolean, pinned: boolean, invocationId?: string) => invoke<void>('set_settings_pinned', { active, pinned, invocationId })
+          : undefined,
     }))
   } catch {
     failMount()
