@@ -59,6 +59,7 @@ impl Rows {
 pub(super) struct Files {
     rows: Mutex<Rows>,
     serial_search: Arc<tokio::sync::Mutex<()>>,
+    serial_thumbnail: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Files {
@@ -192,6 +193,30 @@ fn resolve(service: &super::Host, registry: &ResultRegistry, request: &str, resu
         let target = published.targets.get(index).ok_or_else(stale)?.clone();
         Ok((published.scope.clone(), target, ticket))
     }).unwrap_or_else(|| Err(stale()))
+}
+
+#[tauri::command]
+pub(crate) async fn load_find_thumbnail(window: WebviewWindow, request_id: String, result_id: String) -> Response<Option<String>> {
+    check_find(&window)?;
+    if !window.is_visible().unwrap_or(false) { return Ok(None); }
+    let app = window.app_handle().clone();
+    let service = host(&app);
+    let registry = registries(&app).find().clone();
+    let serial = service.files.serial_thumbnail.clone().lock_owned().await;
+    let (scope, target, ticket) = resolve(&service, &registry, &request_id, &result_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _serial = serial;
+        objc2::rc::autoreleasepool(|_| {
+            #[cfg(not(feature = "macos-find-system-qa"))]
+            super::documents::snapshot(&app, ticket.invocation_id())?;
+            let thumbnail = crate::macos_find_results::load_thumbnail(&scope, &target, || {
+                window.is_visible().unwrap_or(false) && service.controller.with_visible_admission(ticket.invocation_id(), || {
+                    registry.is_execution_ticket_current(&ticket)
+                }).unwrap_or(false)
+            }).ok().flatten();
+            Ok(thumbnail)
+        })
+    }).await.map_err(|_| error("fileSearchWorkerFailed"))?
 }
 
 pub(crate) async fn execute_file(window: WebviewWindow, request_id: String, result_id: String, document: bool) -> Response<Value> {

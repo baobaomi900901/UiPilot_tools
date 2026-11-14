@@ -442,7 +442,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
             >
               {selected ? <>
                 <Tooltip title={selected.name}><h2>{selected.name}</h2></Tooltip>
-                {!macos && <div className="find-preview-media">
+                <div className="find-preview-media">
                   {snapshot.thumbnailPending ? <Spin size="small" /> : null}
                   {!snapshot.thumbnailPending && showThumbnail ? (
                     <img
@@ -459,7 +459,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
                       <span>无预览图片</span>
                     </div>
                   ) : null}
-                </div>}
+                </div>
                 <dl>
                   <dt>类型</dt><dd>{fileType(selected.kind, selected.name)}</dd>
                   <dt>大小</dt><dd>{fileSize(selected.kind, selected.sizeBytes)}</dd>

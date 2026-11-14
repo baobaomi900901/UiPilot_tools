@@ -40,7 +40,7 @@ test('preview grants main and Find separate local IPC routes', () => {
   assert.deepEqual(find.webviews, ['find']);
   assert.deepEqual(find.permissions.toSorted(), [
     'allow-cancel-find-query', 'allow-commit-find-ready', 'allow-execute-result', 'allow-get-find-ready-status',
-    'allow-hide-find-window', 'allow-open-find-document', 'allow-prepare-find-initialization', 'allow-search-files',
+    'allow-hide-find-window', 'allow-load-find-thumbnail', 'allow-open-find-document', 'allow-prepare-find-initialization', 'allow-search-files',
     'allow-set-find-pinned', 'allow-set-find-preview-preference',
     'core:event:allow-listen', 'core:event:allow-unlisten',
   ].toSorted());

@@ -237,7 +237,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const requestId = model.requestId
     const selected = model.results[model.selectedIndex]
     if (
-      client.macos || !model.previewEnabled || !model.ready || !invocationId || !requestId || !selected ||
+      !model.previewEnabled || model.hidePending || !model.ready || !invocationId || !requestId || !selected ||
       selected.view.kind !== 'file' || !PREVIEW_IMAGE_EXTENSION.test(selected.view.name)
     ) {
       publish()
@@ -761,6 +761,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     const owner = ++operationToken
     hideOwner = owner
     model.hidePending = true
+    clearThumbnail()
     model.status = ''
     publish()
     try {
@@ -779,6 +780,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       if (destroyed || owner !== hideOwner || invocationId !== model.invocationId) return
       model.hidePending = false
       model.status = errorText(error, Boolean(client.macos))
+      beginThumbnail()
       publish()
     }
   }

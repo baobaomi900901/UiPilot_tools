@@ -807,3 +807,12 @@ Command 快捷键候选 `c42c381` 已完成无 GUI App/DMG 构建，实际 DMG �
 - 插件列表 ⌘F 聚焦搜索框；进入 Demo Multi 详情后按 ⌘F 返回列表并自动聚焦搜索框。
 
 以上主界面与设置页的人工验收通过。Find 窗口对应快捷键、未保存草稿确认及 Esc/输入选区恢复未在本轮单列实测，保持待验收。全部 GUI 操作由用户完成；Mac 生产插件 Runtime 仍未开放。
+
+
+## 2026-11-14 Find 图片缩略图补齐
+
+用户在 `c42c381` 确认 `/find` 打开并自动聚焦，操作面板各项可用；随后发现 PNG/JPG 选中后右侧只有名称、类型、大小和修改时间，没有缩略图。源码确认当时 Mac 仍显式跳过 thumbnail IPC 并隐藏媒体区域，属于未接入能力，不能记为图片预览通过。
+
+本轮补齐授权 PNG/JPEG 缩略图：共享预览 UI、Find 专属 opaque ID IPC、scope/身份/授权复核、描述符相对读取、禁止 dataless 下载、尺寸及内存限制、串行后台解码和 JPEG 方向处理。关闭预览、窗口隐藏、查询或选择变化、撤销授权的旧响应失效。Mac Runtime 门禁保持关闭，原有插件不需重装。没有读取私人原图，没有操作 GUI。
+
+自动验证：Find 前端 84 项通过；Mac Find 原生 59 项通过、4 项原有隔离实机测试忽略；ACL 4 项通过；Cargo all-targets check、TypeScript/Vite 与 diff 检查通过。覆盖 PNG/JPEG 解码、输出尺寸与长度、损坏/超限输入、Unicode 文件名、文件替换/符号链接、不同 scope、查询过期、授权撤销、隐藏/关闭预览及迟到响应。日志 `/private/tmp/uipilot-thumbnail-{rust,ui,acl,check,build}.log`。真实 WKWebView 图片显示与主题效果仍待用户验收。

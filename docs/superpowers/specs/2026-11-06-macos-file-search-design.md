@@ -178,3 +178,15 @@ int main(void) { @autoreleasepool {
 OBJC
 xcrun clang -fobjc-arc -fblocks -framework Foundation "$probe_dir/probe.m" -o "$probe_dir/probe" && "$probe_dir/probe"
 ```
+
+
+## 2026-11-14：授权结果的 PNG / JPEG 缩略图补齐
+
+用户实测 Find 操作菜单通过，但图片右侧只有元数据，要求补齐缩略图。本节替代上文“此阶段不生成缩略图”的阶段限制，不扩大搜索或授权范围。
+
+- `load_find_thumbnail` 仅向本地 Find webview 开放，输入仍为 `requestId` / `resultId`，不得接受路径。查询、窗口会话、授权范围失效后不再回传图片；不消耗文件操作票据。
+- 从已发布的 `AuthorizedFile` 出发，复用 scope、挂载、文件引用及身份复核。通过已核验根目录逐级 `openat`，拒绝符号链接；读前读后检查文件身份、时间和大小。读取期间持有文稿授权 lease，撤销后拒绝输出。
+- 在读取线程临时设置 macOS dataless materialization 为 OFF，离开恢复原策略。不得触发云占位符下载；策略设置失败时不读取。
+- 本次解码格式为 PNG、JPEG。输入至多 32 MiB、每边至多 16384 像素、总计至多 4000 万像素，解码器预算 256 MiB；宿主串行生成，输出最长边 256 像素的 8-bit RGBA PNG data URL，遵守共享前端长度限制。JPEG 方向元数据应用于缩略图。不写磁盘缓存，不传递原图或文件 URL。
+- 前端复用右侧预览的加载、图片及“无预览图片”状态。切换选择、查询、关闭预览、隐藏窗口、撤销文稿授权或销毁页面后忽略旧响应；失败不影响文件信息及 Finder 操作。暂未支持的格式与损坏、超限图片显示无预览。
+- 自动验证使用临时生成图片；不读取用户截图所指向的私人原图。真实 WKWebView、Light/Dark 和用户 PNG/JPG 的视觉效果由用户在新候选包手动验收。

@@ -279,6 +279,26 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_is_discarded_when_documents_are_revoked_after_read() {
+        let fixture = Fixture::new();
+        let file = fixture.docs.join("image.png");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 4).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        fs::write(&file, bytes.into_inner()).unwrap();
+        let grant = fixture.grant();
+        let scope = fixture.scope(Some(grant.clone()));
+        let target = authorize_row(&scope, file, FileCategory::Image).unwrap().unwrap().target;
+        let calls = std::cell::Cell::new(0);
+        let outcome = load_thumbnail(&scope, &target, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 { grant.revoke(); }
+            true
+        });
+        assert_eq!(outcome, Err(FindError::Stale));
+        assert!(load_thumbnail(&scope, &target, || true).is_err());
+    }
+
+    #[test]
     fn concurrent_revocation_at_final_admission_denies_native_submission() {
         let fixture = Fixture::new();
         let file = fixture.docs.join("report.pdf");

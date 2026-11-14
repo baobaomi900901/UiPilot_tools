@@ -927,11 +927,12 @@ it('Find category action and Tab share cycling without trapping result navigatio
   expect(document.activeElement).toBe(host.querySelector('.find-category'))
 })
 
-it('exposes Mac preview scope, Finder actions and metadata without requesting a thumbnail', async () => {
+it('exposes Mac scope, Finder actions and selected image preview', async () => {
   const fake = fakeClient()
   const entry = response()
   Object.assign(entry.items[0], { name: '样例.png', fullPath: '/approved/样例.png', canOpenDocument: true })
   vi.mocked(fake.client.searchFiles).mockResolvedValue(entry)
+  fake.loadThumbnail.mockResolvedValue('data:image/png;base64,UE5H')
   const openDocument = vi.fn(async (): Promise<ExecuteOutcome> => ({ status: 'fileOpenRequested' }))
   const cancelQuery = vi.fn(async () => {})
   const core = createFindCore({ ...fake.client, macos: { scope: 'public-preview', openDocument, cancelQuery } })
@@ -939,8 +940,8 @@ it('exposes Mac preview scope, Finder actions and metadata without requesting a 
   await act(async () => fake.emitForward({ invocationId: 'mac-1', forwardSequence: '1', query: '样例' }))
   expect(host.textContent).toContain('本机公共字体与共享目录（仅限 Spotlight 已索引项目）')
   expect(host.textContent).toContain('PNG 文件')
-  expect(fake.loadThumbnail).not.toHaveBeenCalled()
-  expect(host.querySelector('.find-preview-media')).toBeNull()
+  expect(fake.loadThumbnail).toHaveBeenCalledWith({ requestId: 'request-1', resultId: 'secret-result-id' })
+  expect(host.querySelector<HTMLImageElement>('.find-preview-thumbnail')?.src).toBe('data:image/png;base64,UE5H')
   const option = host.querySelector<HTMLElement>('[role=option]')!
   option.focus()
   await pressFind(option, 'k', { metaKey: true, isComposing: true })

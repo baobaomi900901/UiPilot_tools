@@ -7,6 +7,9 @@ mod extensions;
 use extensions::FileCategory;
 #[path = "macos_find_documents.rs"]
 mod documents;
+#[path = "macos_find_thumbnail.rs"]
+mod thumbnail;
+pub(crate) use thumbnail::load as load_thumbnail;
 pub(crate) use documents::DocumentsGrant;
 #[cfg(all(feature = "macos-find-preview", not(feature = "macos-find-system-qa")))]
 pub(crate) use documents::documents_directory_url;
@@ -617,6 +620,45 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) { fs::remove_dir_all(&self.path).unwrap(); }
+    }
+
+    #[test]
+    fn thumbnail_requires_live_authorized_unchanged_regular_file() {
+        let fixture = Fixture::new();
+        let path = fixture.path.join("资料🐱.png");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 4).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        fs::write(&path, encoded.into_inner()).unwrap();
+        let batch = fixture.batch(&["资料🐱.png"], "image");
+        let target = &batch.rows[0].target;
+        assert!(load_thumbnail(&fixture.scope, target, || true).unwrap().is_some());
+        // Preview is repeatable and does not change the native action target.
+        assert!(load_thumbnail(&fixture.scope, target, || true).unwrap().is_some());
+        assert_eq!(load_thumbnail(&fixture.scope, target, || false), Err(FindError::Stale));
+        let other = Fixture::new();
+        assert!(load_thumbnail(&other.scope, target, || true).is_err());
+        fs::rename(&path, fixture.path.join("old.png")).unwrap();
+        symlink("old.png", &path).unwrap();
+        assert!(load_thumbnail(&fixture.scope, target, || true).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(load_thumbnail(&fixture.scope, target, || true).is_err());
+    }
+
+    #[test]
+    fn thumbnail_discards_output_if_query_changes_during_decode() {
+        let fixture = Fixture::new();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 4).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        fs::write(fixture.path.join("a.png"), encoded.into_inner()).unwrap();
+        let batch = fixture.batch(&["a.png"], "image");
+        let calls = std::cell::Cell::new(0);
+        let outcome = load_thumbnail(&fixture.scope, &batch.rows[0].target, || {
+            calls.set(calls.get() + 1);
+            calls.get() < 3
+        });
+        assert_eq!(outcome, Err(FindError::Stale));
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]

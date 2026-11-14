@@ -278,7 +278,7 @@ describe('find forwarding and query ownership', () => {
     expect(core.getSnapshot().results[0]?.name).toBe('Current.txt')
   })
 
-  it('loads only the current selected result thumbnail', async () => {
+  it.each([false, true])('loads only the current selected result thumbnail (Mac=%s)', async (mac) => {
     const fake = fakeClient()
     const first = deferred<unknown>()
     const second = deferred<unknown>()
@@ -294,7 +294,7 @@ describe('find forwarding and query ownership', () => {
       fullPath: String.raw`C:\Private\Second.png`,
     })
     vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(response)
-    const core = createFindCore(fake.client)
+    const core = createFindCore({ ...fake.client, ...(mac ? { macos: { scope: 'public-preview' as const, openDocument: vi.fn(), cancelQuery: vi.fn() } } : {}) })
     await core.start()
     fake.emitForward({ invocationId: 'inv-1', forwardSequence: '1', query: 'png' })
     await vi.waitFor(() => expect(fake.loadThumbnail).toHaveBeenCalledWith({
@@ -342,6 +342,28 @@ describe('find forwarding and query ownership', () => {
     expect(core.getSnapshot()).toMatchObject({ selectedIndex: 1, thumbnailPending: false })
     expect(core.getSnapshot()).not.toHaveProperty('thumbnailDataUrl')
     expect(fake.loadThumbnail).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['preview', 'query', 'hide', 'destroy'] as const)('discards late Mac thumbnails after %s', async (change) => {
+    const fake = fakeClient()
+    const pending = deferred<unknown>()
+    fake.loadThumbnail.mockReturnValueOnce(pending.promise)
+    vi.mocked(fake.client.searchFiles).mockResolvedValueOnce(fileResponse('图片🐱.jpg'))
+    const core = createFindCore({ ...fake.client, macos: {
+      scope: 'public-preview', openDocument: vi.fn(), cancelQuery: vi.fn(async () => {}),
+    } })
+    await core.start()
+    fake.emitForward({ invocationId: 'mac', forwardSequence: '1', query: '图片' })
+    await vi.waitFor(() => expect(fake.loadThumbnail).toHaveBeenCalledOnce())
+    if (change === 'preview') core.setPreviewEnabled(false)
+    if (change === 'query') core.setQuery('')
+    if (change === 'hide') await core.requestHide(true)
+    if (change === 'destroy') core.destroy()
+    pending.resolve('data:image/png;base64,UE5H')
+    await pending.promise
+    await Promise.resolve()
+    expect(core.getSnapshot().thumbnailDataUrl).toBeUndefined()
+    core.destroy()
   })
 })
 
@@ -483,6 +505,22 @@ describe('Documents access in the Mac public preview', () => {
     } })
     return { ...fake, docs, core }
   }
+
+  it('removes pending thumbnail authority immediately on Documents revocation', async () => {
+    const { core, client, docs, loadThumbnail, emitForward } = setup()
+    docs.get.mockResolvedValue({ status: 'granted', persistence: 'remembered', revision: '1' })
+    const pending = deferred<unknown>()
+    loadThumbnail.mockReturnValueOnce(pending.promise)
+    vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('private.png'))
+    await core.start()
+    emitForward({ invocationId: 'find', forwardSequence: '1', query: 'private' })
+    await vi.waitFor(() => expect(loadThumbnail).toHaveBeenCalledOnce())
+    const revoking = core.updateDocuments('revoke')
+    pending.resolve('data:image/png;base64,UE5H')
+    await revoking
+    expect(core.getSnapshot().thumbnailDataUrl).toBeUndefined()
+    core.destroy()
+  })
 
   it('keeps the current search after chooser cancellation, refreshes on authorization, and removes old rows on revoke', async () => {
     const { core, client, docs, emitForward } = setup()

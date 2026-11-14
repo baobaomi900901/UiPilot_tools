@@ -121,6 +121,37 @@ impl FindPathIdentity {
         self.chain == other.chain && self.kind == other.kind
     }
 
+    /// Open only the captured regular object, through the retained directory chain.
+    /// Caller disables dataless materialization for this thread before calling.
+    pub(crate) fn open_read(&self, root: &File) -> Result<File, IdentityError> {
+        self.revalidate(root)?;
+        if self.is_directory() { return Err(IdentityError::Ineligible); }
+        let mut directory = rustix::io::fcntl_dupfd_cloexec(root, 0)?;
+        let mut parts = self.relative.components().peekable();
+        while let Some(part) = parts.next() {
+            let last = parts.peek().is_none();
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+            directory = openat(&directory, part.as_os_str(),
+                if last { flags } else { flags | OFlags::DIRECTORY }, Mode::empty())?;
+        }
+        let file = File::from(directory);
+        self.check_open_file(&file)?;
+        self.revalidate(root)?;
+        Ok(file)
+    }
+
+    pub(crate) fn check_open_file(&self, file: &File) -> Result<(), IdentityError> {
+        let stat = fstat(file)?;
+        if self.chain.last() != Some(&ObjectId::from(&stat))
+            || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_flags & SF_DATALESS != 0 || stat.st_mode != self.mode
+            || (stat.st_ctime, stat.st_ctime_nsec) != self.changed
+            || (stat.st_mtime, stat.st_mtime_nsec) != self.modified || stat.st_size != self.size {
+            return Err(IdentityError::Changed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn inode_at_depth(&self, depth: usize) -> Option<u64> {
         self.chain.get(depth).map(|object| object.inode)
     }

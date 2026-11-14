@@ -14,7 +14,7 @@
       "allow-prepare-find-initialization", "allow-commit-find-ready",
       "allow-get-find-ready-status", "allow-set-find-pinned", "allow-set-find-preview-preference",
       "allow-hide-find-window", "allow-search-files", "allow-cancel-find-query",
-      "allow-execute-result", "allow-open-find-document"
+      "allow-execute-result", "allow-open-find-document", "allow-load-find-thumbnail"
     ]
   }
 ]

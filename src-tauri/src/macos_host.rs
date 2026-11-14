@@ -430,6 +430,7 @@ pub fn run() {
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::set_find_preview_preference,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::hide_find_window,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::search_files,
+            #[cfg(feature = "macos-find-preview")] crate::macos_find_host::load_find_thumbnail,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::cancel_find_query,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_document,
             #[cfg(all(feature = "macos-find-preview", not(feature = "macos-find-system-qa")))]

@@ -2187,6 +2187,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5229,6 +5231,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "icu_casemap",
+ "image",
  "libc",
  "native-tls",
  "objc2",
