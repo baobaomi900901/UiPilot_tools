@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   parseLauncherShown,
+  parseFindForwardPayload,
   parseFindDocumentsAccess,
   parseBuiltinFeatures,
   parseResultActionMetadata,
@@ -324,4 +325,13 @@ describe('plugin detail configuration protocol', () => {
     expect(parsePublicPluginInventory({ ...inventory, items: [{ ...item, commands: [command, command] }] })).toBeNull()
     expect(parsePublicPluginInventory({ ...inventory, items: [{ ...item, installationDirectory: 42 }] })).toBeNull()
   })
+})
+
+
+it('limits Find session preservation to an empty Mac focus-only forward', () => {
+  const payload = {invocationId:'find-1', forwardSequence:'2', query:'', pinned:true, preserveSession:true}
+  expect(parseFindForwardPayload(payload, true)).toEqual(payload)
+  expect(parseFindForwardPayload(payload)).toBeNull()
+  expect(parseFindForwardPayload({...payload, query:'new'}, true)).toBeNull()
+  expect(parseFindForwardPayload({...payload, preserveSession:'true'}, true)).toBeNull()
 })

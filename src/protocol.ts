@@ -582,7 +582,7 @@ export type PluginTimerErrorName =
   | 'TimerInputNotAllowed'
   | 'MessageStoreUnavailable'
   | 'TimerUnavailable'
-export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string; pinned?: boolean }
+export interface FindForwardPayload { invocationId: string; forwardSequence: U64Decimal; query: string; pinned?: boolean; preserveSession?: boolean }
 export type OpenFindOutcome = { status: 'forwarded' } | { status: 'superseded' }
 export interface OpenFindInput { query: string; invocationId: string; querySequence: number }
 export interface FindInitializationPrepared {
@@ -1591,12 +1591,15 @@ export function parseFindForwardPayload(value: unknown, macos = false): FindForw
   const payload = plainRecord(value)
   if (!payload) return null
   const hasPin = macos && Object.prototype.hasOwnProperty.call(payload, 'pinned')
-  const keys = hasPin ? ['forwardSequence', 'invocationId', 'pinned', 'query'] : ['forwardSequence', 'invocationId', 'query']
+  const hasPreserve = macos && Object.prototype.hasOwnProperty.call(payload, 'preserveSession')
+  const keys = ['forwardSequence', 'invocationId', 'query', ...(hasPin ? ['pinned'] : []), ...(hasPreserve ? ['preserveSession'] : [])].sort()
   const forwardSequence = parseU64Decimal(payload.forwardSequence)
   if (!exactKeys(payload, keys) || typeof payload.invocationId !== 'string' || payload.invocationId.length === 0 ||
-      typeof payload.query !== 'string' || !forwardSequence || (hasPin && typeof payload.pinned !== 'boolean')) return null
+      typeof payload.query !== 'string' || !forwardSequence || (hasPin && typeof payload.pinned !== 'boolean') ||
+      (hasPreserve && (typeof payload.preserveSession !== 'boolean' || (payload.preserveSession && payload.query.trim() !== '')))) return null
   return { invocationId: payload.invocationId, forwardSequence, query: payload.query,
-    ...(hasPin ? { pinned: payload.pinned as boolean } : {}) }
+    ...(hasPin ? { pinned: payload.pinned as boolean } : {}),
+    ...(hasPreserve ? { preserveSession: payload.preserveSession as boolean } : {}) }
 }
 
 const FIND_THUMBNAIL_PREFIX = 'data:image/png;base64,'

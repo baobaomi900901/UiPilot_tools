@@ -175,7 +175,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
     menuRef.current = menu
     const stamp = () => {
       const state = core.getSnapshot()
-      return JSON.stringify([state.ready, state.invocationId, state.query, state.category,
+      return JSON.stringify([state.ready, state.invocationId, state.forwardSequence, state.query, state.category,
         state.results[state.selectedIndex]?.key, state.searchPending, state.executePending,
         state.hidePending, state.pinned, state.pinPending, state.previewEnabled, state.previewPending,
         state.documents?.access?.revision, state.documents?.access?.status, state.documents?.pending, state.documents?.storageError])
@@ -223,7 +223,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
 
   useEffect(() => {
     if (snapshot.ready) inputRef.current?.focus()
-  }, [snapshot.ready, snapshot.invocationId])
+  }, [snapshot.ready, snapshot.invocationId, snapshot.forwardSequence])
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {

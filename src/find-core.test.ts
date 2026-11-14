@@ -695,3 +695,30 @@ describe('Documents access in the Mac public preview', () => {
     core.destroy()
   })
 })
+
+
+describe('Mac Find focus-only forwarding', () => {
+  it('retains results, selected image and tickets, then searches explicit parameters', async () => {
+    const fake = fakeClient()
+    vi.mocked(fake.client.searchFiles).mockResolvedValue(fileResponse('First.png'))
+    fake.loadThumbnail.mockResolvedValue('data:image/png;base64,SU1BR0U=')
+    const core = createFindCore({ ...fake.client, macos: { scope: 'public-preview', openDocument: vi.fn(), cancelQuery: vi.fn() } })
+    await core.start()
+    fake.emitForward({ invocationId: 'mac-1', forwardSequence: '1', query: '小羊', pinned: true })
+    await vi.waitFor(() => expect(core.getSnapshot().thumbnailDataUrl).toBe('data:image/png;base64,SU1BR0U='))
+    const before = core.getSnapshot()
+    fake.emitForward({ invocationId: 'mac-1', forwardSequence: '2', query: '', pinned: true, preserveSession: true })
+    expect(core.getSnapshot()).toMatchObject({ ...before, forwardSequence: '2' })
+    expect(fake.client.searchFiles).toHaveBeenCalledTimes(1)
+    expect(fake.loadThumbnail).toHaveBeenCalledTimes(1)
+    // Unknown sessions may not keep another invocation's actionable results.
+    fake.emitForward({ invocationId: 'wrong', forwardSequence: '3', query: '', preserveSession: true })
+    expect(core.getSnapshot().invocationId).toBe('mac-1')
+    core.keyDown('Enter', false)
+    expect(fake.client.executeResult).toHaveBeenCalledWith({ requestId: 'request-1', resultId: 'result-First.png' })
+    fake.emitForward({ invocationId: 'mac-2', forwardSequence: '4', query: '新图片', pinned: true, preserveSession: false })
+    await vi.waitFor(() => expect(fake.client.searchFiles).toHaveBeenCalledTimes(2))
+    expect(fake.client.searchFiles).toHaveBeenLastCalledWith(expect.objectContaining({query:'新图片', invocationId:'mac-2', querySequence:1}))
+    core.destroy()
+  })
+})

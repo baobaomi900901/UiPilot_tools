@@ -197,3 +197,10 @@ xcrun clang -fobjc-arc -fblocks -framework Foundation "$probe_dir/probe.m" -o "$
 用户要求：从主界面选中 Find 回车，独立 Find 窗口出现后主窗口消失，不能被主窗口置顶层遮挡。Mac 原生转发在已确认 Find 焦点、成功提交 scope 并投递 forwarded 后，使用源 main invocation 调用 `hide_if_current`。不提前隐藏源窗口；失败、超时、已关闭或过期转发保留原有回滚处理。隐藏清理 main 的会话、应用结果与管理状态，不清理 Find 的独立 registry。新的 main invocation 不得被旧转发隐藏。
 
 连续打开时，尚有排队转发就保留源会话，最后一个成功转发再隐藏主窗口；等待期间屏蔽普通主窗口失焦隐藏。移除成功交接后长期保留主窗口的失焦豁免。Find 图钉状态和焦点策略不变，不通过永久置顶 Find 来掩盖源窗口。
+
+
+### 2026-11-14：已显示窗口的无参数再次唤起
+
+用户明确要求：Mac Find 已打开（通常已固定）并有搜索结果时，从主启动器选择 `/find` 或提交不含参数的 `/find` 只重新聚焦独立窗口，不清空查询、分类、选择和缩略图；携带非空参数则按新查询处理。
+
+仅当焦点交接的原状态为 VisibleReady 且参数 trim 后为空时，宿主保留原 invocation、结果注册表和文件身份表，以新的 forwardSequence 发送 preserveSession。前端只接受同 invocation 的空参数保留事件，保留查询序号和结果请求 ID，用 forwardSequence 重新聚焦搜索框并关闭旧动作面板。初次打开/关闭后的新会话和显式参数仍创建新 scope 并清理旧结果。交接失败仍撤销结果；不得重新激活已关闭或被撤权的旧票据。Windows 的既有转发合同保持不变。

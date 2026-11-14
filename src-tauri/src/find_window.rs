@@ -48,6 +48,8 @@ pub(crate) struct FindForwardPayload {
     pub(crate) invocation_id: String,
     pub(crate) forward_sequence: String,
     pub(crate) query: String,
+    #[cfg(target_os = "macos")]
+    pub(crate) preserve_session: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +335,8 @@ impl FindWindowController {
                 invocation_id,
                 forward_sequence: forward_sequence.to_string(),
                 query,
+                #[cfg(target_os = "macos")]
+                preserve_session: false,
             },
             transfer_id,
             retirement,
@@ -504,6 +508,17 @@ impl FindWindowController {
             || transfer.phase != TransferPhase::CommitScope
         {
             return Err(ControllerError::Unavailable);
+        }
+        // A bare activation of a visible Mac Find window is a focus transfer,
+        // not a new search. Keep result tickets and the existing invocation.
+        #[cfg(target_os = "macos")]
+        if transfer.transaction.payload.query.trim().is_empty() {
+            if let TransferOrigin::Visible { invocation_id } = &transfer.origin {
+                transfer.transaction.payload.invocation_id = invocation_id.clone();
+                transfer.transaction.payload.preserve_session = true;
+                transfer.phase = TransferPhase::Emitting;
+                return Ok(transfer.transaction.payload.clone());
+            }
         }
         if registries
             .find()
@@ -948,6 +963,29 @@ mod tests {
             OpenFindCompletion::Forwarded
         );
         invocation_id
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn bare_visible_activation_preserves_result_tickets_but_parameters_replace_them() {
+        for (query, preserve, emitted) in [("", true, true), ("  ", true, true), ("new query", false, true), ("", true, false)] {
+            let now = Instant::now();
+            let controller = FindWindowController::default();
+            let registries = ResultRegistries::default();
+            let original = make_ready(&controller, &registries, now);
+            controller.set_pin(&original, true);
+            let ticket = current_find_ticket(&registries, &original);
+            let submission = prepared_open(&controller, &registries, 2, query, now);
+            let plan = controller.admit_queued_transfer(snapshot(true, false, ForegroundWindow::Main), now).unwrap();
+            assert_eq!(controller.confirm_transfer_focus(plan.transfer_id, snapshot(false, true, ForegroundWindow::Find)), TransferFocusResult::CommitFindScope);
+            let payload = controller.commit_find_scope(plan.transfer_id, &registries).unwrap();
+            assert_eq!(payload.preserve_session, preserve);
+            assert_eq!(payload.invocation_id == original, preserve);
+            assert_eq!(registries.find().is_execution_ticket_current(&ticket), preserve);
+            controller.finish_forward_emit(plan.transfer_id, emitted, &registries);
+            assert_eq!(registries.find().is_execution_ticket_current(&ticket), preserve && emitted);
+            assert_eq!(submission.completion.recv().unwrap(), if emitted { OpenFindCompletion::Forwarded } else { OpenFindCompletion::Unavailable });
+        }
     }
 
     #[test]

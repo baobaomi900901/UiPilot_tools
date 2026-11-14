@@ -178,7 +178,7 @@ fn drive(app: &AppHandle) {
                     rollback(app, transfer);
                     return;
                 };
-                service.files.clear();
+                if !payload.preserve_session { service.files.clear(); }
                 let mut forwarded = json!(payload);
                 forwarded["pinned"] = json!(controller.pinned());
                 let emitted = find.emit_to("find", "find://forwarded", forwarded).is_ok();

@@ -994,3 +994,19 @@ it('remembers and forgets Documents access from the header and keyboard Actions 
   expect(document.querySelector('.uipilot-context-actions')?.textContent).toContain('忘记文稿授权')
   expect(grant).toHaveBeenCalledOnce()
 })
+
+
+it('focuses the Mac search input again without replacing the visible Find session', async () => {
+  const fake = fakeClient()
+  const core = createFindCore({ ...fake.client, macos: { scope: 'public-preview', openDocument: vi.fn(), cancelQuery: vi.fn() } })
+  const host = await mount(core)
+  await vi.waitFor(() => expect(core.getSnapshot().ready).toBe(true))
+  await act(async () => fake.emitForward())
+  await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+  host.querySelector<HTMLButtonElement>('.find-category')!.focus()
+  await act(async () => core.acceptForward({ invocationId:'inv-1', forwardSequence:'2', query:'', pinned:true, preserveSession:true }))
+  expect(document.activeElement).toBe(host.querySelector('[role="combobox"]'))
+  expect(core.getSnapshot().query).toBe('quarterly')
+  expect(core.getSnapshot().results).toHaveLength(1)
+  expect(fake.client.searchFiles).toHaveBeenCalledTimes(1)
+})

@@ -38,6 +38,7 @@ export interface FindSnapshot {
   ready: boolean
   theme: ThemePreference
   invocationId?: string
+  forwardSequence?: string
   query: string
   category: FileCategory
   sort: FileSort
@@ -88,6 +89,7 @@ interface Model {
   ready: boolean
   theme: ThemePreference
   invocationId?: string
+  forwardSequence?: string
   query: string
   category: FileCategory
   sort: FileSort
@@ -192,6 +194,7 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
       ready: model.ready,
       theme: model.theme,
       ...(model.invocationId ? { invocationId: model.invocationId } : {}),
+      forwardSequence: model.forwardSequence,
       query: model.query,
       category: model.category,
       sort: model.sort,
@@ -467,7 +470,18 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     if (destroyed) return
     const payload = parseFindForwardPayload(value, Boolean(client.macos))
     if (!payload || (lastForward && compareDecimalRevision(payload.forwardSequence, lastForward) <= 0)) return
+    if (payload.preserveSession && payload.invocationId !== model.invocationId) return
     lastForward = payload.forwardSequence
+    model.forwardSequence = payload.forwardSequence
+    if (payload.preserveSession) {
+      if (payload.pinned !== undefined) {
+        pinOwner = ++operationToken
+        model.pinPending = false
+        model.pinned = payload.pinned
+      }
+      publish()
+      return
+    }
     documentsOwner++
     documentsReadFailed = false
     if (documents) model.documents = {}
