@@ -864,9 +864,12 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       : statusResult.hasDefaultAction === false ? '' : snapshot.mainResultCommand ? '复制' : '执行'
     : ''
   const macPluginFeedback = snapshot.view === 'settings' && activeSettingsTab === 'plugins' && core.capabilities.pluginManagement && !core.capabilities.plugins ? macPluginStatus : undefined
+  const macQuicklinksFeedback = snapshot.view === 'launcher' && quicklinks && !quicklinksCreateOpen && core.capabilities.platform === 'macos'
+    ? quicklinks.error ? { message: quicklinks.error, tone: 'error' } : quicklinksStatus : undefined
   const status =
     operationsError ||
     macPluginFeedback?.message ||
+    macQuicklinksFeedback?.message ||
     (snapshot.view === 'settings' && activeSettingsTab === 'credentials'
       ? credentialStatus.message : '') ||
     snapshot.shownNotice ||
@@ -1852,7 +1855,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                     <strong>{quicklinksDraft?.name || '未命名目录'}</strong>
                     <code>/{quicklinksDraft?.command}</code>
                   </div>
-                  {quicklinksStatus ? (
+                  {quicklinksStatus && core.capabilities.platform !== 'macos' ? (
                     <span
                       className="quicklinks-editor-status"
                       data-tone={quicklinksStatus.tone}
@@ -1922,7 +1925,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                       onChange={(event) => core.setQuicklinkDraft('template', event.target.value)}
                     />
                   </Form.Item>
-                  {quicklinks.error ? <div className="quicklinks-error">{quicklinks.error}</div> : null}
+                  {quicklinks.error && core.capabilities.platform !== 'macos' ? <div className="quicklinks-error">{quicklinks.error}</div> : null}
                   <div className="quicklinks-actions">
                     <Button
                       type="primary"
@@ -2540,6 +2543,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             <div className={`launcher-region launcher-status-region${snapshot.view === 'settings' ? ' settings-status-region' : ''}`}>
               <div className={`status-region${macPluginFeedback?.message && !operationsError
                 ? macPluginFeedback.tone === 'error' ? ' is-action-error' : macPluginFeedback.tone === 'success' ? ' is-action-success' : ''
+                : macQuicklinksFeedback?.message && !operationsError
+                ? macQuicklinksFeedback.tone === 'error' ? ' is-action-error' : ' is-action-success'
                 : snapshot.view === 'settings' && activeSettingsTab === 'credentials' && credentialStatus.message
                 ? credentialStatus.tone === 'error' ? ' is-action-error' : credentialStatus.tone === 'success' ? ' is-action-success' : ''
                 : snapshot.view === 'launcher' && !snapshot.shownNotice && !snapshot.status && panel?.feedback?.status.message

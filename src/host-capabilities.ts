@@ -7,11 +7,12 @@ export type HostCapabilities = Readonly<{
   version: 1
   platform: 'windows' | 'macos'
   pluginManagement?: boolean
+  quicklinks?: boolean
 } & Record<typeof flags[number], boolean>>
 
 // Standalone clients (browser preview and test fixtures) model the full Windows host.
 export const previewCapabilities: HostCapabilities = Object.freeze({
-  version: 1, platform: 'windows', plugins: true, files: true, screenshot: true,
+  version: 1, platform: 'windows', quicklinks: true, plugins: true, files: true, screenshot: true,
   messages: true, credentials: true, builtinFeatures: true, commandHotkeys: true,
   autostart: true, doubleTap: true, webSearch: true, loginItems: false,
 })
@@ -22,6 +23,7 @@ export function parseHostCapabilities(value: unknown): HostCapabilities | null {
   if (snapshot.version !== 1 || (snapshot.platform !== 'macos' && snapshot.platform !== 'windows') ||
       flags.some(key => !Object.prototype.hasOwnProperty.call(snapshot, key) || typeof snapshot[key] !== 'boolean')) return null
   if (snapshot.pluginManagement !== undefined && typeof snapshot.pluginManagement !== 'boolean') return null
+  if (snapshot.quicklinks !== undefined && typeof snapshot.quicklinks !== 'boolean') return null
   return Object.freeze({ ...snapshot }) as HostCapabilities
 }
 
@@ -39,6 +41,12 @@ export function settingsTabAvailable(host: HostCapabilities, tab: string): boole
 export function resultAvailable(host: HostCapabilities, activation: LauncherResultActivation, item: ResultItem): boolean {
   if (activation.kind === 'unavailablePlugin') return host.platform === 'macos' && host.pluginManagement === true && !host.plugins && !item.actions && !item.pluginIconUrl && !item.iconKind && item.hasDefaultAction === false
   if (!host.plugins && (item.actions || item.pluginIconUrl || item.favorite?.target?.kind === 'publicPlugin')) return false
+  if (host.platform === 'macos' && host.quicklinks === true) {
+    if (activation.kind === 'openQuicklinks' && item.title === '/quicklinks' && item.iconKind === 'quicklinks' && item.hasDefaultAction === false &&
+        item.favorite?.target.kind === 'builtin' && item.favorite.target.feature === 'quicklinks') return true
+    if (activation.kind === 'completion' && !item.iconKind && !item.favorite && item.hasDefaultAction === false &&
+        /^\/[a-z][a-z0-9-]{0,31}$/.test(item.title) && activation.completionText === `${item.title} `) return true
+  }
   if (host.platform === 'macos' && host.webSearch && item.iconKind === 'webSearch' &&
       activation.kind === 'completion' && activation.completionText === '/web-search ' && item.title === '/web-search' &&
       item.hasDefaultAction === false && item.favorite?.target.kind === 'builtin' && item.favorite.target.feature === 'webSearch') return true

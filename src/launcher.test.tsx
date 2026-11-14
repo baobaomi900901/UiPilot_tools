@@ -11872,3 +11872,62 @@ it('keeps the Mac web command capability limited to its fixed completion and own
     for (const row of invalid) expect(resultAvailable(host, row.activation, row)).toBe(false)
   }
 })
+
+it('opens and edits Mac quicklinks with Command shortcuts without enabling unrelated builtins', async () => {
+  installMatchMedia(false)
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+  const { client, emit } = fakeClient()
+  const host = { ...previewCapabilities, platform: 'macos' as const, plugins: false, builtinFeatures: false, quicklinks: true }
+  const entry: ResultItem = { resultId: 'links', title: '/quicklinks', iconKind: 'quicklinks', activation: { kind: 'openQuicklinks' }, hasDefaultAction: false,
+    favorite: { target: { kind: 'builtin', feature: 'quicklinks' }, favorite: false } }
+  vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'mac-links', replaceLocalResults: true, items: [entry] })
+  const core = createLauncherCore(client, undefined, host)
+  await core.start()
+  const mounted = await mountLauncherView(core)
+  try {
+    await act(async () => emit(shown('mac-links')))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await act(async () => mounted.host.querySelector<HTMLElement>('[role="option"]')!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    let favorite: HTMLElement | undefined
+    await vi.waitFor(() => { favorite = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(el => el.textContent?.trim() === '设为常用'); expect(favorite).toBeDefined() })
+    await act(async () => favorite!.click())
+    expect(client.setBuiltinFeatureFavorite).toHaveBeenCalledWith({ feature: 'quicklinks', favorite: true })
+    await act(async () => core.keyDown('Enter', false))
+    await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.status).toBe('ready'))
+    expect(client.listBuiltinFeatures).not.toHaveBeenCalled()
+    const input = mounted.host.querySelector<HTMLInputElement>('[aria-label="搜索快速链接目录"]')!
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'n', metaKey: true, bubbles: true, cancelable: true })))
+    expect(core.getSnapshot().quicklinks?.createDraft).toBeDefined()
+    await act(async () => {
+      core.setNewQuicklinkDraft('name', 'Mac 链接')
+      core.setNewQuicklinkDraft('command', 'mac-link')
+      core.setNewQuicklinkDraft('template', 'https://example.test/?q={Query}')
+      await core.saveNewQuicklink()
+    })
+    expect(core.getSnapshot().quicklinks?.items[0].command).toBe('mac-link')
+    await act(async () => { core.setQuicklinkDraft('name', '已修改') })
+    const name = mounted.host.querySelector<HTMLInputElement>('.quicklinks-editor [aria-label="目录名称"]')!
+    await act(async () => name.dispatchEvent(new KeyboardEvent('keydown', { key: 's', metaKey: true, bubbles: true, cancelable: true })))
+    await vi.waitFor(() => expect(core.getSnapshot().quicklinks?.items[0].name).toBe('已修改'))
+    expect(mounted.host.querySelector('#launcher-status-message')?.textContent).toContain('已保存')
+    expect(mounted.host.querySelector('.quicklinks-editor-status')).toBeNull()
+    expect(client.executeResult).not.toHaveBeenCalled()
+    expect(client.hideLauncher).not.toHaveBeenCalled()
+    await act(async () => core.deleteQuicklink())
+    expect(core.getSnapshot().quicklinks?.items).toHaveLength(0)
+  } finally { await mounted.unmount(); core.destroy() }
+})
+
+it('admits only Mac quicklink entry and well-formed custom completions through the narrow capability', () => {
+  const host = { ...previewCapabilities, platform: 'macos' as const, plugins: false, builtinFeatures: false, quicklinks: true }
+  const row: ResultItem = { resultId: 'link', title: '/custom-link', activation: { kind: 'completion', completionText: '/custom-link ' }, hasDefaultAction: false }
+  expect(resultAvailable(host, row.activation, row)).toBe(true)
+  expect(resultAvailable({ ...host, quicklinks: false }, row.activation, row)).toBe(false)
+  for (const bad of [
+    { ...row, title: '/bad name' }, { ...row, hasDefaultAction: true },
+    { ...row, activation: { kind: 'completion' as const, completionText: '/another ' } },
+    { ...row, pluginIconUrl: 'uipilot-public-plugin://localhost/icon.png' },
+  ]) expect(resultAvailable(host, bad.activation, bad)).toBe(false)
+  const screenshot: ResultItem = { resultId: 'shot', title: '/screenshot', iconKind: 'screenshot', activation: { kind: 'openScreenshot' } }
+  expect(resultAvailable({ ...host, screenshot: false }, screenshot.activation, screenshot)).toBe(false)
+})
