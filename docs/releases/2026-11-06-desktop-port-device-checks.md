@@ -897,3 +897,12 @@ Mac 主窗口/快捷键生命周期回归另 24 项通过，含旧完成不能�
 用户报告候选 `9450606` 仍偶发清空；截图显示查询“小羊”保留、图钉点亮，但文稿状态为“无法读取文稿授权，可重试”。找到可复现的顺序缺口：原生焦点刷新在交接 Transferring 阶段被可见准入拒绝，前端误当授权读取失败清空；交接前状态回复也可晚于保留事件。
 
 修复只读状态入口对同 invocation 的空参数交接做锁外有界等待，保持原授权校验；前端废弃旧只读刷新并重新读取。真实撤权与存储错误仍按失败处理。增加准入阶段/有界等待/旧回复迟到/真实授权丢失回归。Find Rust 84 passed / 4 ignored，前端 Find/协议 106 passed，TypeScript/Vite 构建通过；偶发场景等待新候选人工确认，不将上一包记为通过。
+
+竞态修复候选 `8e5a1b6`：Rust all-targets check、无 GUI App/DMG 构建、bundle/entitlement/arm64/最低系统校验、preflight、ZIP CRC 和 manifest 10 文件哈希通过。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-find-race-8e5a1b6.zip`。
+- ZIP SHA-256：`bd17317c9f5353e97e4d87bc66434ca408f753f71351e64a752cafdee65c7ff3`。
+- DMG SHA-256：`effea63fea27c1c723a3fc22d7517edf5be44ee8252d7cc2117ea01e4b14fdcd`。
+- 主程序 SHA-256：`072413b2a7a320ca5081a616895c9f1c99a2a263f99914a58675dd778f087dab`。
+
+需用户替换后重复固定 Find → 主界面 → 无参数 `/find`，确认不再误报文稿授权读取失败或清空结果，并保留带参数新查询与真实撤权的行为。尚未记为人工通过。
