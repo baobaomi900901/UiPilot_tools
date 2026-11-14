@@ -946,3 +946,9 @@ Mac 主窗口/快捷键生命周期回归另 24 项通过，含旧完成不能�
 用户确认 ⌘F 返回插件列表聚焦筛选框、一次 Tab 到首个详情入口、再次 Tab 到启用开关均正常，空格第一次切换成功。随后明确报告保存后开关失去焦点，第二次空格无法切回。因此连续空格操作未通过，不以首次切换成功替代。
 
 修复使三个持久配置开关在短暂保存期间保留可聚焦状态，使用 aria-disabled/aria-busy 和事件准入阻止重复写入。组件/客户端 30 项通过（新增四个回归覆盖三个开关连续操作和用户移走焦点）；TypeScript/Vite 构建通过。测试显式检查原生 disabled 属性，避免 jsdom 不自动模拟 WKWebView disabled-blur 的行为而产生假通过。新包真实键盘验收仍待用户执行。
+
+焦点修复候选为 `9b1540a`，交付 `/Users/mobytang/Documents/UiPilot-Mac-toggle-focus-9b1540a.zip`。真实 arm64 App 构建、DMG 只读检查、内部签名/entitlements/最低系统检查、preflight、ZIP CRC 与 8 个清单文件哈希一致通过。源码已提交 macOS 分支，未合并 main；连续两次空格切换仍待用户复测。
+
+- ZIP SHA-256：`9899ed5467eac24dd2613a71bfc4811b28a58d3a6ae7d644fc610b2d6599441c`
+- DMG SHA-256：`32587c1e206b842fb192165c2f9792acea0cdc699e733e432f78e86cbbb54aea`
+- 主程序 SHA-256：`b335e63de552613069a95bb8fcf9d490de6440e005eb42060787d50c69e90753`
