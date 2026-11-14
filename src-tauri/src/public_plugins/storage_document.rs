@@ -164,6 +164,11 @@ pub(super) fn parse_mac_document(bytes: &[u8], owner: &str) -> Option<StorageDoc
 
 #[cfg(target_os = "macos")]
 pub(super) fn validate_mac_json(bytes: &[u8]) -> Option<()> {
+    validate_bounded_mac_json(bytes, STORAGE_QUOTA_BYTES + 256)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn validate_bounded_mac_json(bytes: &[u8], max_bytes: usize) -> Option<()> {
     use serde::de::{self, MapAccess, SeqAccess, Visitor};
     struct Unique;
     impl<'de> Deserialize<'de> for Unique {
@@ -210,7 +215,7 @@ pub(super) fn validate_mac_json(bytes: &[u8]) -> Option<()> {
             deserializer.deserialize_any(Check)
         }
     }
-    if bytes.len() > STORAGE_QUOTA_BYTES + 256 {
+    if bytes.len() > max_bytes {
         return None;
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);

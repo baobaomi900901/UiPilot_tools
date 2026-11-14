@@ -1,5 +1,7 @@
 //! Shared diagnostic pipe runner for the probe and macOS host tests.
-use super::{validate_mac_json, DataCall, PluginRequestContext, ReplyPermit};
+use super::{
+    validate_mac_json, DataCall, PluginRequestContext, ReplyPermit, MAX_MODULE_INIT_BYTES,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -77,6 +79,7 @@ pub(super) struct Pipe {
     pub(super) deadline: Instant,
     reaped: bool,
     sent: usize,
+    initial_sent: bool,
     cancelled: Box<dyn Fn() -> bool + Send>,
 }
 impl Pipe {
@@ -114,6 +117,7 @@ impl Pipe {
             deadline,
             reaped: false,
             sent: 0,
+            initial_sent: false,
             cancelled: Box::new(cancelled),
         };
         let reader = thread::Builder::new()
@@ -212,6 +216,19 @@ impl Pipe {
             .checked_duration_since(Instant::now())
             .ok_or(())
     }
+    /// One bounded initialization frame; it cannot be used for later RPC replies.
+    pub(super) fn write_initial(&mut self, value: Value) -> Result<(), ()> {
+        self.remaining()?;
+        if self.initial_sent || self.sent != 0 {
+            return Err(());
+        }
+        let body = serde_json::to_vec(&value).map_err(|_| ())?;
+        if body.len() > MAX_MODULE_INIT_BYTES {
+            return Err(());
+        }
+        self.initial_sent = true;
+        self.write_body(body, None)
+    }
     pub(super) fn write(&mut self, value: Value, permit: Option<ReplyPermit>) -> Result<(), ()> {
         self.remaining()?;
         let body = serde_json::to_vec(&value).map_err(|_| ())?;
@@ -222,6 +239,9 @@ impl Pipe {
         if self.sent > 8192 {
             return Err(());
         }
+        self.write_body(body, permit)
+    }
+    fn write_body(&mut self, body: Vec<u8>, permit: Option<ReplyPermit>) -> Result<(), ()> {
         let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
         bytes.extend(body);
         let (tx, rx) = mpsc::sync_channel(1);

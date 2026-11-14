@@ -3,6 +3,7 @@ use super::*;
 use crate::public_plugins::{
     call_session::ReplyPermit, request_contract::PluginRequestContext,
     storage_document::validate_mac_json,
+    runtime_modules::MAX_MODULE_INIT_BYTES,
 };
 
 #[path = "../../../spikes/macos-runtime-bridge-probe/src/pipe.rs"]
@@ -53,21 +54,6 @@ impl QuickJsProbe {
 
 impl RuntimeTransport for QuickJsProbe {
     fn run(&self, input: RuntimeInput, cancel: Cancellation) -> Result<TerminalResult, Error> {
-        let mut modules = std::collections::BTreeMap::new();
-        let mut source_bytes = 0;
-        for (path, bytes) in input
-            .package
-            .resources()
-            .filter(|(path, _)| path.ends_with(".js"))
-        {
-            source_bytes += bytes.len();
-            if modules.len() >= 32 || source_bytes > 2048 {
-                return Err(Error::Unavailable);
-            }
-            let source = std::str::from_utf8(bytes).map_err(|_| Error::Unavailable)?;
-            modules.insert(format!("pkg/{path}"), source);
-        }
-        let entry = format!("pkg/{}", input.package.manifest().runtime.entry);
         let context = input.binding.context();
         let cancelled = cancel.clone();
         let mut pipe = Pipe::new(&self.helper, input.deadline, move || {
@@ -82,10 +68,9 @@ impl RuntimeTransport for QuickJsProbe {
             cancelled_before_deadline: false,
         };
         let result = (|| {
-            pipe.write(
+            pipe.write_initial(
                 json!({"mode":"launcherDemo","context":context,
-                    "invocation":input.invocation,"graph":{"entry":entry,"modules":modules}}),
-                None,
+                    "invocation":input.invocation,"graph":input.modules}),
             )?;
             let mut stderr_eof = false;
             loop {
@@ -199,10 +184,79 @@ fn module_imports_use_the_installed_snapshot_and_real_data_service() {
 
 #[test]
 #[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn larger_unicode_graph_cycles_and_reexports_use_owned_snapshot() {
+    let temp = Temp::new();
+    let mut source = String::from("import { value, bump } from '../共享 模块/状态.js';\n");
+    for n in 0..40 { source.push_str(&format!("import '../m{n}.js';\n")); }
+    source.push_str(&format!("/*{}*/\n", "\u{0001}".repeat(1024 * 1024)));
+    source.push_str(r#"
+        export function initial() { return 7; }
+        export async function onCommand(inv, api) {
+            bump();
+            const again = await import('../共享 模块/导出.js');
+            return {requestId:inv.requestId, results:[{id:'graph',title: value + ':' + again.value}]};
+        }
+    "#);
+    let package = nested_entry(&temp, &source);
+    fs::create_dir(package.join("共享 模块")).unwrap();
+    fs::write(package.join("共享 模块/状态.js"),
+        "import { initial } from '../entry/run.js'; export let value=initial(); export function bump(){value++;}").unwrap();
+    fs::write(package.join("共享 模块/导出.js"), "export { value } from './状态.js';").unwrap();
+    for n in 0..40 { fs::write(package.join(format!("m{n}.js")), "export const unused=1;").unwrap(); }
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    fs::write(package.join("共享 模块/状态.js"), "throw Error('replaced source must not execute');").unwrap();
+    let registry = registry();
+    let probe = QuickJsProbe::new(None);
+    let runtime = LauncherRuntime::with_transport(state.clone(), registry.clone(), probe.clone(), Duration::from_secs(5));
+    start(&runtime, &registry);
+    let Route::Published(response) = launch(&runtime, &temp.0, 1, "/settings-demo", true).unwrap() else {
+        panic!("expected cyclic Unicode snapshot to publish")
+    };
+    assert_eq!(response.items[0].title, "8:8");
+    let report = probe.take_report();
+    assert_eq!(report.data_calls, 0);
+    drain(&runtime, &state);
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn denied_dynamic_import_does_not_poison_next_invocation() {
+    let temp = Temp::new();
+    nested_entry(&temp, r#"
+        export async function onCommand(inv, api) {
+            if (inv.input === 'deny') await import('../../outside.js');
+            return {requestId:inv.requestId, results:[{id:'recovered',title:'recovered'}]};
+        }
+    "#);
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    let registry = registry();
+    let probe = QuickJsProbe::new(None);
+    let runtime = LauncherRuntime::with_transport(state.clone(), registry.clone(), probe.clone(), Duration::from_secs(5));
+    start(&runtime, &registry);
+    assert!(matches!(launch(&runtime, &temp.0, 1, "/settings-demo deny", true), Err(Error::Unavailable)));
+    assert_eq!(probe.take_report().data_calls, 0);
+    let Route::Published(response) = launch(&runtime, &temp.0, 2, "/settings-demo recover", true).unwrap() else {
+        panic!("new invocation must recover after an import failure")
+    };
+    assert_eq!(response.items[0].title, "recovered");
+    probe.take_report();
+    drain(&runtime, &state);
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
 fn missing_and_outside_modules_fail_before_data_calls_or_publication() {
     for import in [
         "import './missing.js';",
         "await import('../../outside.js');",
+        "import 'std';",
+        "import 'node:fs';",
+        "await import('https://example.invalid/module.js');",
+        "import './run.js?query';",
+        "import './%72un.js';",
+        "import './run.js' with { type: 'json' };",
     ] {
         let temp = Temp::new();
         nested_entry(
@@ -559,4 +613,48 @@ fn disabling_plugin_reaps_child_waiting_for_reply_before_acknowledgement() {
         Ok(Route::NotHandled)
     ));
     drain(&runtime, &state);
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn module_initialization_allowance_is_one_time_and_rpc_stays_bounded() {
+    let probe = QuickJsProbe::new(None);
+    let mut pipe = Pipe::new(&probe.helper, Instant::now() + Duration::from_secs(3), || false).unwrap();
+    let init = json!({"mode":"roundtrip","context": {
+        "pluginId":"com.uipilot.fixture","pluginGeneration":1,"requestId":"public-request-0000000000000001"
+    }});
+    pipe.write_initial(init.clone()).unwrap();
+    assert!(pipe.write_initial(init).is_err());
+    assert!(matches!(pipe.event().unwrap(), Event::Frame(Frame::Call { .. })));
+    assert!(pipe.write(json!({"oversized":"x".repeat(4096)}), None).is_err());
+    assert!(pipe.stop());
+    let mut pipe = Pipe::new(&probe.helper, Instant::now() + Duration::from_secs(3), || false).unwrap();
+    assert!(pipe.write_initial(json!("x".repeat(crate::public_plugins::runtime_modules::MAX_MODULE_INIT_BYTES))).is_err());
+    assert!(pipe.stop());
+    let mut pipe = Pipe::new(&probe.helper, Instant::now() + Duration::from_secs(3), || false).unwrap();
+    pipe.write_initial(json!({"mode":"readRpcFrames","context":{"requestId":"public-request-0000000000000001"}})).unwrap();
+    // Each serialized string is 4090 bytes; two framed writes total 8188.
+    pipe.write(json!("x".repeat(4088)), None).unwrap();
+    pipe.write(json!("x".repeat(4088)), None).unwrap();
+    assert!(pipe.write(json!(null), None).is_err());
+    assert!(pipe.stop());
+
+}
+
+#[test]
+#[ignore = "requires the separately built diagnostic QuickJS helper"]
+fn cancelled_large_initialization_write_reaps_nonreading_child() {
+    let probe = QuickJsProbe::new(None);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let observe = cancelled.clone();
+    let mut pipe = Pipe::new(&probe.helper, Instant::now() + Duration::from_secs(3), move || observe.load(Ordering::Acquire)).unwrap();
+    let pid = pipe.pid();
+    unsafe { assert_eq!(libc::kill(pid as i32, libc::SIGSTOP), 0); }
+    let trigger = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        cancelled.store(true, Ordering::Release);
+    });
+    assert!(pipe.write_initial(json!({"blocked":"x".repeat(1024 * 1024)})).is_err());
+    assert!(pipe.stop());
+    trigger.join().unwrap();
 }

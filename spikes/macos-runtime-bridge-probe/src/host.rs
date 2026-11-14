@@ -1,6 +1,7 @@
 //! Supervised fixed fixtures: testMemory plus actual private data services.
 //! Internal transport, not the production plugin loader or an OS sandbox.
 use crate::{
+    runtime_modules::MAX_MODULE_INIT_BYTES,
     call_session::{CallEndpoint, CallPermit, CallSession, ReplyPermit},
     data_call_gate::{PluginDataCallGate, PluginDataCallIdentity},
     request_contract::PluginRequestContext,

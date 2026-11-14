@@ -609,7 +609,7 @@ fn validate(document: &Inventory) -> Result<BTreeMap<String, VerifiedPackage>> {
                 .get(key)
                 .and_then(|p| p.name_override.as_deref())
                 .unwrap_or(&command.default_name);
-            if super::launcher_runtime_macos::host_command_names().any(|reserved| reserved == name)
+            if super::host_command_names::host_command_names().any(|reserved| reserved == name)
                 || !names.insert(name.to_lowercase())
             {
                 return Err(LifecycleError::CommandConflict);

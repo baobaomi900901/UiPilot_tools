@@ -65,3 +65,33 @@ pub fn validate_launcher_invocation(value: &serde_json::Value, request_id: &str)
     }
     Ok(())
 }
+
+#[path = "../../../src-tauri/src/public_plugins/runtime_modules.rs"]
+pub mod runtime_modules;
+
+/// Initialization has its own byte allowance; storage and RPC keep their limits.
+pub fn validate_module_init_json(bytes: &[u8]) -> Result<(), ()> {
+    storage_document::validate_bounded_mac_json(bytes, runtime_modules::MAX_MODULE_INIT_BYTES)
+        .ok_or(())
+}
+
+#[path = "../../../src-tauri/src/public_plugins/host_command_names.rs"]
+mod host_command_names;
+
+#[cfg(test)]
+mod init_json_tests {
+    use super::*;
+    #[test]
+    fn large_init_preserves_duplicate_depth_and_storage_limits() {
+        let padding = " ".repeat(6 * 1024 * 1024);
+        let valid = format!(r#"{{"source":"{padding}"}}"#);
+        assert!(validate_module_init_json(valid.as_bytes()).is_ok());
+        assert!(validate_wire_json(valid.as_bytes()).is_err());
+        let duplicate = format!(r#"{{"source":"{padding}","source":""}}"#);
+        assert!(validate_module_init_json(duplicate.as_bytes()).is_err());
+        assert!(validate_module_init_json(
+            format!("{}0{}", "[".repeat(129), "]".repeat(129)).as_bytes()
+        )
+        .is_err());
+    }
+}

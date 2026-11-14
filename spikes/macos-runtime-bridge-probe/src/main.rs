@@ -1,4 +1,3 @@
-#[path = "../../macos-quickjs-runtime-probe/src/loader.rs"]
 mod loader;
 
 use rquickjs::{Context, Function, Module, Promise, Runtime};
@@ -10,15 +9,22 @@ use std::{
     time::{Duration, Instant},
 };
 fn read_frame() -> Result<Value, ()> {
+    read_frame_with_limit(4096)
+}
+fn read_frame_with_limit(limit: usize) -> Result<Value, ()> {
     let mut header = [0u8; 4];
     std::io::stdin().read_exact(&mut header).map_err(|_| ())?;
     let len = u32::from_be_bytes(header) as usize;
-    if len > 4096 {
+    if len > limit {
         return Err(());
     }
     let mut bytes = vec![0; len];
     std::io::stdin().read_exact(&mut bytes).map_err(|_| ())?;
-    uipilot_runtime_bridge_probe::validate_wire_json(&bytes)?;
+    if limit > 4096 {
+        uipilot_runtime_bridge_probe::validate_module_init_json(&bytes)?;
+    } else {
+        uipilot_runtime_bridge_probe::validate_wire_json(&bytes)?;
+    }
     serde_json::from_slice(&bytes).map_err(|_| ())
 }
 fn send(value: Value) -> Result<(), ()> {
@@ -51,22 +57,21 @@ struct ModuleSnapshot {
 
 impl ModuleSnapshot {
     fn into_graph(self) -> Result<(String, loader::Graph), ()> {
-        if self.modules.values().map(String::len).sum::<usize>() > 2048 {
-            return Err(());
-        }
-        let entries: Vec<_> = self.modules.iter()
-            .map(|(name, source)| (name.as_str(), source.as_str()))
-            .collect();
-        let graph = loader::Graph::new(&entries)?;
-        if graph.source(&self.entry).is_none() {
-            return Err(());
-        }
+        let graph = loader::Graph(
+            uipilot_runtime_bridge_probe::runtime_modules::RuntimeModuleGraph::new(
+                &self.entry,
+                self.modules.iter().map(|(p, s)| (p.as_str(), s.as_bytes())),
+            )?,
+        );
         Ok((self.entry, graph))
     }
 }
 
 fn run() -> Result<(), ()> {
-    let init: Init = serde_json::from_value(read_frame()?).map_err(|_| ())?;
+    let init: Init = serde_json::from_value(read_frame_with_limit(
+        uipilot_runtime_bridge_probe::runtime_modules::MAX_MODULE_INIT_BYTES,
+    )?)
+    .map_err(|_| ())?;
     let launcher = init.mode == "launcherDemo";
     if (init.mode == "installedDemo") != init.source.is_some()
         || launcher != init.invocation.is_some()
@@ -84,6 +89,13 @@ fn run() -> Result<(), ()> {
     }
     let mode = init.mode;
     if mode == "exit" {
+        return Err(());
+    }
+    if mode == "readRpcFrames" {
+        for _ in 0..2 {
+            read_frame()?;
+        }
+        std::thread::sleep(Duration::from_secs(5));
         return Err(());
     }
     if mode == "dataWrongEnvelope" {
@@ -188,7 +200,8 @@ fn run() -> Result<(), ()> {
         runtime.set_loader(graph.clone(), graph.clone());
     }
     let engine = Context::full(&runtime).map_err(|_| ())?;
-    let data_mode = mode.starts_with("data") || matches!(mode.as_str(), "installedDemo" | "launcherDemo");
+    let data_mode =
+        mode.starts_with("data") || matches!(mode.as_str(), "installedDemo" | "launcherDemo");
     let response=engine.with(|ctx|->rquickjs::Result<String>{
         let next=Cell::new(1u64);let owner=context.clone();
         let bridge=Function::new(ctx.clone(),move |operation:String,key:String,value:String|->rquickjs::Result<String>{

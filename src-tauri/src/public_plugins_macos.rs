@@ -76,3 +76,9 @@ pub(crate) mod management_macos;
 
 #[path = "public_plugins/launcher_runtime_macos.rs"]
 pub(crate) mod launcher_runtime_macos;
+
+#[path = "public_plugins/runtime_modules.rs"]
+mod runtime_modules;
+
+#[path = "public_plugins/host_command_names.rs"]
+mod host_command_names;

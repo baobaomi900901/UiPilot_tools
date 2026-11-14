@@ -954,3 +954,24 @@ fn renamed_favorite_catalog_and_dispatch_keep_the_original_command_identity() {
     assert_eq!(result.items[0].title, "renamed result");
     drain(&runtime, &state);
 }
+
+#[test]
+fn reserved_commands_include_every_managed_builtin_default() {
+    for feature in crate::settings::ManagedBuiltinFeature::ALL {
+        assert!(host_command_names().any(|name| name == feature.default_name()));
+    }
+}
+
+#[test]
+fn invalid_module_source_never_enters_transport_and_retires_binding() {
+    let temp = Temp::new();
+    fs::write(temp.0.join("package/runtime.js"), [0xff]).unwrap();
+    let state = Arc::new(ManagementState::default());
+    temp.install(&state);
+    let registry = registry();
+    let fake = Arc::new(Fake(|_: RuntimeInput, _: Cancellation| panic!("invalid graph must not dispatch")));
+    let runtime = LauncherRuntime::with_transport(state.clone(), registry.clone(), fake, Duration::from_secs(2));
+    start(&runtime, &registry);
+    assert!(matches!(launch(&runtime, &temp.0, 1, "/settings-demo", true), Err(Error::Unavailable)));
+    drain(&runtime, &state);
+}

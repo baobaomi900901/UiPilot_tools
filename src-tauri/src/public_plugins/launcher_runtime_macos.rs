@@ -1,6 +1,7 @@
 //! Host scheduling/data/publication wiring, not a production execution engine.
 //! Only tests can provide a transport. The normal constructor is closed and
 //! never discovers inventory, launches a process, or evaluates plugin source.
+use super::host_command_names::host_command_names;
 pub(crate) use super::request_contract::PluginInvocationTheme as InvocationTheme;
 use super::{
     lifecycle_macos::LifecycleError,
@@ -81,6 +82,7 @@ struct TerminalResult {
 struct RuntimeInput {
     invocation: PluginInvocation,
     package: VerifiedPackage,
+    modules: super::runtime_modules::RuntimeModuleGraph,
     binding: RuntimeDataBinding,
     deadline: Instant,
 }
@@ -586,8 +588,18 @@ impl LauncherRuntime {
                 invoked_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             },
         };
+        let modules = match installed.package().runtime_modules() {
+            Ok(modules) => modules,
+            Err(_) => {
+                drop(running);
+                run.signal();
+                close_later(self.management.clone(), identity);
+                return Err(Error::Unavailable);
+            }
+        };
         let input = RuntimeInput {
             invocation: wire,
+            modules,
             package: installed.package().clone(),
             binding: installed.binding().clone(),
             deadline,
@@ -757,13 +769,6 @@ fn watch_deadline(
             close_later(management, run.identity.clone());
         })
         .is_ok()
-}
-pub(super) fn host_command_names() -> impl Iterator<Item = &'static str> {
-    ["find", "settings", "plugins"].into_iter().chain(
-        crate::settings::ManagedBuiltinFeature::ALL
-            .into_iter()
-            .map(crate::settings::ManagedBuiltinFeature::default_name),
-    )
 }
 
 fn split_query(query: &str) -> Option<(&str, &str)> {

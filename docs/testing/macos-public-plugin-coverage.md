@@ -28,3 +28,5 @@ CLI 检查由 `npm run verify:local` 的 `reference package validation` 阶段�
 
 
 2026-11-14 Mac 管理人工验收补充：`demo-settings` 安装、普通设置保存/重启恢复和 1.0.1 兼容升级保留设置已通过；`demo-multi` 的命令目录、独立收藏、改名及恢复默认、重启保留、名称冲突/格式拒绝已通过。设置图钉、统一底栏提示也已实测。以上是管理能力证据，Mac 生产 Runtime 仍关闭，不增加双端生产运行通过数。候选 `b77d3e4` 的命令设置直达入口待人工验证，详情见设备验收记录。
+
+2026-11-14 模块加载补充：安装快照模块图与真实 QuickJS 诊断共用包路径规则，43 个模块、Unicode/空格路径、循环/live binding、re-export/TLA、源码目录替换隔离与失败后恢复通过。初始化容量单独计入，原 RPC 限额、重复键拒绝与进程取消回收保留；三个示例加兼容升级归档诊断回归通过。具体证据见[模块图计划](../superpowers/plans/2026-11-14-macos-runtime-module-graph.md)。生产运行、签名身份和 OS 沙箱不由此证明，仍为 0 / 17。

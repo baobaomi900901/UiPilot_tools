@@ -36,6 +36,12 @@ pub(super) struct VerifiedPackage {
     encoded: Vec<u8>,
 }
 impl VerifiedPackage {
+    pub(super) fn runtime_modules(&self) -> Result<super::runtime_modules::RuntimeModuleGraph> {
+        super::runtime_modules::RuntimeModuleGraph::new(
+            &self.manifest.runtime.entry,
+            self.resources().filter(|(path, _)| path.ends_with(".js")),
+        ).map_err(|_| PublicPackageError::InvalidPackage)
+    }
     pub(super) fn manifest(&self) -> &PublicManifestV1 {
         &self.manifest
     }

@@ -14,7 +14,7 @@ close 先退役并阻止新 call/reply/submit，返回 drain 在锁外等待；s
 
 ## 实际 adapter
 
-每次运行独立 spawn 固定 QuickJS helper；父进程拥有 endpoint，子进程只回显 context 供比较。四字节大端长度帧，每帧最多 4096 字节；两个方向分别最多 8192 字节，子进程 stdout/stderr 合计计入出站预算。直接反序列化 typed deny_unknown_fields，测试重复 kind/context/callId/response.requestId 与未知字段拒绝。reader 队列最多 2 项，writer 队列最多 1 项且 try_send；每次 writer ack 后才处理后续消息，回复许可先释放再 ack。
+每次运行独立 spawn 固定 QuickJS helper；父进程拥有 endpoint，子进程只回显 context 供比较。四字节大端长度帧。模块图初始化可使用一次单独的 24 MiB 输入预算；随后的 RPC 每帧最多 4096 字节，两个方向分别最多 8192 字节，子进程 stdout/stderr 合计计入出站预算。直接反序列化 typed deny_unknown_fields，测试重复 kind/context/callId/response.requestId 与未知字段拒绝。reader 队列最多 2 项，writer 队列最多 1 项且 try_send；每次 writer ack 后才处理后续消息，回复许可先释放再 ack。
 
 父进程使用绝对 deadline（通常 2 秒，固定挂起负例 150ms），不因片段重置。complete 后仍检查完整 stdout **和 stderr** EOF，拒绝第二份完成、尾字节、reader 故障及超限，确认 child 正常退出后才提交。真实回归覆盖先关闭 stdout、随后超量 stderr 但正常退出的漏洞；旧实现误接纳的红测保留，双 EOF 后拒绝。
 
@@ -66,7 +66,7 @@ spikes/macos-runtime-bridge-probe/build.sh
 UIPILOT_LAUNCHER_TEST_HELPER=/private/tmp/uipilot-bridge-probe.XXXXXX/helper \
   cargo test --offline --locked --manifest-path src-tauri/Cargo.toml --lib \
   --features macos-find-preview,macos-login-item-preview \
-  launcher_runtime_macos::tests::process -- --ignored --nocapture
+  launcher_runtime_macos::tests::process -- --ignored --skip process::archive --nocapture
 ```
 
 宿主测试从临时安装库调用正式宿主协调器。原样示例核对四项设置和真实注册表结果，停用场景核对等待首条回复的子进程在管理操作返回前已回收。多文件场景删除导入来源后执行快照中的嵌套入口，验证静态导入、重导出、动态导入、绑定更新及真实设置读取。缺失模块和越界导入在调用宿主数据服务和发布结果前失败。
@@ -81,7 +81,9 @@ UIPILOT_LAUNCHER_TEST_HELPER=/private/tmp/uipilot-bridge-probe.XXXXXX/helper \
 
 两个独立的宿主测试进程验证设置重启恢复和兼容升级。归档测试还覆盖双命令共享存储，以及复制授权和撤权。输出目录包含可复用的插件包、SHA-256 清单、逐平台 CLI 报告和宿主测试日志。`verification.json` 分别记录 CLI 与 macOS 诊断宿主的结果，正式宿主验收单独登记。
 
-模块快照仅含已验证安装包中的 UTF-8 JavaScript。诊断预算为最多 32 个模块、源码合计 2048 字节、每帧 4096 字节、每方向合计 8192 字节。复用 QuickJS 探针的 ASCII 虚拟路径解析器，静态和动态导入均在同一快照中解析。
+模块图由宿主在传输前从 VerifiedPackage 的已拥有资源生成，并在 helper 再验。复用 package_rules 的 256 文件、单文件 2 MiB、总源码 16 MiB、8 层和路径限制；安装快照原有 5 MiB 序列化上限仍约束实际包。支持精确 Unicode/空格路径、循环依赖、re-export、live binding、动态 import 和 TLA。拒绝缺模块、大小写/NFC 别名、目录冲突、NUL/无效 UTF-8，以及 URL、裸系统模块、越界、import attributes 和百分号形式。无文件系统回退。
+
+首个初始化帧单独允许 24 MiB，仍校验唯一 JSON 键和深度。后续 RPC 的 4 KiB 单帧/8 KiB 累计不变；重复初始化拒绝。真实安装测试包含 43 个模块、超过 1 MiB 源码和超过 6 MiB 的转义 JSON 首帧，源目录替换后仍执行安装快照。阻塞的大首帧写入取消后会 kill/wait 并回收线程。QuickJS 仍限 8 MiB 堆、1 MiB 栈及 1 秒引擎截止；这些是诊断预算，不代表所有包可在这些资源下运行。
 
 这个适配器仅编译进宿主测试。普通构建仍关闭插件执行。签名 XPC、系统沙箱及 GUI 交互另行验收。
 
