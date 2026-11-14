@@ -710,3 +710,12 @@ ZIP CRC 与 manifest 中 7 个文件哈希验证通过。新包只需人工确�
 本次统一管理页的处理进度、刷新、安装、启用/权限/名称/收藏保存、冲突、读取/写入错误、缺少管理服务和输入校验至宿主底栏左侧，使用结构化消息与语义颜色。删除内容区和按钮旁的重复提示及预留空白；字段仍有 aria-invalid，并关联底栏可访问状态。静态功能说明、空列表和确认对话框保留各自用途。切换到其他设置页面不显示旧管理提示。已将统一位置写入 UI 规范，防止后续只迁移单条消息。
 
 验证：相关前端 **423 通过、18 跳过**，TypeScript/Vite 构建通过；浅色/深色的 Launcher DOM 回归实际保存与冲突事件，确认消息只出现在底栏、颜色正确、冲突恢复原名且切换通用页后不残留。没有运行 GUI 自动化；实际位置仍由用户确认。日志 `/private/tmp/uipilot-unified-status-ui.log`、`/private/tmp/uipilot-unified-status-build.log`。
+
+
+统一状态候选 `a9a3dcf` 完成无 GUI 的 App/DMG 构建，通过签名、架构、最低系统和 Documents entitlement 检查，只读 preflight 通过。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-unified-status-a9a3dcf.zip`，SHA-256 `96c094e74481e73c92e7d1841af472b5379718ce2d29cdcbf6b313235d1abdd1`。
+- DMG SHA-256：`784fe27ba5f3a7200cb9f6235219b87306a04de4ff8512189015fe9b35f76524`。
+- 主程序 SHA-256：`da1fe1a9773e9eed944bd8fadec8fab1ffb41d3e38a910a86eb5bf6990b8ec22`。
+
+ZIP CRC 与 manifest 中 8 个文件哈希验证通过。新包待用户确认冲突及其他操作提示均位于底栏左侧；既有插件无需重新导入。
