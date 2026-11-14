@@ -816,3 +816,12 @@ Command 快捷键候选 `c42c381` 已完成无 GUI App/DMG 构建，实际 DMG �
 本轮补齐授权 PNG/JPEG 缩略图：共享预览 UI、Find 专属 opaque ID IPC、scope/身份/授权复核、描述符相对读取、禁止 dataless 下载、尺寸及内存限制、串行后台解码和 JPEG 方向处理。关闭预览、窗口隐藏、查询或选择变化、撤销授权的旧响应失效。Mac Runtime 门禁保持关闭，原有插件不需重装。没有读取私人原图，没有操作 GUI。
 
 自动验证：Find 前端 84 项通过；Mac Find 原生 59 项通过、4 项原有隔离实机测试忽略；ACL 4 项通过；Cargo all-targets check、TypeScript/Vite 与 diff 检查通过。覆盖 PNG/JPEG 解码、输出尺寸与长度、损坏/超限输入、Unicode 文件名、文件替换/符号链接、不同 scope、查询过期、授权撤销、隐藏/关闭预览及迟到响应。日志 `/private/tmp/uipilot-thumbnail-{rust,ui,acl,check,build}.log`。真实 WKWebView 图片显示与主题效果仍待用户验收。
+
+
+图片预览候选 `1ee112e` 已完成无 GUI App/DMG 构建；实际 DMG 的 arm64、最低 macOS 15.7.4、签名、资源与 Documents entitlement 检查通过。只读 preflight、ZIP CRC 和 manifest 的 11 个文件哈希均通过。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-image-preview-1ee112e.zip`，SHA-256 `67c2c8fdc2a1cd089401c08b8e1eb00b7a355da6b95544a7d9ea958adead77c3`。
+- DMG SHA-256：`b074b5baa7db617f5d0160f3ec20b0b17a1aa6a8c4c80e3730da1177909105dc`。
+- 主程序 SHA-256：`24ce5d3f9f17fe887584426a50717c13dabfa5524841e4af64c01d9315311388`。
+
+交由用户手动替换并验证 PNG/JPG 缩略图；暂无原生视觉通过结论。代码留在 `codex/macos-port-plan`，不合并 main。
