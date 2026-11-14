@@ -18,9 +18,11 @@ const errors: Record<string, string> = {
   pluginManagementStorage: '无法读取或保存插件配置，请刷新核对。',
   pluginManagementBusy: '另一项插件管理操作尚未结束。',
 }
+function errorCode(error: unknown): string {
+  return typeof error === 'string' ? error : typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
+}
 function message(error: unknown) {
-  const code = typeof error === 'string' ? error : typeof error === 'object' && error && 'code' in error ? String(error.code) : ''
-  return errors[code] ?? '插件管理暂不可用，请刷新后重试。'
+  return errors[errorCode(error)] ?? '插件管理暂不可用，请刷新后重试。'
 }
 function parseValue(d: OrdinarySetting, v: string | boolean): string | number | boolean {
   if (d.type === 'boolean' && typeof v === 'boolean') return v
@@ -97,11 +99,17 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
     if (selected) { requestLeave(() => { clearDrafts(); setSelected(null) }); return true }
     return false
   } }))
-  const mutate = async (operation: () => Promise<MacPluginSnapshot>, success: string) => {
+  const mutate = async (operation: () => Promise<MacPluginSnapshot>, success: string, discardConflictingName = false) => {
     if (needsReview || !begin()) return
     const epoch = generation.current
     try { const value = await operation(); if (owns(epoch)) { publish(value); setNotice(success) } }
-    catch (e) { if (owns(epoch)) { setError(message(e)); setNeedsReview(true) } }
+    catch (e) { if (owns(epoch)) {
+      if (discardConflictingName && errorCode(e) === 'pluginManagementConflict') {
+        setCommandDraft(null)
+        setNeedsReview(false)
+        setError('启动名称与内置命令或已安装插件冲突，已恢复原名称。')
+      } else { setError(message(e)); setNeedsReview(true) }
+    } }
     finally { finish(epoch) }
   }
   const choose = async (kind: 'archive' | 'directory') => {
@@ -171,11 +179,11 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
       <h2 ref={heading} tabIndex={-1}>{plugin.name}</h2><p>{plugin.description || '暂无插件说明'}</p><p className="mac-plugin-metadata">{plugin.pluginId} · {plugin.version}</p>
       {command ? <form className="mac-plugin-settings" aria-label="启动命令配置" noValidate onSubmit={e => {
         e.preventDefault()
-        if (!disabled && !invalidCommand && commandDraft !== null && !drafts.size) void mutate(() => client.command({ pluginId: plugin.pluginId, commandId: command.id, nameOverride: commandName === command.defaultName ? null : commandName, favorite: command.favorite, expectedRevision: snapshot.revision }), '启动名称已保存。')
+        if (!disabled && !invalidCommand && commandDraft !== null && !drafts.size) void mutate(() => client.command({ pluginId: plugin.pluginId, commandId: command.id, nameOverride: commandName === command.defaultName ? null : commandName, favorite: command.favorite, expectedRevision: snapshot.revision }), '启动名称已保存。', true)
       }}>
         <div className="mac-plugin-command-heading"><h3>启动命令</h3><Button type="text" title={command.favorite ? '取消常用' : '设为常用'} aria-label={command.favorite ? '取消常用' : '设为常用'} aria-pressed={command.favorite} icon={<Star size={16} fill={command.favorite ? 'currentColor' : 'none'} />} disabled={disabled || dirty} onClick={() => void mutate(() => client.command({ pluginId: plugin.pluginId, commandId: command.id, nameOverride: command.nameOverride, favorite: !command.favorite, expectedRevision: snapshot.revision }), '常用配置已保存。')} /></div>
         {plugin.commands.length > 1 ? <div className="mac-plugin-field"><label htmlFor="mac-plugin-command">选择命令</label><Select id="mac-plugin-command" aria-label="选择命令" value={command.id} disabled={busy} options={plugin.commands.map(c => ({ value: c.id, label: `${c.id} · /${c.name}` }))} onChange={id => requestLeave(() => { clearDrafts(); setSelectedCommand(id) })} /></div> : null}
-        <div className="mac-plugin-field"><label htmlFor="mac-plugin-command-name">启动名称</label><Input id="mac-plugin-command-name" aria-label="启动名称" prefix="/" placeholder={command.defaultName} value={commandDraft ?? command.name} disabled={disabled || drafts.size > 0} aria-invalid={commandDraft !== null && invalidCommand} onChange={e => { setCommandDraft(e.target.value); setNotice('') }} />
+        <div className="mac-plugin-field"><label htmlFor="mac-plugin-command-name">启动名称</label><Input id="mac-plugin-command-name" aria-label="启动名称" prefix="/" placeholder={command.defaultName} value={commandDraft ?? command.name} disabled={disabled || drafts.size > 0} aria-invalid={commandDraft !== null && invalidCommand} onChange={e => { setCommandDraft(e.target.value); setNotice(''); setError('') }} />
           {commandDraft !== null && invalidCommand ? <span role="alert">使用小写字母、数字或短横线，以字母开头，最多 32 个字符。</span> : null}
         </div>
         <div className="mac-plugin-form-actions"><Button type="primary" htmlType="submit" disabled={disabled || drafts.size > 0 || commandDraft === null || invalidCommand}>保存启动名称</Button><Button disabled={disabled || drafts.size > 0 || (commandDraft ?? command.name) === command.defaultName} onClick={() => setCommandDraft(command.defaultName)}>恢复默认名称</Button><Button disabled={busy || commandDraft === null} onClick={() => setCommandDraft(null)}>取消名称修改</Button></div>
