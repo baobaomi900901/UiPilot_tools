@@ -22,7 +22,7 @@
 **Dependencies:** Task 1；设计「查询与执行所有权」和「验证边界」。
 
 - [x] 窄能力启用现有管理面板、收藏路径和键盘交互。
-- [ ] 自动回归、arm64 App/DMG 校验与测试包交付。
+- [x] 自动回归、arm64 App/DMG 校验与测试包交付。
 - [ ] 用户逐步人工验收。
 
 **Distinct test coverage:** Mac 能力不开放无关内置功能；创建/编辑/删除后查询更新；空命令只补全；收藏、设置及重启保留。
@@ -32,3 +32,5 @@
 ## 自动验证记录
 
 Mac 库全量 626 通过、22 项既有 ignored；启动器 411 通过、18 项既有 skipped；ACL 4 通过。带 preview 与默认配置的 all-targets 检查、TypeScript/Vite 构建通过。新增磁盘提交失败时保留已保存缓存测试。自查命名空间双向互斥、最终执行准入、调用者身份及选择器生命周期；未运行 GUI，安装后交互待用户验收。
+
+后端提交 `0052602`，界面提交 `aa3a72d`。arm64 App 构建及 CLI 生成 DMG 的只读挂载、签名、资源、最低系统验证通过；ZIP 全部条目 CRC 和 manifest 文件哈希通过。交付 `~/Documents/UiPilot-Mac-quicklinks-aa3a72d.zip`，详见设备验收单最新候选。人工验收待开始。
