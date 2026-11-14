@@ -212,13 +212,34 @@ pub(super) fn snapshot(app: &AppHandle, id: &str) -> Response<(Value, Option<Arc
     access_snapshot(app, id, false)
 }
 
+// Focus can reach WebKit before the host finishes committing the handoff.
+// Retry only a still-owned session's lifecycle rejection, outside all host locks.
+fn settled_status_read(
+    mut read: impl FnMut() -> Response<Value>,
+    mut retained: impl FnMut() -> bool,
+    deadline: std::time::Instant,
+) -> Response<Value> {
+    loop {
+        let result = read();
+        if result.as_ref().err() != Some(&stale()) || !retained() { return result; }
+        if std::time::Instant::now() >= deadline { return Err(error("documentsAccessBusy")); }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn get_find_documents_access(window: WebviewWindow, invocation_id: String) -> Response<Value> {
     check_find(&window)?;
     if !window.is_visible().unwrap_or(false) { return Err(stale()); }
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn_blocking(move || access_snapshot(&app, &invocation_id, true).map(|(view, _)| view))
-        .await.map_err(|_| failed())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let service = host(&app);
+        settled_status_read(
+            || access_snapshot(&app, &invocation_id, true).map(|(view, _)| view),
+            || service.controller.retains_document_status_owner(&invocation_id),
+            std::time::Instant::now() + crate::find_window::TRANSFER_TIMEOUT,
+        )
+    }).await.map_err(|_| failed())?
 }
 
 #[tauri::command]
@@ -512,6 +533,23 @@ mod tests {
     use super::*;
     use crate::result_registry::{QueryDomain, ResultAction, ResultRegistries};
     use std::{fs, sync::atomic::{AtomicU64, Ordering}};
+
+    #[test]
+    fn status_read_retries_only_retained_handoff_rejections() {
+        let mut calls = 0;
+        let allowed = json!({"status":"granted","persistence":"remembered","revision":"1"});
+        let value = settled_status_read(|| {
+            calls += 1;
+            if calls < 3 { Err(stale()) } else { Ok(allowed.clone()) }
+        }, || true, std::time::Instant::now() + std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(value, allowed);
+        assert_eq!(calls, 3);
+        assert_eq!(settled_status_read(|| Err(stale()), || true, std::time::Instant::now()), Err(error("documentsAccessBusy")));
+        assert_eq!(settled_status_read(|| Err(stale()), || false, std::time::Instant::now()), Err(stale()));
+        assert_eq!(settled_status_read(|| Err(storage_failed()), || panic!("storage error must not retry"), std::time::Instant::now()), Err(storage_failed()));
+        let revoked = json!({"status":"needsReauthorization","persistence":"remembered","revision":"2"});
+        assert_eq!(settled_status_read(|| Ok(revoked.clone()), || panic!("actual grant loss must be returned"), std::time::Instant::now()), Ok(revoked));
+    }
 
     struct Fixture { base: PathBuf, expected: PathBuf }
     impl Fixture {

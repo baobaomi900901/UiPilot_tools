@@ -584,6 +584,22 @@ impl FindWindowController {
             )
     }
 
+    // Read-only status retries may wait for this existing Mac session to finish
+    // a focus-only handoff. This does not admit searches, mutations or actions.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retains_document_status_owner(&self, invocation_id: &str) -> bool {
+        let core = self.lock();
+        if core.shutdown || core.queued.as_ref().is_some_and(|next| !next.payload.query.trim().is_empty()) {
+            return false;
+        }
+        match &core.state {
+            AdmissionState::VisibleReady { invocation_id: active } => active == invocation_id,
+            AdmissionState::Transferring(transfer) => transfer.transaction.payload.query.trim().is_empty()
+                && matches!(&transfer.origin, TransferOrigin::Visible { invocation_id: active } if active == invocation_id),
+            _ => false,
+        }
+    }
+
     pub(crate) fn with_visible_admission<T, F>(
         &self,
         invocation_id: &str,
@@ -976,14 +992,20 @@ mod tests {
             controller.set_pin(&original, true);
             let ticket = current_find_ticket(&registries, &original);
             let submission = prepared_open(&controller, &registries, 2, query, now);
+            assert_eq!(controller.retains_document_status_owner(&original), preserve);
+            assert!(!controller.retains_document_status_owner("old-invocation"));
             let plan = controller.admit_queued_transfer(snapshot(true, false, ForegroundWindow::Main), now).unwrap();
+            assert_eq!(controller.retains_document_status_owner(&original), preserve);
+            assert!(!controller.admit_search(&original));
             assert_eq!(controller.confirm_transfer_focus(plan.transfer_id, snapshot(false, true, ForegroundWindow::Find)), TransferFocusResult::CommitFindScope);
             let payload = controller.commit_find_scope(plan.transfer_id, &registries).unwrap();
             assert_eq!(payload.preserve_session, preserve);
+            assert_eq!(controller.retains_document_status_owner(&original), preserve);
             assert_eq!(payload.invocation_id == original, preserve);
             assert_eq!(registries.find().is_execution_ticket_current(&ticket), preserve);
             controller.finish_forward_emit(plan.transfer_id, emitted, &registries);
             assert_eq!(registries.find().is_execution_ticket_current(&ticket), preserve && emitted);
+            assert_eq!(controller.retains_document_status_owner(&original), preserve && emitted);
             assert_eq!(submission.completion.recv().unwrap(), if emitted { OpenFindCompletion::Forwarded } else { OpenFindCompletion::Unavailable });
         }
     }

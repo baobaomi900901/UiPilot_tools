@@ -573,6 +573,48 @@ describe('Documents access in the Mac public preview', () => {
     core.destroy()
   })
 
+  it('discards a pre-handoff status failure and preserves the current image after a fresh status read', async () => {
+    const {core, client, docs, loadThumbnail, emitForward} = setup()
+    const allowed = {status:'granted', persistence:'remembered', revision:'1'}
+    docs.get.mockResolvedValue(allowed)
+    vi.mocked(client.searchFiles).mockResolvedValue(fileResponse('private.png'))
+    loadThumbnail.mockResolvedValue('data:image/png;base64,UE5H')
+    await core.start()
+    emitForward({invocationId:'find', forwardSequence:'1', query:'小羊', pinned:true})
+    await vi.waitFor(() => expect(core.getSnapshot().thumbnailDataUrl).toBe('data:image/png;base64,UE5H'))
+    const late = deferred<unknown>()
+    docs.get.mockReturnValueOnce(late.promise as never)
+    const pending = core.updateDocuments('get')
+    emitForward({invocationId:'find', forwardSequence:'2', query:'', pinned:true, preserveSession:true})
+    late.reject({code:'staleRequest'})
+    await pending
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.pending).toBeUndefined())
+    expect(core.getSnapshot()).toMatchObject({query:'小羊', thumbnailDataUrl:'data:image/png;base64,UE5H', documents:{access:allowed}})
+    expect(core.getSnapshot().results).toHaveLength(1)
+    expect(client.searchFiles).toHaveBeenCalledTimes(1)
+    expect(docs.get).toHaveBeenCalledTimes(3)
+    core.destroy()
+  })
+
+  it('retains known results on a bounded handoff wait but clears them on confirmed grant loss', async () => {
+    const {core, client, docs, emitForward} = setup()
+    docs.get.mockResolvedValueOnce({status:'granted', persistence:'remembered', revision:'1'})
+      .mockRejectedValueOnce({code:'documentsAccessBusy'})
+      .mockResolvedValueOnce({status:'needsReauthorization', persistence:'remembered', revision:'2'})
+    vi.mocked(client.searchFiles).mockResolvedValueOnce(fileResponse('private.png')).mockResolvedValueOnce(null)
+    await core.start()
+    emitForward({invocationId:'find', forwardSequence:'1', query:'小羊', pinned:true})
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    await core.updateDocuments('get')
+    expect(core.getSnapshot().results).toHaveLength(1)
+    expect(core.getSnapshot().documents?.access?.status).toBe('granted')
+    emitForward({invocationId:'find', forwardSequence:'2', query:'', pinned:true, preserveSession:true})
+    await vi.waitFor(() => expect(core.getSnapshot().documents?.access?.status).toBe('needsReauthorization'))
+    expect(core.getSnapshot().results).toEqual([])
+    expect(core.getSnapshot().thumbnailDataUrl).toBeUndefined()
+    core.destroy()
+  })
+
   it('restores results once when a previously granted scope is readable after a failed status check', async () => {
     const { core, client, docs, emitForward } = setup()
     const allowed = { status: 'granted', persistence: 'remembered', revision: '1' }

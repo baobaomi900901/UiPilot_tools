@@ -204,3 +204,9 @@ xcrun clang -fobjc-arc -fblocks -framework Foundation "$probe_dir/probe.m" -o "$
 用户明确要求：Mac Find 已打开（通常已固定）并有搜索结果时，从主启动器选择 `/find` 或提交不含参数的 `/find` 只重新聚焦独立窗口，不清空查询、分类、选择和缩略图；携带非空参数则按新查询处理。
 
 仅当焦点交接的原状态为 VisibleReady 且参数 trim 后为空时，宿主保留原 invocation、结果注册表和文件身份表，以新的 forwardSequence 发送 preserveSession。前端只接受同 invocation 的空参数保留事件，保留查询序号和结果请求 ID，用 forwardSequence 重新聚焦搜索框并关闭旧动作面板。初次打开/关闭后的新会话和显式参数仍创建新 scope 并清理旧结果。交接失败仍撤销结果；不得重新激活已关闭或被撤权的旧票据。Windows 的既有转发合同保持不变。
+
+### 再次唤起时的文稿状态刷新顺序
+
+原生 Find 焦点事件可能早于保留会话的交接提交，此时旧的可见准入检查返回 staleRequest，不代表文稿授权丢失。只读授权状态入口在当前 invocation 仍属于可见会话或空参数交接时，在锁外有界等待（最长 TRANSFER_TIMEOUT），重新执行原有授权/身份检查；不放宽搜索、文件操作或授权修改的准入。旧 invocation、非空参数替换、隐藏和真实存储错误不按此重试。
+
+等待超时返回 documentsAccessBusy，前端保留已有结果和已知授权状态并给出可重试提示，每次文件操作仍由宿主重新校验。收到 preserveSession 后废弃交接前尚未返回的只读状态请求，再取新状态；不得废弃 grant/revoke 修改。真实授权 revision/status 变化仍清除旧结果和缩略图。

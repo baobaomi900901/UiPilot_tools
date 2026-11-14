@@ -403,6 +403,11 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     } catch (error) {
       if (!current()) return
       if (operation === 'get') {
+        if ((error as {code?: unknown} | null)?.code === 'documentsAccessBusy') {
+          model.documents = { ...control, pending: undefined, notice: '窗口切换中，请稍后重试。' }
+          publish()
+          return
+        }
         documentsReadFailed = true
         model.documents = {
           storageError: (error as {code?: unknown} | null)?.code === 'documentsAccessStorageFailed',
@@ -474,12 +479,19 @@ export function createFindCore(client: FindClient, maximumQuerySequence = Number
     lastForward = payload.forwardSequence
     model.forwardSequence = payload.forwardSequence
     if (payload.preserveSession) {
+      // A focus event may have started a read before native handoff committed.
+      // Its late failure must not overwrite the post-handoff status snapshot.
+      if (model.documents?.pending === 'get') {
+        documentsOwner++
+        model.documents = { ...model.documents, pending: undefined }
+      }
       if (payload.pinned !== undefined) {
         pinOwner = ++operationToken
         model.pinPending = false
         model.pinned = payload.pinned
       }
       publish()
+      void updateDocuments('get')
       return
     }
     documentsOwner++
