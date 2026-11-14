@@ -882,3 +882,12 @@ Mac 主窗口/快捷键生命周期回归另 24 项通过，含旧完成不能�
 用户在 `8c0ca12` 确认：搜索“小羊”可见 PNG/JPG，选中图片可见正确预览；点击“停止并忘记文稿”后，图片结果和右侧缩略图均清除。该清理项人工通过；关闭/重开后不自动恢复授权尚未继续确认。
 
 用户随后报告固定 Find 的再次激活会清空结果。修复为：已显示 Find 的无参数转发只聚焦并保留查询/选择/预览以及后台结果票据；带参数仍创建新查询，成功交接后主窗口照常隐藏。新增后端票据保留/显式参数失效/发送失败清理、前端结果和缩略图保留/可执行/输入焦点、Mac-only 载荷校验测试。候选包人工验收待进行，GUI 由用户执行。
+
+修复候选 `9450606` 已完成无 GUI App/DMG 构建，arm64、最低系统、签名/资源/Documents entitlement、preflight、ZIP CRC 和 manifest 10 个文件哈希校验通过。Find Rust 83 passed / 4 ignored；前端 Find/协议 104 passed；TypeScript/Vite 构建及 Rust all-targets check 通过。
+
+- 交付 ZIP：`/Users/mobytang/Documents/UiPilot-Mac-find-preserve-9450606.zip`。
+- ZIP SHA-256：`5803ca2b88b2b603216da36909481c46ecd899ad9530010c20e39a0025c6568d`。
+- DMG SHA-256：`f010105f509be7b503729d44bab6e445ced4370d52e933479b78088759872351`。
+- 主程序 SHA-256：`a3f988d5a549312d60ef1e5f805e4399321197d36b74fb518cb900aa5ebea085`。
+
+固定窗口的无参数再次激活、带参数更新查询和保留结果的 Finder 操作等待人工确认。Mac 生产插件仍关闭；分支不合并 main。
