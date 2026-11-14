@@ -1,4 +1,4 @@
-import { previewCapabilities } from './host-capabilities'
+import { previewCapabilities, resultAvailable } from './host-capabilities'
 // @vitest-environment jsdom
 
 import { existsSync, readFileSync } from 'node:fs'
@@ -37,6 +37,7 @@ import {
   type ControlKey,
   type ExecuteOutcome,
   type ResultActionOutcome,
+  type ResultItem,
   type FileResultItem,
   type FileSearchResponse,
   type LauncherClient,
@@ -9469,6 +9470,7 @@ describe('real adapter and startup', () => {
         ...fileItem(), fullPath: '/Users/Shared/example.png', name: 'example.png', canOpenDocument: true,
       }])
       if (command === 'execute_result') return {status: 'fileRevealRequested'}
+      if (command === 'load_find_thumbnail') return 'data:image/png;base64,UE5H'
       if (command === 'get_find_documents_access') return {status: 'notGranted', persistence: 'none', revision: '0'}
       if (command === 'grant_find_documents_access') return {status: 'granted', persistence: 'remembered', revision: '1'}
       if (command === 'revoke_find_documents_access') return {status: 'notGranted', persistence: 'none', revision: '2'}
@@ -9498,7 +9500,7 @@ describe('real adapter and startup', () => {
       const activeRow = document.querySelector<HTMLElement>('[role=option]')!
       await act(async () => { activeRow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
       expect(tauriCapture.invoke).toHaveBeenCalledWith('execute_result', {requestId: 'file-request-1', resultId: 'file-result-1'})
-      expect(tauriCapture.invoke.mock.calls.some(([command]) => command === 'load_find_thumbnail')).toBe(false)
+      expect(tauriCapture.invoke).toHaveBeenCalledWith('load_find_thumbnail', {requestId: 'file-request-1', resultId: 'file-result-1'})
       expect(tauriCapture.capabilities).not.toHaveBeenCalled()
     } finally {
       await pagehide()
@@ -11813,4 +11815,60 @@ it.each(['context', 'keyboard'] as const)('opens the exact Mac command settings 
     await activateSettingsTab(view.host, '插件')
     expect(view.host.querySelector('.mac-plugin-detail')).toBeNull()
   } finally { await view.unmount(); core.destroy() }
+})
+
+it('offers the Mac web command favorite context menu and completes it before executing a parameter search', async () => {
+  installMatchMedia(false)
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+  const { client, emit } = fakeClient()
+  let favorite = false
+  vi.mocked(client.setBuiltinFeatureFavorite).mockImplementation(async input => { favorite = input.favorite })
+  vi.mocked(client.searchApps).mockImplementation(async request => ({ requestId: 'mac-web-command', replaceLocalResults: true, items: request.query.trim() === '/web-search 中文 & test' ? [{
+    resultId: 'web-query', title: 'Bing 搜索', subtitle: '搜索：中文 & test', iconKind: 'webSearch', activation: executeActivation, hasDefaultAction: true,
+  }] : [{ resultId: 'web-entry', title: '/web-search', subtitle: '输入关键词搜索网页', iconKind: 'webSearch',
+    favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite },
+    activation: { kind: 'completion', completionText: '/web-search ' }, hasDefaultAction: false,
+  }] }))
+  const core = createLauncherCore(client, undefined, { ...previewCapabilities, platform: 'macos', plugins: false, builtinFeatures: false, webSearch: true })
+  await core.start()
+  const mounted = await mountLauncherView(core)
+  try {
+    await act(async () => emit(shown('mac-web-command')))
+    await vi.waitFor(() => expect(mounted.host.querySelectorAll('[role="option"]')).toHaveLength(1))
+    await act(async () => mounted.host.querySelector<HTMLElement>('[role="option"]')!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true })))
+    let action: HTMLElement | undefined
+    await vi.waitFor(() => { action = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(item => item.textContent?.trim() === '设为常用'); expect(action).toBeDefined() })
+    await act(async () => action!.click())
+    expect(client.setBuiltinFeatureFavorite).toHaveBeenCalledExactlyOnceWith({ feature: 'webSearch', favorite: true })
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.favorite?.favorite).toBe(true))
+    await act(async () => core.keyDown('Enter', false))
+    expect(core.getSnapshot().query).toBe('/web-search ')
+    expect(client.executeResult).not.toHaveBeenCalled()
+    expect(client.listBuiltinFeatures).not.toHaveBeenCalled()
+    await act(async () => core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '/web-search 中文 & test', inputType: 'insertText' }))
+    await vi.waitFor(() => expect(core.getSnapshot().results[0]?.title).toBe('Bing 搜索'))
+    expect(core.getSnapshot().results[0].favorite).toBeUndefined()
+    await act(async () => core.keyDown('Enter', false))
+    expect(client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'mac-web-command', resultId: 'web-query' })
+  } finally { await mounted.unmount(); core.destroy() }
+})
+
+it('keeps the Mac web command capability limited to its fixed completion and own favorite identity', () => {
+  const entry: ResultItem = { resultId: 'web-entry', title: '/web-search', iconKind: 'webSearch', hasDefaultAction: false,
+    activation: { kind: 'completion', completionText: '/web-search ' },
+    favorite: { target: { kind: 'builtin', feature: 'webSearch' }, favorite: false } }
+  const invalid: ResultItem[] = [
+    { ...entry, activation: { kind: 'completion', completionText: '/quicklinks ' } },
+    { ...entry, activation: { kind: 'completion', completionText: '/web-search injected' } },
+    { ...entry, title: '/quicklinks' },
+    { ...entry, hasDefaultAction: true },
+    { ...entry, favorite: { target: { kind: 'builtin', feature: 'quicklinks' }, favorite: false } },
+    { ...entry, favorite: undefined },
+    { ...entry, pluginIconUrl: 'uipilot-public-plugin://localhost/icon.png' },
+  ]
+  for (const webSearch of [true, false]) {
+    const host = { ...previewCapabilities, platform: 'macos' as const, plugins: false, builtinFeatures: false, webSearch }
+    expect(resultAvailable(host, entry.activation, entry)).toBe(webSearch)
+    for (const row of invalid) expect(resultAvailable(host, row.activation, row)).toBe(false)
+  }
 })

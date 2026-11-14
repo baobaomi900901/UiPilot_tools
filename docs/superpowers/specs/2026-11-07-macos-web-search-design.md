@@ -81,3 +81,18 @@ worker 开始时解析原 registry 的当前 request/result，取服务端 engin
 ## 源文件分工
 
 后端实现者负责共享 `web_search.rs` 的平台边界、新 `macos_browser_open.rs` 及 fake tests、`macos_apps.rs` 的 fallback/执行、registry 的窄 host-action 消费接口与回归。协调者负责 `platform.rs` module 接线、Mac 设置 IPC、ACL/handler、前端能力与设置/错误呈现、规格计划和最终集成验证。Windows `browser_open` 与 Windows 命令流程保持原实现。
+
+
+## 2026-11-15 扩展：可收藏的 `/web-search` 入口
+
+本节扩展前述「仅普通查询 fallback」范围；前文对 completion/收藏的排除只描述初始版本。普通查询仍保留原行为，新增固定命令 `/web-search`，不开放全部 `builtinFeatures`、命令改名、独立热键或公开插件运行。
+
+空查询或匹配的 slash 前缀返回宿主 completion 行，显示「输入关键词搜索网页」。Enter 仅补全 `/web-search `，没有可执行票据，不打开浏览器。该行使用已有 `BuiltinFeature::WebSearch`、`ResultFavorite::builtin`、前端严格解析和 `favoriteMatchesResult` 的同一收藏身份；右键可设为/取消常用，持久化后重启保留。输入完整命令加非空参数后返回查询动作，查询动作本身不收藏。
+
+显式命令的参数直接作为搜索词，不进入快速计算或 Find 分流；中文、特殊字符、`2+2`、`/find` 及 URL 形状文字均编码为固定搜索引擎的单个 q 参数。仍限制 4096 UTF-8 字节、拒绝 NUL，遵守固定 provider 和 16 KiB URL 限制。服务端 action 仅保存引擎与参数，执行仍只收 request/result ID，并沿用一次性最终准入与完成归属。执行校验不再排除参数首字符 `/`，因为普通查询的 slash 排除在发布层保留，而显式命令允许搜索该文字。
+
+Mac 前端仅增加一个窄允许形态：`webSearch=true`、宿主 Web 图标、固定 title/completionText、无默认执行动作，以及 WebSearch builtin 收藏身份；插件动作和插件图标仍拒绝。既有 query action 保持无收藏的 executeResult 形态。
+
+收藏 IPC 移入 Mac main 常规 ACL 和 handler，仍先执行 `require_main`，只允许 WebSearch，以及启用 Find preview 时的 Find。拒绝其它 builtin 枚举、未知字段和非布尔收藏值；Find/插件窗口和远程页面没有新增权限。默认构建与 Find preview 构建都需验证。
+
+自动验收覆盖完整右键收藏→刷新星标→Enter 补全→输入参数→执行 ID 的前端链路，以及后端收藏重新加载、参数编码、无效参数、功能停用、一次性消费和严格能力/ACL。真实浏览器提交、键盘和重启收藏交由用户逐步验证；自动检查不启动浏览器或操作 GUI。

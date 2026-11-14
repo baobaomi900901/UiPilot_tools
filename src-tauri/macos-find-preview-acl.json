@@ -3,7 +3,7 @@
     "identifier": "macos-find-preview-main",
     "platforms": ["macOS"],
     "webviews": ["main"],
-    "permissions": ["allow-open-find-window", "allow-set-builtin-feature-favorite"]
+    "permissions": ["allow-open-find-window"]
   },
   {
     "identifier": "macos-find-preview-window",

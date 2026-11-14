@@ -36,6 +36,7 @@
     "allow-save-macos-plugin-settings",
     "allow-save-macos-plugin-command",
     "allow-set-plugin-favorite",
-    "allow-remove-macos-plugin"
+    "allow-remove-macos-plugin",
+    "allow-set-builtin-feature-favorite"
   ]
 }

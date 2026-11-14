@@ -39,6 +39,9 @@ export function settingsTabAvailable(host: HostCapabilities, tab: string): boole
 export function resultAvailable(host: HostCapabilities, activation: LauncherResultActivation, item: ResultItem): boolean {
   if (activation.kind === 'unavailablePlugin') return host.platform === 'macos' && host.pluginManagement === true && !host.plugins && !item.actions && !item.pluginIconUrl && !item.iconKind && item.hasDefaultAction === false
   if (!host.plugins && (item.actions || item.pluginIconUrl || item.favorite?.target?.kind === 'publicPlugin')) return false
+  if (host.platform === 'macos' && host.webSearch && item.iconKind === 'webSearch' &&
+      activation.kind === 'completion' && activation.completionText === '/web-search ' && item.title === '/web-search' &&
+      item.hasDefaultAction === false && item.favorite?.target.kind === 'builtin' && item.favorite.target.feature === 'webSearch') return true
   if (host.webSearch && !item.favorite && item.iconKind === 'webSearch' && activation.kind === 'executeResult') return true
   // Mac supports query values before the full reusable built-in command system.
   // Currency is an unavailable informational row until its service is enabled.

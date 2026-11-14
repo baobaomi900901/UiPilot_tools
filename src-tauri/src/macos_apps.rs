@@ -161,8 +161,7 @@ pub(crate) async fn search_apps(
             .await.map_err(|_| Error::unavailable())?
             .map_err(|_| Error { code: "searchUnavailable", message: "无法读取插件命令，请在设置中刷新插件列表" })?
     } else { Vec::new() };
-    #[cfg(feature = "macos-find-preview")]
-    if crate::host_capabilities::mac_find_enabled() && (query.trim().is_empty() || query.trim().starts_with('/')) {
+    if query.trim().starts_with('/') || (crate::host_capabilities::mac_find_enabled() && query.trim().is_empty()) {
         return Ok(publish_with_plugins(&service, app.state::<SettingsStore>().inner(), token, &query, plugins));
     }
     let retrying = *service.ready.borrow() == Some(false);
@@ -188,6 +187,11 @@ fn web_entry(settings: &SettingsStore, query: &str) -> Option<(crate::model::Res
     let query = query.trim();
     if query.is_empty() || query.starts_with('/') || query.len() > MAX_WEB_QUERY_BYTES || query.contains('\0')
         || !matches!(crate::quick_evaluation::classify(query), crate::quick_evaluation::QuickClassification::NoMatch) { return None; }
+    web_query_entry(settings, query)
+}
+
+fn web_query_entry(settings: &SettingsStore, query: &str) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
+    if query.is_empty() || query.len() > MAX_WEB_QUERY_BYTES || query.contains('\0') { return None; }
     let settings = settings.snapshot();
     if !settings.builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::WebSearch) { return None; }
     let engine = settings.web_search_engine;
@@ -201,6 +205,24 @@ fn web_entry(settings: &SettingsStore, query: &str) -> Option<(crate::model::Res
     }, Some(ResultAction::OpenWebSearch { engine, query: query.into() })))
 }
 
+fn web_command_entry(settings: &SettingsStore, query: &str) -> Option<(crate::model::ResultItem, Option<ResultAction>)> {
+    use crate::{model::{LauncherResultActivation, ResultFavorite, ResultIconKind, ResultItem}, settings::{BuiltinFeature, ManagedBuiltinFeature}};
+    const COMMAND: &str = "/web-search";
+    let snapshot = settings.snapshot();
+    if !snapshot.builtin_feature_enabled(ManagedBuiltinFeature::WebSearch) { return None; }
+    if query.is_empty() || (query.starts_with('/') && COMMAND.starts_with(query)) {
+        return Some((ResultItem {
+            result_id: String::new(), title: COMMAND.into(), subtitle: Some("输入关键词搜索网页".into()),
+            activation: LauncherResultActivation::Completion { completion_text: format!("{COMMAND} ") },
+            result_actions: None, icon: None, plugin_icon_url: None, icon_kind: Some(ResultIconKind::WebSearch), detail: None,
+            favorite: Some(ResultFavorite::builtin(BuiltinFeature::WebSearch, snapshot.favorite_builtin_features.contains(&BuiltinFeature::WebSearch))),
+            has_default_action: false,
+        }, None));
+    }
+    let argument = query.strip_prefix(COMMAND).filter(|tail| tail.starts_with(char::is_whitespace))?.trim();
+    web_query_entry(settings, argument)
+}
+
 #[cfg(test)]
 fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str) -> Option<SearchResponse> {
     publish_with_plugins(service, settings, token, query, Vec::new())
@@ -208,7 +230,7 @@ fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToke
 fn publish_with_plugins(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str, plugins: Vec<crate::model::ResultItem>) -> Option<SearchResponse> {
     let query = query.trim();
     let preview = crate::host_capabilities::mac_find_enabled();
-    let command = preview && (query.starts_with('/') || query.is_empty());
+    let command = query.starts_with('/') || (preview && query.is_empty());
     let mut entries = Vec::new();
     if !command {
         let mut applications = service.cache.snapshot();
@@ -228,6 +250,7 @@ fn publish_with_plugins(service: &MacApplications, settings: &SettingsStore, tok
             entries.push((crate::model::find_item(argument.into(), subtitle, favorite), None));
         }
     }
+    if let Some(entry) = web_command_entry(settings, query) { entries.push(entry); }
     entries.extend(plugins.into_iter().map(|item| (item, None)));
     if let Some(entry) = web_entry(settings, query) { entries.push(entry); }
     service.registry.publish_if_latest(token, entries, || true, |id, items| {
@@ -312,7 +335,7 @@ fn execute_web_registered(
     let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
     let ResultAction::OpenWebSearch { engine, query } = action else { return Err(Error::unavailable()); };
     if !settings.snapshot().builtin_feature_enabled(ManagedBuiltinFeature::WebSearch)
-        || query.is_empty() || query.starts_with('/') || query.len() > MAX_WEB_QUERY_BYTES || query.contains('\0') {
+        || query.is_empty() || query.len() > MAX_WEB_QUERY_BYTES || query.contains('\0') {
         return Err(Error { code: "webSearchFailed", message: "无法打开搜索页面" });
     }
     let url = crate::web_search::search_url(engine, &query).ok_or(Error { code: "webSearchFailed", message: "无法打开搜索页面" })?;
@@ -654,6 +677,57 @@ mod platform_app_commands {
         assert_eq!(row.title, "Bing 搜索"); assert!(row.favorite.is_none());
         assert!(matches!(service.registry.resolve(&response.request_id, &row.result_id),
             Ok(ResultAction::OpenWebSearch { engine: crate::settings::WebSearchEngine::Bing, query }) if query == "我是 Jack & Jill"));
+    }
+    #[test]
+    fn reusable_web_command_has_persisted_favorite_and_no_executable_ticket() {
+        let (f, service, settings) = fixture();
+        settings.set_builtin_feature_favorite(crate::settings::BuiltinFeature::WebSearch, true).unwrap();
+        let settings = SettingsStore::load(&f.0.join("settings")).unwrap();
+        for (index, query) in ["", "/", "/web", "/web-search", "/web-search "].into_iter().enumerate() {
+            let token = service.registry.begin_query(QueryDomain::Application, "1", index as u64 + 1).unwrap();
+            let response = publish(&service, &settings, token, query).unwrap();
+            let entry = response.items.iter().find(|item| item.title == "/web-search").expect("reusable web command");
+            assert_eq!(entry.favorite, Some(crate::model::ResultFavorite::builtin(crate::settings::BuiltinFeature::WebSearch, true)));
+            assert!(matches!(&entry.activation, crate::model::LauncherResultActivation::Completion { completion_text } if completion_text == "/web-search "));
+            assert!(!entry.has_default_action);
+            assert_eq!(service.registry.resolve(&response.request_id, &entry.result_id), Err(RegistryError::UnknownResult));
+        }
+    }
+    #[test]
+    fn explicit_web_command_routes_only_its_argument_and_still_consumes_one_host_ticket() {
+        let (_f, service, settings) = fixture();
+        settings.set_web_search_engine(crate::settings::WebSearchEngine::Google).unwrap();
+        for (index, argument) in ["中文 & 空格 # ?", "2+2", "/find", "https://other.test/?a=1&b=2"].into_iter().enumerate() {
+            service.registry.on_show("1".into());
+            let token = service.registry.begin_query(QueryDomain::Application, "1", index as u64 + 1).unwrap();
+            let response = publish(&service, &settings, token, &format!("/web-search {argument}")).unwrap();
+            assert!(response.replace_local_results);
+            assert_eq!(response.items.len(), 1);
+            let row = &response.items[0];
+            assert_eq!(row.title, "Google 搜索"); assert!(row.favorite.is_none());
+            let owner = execute_web_registered(&service, &settings, &response.request_id, &row.result_id, |raw, admit| {
+                let url = url::Url::parse(raw).unwrap();
+                assert_eq!(url.host_str(), Some("www.google.com"));
+                assert_eq!(url.query_pairs().collect::<Vec<_>>(), vec![("q".into(), argument.into())]);
+                assert!(admit()); Ok(())
+            }).unwrap();
+            assert!(execute_web_registered(&service, &settings, &response.request_id, &row.result_id, |_, _| panic!("duplicate browser dispatch")).is_err());
+            assert!(service.registry.finish_main_action(&owner));
+        }
+    }
+    #[test]
+    fn explicit_web_command_rejects_other_names_invalid_arguments_and_disabled_feature() {
+        let (_f, service, settings) = fixture();
+        let overlong = format!("/web-search {}", "a".repeat(MAX_WEB_QUERY_BYTES + 1));
+        for (index, query) in ["/web-searcher hello", "/web hello", "/unknown", "/web-search a\0b", &overlong].into_iter().enumerate() {
+            let token = service.registry.begin_query(QueryDomain::Application, "1", index as u64 + 1).unwrap();
+            assert!(publish(&service, &settings, token, query).unwrap().items.is_empty(), "{query:?}");
+        }
+        settings.set_builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::WebSearch, false).unwrap();
+        for (index, query) in ["/web", "/web-search query"].into_iter().enumerate() {
+            let token = service.registry.begin_query(QueryDomain::Application, "1", index as u64 + 20).unwrap();
+            assert!(publish(&service, &settings, token, query).unwrap().items.is_empty());
+        }
     }
     fn web_row(service: &MacApplications, settings: &SettingsStore) -> SearchResponse {
         let token = service.registry.begin_query(QueryDomain::Application, "1", 1).unwrap();

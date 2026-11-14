@@ -345,18 +345,21 @@ async fn hide_launcher(window: WebviewWindow, invocation_id: String) -> Result<(
     receive.await.map_err(|_| "windowFailed")?.map_err(|_| "windowFailed")
 }
 
-#[cfg(feature = "macos-find-preview")]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FavoriteInput { feature: crate::settings::BuiltinFeature, favorite: bool }
 
-#[cfg(feature = "macos-find-preview")]
 #[tauri::command]
 fn set_builtin_feature_favorite(window: WebviewWindow, input: FavoriteInput) -> Result<(), &'static str> {
     require_main(&window)?;
-    if !crate::host_capabilities::mac_find_enabled() || input.feature != crate::settings::BuiltinFeature::Find { return Err("invalidCaller"); }
+    if !favorite_feature_available(input.feature) { return Err("invalidCaller"); }
     window.state::<SettingsStore>().set_builtin_feature_favorite(input.feature, input.favorite)
         .map_err(|_| "settingsFailed")
+}
+
+fn favorite_feature_available(feature: crate::settings::BuiltinFeature) -> bool {
+    use crate::settings::BuiltinFeature;
+    feature == BuiltinFeature::WebSearch || (feature == BuiltinFeature::Find && crate::host_capabilities::mac_find_enabled())
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -421,7 +424,7 @@ pub fn run() {
             hide_launcher, set_settings_pinned, set_web_search_engine, hotkey::save_hotkey, hotkey::set_hotkey_recording, hotkey::get_launcher_hotkey_status,
             get_macos_login_item, set_macos_login_item, open_macos_login_item_settings,
             crate::macos_apps::search_apps, crate::macos_apps::execute_result,
-            #[cfg(feature = "macos-find-preview")] set_builtin_feature_favorite,
+            set_builtin_feature_favorite,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_window,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::prepare_find_initialization,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::commit_find_ready,
@@ -490,6 +493,17 @@ pub fn run() {
 #[cfg(test)]
 mod platform_bootstrap {
     use super::*;
+    #[test]
+    fn favorite_writes_only_allow_shipped_mac_features() {
+        use crate::settings::BuiltinFeature;
+        assert!(favorite_feature_available(BuiltinFeature::WebSearch));
+        assert_eq!(favorite_feature_available(BuiltinFeature::Find), crate::host_capabilities::mac_find_enabled());
+        assert!(!favorite_feature_available(BuiltinFeature::Quicklinks));
+        assert!(!favorite_feature_available(BuiltinFeature::Screenshot));
+        for invalid in [r#"{"feature":"webSearch","favorite":"true"}"#, r#"{"feature":"webSearch","favorite":true,"url":"https://example.test"}"#] {
+            assert!(serde_json::from_str::<FavoriteInput>(invalid).is_err());
+        }
+    }
     #[test]
     fn login_item_gate_and_update_are_explicit() {
         assert_eq!(login_item_available(false), Err("loginItemUnavailable"));

@@ -16,7 +16,7 @@ test('Mac production enables only a local main capability and its core commands'
     'allow-get-macos-login-item', 'allow-set-macos-login-item', 'allow-open-macos-login-item-settings',
     'allow-list-macos-plugins', 'allow-prepare-macos-plugin-install', 'allow-commit-macos-plugin-install',
     'allow-cancel-macos-plugin-install', 'allow-set-macos-plugin-enabled', 'allow-set-macos-plugin-permission',
-    'allow-save-macos-plugin-command', 'allow-set-plugin-favorite',
+    'allow-save-macos-plugin-command', 'allow-set-plugin-favorite', 'allow-set-builtin-feature-favorite',
     'allow-save-macos-plugin-settings', 'allow-remove-macos-plugin',
     'allow-get-launcher-hotkey-status', 'core:window:allow-start-dragging',
     'core:app:allow-version', 'core:event:allow-listen', 'core:event:allow-unlisten',
@@ -36,7 +36,7 @@ test('preview grants main and Find separate local IPC routes', () => {
     assert.equal(acl.windows, undefined);
   }
   assert.deepEqual(main.webviews, ['main']);
-  assert.deepEqual(main.permissions.toSorted(), ['allow-open-find-window', 'allow-set-builtin-feature-favorite']);
+  assert.deepEqual(main.permissions.toSorted(), ['allow-open-find-window']);
   assert.deepEqual(find.webviews, ['find']);
   assert.deepEqual(find.permissions.toSorted(), [
     'allow-cancel-find-query', 'allow-commit-find-ready', 'allow-execute-result', 'allow-get-find-ready-status',
