@@ -836,3 +836,12 @@ Command 快捷键候选 `c42c381` 已完成无 GUI App/DMG 构建，实际 DMG �
 Find 回归 82 项通过、4 项原有隔离实机项忽略；包括成功、投递失败、原生关闭后的过期完成、排队转发后才隐藏的顺序验证。日志 `/private/tmp/uipilot-find-transfer-tests.log`。
 
 Mac 主窗口/快捷键生命周期回归另 24 项通过，含旧完成不能隐藏新或待显示 invocation。日志 `/private/tmp/uipilot-find-transfer-main-tests.log`。
+
+
+窗口交接候选 `8c0ca12` 已完成无 GUI App/DMG 构建；实际 DMG 的 arm64、最低 macOS 15.7.4、签名、资源和 Documents entitlement 校验通过；preflight、ZIP CRC、manifest 13 个文件哈希通过。包内同时保留 `1ee112e` 的 PNG/JPEG 缩略图实现，旧版相关自动验证日志随包保留；本次窗口交接验证日志单独列出。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-find-transfer-8c0ca12.zip`，SHA-256 `c0347b9dfadc45b912238687951070f63fd0c32d0cffd7872af9bd5301211d65`。
+- DMG SHA-256：`fa63f80a0e6dc63e52017c63df8bd79fcee7f1dfd4005c5829a161af2bb51fe6`。
+- 主程序 SHA-256：`9571d23ddd4aab2e51ab2425b3be54f12b2b4977fa3e351711a3d076268e8888`。
+
+窗口交接和图片预览均等待用户手动验收，不计为实机通过。分支留在 `codex/macos-port-plan`，不合并 main。
