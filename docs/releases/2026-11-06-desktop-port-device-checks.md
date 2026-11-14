@@ -692,3 +692,12 @@ ZIP CRC 与 manifest 中 8 个文件哈希逐项通过。只需用户在新包�
 已调整启动名称保存的冲突处理：仅明确收到 `pluginManagementConflict` 时丢弃名称草稿，恢复当前已保存名称，显示“启动名称与内置命令或已安装插件冲突，已恢复原名称。”，解除待核对锁定，可以直接输入其他名称，不自动重试。再次编辑会清除旧冲突提示。其他保存错误仍沿用原有核对流程，不擅自丢弃输入。原名称、收藏、其他命令及权限配置不变。
 
 相关管理组件与客户端测试 **19 项通过**，覆盖字符串及对象形式的冲突、自动回退、可以再次编辑、无自动重试和独立收藏。新包原生行为待用户验收。
+
+
+名称冲突修复候选 `aef913a` 完成 TypeScript/Vite 与 release App 构建；通过签名、架构、最低系统和 Documents entitlement 校验，只读 preflight 通过。App 使用无界面构建，DMG 由 hdiutil 生成；没有安装或启动 GUI。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-command-conflict-aef913a.zip`，SHA-256 `7300a99789ed51f44aef9b91f7221160963aff53928d982e2552deb7b4d1ebb7`。
+- DMG SHA-256：`3dde2020acc713c03c350f9233006131cbfcbe25e772929b3d7cd78ffcdf685a`。
+- 主程序 SHA-256：`56078f631677ea23201b5ca5bd3a646d0e2a23ce73192fa2d748498904e66573`。
+
+ZIP CRC 与 manifest 中 7 个文件哈希验证通过。新包只需人工确认冲突自动回退，已有插件及此前验收结果保留。
