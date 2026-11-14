@@ -568,3 +568,53 @@ fn closed_runtime_catalog_reflects_installed_command_favorites_renames_and_disab
     state.with(&temp.0, |m| { let revision = m.list()?.revision; m.remove(ID, &revision)?; Ok(()) }).unwrap();
     assert!(state.unavailable_launcher_entries(&temp.0, "").unwrap().is_empty());
 }
+
+#[test]
+fn package_toggle_survives_reload_and_preserves_each_command_settings_and_denied_permission() {
+    let temp = Temp::new();
+    temp.add_permission();
+    let manifest_path = temp.0.join("package/plugin.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let command = manifest.as_object_mut().unwrap().remove("command").unwrap();
+    let mut upper = command.clone();
+    upper["id"] = json!("upper"); upper["defaultName"] = json!("demo-upper");
+    let mut lower = command;
+    lower["id"] = json!("lower"); lower["defaultName"] = json!("demo-lower");
+    manifest["commands"] = json!([upper, lower]);
+    manifest["minimumHostVersion"] = json!("0.5.0");
+    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let mut manager = Management::load(&temp.0).unwrap();
+    let installed = temp.install(&mut manager);
+    let named = manager.command_preference(ID, "upper", CommandPreference {
+        name_override: Some("mac-upper".into()), favorite: true,
+    }, &installed.revision).unwrap();
+    let saved = manager.settings(ID, &BTreeMap::from([("greeting".into(), json!("Mac test"))]), &named.revision).unwrap();
+    let denied = manager.permission(ID, PublicPermission::ClipboardWrite, false, &saved.revision).unwrap();
+    let expected = serde_json::to_value(&denied.plugins[0]).unwrap();
+    let disabled = manager.enabled(ID, false, &denied.revision).unwrap();
+    drop(manager);
+
+    let state = ManagementState::default();
+    assert!(state.unavailable_launcher_entries(&temp.0, "/").unwrap().is_empty());
+    drop(state);
+    let mut manager = Management::load(&temp.0).unwrap();
+    let loaded = manager.list().unwrap();
+    assert_eq!(loaded.revision, disabled.revision);
+    let mut actual = serde_json::to_value(&loaded.plugins[0]).unwrap();
+    assert_eq!(actual["enabled"], json!(false));
+    actual["enabled"] = json!(true);
+    assert_eq!(actual, expected, "disabling must retain every other setting");
+    manager.enabled(ID, true, &loaded.revision).unwrap();
+    drop(manager);
+
+    // A new manager represents a fresh application session, not a cached list.
+    let mut manager = Management::load(&temp.0).unwrap();
+    assert_eq!(serde_json::to_value(&manager.list().unwrap().plugins[0]).unwrap(), expected);
+    drop(manager);
+    let rows = ManagementState::default().unavailable_launcher_entries(&temp.0, "/").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.title == "/mac-upper" && row.favorite.as_ref().unwrap().favorite));
+    assert!(rows.iter().any(|row| row.title == "/demo-lower" && !row.favorite.as_ref().unwrap().favorite));
+    assert!(rows.iter().all(|row| !row.has_default_action));
+}

@@ -155,7 +155,7 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     (commandDraft !== null && invalidCommand ? '启动名称无效：使用小写字母、数字或短横线，以字母开头，最多 32 个字符。' : '') ||
     (invalid ? '请检查设置值的类型、范围或选项。' : '') || notice
   const feedbackTone: MacPluginManagementStatus['tone'] = error || !client || (!busy && ((commandDraft !== null && invalidCommand) || invalid))
-    ? 'error' : !busy && (notice.includes('已保存') || notice === '已刷新') ? 'success' : 'default'
+    ? 'error' : !busy && (notice.includes('已保存') || notice.startsWith('插件已停用') || notice === '已刷新') ? 'success' : 'default'
   useEffect(() => {
     onStatusChange?.({ message: feedbackMessage, tone: feedbackTone })
     return () => onStatusChange?.({ message: '', tone: 'default' })
@@ -181,6 +181,11 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     input?.setSelectionRange(input.value.length, input.value.length)
   }, [filterFocusRequest, selected])
   const disabled = busy || needsReview || !snapshot || !client
+  const setPluginEnabled = (pluginId: string, enabled: boolean) => {
+    if (!snapshot || !client || disabled || dirty) return
+    void mutate(() => client.enabled({ pluginId, enabled, expectedRevision: snapshot.revision }),
+      enabled ? '启用配置已保存；当前 Mac 插件暂不能运行。' : '插件已停用，命令和设置已保留。')
+  }
   const list = snapshot?.plugins.filter(p => `${p.name} ${p.commands.map(c => c.name).join(' ')}`.toLocaleLowerCase().includes(filter.toLocaleLowerCase())) ?? []
   const installed = prepared ? snapshot?.plugins.find(p => p.pluginId === prepared.plugin.pluginId) : undefined
   const listKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -203,9 +208,12 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     {!selected ? <>
       <Input aria-label="搜索插件名称或启动命令" placeholder="搜索插件名称或启动命令" value={filter} onChange={e => setFilter(e.target.value)} allowClear />
       <div className="mac-plugin-list" onKeyDown={listKeyDown}>
-        {list.map(p => <button className="mac-plugin-row" key={p.pluginId} data-plugin-id={p.pluginId} disabled={busy} onClick={() => { setSelected(p.pluginId); setSelectedCommand(null); clearDrafts(); setNotice('') }}>
+        {list.map(p => <div className="mac-plugin-list-item" key={p.pluginId}>
+          <button className="mac-plugin-row" data-plugin-id={p.pluginId} disabled={busy} onClick={() => { setSelected(p.pluginId); setSelectedCommand(null); clearDrafts(); setNotice('') }}>
           <span><strong>{p.name}</strong><small>{p.commands.map(c => `/${c.name}`).join(' · ')}</small></span><span>{p.version}<small>{p.enabled ? '启用配置已保存' : '已停用'}</small></span>
-        </button>)}
+          </button>
+          <Switch aria-label={`启用插件：${p.name}`} checked={p.enabled} disabled={disabled} onChange={enabled => setPluginEnabled(p.pluginId, enabled)} />
+        </div>)}
         {!list.length && snapshot ? <p className="mac-plugin-empty">{snapshot.plugins.length ? '没有匹配的插件。' : '尚未安装插件，请导入插件包或开发目录。'}</p> : null}
       </div>
     </> : plugin && snapshot && client ? <div className="mac-plugin-detail">
@@ -220,7 +228,7 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
         </div>
         <div className="mac-plugin-form-actions"><Button type="primary" htmlType="submit" disabled={disabled || drafts.size > 0 || commandDraft === null || invalidCommand}>保存启动名称</Button><Button disabled={disabled || drafts.size > 0 || (commandDraft ?? command.name) === command.defaultName} onClick={() => setCommandDraft(command.defaultName)}>恢复默认名称</Button><Button disabled={busy || commandDraft === null} onClick={() => setCommandDraft(null)}>取消名称修改</Button></div>
       </form> : null}
-      <label className="mac-plugin-switch"><span>保存启用配置</span><Switch aria-label="保存启用配置" checked={plugin.enabled} disabled={disabled || dirty} onChange={enabled => void mutate(() => client.enabled({ pluginId: plugin.pluginId, enabled, expectedRevision: snapshot.revision }), '启用配置已保存；当前暂不能运行。')} /></label>
+      <label className="mac-plugin-switch"><span>保存启用配置</span><Switch aria-label="保存启用配置" checked={plugin.enabled} disabled={disabled || dirty} onChange={enabled => setPluginEnabled(plugin.pluginId, enabled)} /></label>
       {plugin.permissions.length ? <section aria-label="插件权限"><h3>权限配置</h3>{plugin.permissions.map(p => <label key={p.permission} className="mac-plugin-switch"><span>允许写入剪贴板（运行可用后生效）</span><Switch aria-label="允许写入剪贴板" checked={p.granted} disabled={disabled || dirty} onChange={granted => void mutate(() => client.permission({ pluginId: plugin.pluginId, permission: p.permission, granted, expectedRevision: snapshot.revision }), '权限配置已保存。')} /></label>)}</section> : null}
       {plugin.settings.length ? <form className="mac-plugin-settings" aria-label="普通设置" noValidate onSubmit={e => { e.preventDefault(); if (!invalid && drafts.size && !disabled && commandDraft === null) void mutate(() => client.settings({ pluginId: plugin.pluginId, expectedRevision: snapshot.revision, updates }), '设置已保存。') }}>
         <h3>普通设置</h3>

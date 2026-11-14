@@ -18,3 +18,20 @@
 **Verify:** `npm test`、`npm run build`、`node --test scripts/macos-host-acl.test.mjs`；`cargo test --offline --locked --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview`；同特性的 `cargo check --all-targets`。
 
 原生选包/授权与完整应用手工验收另列未测，不以浏览器渲染替代。
+
+### Task 2: 列表直接启停与配置恢复验收
+
+**Files:** `src/macos-plugin-management.{tsx,css}`、组件测试、`src-tauri/src/public_plugins/management_macos_tests.rs`、设备验收记录。
+
+**Dependencies:** Task 1；设计的“列表直接启停整个插件”和“界面、键盘与异步状态”。
+
+- [x] 列表开关与详情共用启停入口，独立可访问控件，反馈统一底栏。
+- [x] 连点仅提交一次；迟到/失败不乐观改变已确认开关，明确刷新后才能继续。
+- [x] 真实磁盘重开验证多命令配置、普通设置和撤回权限在停用/启用后保留。
+- [ ] 新候选在 M1 上验收列表启停、主目录同步、重启保留和权限配置独立性。
+
+**Distinct test coverage:** 开关操作不误进详情、不改权限；异步停用确认前保持原状态，重复点击不重复提交；stale 拒绝后刷新读回新清单，不自动重放旧操作；多命令包停用并重开后目录为空，重新启用及重开后恢复逐命令名称/收藏，拒绝的剪贴板权限仍保持拒绝。
+
+**Verify:** `npm test -- src/macos-plugin-management.test.tsx src/macos-plugin-management-client.test.ts`；Rust `public_plugins::management_macos::tests` 过滤器；`npm run build`。发布 App/DMG 与手工验收分开记录。按用户要求不使用 GUI 自动化，新布局的实机和主题外观留给人工节点。
+
+2026-11-14 自动证据：组件/客户端 26 通过；真实管理器 15 通过；Launcher 的 Mac 聚焦集成 2 通过（423 个无关用例未运行）；main ACL 4 通过；TypeScript/Vite 构建通过。新增组件回归先确认缺失开关导致失败，再实现通过。Rust 回归只用私有临时目录，不改动个人插件数据。新包的 GUI/浅深主题仍待用户实测。

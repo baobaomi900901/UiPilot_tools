@@ -231,3 +231,63 @@ it('does not steal focus from an installation confirmation with the filter short
   expect(client.cancel).not.toHaveBeenCalled()
   expect(client.commit).not.toHaveBeenCalled()
 })
+
+it('toggles a whole package from the list without opening details or rewriting command and permission configuration', async () => {
+  const client = fixture()
+  const configured: MacPluginRow = { ...row, enabled: true, commands: [
+    { id: 'upper', name: 'mac-upper', defaultName: 'demo-upper', nameOverride: 'mac-upper', favorite: true },
+    { id: 'lower', name: 'demo-lower', defaultName: 'demo-lower', nameOverride: null, favorite: false },
+  ], values: { greeting: 'Mac test', count: 3 } }
+  let current: MacPluginSnapshot = { revision: '12', plugins: [configured] }
+  let resolve!: (value: MacPluginSnapshot) => void
+  client.list.mockImplementation(async () => current)
+  client.enabled.mockImplementationOnce(() => new Promise(r => { resolve = r }))
+  const { onStatusChange } = await render(client)
+  const toggle = button('启用插件：设置示例')
+  expect(toggle).toBeDefined()
+  expect(toggle.closest('button[data-plugin-id]')).toBeNull()
+  toggle.focus()
+  await act(async () => { toggle.click(); toggle.click() })
+  expect(client.enabled).toHaveBeenCalledExactlyOnceWith({ pluginId: row.pluginId, enabled: false, expectedRevision: '12' })
+  expect(toggle.getAttribute('aria-checked')).toBe('true')
+  expect(toggle.disabled).toBe(true)
+  current = { revision: '13', plugins: [{ ...configured, enabled: false }] }
+  await act(async () => resolve(current))
+  expect(toggle.getAttribute('aria-checked')).toBe('false')
+  expect(host.querySelector('.mac-plugin-detail')).toBeNull()
+  expect(host.textContent).toContain('/mac-upper · /demo-lower')
+  expect(onStatusChange).toHaveBeenLastCalledWith({ message: '插件已停用，命令和设置已保留。', tone: 'success' })
+  expect(client.command).not.toHaveBeenCalled()
+  expect(client.permission).not.toHaveBeenCalled()
+  expect(client.settings).not.toHaveBeenCalled()
+  client.enabled.mockImplementationOnce(async () => ({ revision: '14', plugins: [configured] }))
+  await click('启用插件：设置示例')
+  expect(client.enabled).toHaveBeenLastCalledWith({ pluginId: row.pluginId, enabled: true, expectedRevision: '13' })
+  expect(onStatusChange).toHaveBeenLastCalledWith({ message: '启用配置已保存；当前 Mac 插件暂不能运行。', tone: 'success' })
+  await select()
+  expect(button('保存启用配置').getAttribute('aria-checked')).toBe('true')
+  expect(button('允许写入剪贴板').getAttribute('aria-checked')).toBe('false')
+  expect(button('取消常用').getAttribute('aria-pressed')).toBe('true')
+  expect(host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!.value).toBe('mac-upper')
+  expect(host.querySelector<HTMLTextAreaElement>('[aria-label="问候"]')!.value).toBe('Mac test')
+})
+
+it('does not optimistically disable a package or repeat a stale list toggle before refresh', async () => {
+  const client = fixture()
+  client.list.mockResolvedValue({ ...snapshot, plugins: [{ ...row, enabled: true }] })
+  client.enabled.mockRejectedValueOnce('pluginManagementStale')
+  const { onStatusChange } = await render(client)
+  expect(button('启用插件：设置示例')).toBeDefined()
+  await click('启用插件：设置示例')
+  const toggle = button('启用插件：设置示例')
+  expect(toggle.getAttribute('aria-checked')).toBe('true')
+  expect(toggle.disabled).toBe(true)
+  expect(onStatusChange).toHaveBeenLastCalledWith({ message: '插件配置已变化，请刷新后核对并重试。', tone: 'error' })
+  await act(async () => toggle.click())
+  expect(client.enabled).toHaveBeenCalledOnce()
+  client.list.mockResolvedValueOnce({ revision: '14', plugins: [{ ...row, enabled: false }] })
+  await click('刷新插件列表')
+  expect(toggle.getAttribute('aria-checked')).toBe('false')
+  expect(toggle.disabled).toBe(false)
+  expect(client.enabled).toHaveBeenCalledOnce()
+})
