@@ -192,3 +192,42 @@ it.each(['pluginManagementConflict', { code: 'pluginManagementConflict' }])('dis
   expect(host.querySelector('.mac-plugin-row')).not.toBeNull()
   expect(client.command).toHaveBeenCalledOnce()
 })
+
+
+it.each(['missing-plugin', 'missing-command'] as const)('rejects a stale initial command destination: %s', async (kind) => {
+  const client = fixture(); const handled = vi.fn(); const status = vi.fn()
+  await act(async () => root.render(<MacPluginManagement client={client} initialTarget={{ pluginId: kind === 'missing-plugin' ? 'com.test.missing' : row.pluginId, commandId: 'gone' }} onTargetHandled={handled} onStatusChange={status} />))
+  expect(host.querySelector('.mac-plugin-detail')).toBeNull()
+  expect(status).toHaveBeenLastCalledWith({ message: '该插件命令已不在安装清单中，请从列表重新选择。', tone: 'error' })
+  expect(handled).toHaveBeenCalledOnce()
+  expect(client.command).not.toHaveBeenCalled()
+})
+it('guards the filter shortcut while editing and restores focus only after discard', async () => {
+  const { ref } = await render(); await select(); await input('问候', '草稿')
+  await act(async () => ref.current!.focusFilter())
+  expect(document.body.textContent).toContain('放弃未保存修改？')
+  await click('取消')
+  expect(host.querySelector<HTMLTextAreaElement>('[aria-label="问候"]')!.value).toBe('草稿')
+  await act(async () => ref.current!.focusFilter()); await click('放弃修改')
+  expect(host.querySelector('.mac-plugin-detail')).toBeNull()
+  expect(document.activeElement).toBe(host.querySelector('[aria-label="搜索插件名称或启动命令"]'))
+})
+
+it('does not reopen a command from a late inventory response after leaving the page', async () => {
+  const client = fixture(); const handled = vi.fn()
+  let resolve!: (value: MacPluginSnapshot) => void
+  client.list.mockImplementationOnce(() => new Promise(r => { resolve = r }))
+  await act(async () => root.render(<MacPluginManagement client={client} initialTarget={{ pluginId: row.pluginId, commandId: 'default' }} onTargetHandled={handled} />))
+  await act(async () => root.render(null))
+  await act(async () => resolve(snapshot))
+  expect(handled).not.toHaveBeenCalled()
+  expect(host.textContent).toBe('')
+})
+it('does not steal focus from an installation confirmation with the filter shortcut', async () => {
+  const { client, ref } = await render(); await click('导入插件包')
+  const confirm = button('确认替换'); confirm.focus()
+  await act(async () => ref.current!.focusFilter())
+  expect(document.activeElement).toBe(confirm)
+  expect(client.cancel).not.toHaveBeenCalled()
+  expect(client.commit).not.toHaveBeenCalled()
+})

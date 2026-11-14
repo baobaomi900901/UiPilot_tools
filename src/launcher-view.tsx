@@ -1,4 +1,4 @@
-import { MacPluginManagement, type MacPluginManagementHandle, type MacPluginManagementStatus } from './macos-plugin-management'
+import { MacPluginManagement, type MacPluginManagementHandle, type MacPluginManagementStatus, type MacPluginCommandTarget } from './macos-plugin-management'
 import { MacHotkeyStatusNotice } from './macos-hotkey-status'
 import { bindCompositionKeys, isCompositionKey } from './ime-keyboard'
 import { MacLoginItemControl } from './macos-login-item-control'
@@ -372,6 +372,8 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const macPluginManagementRef = useRef<MacPluginManagementHandle | null>(null)
+  const [macPluginTarget, setMacPluginTarget] = useState<(MacPluginCommandTarget & { invocationId: string; viewEpoch: number }) | undefined>(undefined)
+  const clearMacPluginTarget = useCallback(() => setMacPluginTarget(undefined), [])
   const [macPluginStatus, setMacPluginStatus] = useState<MacPluginManagementStatus>({ message: '', tone: 'default' })
   const credentialSettingsRef = useRef<CredentialSettingsHandle | null>(null)
   const [credentialStatus, setCredentialStatus] = useState<CredentialSettingsStatus>({ message: '', tone: 'default', detail: false })
@@ -825,6 +827,23 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
     snapshot.viewEpoch,
   ])
 
+  useEffect(() => {
+    if (macPluginTarget && (snapshot.view !== 'settings' || snapshot.invocationId !== macPluginTarget.invocationId || snapshot.viewEpoch !== macPluginTarget.viewEpoch || snapshot.settingsTab !== 'plugins')) clearMacPluginTarget()
+  }, [macPluginTarget, snapshot.view, snapshot.invocationId, snapshot.viewEpoch, snapshot.settingsTab, clearMacPluginTarget])
+  const canOpenMacPluginSettings = (item: (typeof snapshot.results)[number]) =>
+    core.capabilities.platform === 'macos' && core.capabilities.pluginManagement && !core.capabilities.plugins && item.favorite?.target.kind === 'publicPlugin'
+  const openMacPluginSettings = (item: (typeof snapshot.results)[number]) => {
+    const now = core.getSnapshot()
+    if (!canOpenMacPluginSettings(item) || item.favorite?.target.kind !== 'publicPlugin' || now.view !== 'launcher' || !now.invocationId ||
+        now.invocationId !== snapshot.invocationId || now.viewEpoch !== snapshot.viewEpoch || now.querySequence !== snapshot.querySequence || !now.results.some(row => row.key === item.key)) return
+    favoriteFocusTarget.current = undefined
+    core.closePluginContextMenu()
+    core.navigate('settings')
+    core.selectSettingsTab('plugins')
+    const destination = core.getSnapshot()
+    setMacPluginTarget({ pluginId: item.favorite.target.pluginId, commandId: item.favorite.target.commandId, invocationId: now.invocationId, viewEpoch: destination.viewEpoch })
+  }
+
   const file = snapshot.file
   const activeFileIndex =
     file?.selected === undefined ? -1 : file.results.findIndex((item) => item.fullPath === file.selected?.fullPath)
@@ -895,6 +914,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
         icon: /复制/.test(action.title) ? 'copy' : 'arrow', disabledReason: snapshot.resultActionsDisabled ? '结果暂不可用，请重新运行' : undefined,
         run: owned(() => core.executeResultAction(snapshot.selectedIndex, action.actionId)) }))
       else if (statusResult.hasDefaultAction !== false) context.push({ id: 'result-default', title: resultOperation || '执行', shortcut: 'Enter', icon: snapshot.mainResultCommand ? 'copy' : 'arrow', run: owned(() => core.activateResult(snapshot.selectedIndex)) })
+      if (canOpenMacPluginSettings(statusResult)) context.push({ id: 'plugin-settings', title: '插件设置', icon: 'settings', run: owned(() => openMacPluginSettings(statusResult)) })
       if (snapshot.resultActionRerun) context.push({ id: 'rerun', title: '重新运行', icon: 'arrow', run: owned(core.rerunResultCommand) })
     }
     if (quicklinks) {
@@ -1208,6 +1228,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       !isComposing &&
       event.key.toLowerCase() === 'f'
     ) {
+      if (macPluginManagementRef.current) {
+        event.preventDefault(); event.stopPropagation()
+        if (!event.repeat) macPluginManagementRef.current.focusFilter()
+        return
+      }
       const input = settingsTabsRef.current
         ?.querySelector<HTMLInputElement>('input[aria-label="搜索插件名称或启动命令"]')
       if (!input?.isConnected || input.disabled) return
@@ -1271,6 +1296,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const renderLauncherResult = (item: (typeof snapshot.results)[number], index: number) => {
     const resultFavorite = item.favorite
     const hasActions = Boolean(item.actions?.length)
+    const hasPluginSettings = canOpenMacPluginSettings(item)
     const row = (
       <div
         key={item.key}
@@ -1284,7 +1310,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           core.activateResult(index)
         }}
         onFocus={() => core.selectResult(index)}
-        onContextMenu={resultFavorite || hasActions ? (event) => event.preventDefault() : undefined}
+        onContextMenu={resultFavorite || hasActions || hasPluginSettings ? (event) => event.preventDefault() : undefined}
         ref={(element) => {
           if (element) optionRefs.current.set(item.key, element)
           else optionRefs.current.delete(item.key)
@@ -1333,7 +1359,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
         </span>
       </div>
     )
-    if (!resultFavorite && !hasActions) return row
+    if (!resultFavorite && !hasActions && !hasPluginSettings) return row
     return (
       <Dropdown
         key={item.key}
@@ -1346,6 +1372,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
           items: [
             ...(item.actions ?? []).map((action, actionIndex) => ({ key: `action-${actionIndex}`, label: action.title, disabled: snapshot.resultActionsDisabled })),
             ...(hasActions && resultFavorite ? [{ key: 'separator', type: 'divider' as const }] : []),
+            ...(hasPluginSettings ? [{ key: 'plugin-settings', label: '插件设置' }] : []),
             ...(resultFavorite ? [{
               key: 'favorite',
               label: resultFavorite.favorite ? '取消常用' : '设为常用',
@@ -1382,6 +1409,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               if (action) core.executeResultAction(index, action.actionId)
               return
             }
+            if (key === 'plugin-settings') { openMacPluginSettings(item); return }
             if (!resultFavorite) return
             favoriteFocusTarget.current = {
               invocationId: snapshot.invocationId,
@@ -2193,7 +2221,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const pluginSettingsPanel = (
     <OverlayScrollbarsComponent className="settings-tab-panel settings-plugin-panel" options={settingsScrollbarOptions}>
       <div className="settings-scroll-content">
-        {core.capabilities.pluginManagement && !core.capabilities.plugins ? <MacPluginManagement ref={macPluginManagementRef} client={core.client.macPluginManagement} onStatusChange={setMacPluginStatus} /> : <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />}
+        {core.capabilities.pluginManagement && !core.capabilities.plugins ? <MacPluginManagement ref={macPluginManagementRef} client={core.client.macPluginManagement} onStatusChange={setMacPluginStatus} initialTarget={macPluginTarget?.invocationId === snapshot.invocationId && macPluginTarget?.viewEpoch === snapshot.viewEpoch ? macPluginTarget : undefined} onTargetHandled={clearMacPluginTarget} /> : <PublicPluginPanel client={core.client} removalOutcome={publicPluginRemovalOutcome} onOpenBuiltinDetails={setBuiltinFeatureDetail} onOpenDetails={(plugin, revision, hotkeyRevision) => { setPublicPluginRemovalOutcome(null); setPublicPluginDetail({ plugin, revision, hotkeyRevision, session: ++detailSession.current }) }} />}
         {showLegacyPluginInventory ? (
         <section className="plugin-inventory" aria-labelledby="plugin-inventory-title">
         <div className="plugin-inventory-header">

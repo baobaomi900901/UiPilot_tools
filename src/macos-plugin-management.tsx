@@ -5,7 +5,8 @@ import type { MacPluginManagementClient, MacPluginPreview, MacPluginSnapshot, Or
 import './macos-plugin-management.css'
 
 export interface MacPluginManagementStatus { message: string; tone: 'default' | 'success' | 'error' }
-export interface MacPluginManagementHandle { requestLeave: (action: () => void) => void; back: () => boolean }
+export interface MacPluginCommandTarget { pluginId: string; commandId: string }
+export interface MacPluginManagementHandle { requestLeave: (action: () => void) => void; back: () => boolean; focusFilter: () => void }
 const errors: Record<string, string> = {
   pluginManagementStale: '插件配置已变化，请刷新后核对并重试。',
   pluginManagementCommitUncertain: '保存结果尚未确认，请刷新核对；不会自动重复提交。',
@@ -36,12 +37,15 @@ function parseValue(d: OrdinarySetting, v: string | boolean): string | number | 
   }
   throw new Error()
 }
-export function MacPluginManagement({ client, ref, onStatusChange }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (status: MacPluginManagementStatus) => void }) {
+export function MacPluginManagement({ client, ref, onStatusChange, initialTarget, onTargetHandled }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (status: MacPluginManagementStatus) => void; initialTarget?: MacPluginCommandTarget; onTargetHandled?: () => void }) {
   const [snapshot, setSnapshot] = useState<MacPluginSnapshot | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [selectedCommand, setSelectedCommand] = useState<string | null>(null)
   const [commandDraft, setCommandDraft] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
+  const [filterFocusRequest, setFilterFocusRequest] = useState(0)
+  const handledFilterFocus = useRef(0)
+  const handledTarget = useRef<MacPluginCommandTarget | undefined>(undefined)
   const [drafts, setDrafts] = useState<Map<string, string | boolean>>(new Map())
   const [busy, setBusy] = useState(false); const pending = useRef(false)
   const [notice, setNotice] = useState(''); const [error, setError] = useState('')
@@ -91,7 +95,10 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
     if (dirty) setLeave(() => action)
     else action()
   }
-  useImperativeHandle(ref, () => ({ requestLeave, back: () => {
+  useImperativeHandle(ref, () => ({ requestLeave, focusFilter: () => {
+    if (leave || removeOpen || preparedRef.current || pending.current) return
+    requestLeave(() => { clearDrafts(); setSelected(null); setNotice(''); setFilterFocusRequest(value => value + 1) })
+  }, back: () => {
     if (leave || removeOpen || preparedRef.current || pending.current) return true
     if (selected) { requestLeave(() => { clearDrafts(); setSelected(null) }); return true }
     return false
@@ -153,6 +160,26 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
     onStatusChange?.({ message: feedbackMessage, tone: feedbackTone })
     return () => onStatusChange?.({ message: '', tone: 'default' })
   }, [feedbackMessage, feedbackTone, onStatusChange])
+  useEffect(() => {
+    if (!live.current || pending.current || needsReview || !snapshot || !initialTarget || handledTarget.current === initialTarget) return
+    handledTarget.current = initialTarget
+    const targetPlugin = snapshot.plugins.find(p => p.pluginId === initialTarget.pluginId)
+    if (targetPlugin?.commands.some(c => c.id === initialTarget.commandId)) {
+      setSelected(initialTarget.pluginId); setSelectedCommand(initialTarget.commandId)
+      setNotice(''); setError('')
+    } else {
+      setSelected(null); setSelectedCommand(null)
+      setError('该插件命令已不在安装清单中，请从列表重新选择。')
+    }
+    onTargetHandled?.()
+  }, [snapshot, initialTarget, onTargetHandled, busy, needsReview])
+  useLayoutEffect(() => {
+    if (handledFilterFocus.current === filterFocusRequest || selected) return
+    handledFilterFocus.current = filterFocusRequest
+    const input = section.current?.querySelector<HTMLInputElement>('input[aria-label="搜索插件名称或启动命令"]')
+    input?.focus()
+    input?.setSelectionRange(input.value.length, input.value.length)
+  }, [filterFocusRequest, selected])
   const disabled = busy || needsReview || !snapshot || !client
   const list = snapshot?.plugins.filter(p => `${p.name} ${p.commands.map(c => c.name).join(' ')}`.toLocaleLowerCase().includes(filter.toLocaleLowerCase())) ?? []
   const installed = prepared ? snapshot?.plugins.find(p => p.pluginId === prepared.plugin.pluginId) : undefined

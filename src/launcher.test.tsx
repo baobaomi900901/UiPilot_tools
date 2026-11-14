@@ -11759,3 +11759,49 @@ it('validates closed Mac catalog identity and never accepts executable rows thro
   try { emit(shown('mac-catalog-strict')); await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1)); expect(core.getSnapshot().results[0].title).toBe('/demo-upper') }
   finally { core.destroy() }
 })
+
+
+it.each(['context', 'keyboard'] as const)('opens the exact Mac command settings from %s without running plugins', async (entry) => {
+  installMatchMedia(false)
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
+  const { client: baseClient, emit } = fakeClient()
+  const pluginId = 'com.test.multi'
+  const installed = { revision: '4', plugins: [{ pluginId, name: 'Multi', description: '', version: '1.0.0', enabled: true,
+    commands: [
+      { id: 'lower', name: 'demo-lower', defaultName: 'demo-lower', nameOverride: null, favorite: false },
+      { id: 'upper', name: 'mac-upper', defaultName: 'demo-upper', nameOverride: 'mac-upper', favorite: true },
+    ], permissions: [], settings: [], values: {} }] }
+  const client = { ...baseClient, macPluginManagement: { list: vi.fn(async () => installed) } as unknown as import('./macos-plugin-management-client').MacPluginManagementClient }
+  vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'mac-route', replaceLocalResults: true, items: [{
+    resultId: 'upper', title: '/mac-upper', hasDefaultAction: false,
+    activation: { kind: 'unavailablePlugin', pluginId, commandId: 'upper', favorite: true },
+    favorite: { target: { kind: 'publicPlugin', pluginId, commandId: 'upper' }, favorite: true },
+  }] })
+  const core = createLauncherCore(client, undefined, { ...previewCapabilities, platform: 'macos', plugins: false, pluginManagement: true, builtinFeatures: false })
+  await core.start()
+  const view = await mountLauncherView(core)
+  try {
+    await act(async () => emit(shown('mac-route')))
+    await vi.waitFor(() => expect(core.getSnapshot().results).toHaveLength(1))
+    if (entry === 'context') await act(async () => view.host.querySelector('[role="option"]')!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })))
+    else await act(async () => view.host.querySelector('[role="combobox"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true })))
+    const action = () => [...document.querySelectorAll<HTMLElement>('[role="menuitem"], .uipilot-context-action')].find(e => e.textContent === '插件设置')
+    await vi.waitFor(() => expect(action()).toBeDefined())
+    await act(async () => action()!.click())
+    await vi.waitFor(() => expect(view.host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')?.value).toBe('mac-upper'))
+    expect(core.getSnapshot().settingsTab).toBe('plugins')
+    expect(view.host.querySelector('[aria-label="取消常用"]')).not.toBeNull()
+    expect(document.activeElement).toBe(view.host.querySelector('.mac-plugin-detail h2'))
+    expect(client.executeResult).not.toHaveBeenCalled()
+    expect(client.openPluginPanel).not.toHaveBeenCalled()
+    expect(client.listPublicPlugins).not.toHaveBeenCalled()
+    // Ctrl+F from a detail returns to the list, keeping keyboard navigation usable.
+    await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true })))
+    expect(document.activeElement).toBe(view.host.querySelector('[aria-label="搜索插件名称或启动命令"]'))
+    expect(view.host.querySelector('.mac-plugin-detail')).toBeNull()
+    // The one-shot command destination must not reopen after changing tabs.
+    await activateSettingsTab(view.host, '通用')
+    await activateSettingsTab(view.host, '插件')
+    expect(view.host.querySelector('.mac-plugin-detail')).toBeNull()
+  } finally { await view.unmount(); core.destroy() }
+})
