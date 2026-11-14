@@ -25,3 +25,6 @@
 CLI 检查由 `npm run verify:local` 的 `reference package validation` 阶段执行。macOS 安装预览使用 `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib --features macos-find-preview,macos-login-item-preview tracked_reference_packages_respect_the_current_management_boundary`。两个入口都读取仓库中的参考插件目录。
 
 三个主结果插件与一份兼容升级归档由 `scripts/verify-macos-plugin-archives.mjs` 记录 SHA-256 和 macOS 诊断结果。Windows 侧使用同一份报告和归档，入口为 `scripts/verify-windows-plugin-archives.mjs`。Windows 归档管理验证已通过；2026-11-13 用户在 Windows ARM64 虚拟机内使用 x64 安装包，完成上述三个主结果插件的安装、运行、设置、升级、启停、命令改名与收藏、权限撤销和恢复验收。macOS 同包真实 QuickJS 诊断已通过，但生产执行仍关闭，双端生产宿主同包通过数仍为 0 / 17。详细包哈希和手工结果见 `docs/releases/2026-11-06-desktop-port-device-checks.md`。旧插件另行验收。
+
+
+2026-11-14 Mac 管理人工验收补充：`demo-settings` 安装、普通设置保存/重启恢复和 1.0.1 兼容升级保留设置已通过；`demo-multi` 的命令目录、独立收藏、改名及恢复默认、重启保留、名称冲突/格式拒绝已通过。设置图钉、统一底栏提示也已实测。以上是管理能力证据，Mac 生产 Runtime 仍关闭，不增加双端生产运行通过数。候选 `b77d3e4` 的命令设置直达入口待人工验证，详情见设备验收记录。

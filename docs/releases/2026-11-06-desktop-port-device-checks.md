@@ -762,3 +762,12 @@ ZIP CRC 与 manifest 中 12 个文件哈希验证通过。真实固定后跨应�
 验证：新增入口和焦点/过期目标测试先失败后通过；完整相关 Launcher、Mac 管理及客户端回归 **431 通过、18 跳过**，TypeScript/Vite 构建通过。覆盖右键及 Ctrl+K 指向改名后的 upper、收藏对应、页签重开不重跳、移除包/命令、离页迟到响应、草稿取消/放弃及安装对话框焦点。首次实现验证发现视图没有暴露私有 activation 字段，已改为使用核心校验后的 favorite 稳定身份；测试补齐 jsdom scrollIntoView stub，最终完整回归通过。没有调用 GUI、运行插件或操作用户安装库。
 
 日志：`/private/tmp/uipilot-command-settings-{red,green,ui,build}.log`。原生菜单与键盘交互待新候选人工确认。完整目标当前工程估计约 80%，不因本轮界面接线单独上调；同包双端生产运行通过数仍为 0 / 17。
+
+
+命令设置候选 `b77d3e4` 已完成 App/DMG 构建及实际 DMG 只读校验：arm64、最低 macOS 15.7.4、应用身份、资源、ad-hoc 签名和 Documents entitlement 通过。没有启动应用或操作 GUI。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-command-settings-b77d3e4.zip`，SHA-256 `3050e07d4b1ec8ccb048099f6478cdceb4c7380b91b13650cbc0bfd5a4484c92`。
+- DMG SHA-256：`6d526735c8e0bff262ae8a2d936e0cd717e59ff24f57ad15e5dd2a656062a2ac`。
+- 主程序 SHA-256：`263206a2f3b8164494a2f5b69aaa0b33b500ffca0f2cdf5449b843b7979b99e8`。
+
+只读 preflight、ZIP CRC 和 manifest 中 9 个文件哈希逐项通过。候选交给用户按单动作指引验证右键/Ctrl+K 定位命令及详情 Ctrl+F；原有插件无需重装。原生交互保持待验收，分支推送但不合并 main。
