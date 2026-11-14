@@ -1,7 +1,7 @@
 //! Preview-only local Find window. All native transfers and hides are serialized on
 //! AppKit's main thread. The shared controller owns readiness, pin and invocation order.
 use std::{
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 use crate::{
     find_window::{
         FindReadyStatus, FindWindowController, FocusEffect, ForegroundWindow, NativeFocusSnapshot,
-        OpenFindCompletion, TransferFocusResult, WindowLabel, TRANSFER_TIMEOUT,
+        ForwardFinish, OpenFindCompletion, TransferFocusResult, WindowLabel, TRANSFER_TIMEOUT,
     },
     host_capabilities::{require_find, require_main},
     result_registry::ResultRegistries,
@@ -52,9 +52,6 @@ struct Host {
     transfer: Mutex<Option<Transfer>>,
     driving: AtomicBool,
     stopping: AtomicBool,
-    // An already queued launcher blur check must not hide the source after Find
-    // closes. Only a new main focus edge or invocation ends this exemption.
-    transferred_main: AtomicU64,
 }
 
 pub(crate) fn setup(app: &mut tauri::App) -> tauri::Result<()> {
@@ -111,9 +108,21 @@ async fn on_main<T: Send + 'static>(
 
 pub(crate) fn owns_main_blur(app: &AppHandle) -> bool {
     let Some(service) = app.try_state::<Arc<Host>>() else { return false; };
-    if service.transfer.lock().expect("Find transfer").is_some() { return true; }
-    let transferred = service.transferred_main.load(Ordering::Acquire);
-    transferred != 0 && crate::macos_host::main_invocation_current(app, transferred)
+    let transferring = service.transfer.lock().expect("Find transfer").is_some();
+    transferring || service.controller.queued_query().is_some()
+}
+
+// Only a committed, delivered Find invocation replaces the launcher. Keep the
+// source visible on failure; the hide port must reject a newer main invocation.
+fn finish_forward(
+    controller: &FindWindowController, registries: &ResultRegistries,
+    transfer: u64, source: u64, emitted: bool, hide_source: impl FnOnce(u64),
+) -> ForwardFinish {
+    let outcome = controller.finish_forward_emit(transfer, emitted, registries);
+    // A queued forward still owns a source-query lease. Let the latest forward
+    // finish before retiring that launcher invocation and its registry.
+    if matches!(outcome, ForwardFinish::Visible { snapshot_required: false }) { hide_source(source); }
+    outcome
 }
 
 fn schedule(app: &AppHandle) {
@@ -173,10 +182,12 @@ fn drive(app: &AppHandle) {
                 let mut forwarded = json!(payload);
                 forwarded["pinned"] = json!(controller.pinned());
                 let emitted = find.emit_to("find", "find://forwarded", forwarded).is_ok();
-                controller.finish_forward_emit(transfer.id, emitted, &registries);
-                if emitted {
-                    service.transferred_main.store(source.expect("verified source"), Ordering::Release);
-                } else {
+                finish_forward(controller, &registries, transfer.id, source.expect("verified source"), emitted, |source| {
+                    if crate::macos_host::hide_if_current(app, source).is_err() {
+                        eprintln!("UiPilot: could not hide launcher after Find transfer");
+                    }
+                });
+                if !emitted {
                     let _ = find.hide();
                     if transfer.focus_before == ForegroundWindow::Main && NSRunningApplication::currentApplication().isActive() {
                         if let Some(main) = app.get_webview_window("main") { let _ = main.set_focus(); }
@@ -354,11 +365,6 @@ pub(crate) fn on_window_event(window: &Window, event: &WindowEvent) -> bool {
     let Some(service) = app.try_state::<Arc<Host>>() else { return false; };
     if service.stopping.load(Ordering::Acquire) { return false; }
     if window.label() == "main" {
-        if let WindowEvent::Focused(true) = event {
-            if native_snapshot(app).foreground == ForegroundWindow::Main {
-                service.transferred_main.store(0, Ordering::Release);
-            }
-        }
         return false;
     }
     if window.label() != "find" { return false; }
@@ -443,6 +449,55 @@ pub(crate) fn shutdown(app: &AppHandle, code: Option<i32>, api: &tauri::ExitRequ
 mod tests {
     use super::*;
     use crate::result_registry::QueryDomain;
+
+    #[test]
+    fn only_successful_current_find_forward_hides_its_launcher_source() {
+        for (emitted, stale_transfer, queued) in [(true, false, false), (false, false, false), (true, true, false), (true, false, true)] {
+            let registries = ResultRegistries::default();
+            let ctl = FindWindowController::default();
+            let now = Instant::now();
+            let init = ctl.prepare_initialization(now).unwrap();
+            ctl.commit_ready(&init.token, now);
+            let main = registries.main();
+            main.on_show("7".into());
+            main.begin_query(QueryDomain::Application, "7", 1).unwrap();
+            let lease = main.prepare_application_query_retirement("7", 1).unwrap().unwrap();
+            let submission = ctl.submit_open("image".into(), lease, now).unwrap();
+            let plan = ctl.admit_queued_transfer(NativeFocusSnapshot {
+                main_focused: true, find_focused: false, foreground: ForegroundWindow::Main,
+            }, now).unwrap();
+            assert_eq!(ctl.confirm_transfer_focus(plan.transfer_id, NativeFocusSnapshot {
+                main_focused: false, find_focused: true, foreground: ForegroundWindow::Find,
+            }), TransferFocusResult::CommitFindScope);
+            let payload = ctl.commit_find_scope(plan.transfer_id, &registries).unwrap();
+            let queued_submission = if queued {
+                main.begin_query(QueryDomain::Application, "7", 2).unwrap();
+                let lease = main.prepare_application_query_retirement("7", 2).unwrap().unwrap();
+                Some(ctl.submit_open("latest".into(), lease, now).unwrap())
+            } else { None };
+            if stale_transfer { ctl.finish_native_close(&registries); }
+            let hidden = std::cell::Cell::new(None);
+            finish_forward(&ctl, &registries, plan.transfer_id, 7, emitted, |source| {
+                // Native hiding happens only after Find owns a usable invocation.
+                assert!(ctl.admit_search(&payload.invocation_id));
+                hidden.set(Some(source));
+            });
+            assert_eq!(hidden.get(), if emitted && !stale_transfer && !queued { Some(7) } else { None });
+            let completion = submission.completion.recv().unwrap();
+            if emitted && !stale_transfer { assert_eq!(completion, OpenFindCompletion::Forwarded); }
+            else { assert_ne!(completion, OpenFindCompletion::Forwarded); }
+            if let Some(queued_submission) = queued_submission {
+                let snapshot = NativeFocusSnapshot { main_focused: false, find_focused: true, foreground: ForegroundWindow::Find };
+                let next = ctl.admit_queued_transfer(snapshot, now).unwrap();
+                assert_eq!(ctl.transfer_source_invocation(next.transfer_id, &registries), Some(7));
+                assert_eq!(ctl.confirm_transfer_focus(next.transfer_id, snapshot), TransferFocusResult::CommitFindScope);
+                ctl.commit_find_scope(next.transfer_id, &registries).unwrap();
+                finish_forward(&ctl, &registries, next.transfer_id, 7, true, |source| hidden.set(Some(source)));
+                assert_eq!(hidden.get(), Some(7));
+                assert_eq!(queued_submission.completion.recv().unwrap(), OpenFindCompletion::Forwarded);
+            }
+        }
+    }
 
     #[cfg(not(feature = "macos-find-system-qa"))]
     #[test]

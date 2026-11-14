@@ -825,3 +825,14 @@ Command 快捷键候选 `c42c381` 已完成无 GUI App/DMG 构建，实际 DMG �
 - 主程序 SHA-256：`24ce5d3f9f17fe887584426a50717c13dabfa5524841e4af64c01d9315311388`。
 
 交由用户手动替换并验证 PNG/JPG 缩略图；暂无原生视觉通过结论。代码留在 `codex/macos-port-plan`，不合并 main。
+
+
+## 2026-11-14 Find 打开后的主窗口隐藏修复
+
+用户替换图片预览包后报告：主界面选择 Find 回车，独立窗口位于主窗口下方；要求 Find 出现后主窗口消失。图片缩略图尚未获得用户通过结论，仍待新包一起验证。
+
+原因：Mac 主窗口使用置顶层级，成功 Find 转发后仍设置 `transferred_main` 失焦豁免，没有主动隐藏源窗口。本轮改为只有 Find 确认焦点且最终转发成功后才按源 invocation 隐藏 main；失败/过期不隐藏；连续转发先保留源查询 lease，最后成功转发再隐藏。沿用 `hide_if_current` 防止旧动作误关新主界面；保留独立 Find registry 和图钉状态。无 GUI 自动化。
+
+Find 回归 82 项通过、4 项原有隔离实机项忽略；包括成功、投递失败、原生关闭后的过期完成、排队转发后才隐藏的顺序验证。日志 `/private/tmp/uipilot-find-transfer-tests.log`。
+
+Mac 主窗口/快捷键生命周期回归另 24 项通过，含旧完成不能隐藏新或待显示 invocation。日志 `/private/tmp/uipilot-find-transfer-main-tests.log`。
