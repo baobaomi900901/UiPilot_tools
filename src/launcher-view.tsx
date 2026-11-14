@@ -1,4 +1,4 @@
-import { MacPluginManagement, type MacPluginManagementHandle } from './macos-plugin-management'
+import { MacPluginManagement, type MacPluginManagementHandle, type MacPluginManagementStatus } from './macos-plugin-management'
 import { MacHotkeyStatusNotice } from './macos-hotkey-status'
 import { bindCompositionKeys, isCompositionKey } from './ime-keyboard'
 import { MacLoginItemControl } from './macos-login-item-control'
@@ -372,7 +372,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   const publicPluginDetailRef = useRef<HTMLElement | null>(null)
   const settingsTabsRef = useRef<HTMLDivElement>(null)
   const macPluginManagementRef = useRef<MacPluginManagementHandle | null>(null)
-  const [macPluginStatus, setMacPluginStatus] = useState('')
+  const [macPluginStatus, setMacPluginStatus] = useState<MacPluginManagementStatus>({ message: '', tone: 'default' })
   const credentialSettingsRef = useRef<CredentialSettingsHandle | null>(null)
   const [credentialStatus, setCredentialStatus] = useState<CredentialSettingsStatus>({ message: '', tone: 'default', detail: false })
   const [settingsPinned, setSettingsPin] = useState(false)
@@ -835,10 +835,10 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       ? statusResult.defaultActionTitle ?? (statusResult.actions.length ? '选择动作' : '')
       : statusResult.hasDefaultAction === false ? '' : snapshot.mainResultCommand ? '复制' : '执行'
     : ''
-  const macPluginSaveStatus = snapshot.view === 'settings' && activeSettingsTab === 'plugins' && core.capabilities.pluginManagement && !core.capabilities.plugins ? macPluginStatus : ''
+  const macPluginFeedback = snapshot.view === 'settings' && activeSettingsTab === 'plugins' && core.capabilities.pluginManagement && !core.capabilities.plugins ? macPluginStatus : undefined
   const status =
     operationsError ||
-    macPluginSaveStatus ||
+    macPluginFeedback?.message ||
     (snapshot.view === 'settings' && activeSettingsTab === 'credentials'
       ? credentialStatus.message : '') ||
     snapshot.shownNotice ||
@@ -2501,14 +2501,16 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             {snapshot.view === 'launcher' ? (quicklinksPanel ?? panelLauncher ?? filePanel ?? launcher) : (publicPluginDetailView ?? settingsView)}
           </div>
             <div className={`launcher-region launcher-status-region${snapshot.view === 'settings' ? ' settings-status-region' : ''}`}>
-              <div className={`status-region${macPluginSaveStatus && !operationsError ? ' is-action-success' : snapshot.view === 'settings' && activeSettingsTab === 'credentials' && credentialStatus.message
+              <div className={`status-region${macPluginFeedback?.message && !operationsError
+                ? macPluginFeedback.tone === 'error' ? ' is-action-error' : macPluginFeedback.tone === 'success' ? ' is-action-success' : ''
+                : snapshot.view === 'settings' && activeSettingsTab === 'credentials' && credentialStatus.message
                 ? credentialStatus.tone === 'error' ? ' is-action-error' : credentialStatus.tone === 'success' ? ' is-action-success' : ''
                 : snapshot.view === 'launcher' && !snapshot.shownNotice && !snapshot.status && panel?.feedback?.status.message
                 ? panel.feedback.status.tone === 'error' ? ' is-action-error' : panel.feedback.status.tone === 'success' ? ' is-action-success' : ''
                 : launcherResultsActive && snapshot.resultActionRerun
                 ? snapshot.status === '已复制' ? ' is-action-success' : ' is-action-error'
                 : launcherResultsActive && snapshot.executePending && statusResult?.actions ? ' is-action-pending' : ''}`}
-                data-tauri-drag-region={core.capabilities.platform === 'macos' ? true : undefined} role="status" aria-live="polite" aria-atomic="true" title={status || undefined}>
+                id="launcher-status-message" data-tauri-drag-region={core.capabilities.platform === 'macos' ? true : undefined} role="status" aria-live="polite" aria-atomic="true" title={status || undefined}>
                 {status}
               </div>
               <div className="launcher-status-actions">

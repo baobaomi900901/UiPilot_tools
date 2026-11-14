@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useImperativeHandle, useRef, useState, type
 import type { MacPluginManagementClient, MacPluginPreview, MacPluginSnapshot, OrdinarySetting, SettingValues } from './macos-plugin-management-client'
 import './macos-plugin-management.css'
 
+export interface MacPluginManagementStatus { message: string; tone: 'default' | 'success' | 'error' }
 export interface MacPluginManagementHandle { requestLeave: (action: () => void) => void; back: () => boolean }
 const errors: Record<string, string> = {
   pluginManagementStale: '插件配置已变化，请刷新后核对并重试。',
@@ -35,7 +36,7 @@ function parseValue(d: OrdinarySetting, v: string | boolean): string | number | 
   }
   throw new Error()
 }
-export function MacPluginManagement({ client, ref, onStatusChange }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (message: string) => void }) {
+export function MacPluginManagement({ client, ref, onStatusChange }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (status: MacPluginManagementStatus) => void }) {
   const [snapshot, setSnapshot] = useState<MacPluginSnapshot | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [selectedCommand, setSelectedCommand] = useState<string | null>(null)
@@ -44,10 +45,6 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
   const [drafts, setDrafts] = useState<Map<string, string | boolean>>(new Map())
   const [busy, setBusy] = useState(false); const pending = useRef(false)
   const [notice, setNotice] = useState(''); const [error, setError] = useState('')
-  useEffect(() => {
-    onStatusChange?.(selected && notice === '设置已保存。' ? notice : '')
-    return () => onStatusChange?.('')
-  }, [notice, selected, onStatusChange])
   const [needsReview, setNeedsReview] = useState(false)
   const [prepared, setPrepared] = useState<MacPluginPreview | null>(null)
   const preparedRef = useRef<MacPluginPreview | null>(null)
@@ -146,6 +143,16 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
   }
   const commandName = (commandDraft ?? command?.name ?? '').trim().replace(/^\//, '')
   const invalidCommand = !/^[a-z][a-z0-9-]{0,31}$/.test(commandName)
+  const feedbackMessage = error || (!client ? '插件管理暂不可用。' : '') ||
+    (busy ? '正在处理…' : '') ||
+    (commandDraft !== null && invalidCommand ? '启动名称无效：使用小写字母、数字或短横线，以字母开头，最多 32 个字符。' : '') ||
+    (invalid ? '请检查设置值的类型、范围或选项。' : '') || notice
+  const feedbackTone: MacPluginManagementStatus['tone'] = error || !client || (!busy && ((commandDraft !== null && invalidCommand) || invalid))
+    ? 'error' : !busy && (notice.includes('已保存') || notice === '已刷新') ? 'success' : 'default'
+  useEffect(() => {
+    onStatusChange?.({ message: feedbackMessage, tone: feedbackTone })
+    return () => onStatusChange?.({ message: '', tone: 'default' })
+  }, [feedbackMessage, feedbackTone, onStatusChange])
   const disabled = busy || needsReview || !snapshot || !client
   const list = snapshot?.plugins.filter(p => `${p.name} ${p.commands.map(c => c.name).join(' ')}`.toLocaleLowerCase().includes(filter.toLocaleLowerCase())) ?? []
   const installed = prepared ? snapshot?.plugins.find(p => p.pluginId === prepared.plugin.pluginId) : undefined
@@ -166,7 +173,6 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
       <Button type="primary" icon={<Upload size={16} />} disabled={disabled} onClick={() => requestLeave(() => void choose('archive'))}>导入插件包</Button>
     </div>
     <p className="mac-plugin-runtime-note">可管理插件安装、设置和权限配置。当前 Mac 插件暂不能运行，启用及授权配置会保存。</p>
-    <div className="mac-plugin-feedback" aria-live="polite">{busy ? <span role="status">正在处理…</span> : null}{notice && notice !== '设置已保存。' ? <span role="status">{notice}</span> : null}{error ? <span role="alert">{error}</span> : null}{!client ? <span role="alert">插件管理暂不可用。</span> : null}</div>
     {!selected ? <>
       <Input aria-label="搜索插件名称或启动命令" placeholder="搜索插件名称或启动命令" value={filter} onChange={e => setFilter(e.target.value)} allowClear />
       <div className="mac-plugin-list" onKeyDown={listKeyDown}>
@@ -183,8 +189,7 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
       }}>
         <div className="mac-plugin-command-heading"><h3>启动命令</h3><Button type="text" title={command.favorite ? '取消常用' : '设为常用'} aria-label={command.favorite ? '取消常用' : '设为常用'} aria-pressed={command.favorite} icon={<Star size={16} fill={command.favorite ? 'currentColor' : 'none'} />} disabled={disabled || dirty} onClick={() => void mutate(() => client.command({ pluginId: plugin.pluginId, commandId: command.id, nameOverride: command.nameOverride, favorite: !command.favorite, expectedRevision: snapshot.revision }), '常用配置已保存。')} /></div>
         {plugin.commands.length > 1 ? <div className="mac-plugin-field"><label htmlFor="mac-plugin-command">选择命令</label><Select id="mac-plugin-command" aria-label="选择命令" value={command.id} disabled={busy} options={plugin.commands.map(c => ({ value: c.id, label: `${c.id} · /${c.name}` }))} onChange={id => requestLeave(() => { clearDrafts(); setSelectedCommand(id) })} /></div> : null}
-        <div className="mac-plugin-field"><label htmlFor="mac-plugin-command-name">启动名称</label><Input id="mac-plugin-command-name" aria-label="启动名称" prefix="/" placeholder={command.defaultName} value={commandDraft ?? command.name} disabled={disabled || drafts.size > 0} aria-invalid={commandDraft !== null && invalidCommand} onChange={e => { setCommandDraft(e.target.value); setNotice(''); setError('') }} />
-          {commandDraft !== null && invalidCommand ? <span role="alert">使用小写字母、数字或短横线，以字母开头，最多 32 个字符。</span> : null}
+        <div className="mac-plugin-field"><label htmlFor="mac-plugin-command-name">启动名称</label><Input id="mac-plugin-command-name" aria-label="启动名称" prefix="/" placeholder={command.defaultName} value={commandDraft ?? command.name} disabled={disabled || drafts.size > 0} aria-invalid={commandDraft !== null && invalidCommand} aria-describedby={commandDraft !== null && invalidCommand ? "launcher-status-message" : undefined} onChange={e => { setCommandDraft(e.target.value); setNotice(''); setError('') }} />
         </div>
         <div className="mac-plugin-form-actions"><Button type="primary" htmlType="submit" disabled={disabled || drafts.size > 0 || commandDraft === null || invalidCommand}>保存启动名称</Button><Button disabled={disabled || drafts.size > 0 || (commandDraft ?? command.name) === command.defaultName} onClick={() => setCommandDraft(command.defaultName)}>恢复默认名称</Button><Button disabled={busy || commandDraft === null} onClick={() => setCommandDraft(null)}>取消名称修改</Button></div>
       </form> : null}
@@ -199,10 +204,9 @@ export function MacPluginManagement({ client, ref, onStatusChange }: { client?: 
           const change = (value: string | boolean) => { setDrafts(current => new Map(current).set(d.key, value)); setNotice('') }
           return <div className="mac-plugin-field" key={d.key}><label htmlFor={id}>{d.label}</label>
             {d.type === 'boolean' ? <Switch id={id} aria-label={d.label} checked={value === true} disabled={disabled || commandDraft !== null} onChange={change} />
-              : d.type === 'select' ? <Select id={id} aria-label={d.label} aria-invalid={bad} value={value === undefined ? undefined : String(value)} placeholder="请选择" disabled={disabled || commandDraft !== null} options={[...d.options]} onChange={change} />
-              : d.type === 'text' ? <Input.TextArea id={id} aria-label={d.label} aria-invalid={bad} value={value === undefined ? '' : String(value)} placeholder="输入文本" rows={2} disabled={disabled || commandDraft !== null} onChange={e => change(e.target.value)} />
-              : <Input id={id} aria-label={d.label} aria-invalid={bad} value={value === undefined ? '' : String(value)} placeholder="输入数字" inputMode="decimal" disabled={disabled || commandDraft !== null} onChange={e => change(e.target.value)} />}
-            {bad ? <span role="alert">请检查此设置的类型、范围或选项。</span> : null}
+              : d.type === 'select' ? <Select id={id} aria-label={d.label} aria-invalid={bad} aria-describedby={bad ? "launcher-status-message" : undefined} value={value === undefined ? undefined : String(value)} placeholder="请选择" disabled={disabled || commandDraft !== null} options={[...d.options]} onChange={change} />
+              : d.type === 'text' ? <Input.TextArea id={id} aria-label={d.label} aria-invalid={bad} aria-describedby={bad ? "launcher-status-message" : undefined} value={value === undefined ? '' : String(value)} placeholder="输入文本" rows={2} disabled={disabled || commandDraft !== null} onChange={e => change(e.target.value)} />
+              : <Input id={id} aria-label={d.label} aria-invalid={bad} aria-describedby={bad ? "launcher-status-message" : undefined} value={value === undefined ? '' : String(value)} placeholder="输入数字" inputMode="decimal" disabled={disabled || commandDraft !== null} onChange={e => change(e.target.value)} />}
           </div>
         })}
         <div className="mac-plugin-form-actions"><Button htmlType="submit" type="primary" disabled={disabled || !drafts.size || invalid || commandDraft !== null}>保存设置</Button><Button disabled={busy || !drafts.size} onClick={() => { clearDrafts(); setNotice('已取消修改') }}>取消修改</Button></div>

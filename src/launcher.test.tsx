@@ -9258,10 +9258,16 @@ describe('real adapter and startup', () => {
     await act(async () => window.dispatchEvent(new Event('pagehide')))
   }
 
-  it('opens Mac plugin management without mounting executable or legacy plugin services', async () => {
+  it.each([false, true])('routes Mac plugin feedback to the shared footer without executable services, dark=%s', async (dark) => {
+    installMatchMedia(dark)
     const { client: original, emit } = fakeClient()
-    const list = vi.fn(async () => ({ revision: '0', plugins: [] }))
-    const client = { ...original, macPluginManagement: { list } as unknown as import('./macos-plugin-management-client').MacPluginManagementClient }
+    const installed = { revision: '0', plugins: [{ pluginId: 'com.test.settings', name: 'Settings', description: '', version: '1.0.0', enabled: true,
+      commands: [{ id: 'default', name: 'settings-demo', defaultName: 'settings-demo', nameOverride: null, favorite: true }], permissions: [],
+      settings: [{ type: 'text' as const, key: 'greeting', label: '问候', default: 'Hello' }], values: { greeting: 'Hello' } }] }
+    const list = vi.fn(async () => installed)
+    const command = vi.fn(async () => { throw 'pluginManagementConflict' })
+    const settings = vi.fn(async () => ({ ...installed, revision: '1' }))
+    const client = { ...original, macPluginManagement: { list, command, settings } as unknown as import('./macos-plugin-management-client').MacPluginManagementClient }
     const core = createLauncherCore(client, undefined, { ...hostSnapshot('macos'), pluginManagement: true })
     const view = await mountLauncherView(core)
     try {
@@ -9273,6 +9279,31 @@ describe('real adapter and startup', () => {
       expect(client.listPlugins).not.toHaveBeenCalled()
       expect(client.listPublicPlugins).not.toHaveBeenCalled()
       expect(client.listBuiltinFeatures).not.toHaveBeenCalled()
+      const footer = () => view.host.querySelector<HTMLElement>('.launcher-status-region #launcher-status-message')!
+      expect(footer().textContent).toBe('已刷新')
+      await act(async () => view.host.querySelector<HTMLButtonElement>('.mac-plugin-row')!.click())
+      await act(async () => {
+        const input = view.host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'find')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () => view.host.querySelector('form[aria-label="启动命令配置"]')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })))
+      expect(footer().textContent).toBe('启动名称与内置命令或已安装插件冲突，已恢复原名称。')
+      expect(footer().classList.contains('is-action-error')).toBe(true)
+      expect(view.host.querySelector('.mac-plugin-management')!.textContent).not.toContain('已恢复原名称')
+      expect(view.host.querySelector<HTMLInputElement>('[aria-label="启动名称"]')!.value).toBe('settings-demo')
+      await act(async () => {
+        const input = view.host.querySelector<HTMLTextAreaElement>('[aria-label="问候"]')!
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'Changed')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () => view.host.querySelector('form[aria-label="普通设置"]')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })))
+      expect(footer().textContent).toBe('设置已保存。')
+      expect(footer().classList.contains('is-action-success')).toBe(true)
+      expect(view.host.querySelector('.mac-plugin-management')!.textContent).not.toContain('设置已保存。')
+      await activateSettingsTab(view.host, '通用')
+      expect(footer().textContent).not.toContain('设置已保存。')
+
     } finally { await view.unmount(); core.destroy() }
   })
 

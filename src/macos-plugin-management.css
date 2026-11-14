@@ -4,8 +4,6 @@
 .mac-plugin-management h2 { font-size: 16px; font-weight: 500; }
 .mac-plugin-management h3 { font-size: 14px; font-weight: 500; margin: 16px 0 12px; }
 .mac-plugin-runtime-note, .mac-plugin-metadata, .mac-plugin-empty { color: var(--uipilot-ui-muted-foreground); line-height: 1.6; }
-.mac-plugin-feedback { min-height: 28px; font-size: 13px; display: flex; gap: 8px; flex-wrap: wrap; }
-.mac-plugin-management [role=alert] { color: var(--uipilot-ui-destructive); }
 .mac-plugin-list { margin-top: 12px; }
 .mac-plugin-row { width: 100%; display: flex; justify-content: space-between; gap: 12px; padding: 12px 10px; text-align: left; border: 0; border-bottom: 1px solid var(--uipilot-ui-border); color: inherit; background: transparent; font: inherit; cursor: pointer; }
 .mac-plugin-row:hover { background: var(--uipilot-ui-surface-elevated); }
@@ -20,7 +18,6 @@
 .mac-plugin-settings { max-width: 560px; padding-bottom: 20px; }
 .mac-plugin-field { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 16px; }
 .mac-plugin-field .ant-select { width: 100%; }
-.mac-plugin-field > [role=alert] { font-size: 12px; }
 .mac-plugin-form-actions { margin-top: 16px; }
 @media (forced-colors: active) { .mac-plugin-row:focus-visible { outline-color: Highlight; } }
 /* Programmatic detail focus announces the heading; it is not an input control. */
