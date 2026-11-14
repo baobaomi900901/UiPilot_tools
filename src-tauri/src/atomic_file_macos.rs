@@ -119,6 +119,21 @@ mod tests {
     use super::*;
     use std::{fs, os::unix::fs::symlink};
     #[test]
+    fn shared_store_io_is_lazy_and_refuses_symlinks() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(unique(Path::new("uipilot"), "shared"));
+        let path = root.join("nested/store.json");
+        assert_eq!(read_optional(&path).unwrap(), None);
+        assert!(!root.exists());
+        replace_current(&path, b"saved").unwrap();
+        assert_eq!(read_optional(&path).unwrap().unwrap(), b"saved");
+        let outside = root.join("outside"); fs::write(&outside, b"untouched").unwrap();
+        fs::remove_file(&path).unwrap(); symlink(&outside, &path).unwrap();
+        assert!(read_optional(&path).is_err());
+        assert!(replace_current(&path, b"overwrite").is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn links_are_refused_and_a_replaced_directory_does_not_redirect_writes() {
         let temp = std::env::temp_dir().canonicalize().unwrap().join(unique(Path::new("uipilot"), "test"));
         let owned = temp.join("owned");
@@ -136,4 +151,22 @@ mod tests {
         assert!(paths.read_optional(paths.backup()).is_err());
         fs::remove_dir_all(temp).unwrap();
     }
+}
+
+// Compatibility for shared host stores. Keep directory-relative no-follow IO.
+pub(crate) fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let parent = path.parent().ok_or_else(|| io::Error::other("missing parent"))?;
+    let directory = match open_data_directory(parent, false) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let name = path.file_name().ok_or_else(|| io::Error::other("missing name"))?;
+    AtomicPaths { directory, current: name.into(), backup: PathBuf::new() }.read_optional(Path::new(name))
+}
+pub(crate) fn replace_current(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| io::Error::other("missing parent"))?;
+    let name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| io::Error::other("missing name"))?;
+    let paths = AtomicPaths::open(parent, name)?;
+    paths.replace(paths.current(), bytes)
 }

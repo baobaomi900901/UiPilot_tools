@@ -27,6 +27,8 @@ pub(crate) enum ResultAction {
         engine: WebSearchEngine,
         query: String,
     },
+    #[cfg(target_os = "macos")]
+    MacOpenQuicklink { id: String, command: String, template: String, query: String },
     OpenQuicklink {
         id: String,
         url: String,
@@ -137,20 +139,21 @@ impl ExecutionTicket {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MainActionKind { CopyText, PluginCopyText, WebSearch }
+pub(crate) enum MainActionKind { CopyText, PluginCopyText, WebSearch, Quicklink }
 #[cfg(target_os = "macos")]
 impl MainActionKind {
     fn domain(self) -> QueryDomain {
         match self {
             Self::PluginCopyText => QueryDomain::Plugin,
-            Self::CopyText | Self::WebSearch => QueryDomain::Application,
+            Self::CopyText | Self::WebSearch | Self::Quicklink => QueryDomain::Application,
         }
     }
     fn matches(self, action: &ResultAction) -> bool {
         matches!((self, action),
             (Self::CopyText, ResultAction::CopyBuiltInText { .. }) |
             (Self::PluginCopyText, ResultAction::CopyText { .. }) |
-            (Self::WebSearch, ResultAction::OpenWebSearch { .. }))
+            (Self::WebSearch, ResultAction::OpenWebSearch { .. }) |
+            (Self::Quicklink, ResultAction::MacOpenQuicklink { .. }))
     }
 }
 

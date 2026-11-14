@@ -161,8 +161,12 @@ pub(crate) async fn search_apps(
             .await.map_err(|_| Error::unavailable())?
             .map_err(|_| Error { code: "searchUnavailable", message: "无法读取插件命令，请在设置中刷新插件列表" })?
     } else { Vec::new() };
+    let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
+    let links = service.management.quicklinks(&root).map_err(|_| Error::unavailable())?;
+    let links = tauri::async_runtime::spawn_blocking(move || links.list()).await.map_err(|_| Error::unavailable())?;
+    if links.load_error.is_some() { return Err(Error { code: "quicklinkLoadFailed", message: "无法读取快速链接" }); }
     if query.trim().starts_with('/') || (crate::host_capabilities::mac_find_enabled() && query.trim().is_empty()) {
-        return Ok(publish_with_plugins(&service, app.state::<SettingsStore>().inner(), token, &query, plugins));
+        return Ok(publish_with_links(&service, app.state::<SettingsStore>().inner(), token, &query, plugins, &links.items));
     }
     let retrying = *service.ready.borrow() == Some(false);
     if retrying { service.refresh(); }
@@ -171,7 +175,7 @@ pub(crate) async fn search_apps(
     if usable != Some(true) {
         return Err(Error { code: "searchUnavailable", message: "无法读取应用目录" });
     }
-    Ok(publish_with_plugins(&service, app.state::<SettingsStore>().inner(), token, &query, plugins))
+    Ok(publish_with_links(&service, app.state::<SettingsStore>().inner(), token, &query, plugins, &links.items))
 }
 
 // Outer None means application search should continue; Some(None) means a
@@ -228,6 +232,9 @@ fn publish(service: &MacApplications, settings: &SettingsStore, token: QueryToke
     publish_with_plugins(service, settings, token, query, Vec::new())
 }
 fn publish_with_plugins(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str, plugins: Vec<crate::model::ResultItem>) -> Option<SearchResponse> {
+    publish_with_links(service, settings, token, query, plugins, &[])
+}
+fn publish_with_links(service: &MacApplications, settings: &SettingsStore, token: QueryToken, query: &str, plugins: Vec<crate::model::ResultItem>, links: &[crate::quicklinks::QuicklinkView]) -> Option<SearchResponse> {
     let query = query.trim();
     let preview = crate::host_capabilities::mac_find_enabled();
     let command = query.starts_with('/') || (preview && query.is_empty());
@@ -250,6 +257,7 @@ fn publish_with_plugins(service: &MacApplications, settings: &SettingsStore, tok
             entries.push((crate::model::find_item(argument.into(), subtitle, favorite), None));
         }
     }
+    entries.extend(crate::macos_quicklinks::entries(&settings.snapshot(), query, links));
     if let Some(entry) = web_command_entry(settings, query) { entries.push(entry); }
     entries.extend(plugins.into_iter().map(|item| (item, None)));
     if let Some(entry) = web_entry(settings, query) { entries.push(entry); }
@@ -355,6 +363,36 @@ fn execute_web_registered(
     completion.ok_or_else(Error::stale)
 }
 
+fn execute_quicklink_registered(
+    service: &MacApplications, settings: &SettingsStore, appdata: &std::path::Path, request_id: &str, result_id: &str,
+    open: impl FnOnce(&str, &mut dyn FnMut() -> bool) -> Result<(), crate::macos_browser_open::OpenError>,
+) -> Result<MainActionCompletionOwner, Error> {
+    let _guard = service.execute.lock().expect("application execution");
+    let (action, ticket) = service.registry.resolve_with_ticket(request_id, result_id)?;
+    let ResultAction::MacOpenQuicklink { id, command, template, query } = action else { return Err(Error::unavailable()); };
+    let url = crate::macos_quicklinks::query_url(&template, &query).map_err(|_| Error { code: "quicklinkOpenFailed", message: "无法打开快速链接" })?;
+    let store = service.management.quicklinks(appdata).map_err(|_| Error::stale())?;
+    let unchanged = || store.list().items.iter().any(|q| q.id == id && q.command == command && q.template == template);
+    if !unchanged() { return Err(Error::stale()); }
+    let epoch = service.management.epoch().map_err(|_| Error::stale())?;
+    let mut completion = None;
+    let mut admit = || {
+        if completion.is_some() { return false; }
+        completion = service.management.with_epoch(appdata, epoch.clone(), |_| {
+            if !unchanged() { return Err(crate::public_plugins::management_macos::Error::Stale); }
+            Ok(settings.with_enabled_builtin(crate::settings::ManagedBuiltinFeature::Quicklinks, ||
+                service.registry.consume_main_action(&ticket, MainActionKind::Quicklink).ok()).ok().flatten())
+        }).ok().flatten();
+        completion.is_some()
+    };
+    open(&url, &mut admit).map_err(|error| match error {
+        crate::macos_browser_open::OpenError::Stale => Error::stale(),
+        crate::macos_browser_open::OpenError::Unavailable => Error { code: "quicklinkOpenFailed", message: "无法打开快速链接" },
+        crate::macos_browser_open::OpenError::Unconfirmed => Error { code: "webSearchOpenUnconfirmed", message: "未确认打开链接；请重新搜索" },
+    })?;
+    completion.ok_or_else(Error::stale)
+}
+
 fn finish_host_action(app: &AppHandle, service: &Arc<MacApplications>, owner: MainActionCompletionOwner) {
     let handle = app.clone(); let current_service = Arc::clone(service);
     let _ = app.run_on_main_thread(move || {
@@ -398,6 +436,13 @@ async fn execute_main(window: WebviewWindow, request_id: String, result_id: Stri
             };
             finish_host_action(&app, &service, owner);
             return Ok(serde_json::json!({ "status": "textCopied" }));
+        }
+        if matches!(action, ResultAction::MacOpenQuicklink { .. }) {
+            let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
+            let owner = execute_quicklink_registered(&service, app.state::<SettingsStore>().inner(), &root, &request_id, &result_id,
+                |url, admit| crate::macos_browser_open::open_url(url, admit))?;
+            finish_host_action(&app, &service, owner);
+            return Ok(serde_json::json!({ "status": "launchRequested" }));
         }
         if matches!(action, ResultAction::OpenWebSearch { .. }) {
             let owner = execute_web_registered(&service, app.state::<SettingsStore>().inner(), &request_id, &result_id,
@@ -727,6 +772,68 @@ mod platform_app_commands {
         for (index, query) in ["/web", "/web-search query"].into_iter().enumerate() {
             let token = service.registry.begin_query(QueryDomain::Application, "1", index as u64 + 20).unwrap();
             assert!(publish(&service, &settings, token, query).unwrap().items.is_empty());
+        }
+    }
+    fn quicklink_fixture(service: &MacApplications, root: &std::path::Path) -> crate::quicklinks::QuicklinkView {
+        service.management.with(root, |m| Ok(m.save_quicklink(crate::quicklinks::QuicklinkSaveInput {
+            id: None, name: "测试搜索".into(), command: "fixture-link".into(), template: "https://example.test/?q={Query}".into(), icon_token: None,
+        })?.unwrap())).unwrap()
+    }
+    fn publish_quicklink(service: &MacApplications, settings: &SettingsStore, root: &std::path::Path, sequence: u64) -> SearchResponse {
+        let links = service.management.quicklinks(root).unwrap().list().items;
+        let token = service.registry.begin_query(QueryDomain::Application, "1", sequence).unwrap();
+        publish_with_links(service, settings, token, "/fixture-link 中文 & test", Vec::new(), &links).unwrap()
+    }
+    #[test]
+    fn quicklink_edit_or_delete_before_final_admission_prevents_browser_dispatch() {
+        for delete in [false, true] {
+            let (f, service, settings) = fixture();
+            let link = quicklink_fixture(&service, &f.0);
+            let response = publish_quicklink(&service, &settings, &f.0, 1);
+            assert_eq!(response.items.len(), 1);
+            let error = execute_quicklink_registered(&service, &settings, &f.0, &response.request_id, &response.items[0].result_id, |url, admit| {
+                assert_eq!(url::Url::parse(url).unwrap().query_pairs().collect::<Vec<_>>(), vec![("q".into(), "中文 & test".into())]);
+                service.management.with(&f.0, |m| {
+                    if delete { m.quicklinks.delete(&link.id).unwrap(); }
+                    else { m.save_quicklink(crate::quicklinks::QuicklinkSaveInput { id: Some(link.id.clone()), name: link.name.clone(), command: link.command.clone(), template: "https://other.test/?q={Query}".into(), icon_token: None })?.unwrap(); }
+                    Ok(())
+                }).unwrap();
+                assert!(!admit());
+                Err(crate::macos_browser_open::OpenError::Stale)
+            }).err().unwrap();
+            assert_eq!(error.code, "staleRequest");
+        }
+    }
+    #[test]
+    fn quicklink_admitted_before_delete_finishes_once_but_never_hides_new_query() {
+        let (f, service, settings) = fixture();
+        let link = quicklink_fixture(&service, &f.0);
+        let response = publish_quicklink(&service, &settings, &f.0, 1);
+        let id = &response.items[0].result_id;
+        let owner = execute_quicklink_registered(&service, &settings, &f.0, &response.request_id, id, |_, admit| {
+            assert!(admit()); assert!(!admit());
+            service.management.with(&f.0, |m| { m.quicklinks.delete(&link.id).unwrap(); Ok(()) }).unwrap();
+            Ok(())
+        }).unwrap();
+        assert!(execute_quicklink_registered(&service, &settings, &f.0, &response.request_id, id, |_, _| panic!("duplicate open")).is_err());
+        service.registry.begin_query(QueryDomain::Application, "1", 2).unwrap();
+        assert!(!service.registry.finish_main_action(&owner));
+    }
+    #[test]
+    fn quicklinks_management_entry_is_favoritable_but_empty_custom_command_only_completes() {
+        let (f, service, settings) = fixture();
+        quicklink_fixture(&service, &f.0);
+        settings.set_builtin_feature_favorite(crate::settings::BuiltinFeature::Quicklinks, true).unwrap();
+        let links = service.management.quicklinks(&f.0).unwrap().list().items;
+        for (i, query) in ["/quick", "/fixture-link"].into_iter().enumerate() {
+            let token = service.registry.begin_query(QueryDomain::Application, "1", i as u64 + 1).unwrap();
+            let response = publish_with_links(&service, &settings, token, query, Vec::new(), &links).unwrap();
+            assert_eq!(response.items.len(), 1);
+            let row = &response.items[0];
+            assert!(!row.has_default_action);
+            assert!(service.registry.resolve(&response.request_id, &row.result_id).is_err());
+            if i == 0 { assert_eq!(row.favorite, Some(crate::model::ResultFavorite::builtin(crate::settings::BuiltinFeature::Quicklinks, true))); }
+            else { assert!(matches!(&row.activation, crate::model::LauncherResultActivation::Completion { completion_text } if completion_text == "/fixture-link ")); }
         }
     }
     fn web_row(service: &MacApplications, settings: &SettingsStore) -> SearchResponse {

@@ -359,7 +359,7 @@ fn set_builtin_feature_favorite(window: WebviewWindow, input: FavoriteInput) -> 
 
 fn favorite_feature_available(feature: crate::settings::BuiltinFeature) -> bool {
     use crate::settings::BuiltinFeature;
-    feature == BuiltinFeature::WebSearch || (feature == BuiltinFeature::Find && crate::host_capabilities::mac_find_enabled())
+    matches!(feature, BuiltinFeature::WebSearch | BuiltinFeature::Quicklinks) || (feature == BuiltinFeature::Find && crate::host_capabilities::mac_find_enabled())
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -425,6 +425,8 @@ pub fn run() {
             get_macos_login_item, set_macos_login_item, open_macos_login_item_settings,
             crate::macos_apps::search_apps, crate::macos_apps::execute_result,
             set_builtin_feature_favorite,
+            crate::macos_quicklinks::list_quicklinks, crate::macos_quicklinks::save_quicklink,
+            crate::macos_quicklinks::delete_quicklink, crate::macos_quicklinks::choose_quicklink_icon,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::open_find_window,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::prepare_find_initialization,
             #[cfg(feature = "macos-find-preview")] crate::macos_find_host::commit_find_ready,
@@ -498,7 +500,7 @@ mod platform_bootstrap {
         use crate::settings::BuiltinFeature;
         assert!(favorite_feature_available(BuiltinFeature::WebSearch));
         assert_eq!(favorite_feature_available(BuiltinFeature::Find), crate::host_capabilities::mac_find_enabled());
-        assert!(!favorite_feature_available(BuiltinFeature::Quicklinks));
+        assert!(favorite_feature_available(BuiltinFeature::Quicklinks));
         assert!(!favorite_feature_available(BuiltinFeature::Screenshot));
         for invalid in [r#"{"feature":"webSearch","favorite":"true"}"#, r#"{"feature":"webSearch","favorite":true,"url":"https://example.test"}"#] {
             assert!(serde_json::from_str::<FavoriteInput>(invalid).is_err());

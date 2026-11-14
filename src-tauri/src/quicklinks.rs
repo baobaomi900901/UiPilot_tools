@@ -65,7 +65,7 @@ pub(crate) struct QuicklinkListResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QuicklinkSaveInput {
     pub(crate) id: Option<String>,
     pub(crate) name: String,
@@ -216,27 +216,26 @@ impl QuicklinksStore {
             return Err(QuicklinkErrorCode::CommandConflict);
         }
 
+        let mut candidate = state.document.clone();
         let now = timestamp_string();
         let id = if let Some(index) = existing_index {
-            state.document.items[index].id.clone()
+            candidate.items[index].id.clone()
         } else if let Some(id) = input.id.as_ref() {
             id.clone()
         } else {
-            let id = state.document.next_id.to_string();
-            state.document.next_id = state
-                .document
-                .next_id
+            let id = candidate.next_id.to_string();
+            candidate.next_id = candidate.next_id
                 .checked_add(1)
                 .ok_or(QuicklinkErrorCode::SaveFailed)?;
             id
         };
         let created_at = existing_index
-            .map(|index| state.document.items[index].created_at.clone())
+            .map(|index| candidate.items[index].created_at.clone())
             .unwrap_or_else(|| now.clone());
         let icon_asset = self.save_icon_for_record(
             &id,
             input.icon_token.as_deref(),
-            existing_index.map(|index| state.document.items[index].icon_asset.clone()),
+            existing_index.map(|index| candidate.items[index].icon_asset.clone()),
         )?;
         let record = StoredQuicklink {
             id,
@@ -248,11 +247,12 @@ impl QuicklinksStore {
             updated_at: now,
         };
         if let Some(index) = existing_index {
-            state.document.items[index] = record.clone();
+            candidate.items[index] = record.clone();
         } else {
-            state.document.items.push(record.clone());
+            candidate.items.push(record.clone());
         }
-        self.write_document(&state.document)?;
+        self.write_document(&candidate)?;
+        state.document = candidate;
         state.load_error = None;
         Ok(self.view_for(&record))
     }
@@ -263,9 +263,11 @@ impl QuicklinksStore {
         let Some(index) = state.document.items.iter().position(|item| item.id == id) else {
             return Ok(());
         };
-        let removed = state.document.items.remove(index);
-        self.write_document(&state.document)
+        let mut candidate = state.document.clone();
+        let removed = candidate.items.remove(index);
+        self.write_document(&candidate)
             .map_err(|_| QuicklinkErrorCode::DeleteFailed)?;
+        state.document = candidate;
         if let Some(asset) = removed.icon_asset {
             let _ = fs::remove_file(self.icons_dir().join(asset));
         }
@@ -283,7 +285,10 @@ impl QuicklinksStore {
         {
             return Err(QuicklinkErrorCode::InvalidIcon);
         }
-        let bytes = fs::read(path).map_err(|_| QuicklinkErrorCode::InvalidIcon)?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        fs::File::open(path).and_then(|file| file.take(MAX_ICON_BYTES as u64 + 1).read_to_end(&mut bytes))
+            .map_err(|_| QuicklinkErrorCode::InvalidIcon)?;
         validate_png_icon(&bytes)?;
         let token = format!(
             "icon-{}-{}",
@@ -339,6 +344,7 @@ impl QuicklinksStore {
     }
 
     fn write_document(&self, document: &StoredDocument) -> Result<(), QuicklinkErrorCode> {
+        #[cfg(not(target_os = "macos"))]
         fs::create_dir_all(self.quicklinks_dir()).map_err(|_| QuicklinkErrorCode::SaveFailed)?;
         let bytes =
             serde_json::to_vec_pretty(document).map_err(|_| QuicklinkErrorCode::SaveFailed)?;
@@ -623,7 +629,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
 
         fn path(&self) -> &Path {
@@ -641,6 +647,23 @@ mod tests {
         let dir = TestDir::new(label);
         let store = QuicklinksStore::new(dir.path().to_path_buf());
         (dir, store)
+    }
+
+    #[test]
+    fn failed_disk_commit_preserves_saved_cache_for_edits_and_deletes() {
+        let (_dir, store) = store("failed-commit");
+        let input = QuicklinkSaveInput { id: None, name: "original".into(), command: "original".into(), template: "https://example.test/?q={Query}".into(), icon_token: None };
+        let saved = store.save(input.clone()).unwrap();
+        let path = store.config_path();
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap(); fs::create_dir(&path).unwrap();
+        let mut edited = input; edited.id = Some(saved.id.clone()); edited.command = "changed".into();
+        assert!(store.save(edited).is_err());
+        assert_eq!(store.list().items, vec![saved.clone()]);
+        assert!(store.delete(&saved.id).is_err());
+        assert_eq!(store.list().items, vec![saved]);
+        fs::remove_dir(&path).unwrap(); fs::write(&path, bytes).unwrap();
+        assert_eq!(QuicklinksStore::new(store.root.clone()).list(), store.list());
     }
 
     #[test]

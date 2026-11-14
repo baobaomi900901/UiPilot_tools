@@ -24,6 +24,10 @@ mod macos_quick_evaluation;
 #[cfg(target_os = "macos")]
 mod web_search;
 #[cfg(target_os = "macos")]
+mod quicklinks;
+#[cfg(target_os = "macos")]
+mod macos_quicklinks;
+#[cfg(target_os = "macos")]
 mod macos_browser_open;
 #[cfg(target_os = "macos")]
 mod macos_login_item;

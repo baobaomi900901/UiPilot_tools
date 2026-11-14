@@ -250,11 +250,12 @@ pub(crate) async fn remove_macos_plugin(
     .await
 }
 
-struct PickedSource {
+pub(crate) struct PickedSource {
     url: Retained<NSURL>,
     accessed: bool,
 }
 impl PickedSource {
+    pub(crate) fn path(&self) -> Result<std::path::PathBuf, ()> { self.url.to_file_path().ok_or(()) }
     fn new(url: Retained<NSURL>) -> Self {
         // Public Foundation lifetime pairing. A non-scoped URL may return false;
         // ordinary reads still run and report their real success/failure.
@@ -276,21 +277,25 @@ async fn choose(
     selection: Selection,
 ) -> Result<Option<PickedSource>, &'static str> {
     require_main(window)?;
+    let state = window.app_handle().state::<Arc<ManagementState>>().inner().clone();
+    choose_panel(window, Some(kind), move || state.selection_current(&selection)).await
+}
+pub(crate) async fn choose_quicklink_icon_file(window: &WebviewWindow, epoch: crate::public_plugins::management_macos::ManagementEpoch) -> Result<Option<PickedSource>, &'static str> {
+    require_main(window)?;
+    let state = window.app_handle().state::<Arc<ManagementState>>().inner().clone();
+    choose_panel(window, None, move || state.runtime_epoch_current(&epoch)).await
+}
+async fn choose_panel(window: &WebviewWindow, kind: Option<SourceKind>, current: impl Fn() -> bool + Send + 'static) -> Result<Option<PickedSource>, &'static str> {
+    require_main(window)?;
     let (send, receive) = oneshot::channel();
     let window_copy = window.clone();
     let generation = DIALOG_GENERATION.load(Ordering::Acquire);
-    let state = window
-        .app_handle()
-        .try_state::<Arc<ManagementState>>()
-        .ok_or(FAILED)?
-        .inner()
-        .clone();
     window
         .run_on_main_thread(move || {
             // Recheck the real origin/window immediately before any AppKit effect.
             if require_main(&window_copy).is_err()
                 || DIALOG_GENERATION.load(Ordering::Acquire) != generation
-                || !state.selection_current(&selection)
+                || !current()
             {
                 let _ = send.send(Err(FAILED));
                 return;
@@ -313,20 +318,21 @@ async fn choose(
                 return;
             };
             let panel = NSOpenPanel::openPanel(mtm);
-            panel.setCanChooseDirectories(matches!(kind, SourceKind::Directory));
-            panel.setCanChooseFiles(matches!(kind, SourceKind::Archive));
+            panel.setCanChooseDirectories(matches!(kind, Some(SourceKind::Directory)));
+            panel.setCanChooseFiles(!matches!(kind, Some(SourceKind::Directory)));
             panel.setAllowsMultipleSelection(false);
             panel.setCanCreateDirectories(false);
             panel.setResolvesAliases(false);
-            panel.setTitle(Some(&NSString::from_str("选择插件")));
-            panel.setPrompt(Some(&NSString::from_str("检查插件")));
+            panel.setTitle(Some(&NSString::from_str(if kind.is_some() { "选择插件" } else { "选择 128×128 PNG 图标" })));
+            panel.setPrompt(Some(&NSString::from_str(if kind.is_some() { "检查插件" } else { "选择图标" })));
             panel.setMessage(Some(&NSString::from_str(match kind {
-                SourceKind::Archive => {
+                Some(SourceKind::Archive) => {
                     "选择 .uipilot-plugin 文件。检查后确认安装；当前仅保存配置，不运行插件。"
                 }
-                SourceKind::Directory => {
+                Some(SourceKind::Directory) => {
                     "选择包含 plugin.json 的插件目录。检查后确认安装；当前仅保存配置，不运行插件。"
                 }
+                None => "选择 128×128 PNG 图片，最大 256 KiB。",
             })));
             let owner = Arc::new(());
             PANEL.with_borrow_mut(|p| *p = Some((generation, owner.clone(), panel.clone())));

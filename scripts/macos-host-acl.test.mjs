@@ -11,6 +11,7 @@ test('Mac production enables only a local main capability and its core commands'
   assert.deepEqual(acl.webviews, ['main']);
   assert.equal(acl.remote, undefined);
   assert.deepEqual(acl.permissions.toSorted(), [
+    'allow-list-quicklinks', 'allow-save-quicklink', 'allow-delete-quicklink', 'allow-choose-quicklink-icon',
     'allow-get-host-capabilities', 'allow-hide-launcher', 'allow-set-settings-pinned', 'allow-load-settings', 'allow-set-theme-preference',
     'allow-search-apps', 'allow-execute-result', 'allow-set-web-search-engine', 'allow-save-hotkey', 'allow-set-hotkey-recording',
     'allow-get-macos-login-item', 'allow-set-macos-login-item', 'allow-open-macos-login-item-settings',

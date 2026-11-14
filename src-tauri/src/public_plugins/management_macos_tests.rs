@@ -618,3 +618,51 @@ fn package_toggle_survives_reload_and_preserves_each_command_settings_and_denied
     assert!(rows.iter().any(|row| row.title == "/demo-lower" && !row.favorite.as_ref().unwrap().favorite));
     assert!(rows.iter().all(|row| !row.has_default_action));
 }
+
+fn quicklink_input(command: &str) -> crate::quicklinks::QuicklinkSaveInput {
+    crate::quicklinks::QuicklinkSaveInput { id: None, name: "测试链接".into(), command: command.into(), template: "https://example.test/?q={Query}".into(), icon_token: None }
+}
+#[test]
+fn quicklinks_and_plugin_commands_share_both_sides_of_namespace() {
+    let temp = Temp::new();
+    let mut m = Management::load(&temp.0).unwrap();
+    let installed = temp.install(&mut m);
+    assert_eq!(m.save_quicklink(quicklink_input("settings-demo")).unwrap().unwrap_err(), crate::quicklinks::QuicklinkErrorCode::CommandConflict);
+    m.enabled(ID, false, &installed.revision).unwrap();
+    assert!(m.save_quicklink(quicklink_input("settings-demo")).unwrap().is_err());
+    for reserved in ["settings", "plugins", "find", "quicklinks", "web-search", "screenshot"] {
+        assert_eq!(m.save_quicklink(quicklink_input(reserved)).unwrap().unwrap_err(), crate::quicklinks::QuicklinkErrorCode::CommandConflict);
+    }
+    let link = m.save_quicklink(quicklink_input("shared-link")).unwrap().unwrap();
+    let revision = m.list().unwrap().revision;
+    assert!(matches!(m.command_preference(ID, "default", CommandPreference { name_override: Some("shared-link".into()), favorite: true }, &revision), Err(Error::Conflict)));
+    assert_eq!(m.list().unwrap().plugins[0].commands[0].name, "settings-demo");
+    drop(m);
+    let mut reopened = Management::load(&temp.0).unwrap();
+    assert_eq!(reopened.quicklinks.list().items, vec![link]);
+    assert_eq!(reopened.save_quicklink(quicklink_input("settings-demo")).unwrap().unwrap_err(), crate::quicklinks::QuicklinkErrorCode::CommandConflict);
+}
+#[test]
+fn quicklink_created_after_plugin_preview_prevents_commit_without_overwriting_either() {
+    let temp = Temp::new();
+    let mut m = Management::load(&temp.0).unwrap();
+    let preview = temp.preview(&mut m);
+    let link = m.save_quicklink(quicklink_input("settings-demo")).unwrap().unwrap();
+    assert!(matches!(m.commit(&preview.token, &preview.expected_revision, preview.required_permissions), Err(Error::Conflict)));
+    assert!(m.list().unwrap().plugins.is_empty());
+    assert_eq!(m.quicklinks.list().items, vec![link]);
+    let rev = m.list().unwrap().revision;
+    let selection = m.reserve(SourceKind::Directory, &rev).unwrap();
+    assert!(matches!(m.selected(selection, Some(&temp.0.join("package"))), Err(Error::Conflict)));
+}
+#[test]
+fn lazy_quicklink_catalog_is_shared_with_mutations_without_creating_inventory() {
+    let temp = Temp::new();
+    let state = ManagementState::default();
+    let catalog = state.quicklinks(&temp.0).unwrap();
+    assert!(catalog.list().items.is_empty());
+    assert!(!temp.0.join("plugin-management-v1").exists());
+    state.with(&temp.0, |m| { m.save_quicklink(quicklink_input("shared"))?.unwrap(); Ok(()) }).unwrap();
+    assert_eq!(catalog.list().items.len(), 1);
+    assert!(state.quicklinks(&temp.0.join("other")).is_err());
+}

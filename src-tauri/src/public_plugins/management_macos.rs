@@ -219,6 +219,7 @@ pub(crate) struct Management {
     epoch: Arc<()>,
     host: MacPluginLifecycle,
     appdata: PathBuf,
+    pub(crate) quicklinks: Arc<crate::quicklinks::QuicklinksStore>,
     runtime_catalog: Vec<RuntimeCommand>,
     runtime_owner: Option<Arc<()>>,
     pending: Option<Pending>,
@@ -234,6 +235,7 @@ impl Management {
             epoch: Arc::new(()),
             host: MacPluginLifecycle::load(&inventory, &storage, &settings)?,
             appdata: appdata.to_owned(),
+            quicklinks: Arc::new(crate::quicklinks::QuicklinksStore::new(appdata.to_owned())),
             runtime_catalog: Vec::new(),
             runtime_owner: None,
             pending: None,
@@ -360,6 +362,7 @@ impl Management {
                 command.favorite = previous.favorite;
             }
         }
+        self.check_quicklink_names(plugin.commands.iter().map(|c| c.name.as_str()))?;
         let mut random = [0u8; 32];
         // macOS public libc CSPRNG, no file path or user state access.
         if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
@@ -404,7 +407,12 @@ impl Management {
         if Instant::now() >= pending.expires {
             return Err(Error::Stale);
         }
-        self.expected(expected)?;
+        let current = self.expected(expected)?;
+        let manifest = pending.prepared.package().manifest();
+        let old = current.plugins.iter().find(|p| p.plugin_id == manifest.plugin_id);
+        self.check_quicklink_names(manifest.normalized_commands().map(|(id, command)| {
+            old.and_then(|p| p.commands.iter().find(|c| c.id == id)).and_then(|c| c.name_override.as_deref()).unwrap_or(&command.default_name)
+        }))?;
         let unique: BTreeSet<_> = approved.iter().copied().collect();
         if unique.len() != approved.len() {
             return Err(Error::ConsentRequired);
@@ -445,7 +453,10 @@ impl Management {
         preference: CommandPreference,
         expected: &str,
     ) -> Result<Snapshot> {
-        self.expected(expected)?;
+        let current = self.expected(expected)?;
+        let command = current.plugins.iter().find(|p| p.plugin_id == id)
+            .and_then(|p| p.commands.iter().find(|c| c.id == command_id)).ok_or(Error::InvalidCommand)?;
+        self.check_quicklink_names(std::iter::once(preference.name_override.as_deref().unwrap_or(&command.default_name)))?;
         self.host
             .set_command_preference(id, command_id, preference)?;
         self.list()
@@ -474,6 +485,19 @@ impl Management {
         self.host.remove_expected(id, revision(expected)?)?;
         self.list()
     }
+    fn check_quicklink_names<'a>(&self, names: impl Iterator<Item = &'a str>) -> Result<()> {
+        let links = self.quicklinks.list();
+        if links.load_error.is_some() { return Err(Error::Storage); }
+        if names.into_iter().any(|name| links.items.iter().any(|q| q.command == name)) { return Err(Error::Conflict); }
+        Ok(())
+    }
+    pub(crate) fn save_quicklink(&mut self, input: crate::quicklinks::QuicklinkSaveInput)
+        -> Result<std::result::Result<crate::quicklinks::QuicklinkView, crate::quicklinks::QuicklinkErrorCode>> {
+        let current = self.list()?;
+        let mut names: Vec<_> = current.plugins.iter().flat_map(|p| p.commands.iter().map(|c| c.name.clone())).collect();
+        names.extend(super::host_command_names::host_command_names().map(str::to_owned));
+        Ok(crate::macos_quicklinks::save_validated(&self.quicklinks, input, &names))
+    }
     fn reset(&mut self) {
         if let Some(selection) = self.selection.take() {
             selection.owner.active.store(false, Ordering::Release);
@@ -493,6 +517,7 @@ impl ManagementEpoch {
 #[derive(Default)]
 pub(crate) struct ManagementState {
     inner: Mutex<Option<Management>>,
+    quicklinks: Mutex<Option<(PathBuf, Arc<crate::quicklinks::QuicklinksStore>)>>,
     // Short ownership lock, never held over the management mutex or any IO.
     epoch: Mutex<Arc<()>>,
     runtime_hook: Mutex<Option<Weak<dyn RuntimeInvalidation>>>,
@@ -500,6 +525,16 @@ pub(crate) struct ManagementState {
     pub(crate) before_reset_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl ManagementState {
+    pub(crate) fn quicklinks(&self, appdata: &Path) -> Result<Arc<crate::quicklinks::QuicklinksStore>> {
+        let mut slot = self.quicklinks.lock().map_err(|_| Error::Storage)?;
+        if let Some((root, store)) = slot.as_ref() {
+            return if root == appdata { Ok(store.clone()) } else { Err(Error::Storage) };
+        }
+        let store = Arc::new(crate::quicklinks::QuicklinksStore::new(appdata.to_owned()));
+        *slot = Some((appdata.to_owned(), store.clone()));
+        Ok(store)
+    }
+
     pub(crate) fn epoch(&self) -> Result<ManagementEpoch> {
         Ok(ManagementEpoch(
             self.epoch.lock().map_err(|_| Error::Storage)?.clone(),
@@ -529,7 +564,9 @@ impl ManagementState {
             return Err(Error::Stale);
         }
         if state.is_none() {
-            *state = Some(Management::load(appdata)?);
+            let mut manager = Management::load(appdata)?;
+            manager.quicklinks = self.quicklinks(appdata)?;
+            *state = Some(manager);
         }
         let manager = state.as_mut().unwrap();
         if !Arc::ptr_eq(&manager.epoch, &epoch.0) {
