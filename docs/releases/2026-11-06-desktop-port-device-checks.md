@@ -785,3 +785,12 @@ Mac 宿主操作统一使用 ⌘+K（操作菜单）、⌘+T（图钉）、⌘+F
 
 
 最终自动验证：Launcher、Find、共享菜单、平台快捷键及插件窗口相关回归 **464 通过、18 跳过**；插件面板与注入脚本回归 **40 通过**；TypeScript/Vite 构建通过。日志 `/private/tmp/uipilot-mac-command-keys-{red,green,ui,panel,build}.log`。没有把 DOM 或模拟焦点检查计为原生 Mac 人工通过。
+
+
+Command 快捷键候选 `c42c381` 已完成无 GUI App/DMG 构建，实际 DMG 的 arm64、最低 macOS 15.7.4、签名、资源与 Documents entitlement 检查通过。只读 preflight、ZIP CRC 与 manifest 中 10 个文件哈希通过。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-command-keys-c42c381.zip`，SHA-256 `70c8f41627cde8bdae595308a17c13cd3b4848b5427e027be68ad7c06ebf049b`。
+- DMG SHA-256：`295e98c97fb1de5a68c9afadb0ca059dcc8100dec227f52a8c46437cd485316e`。
+- 主程序 SHA-256：`b99c1f72154c561c24509f6e05ead8e502a1b24cd76a3dec68f014ab278e8817`。
+
+新包的 ⌘K 初始选中/上下键/回车、关闭恢复及 ⌘T/⌘F 原生交互待用户手动确认。分支已推送、不合并 main；现有插件无需重装。
