@@ -670,3 +670,12 @@ ZIP CRC 及 manifest 的 16 个文件哈希全部验证通过，包含新 DMG、
 本次将普通设置保存成功提示接入宿主底栏左侧，沿用成功色和可访问状态播报；移除按钮旁重复提示。继续编辑、离开详情或组件卸载时清除这条提示，其他设置页面不显示它。右侧版本号与操作入口沿用原布局。以上目录、收藏和名称人工验收通过；新提示位置待新包人工确认，插件生产执行仍未开放。
 
 验证：相关前端 **417 通过、18 跳过**；TypeScript/Vite 构建通过。沿用已有底栏双主题成功色、单行截断和版本号/操作入口布局。没有运行 GUI 自动化，实际位置待用户确认。日志：`/private/tmp/uipilot-footer-ui.log`、`/private/tmp/uipilot-footer-build.log`。
+
+
+保存提示修复候选 `1271793` 已构建并通过签名、架构、最低系统与 Documents entitlement 检查，只读 preflight 通过。App 使用 `--bundles app`，DMG 使用 `hdiutil create -format UDZO`，没有运行 Finder 外观自动化或启动应用。
+
+- ZIP：`/Users/mobytang/Documents/UiPilot-Mac-status-footer-1271793.zip`，SHA-256 `ed0226f9157116f344765f22130fd083b03dae3b60f0c36e46d8981b7c4b36fe`。
+- DMG SHA-256：`4c035afecb33e085390196e9d6634e9772cdaf1835e9e207d69fa9a8a6e4e4da`。
+- 主程序 SHA-256：`ed55ebc9f30bcb433ed3b6eba15239d50345db10aa06d95ded3aa184b08bb704`。
+
+ZIP CRC 与 manifest 中 8 个文件哈希逐项通过。只需用户在新包确认底栏左侧保存提示，已有插件无需重装。
