@@ -77,3 +77,48 @@ describe('context actions menu', () => {
   })
 
 })
+
+
+it.each(['control', 'meta'] as const)('uses an explicit keyboard selection and the %s menu shortcut', (primaryModifier) => {
+  document.body.innerHTML = '<input value="keep selection">'
+  const input = document.querySelector('input')!; input.focus(); input.setSelectionRange(1, 4)
+  const first = vi.fn(); const second = vi.fn()
+  const menu = createContextActionsMenu(document)
+  const open = () => menu.open({ context: [{ id: 'first', title: '第一项', run: first }, { id: 'disabled', title: '不可用', disabledReason: '未选中', run: vi.fn() }, { id: 'second', title: '第二项', run: second }] }, { primaryModifier })
+  const key = (key: string, extra: KeyboardEventInit = {}) => document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...extra }))
+  open()
+  const buttons = [...document.querySelectorAll<HTMLButtonElement>('.uipilot-context-action')]
+  expect(buttons[0].getAttribute('tabindex')).toBe('0')
+  expect(document.activeElement).toBe(buttons[0])
+  // A host refocus or native focus refusal must not erase the menu's selected action.
+  input.focus(); key('ArrowDown')
+  expect(document.activeElement).toBe(buttons[2])
+  expect(buttons[2].classList.contains('is-active')).toBe(true)
+  key('ArrowUp'); expect(document.activeElement).toBe(buttons[0])
+  key('ArrowDown'); key('Enter', { repeat: true }); expect(second).not.toHaveBeenCalled()
+  key('Enter'); expect(second).toHaveBeenCalledOnce(); expect(first).not.toHaveBeenCalled()
+  expect(document.activeElement).toBe(input)
+  open()
+  key('k', primaryModifier === 'meta' ? { ctrlKey: true } : { metaKey: true })
+  expect(menu.isOpen).toBe(true)
+  key('k', primaryModifier === 'meta' ? { metaKey: true } : { ctrlKey: true })
+  expect(menu.isOpen).toBe(false)
+  expect([input.selectionStart, input.selectionEnd]).toEqual([1, 4])
+})
+
+it('retains a usable menu selection when native button focus is refused', () => {
+  document.body.innerHTML = '<input>'
+  const run = vi.fn(); const menu = createContextActionsMenu(document)
+  const nativeFocus = HTMLElement.prototype.focus
+  const focus = vi.spyOn(HTMLElement.prototype, 'focus').mockImplementation(function(this: HTMLElement, options) {
+    if (!this.matches('.uipilot-context-action')) nativeFocus.call(this, options)
+  })
+  try {
+    menu.open({ context: [{ id: 'first', title: 'First', run: vi.fn() }, { id: 'second', title: 'Second', run }] })
+    expect(document.activeElement?.classList.contains('uipilot-context-actions')).toBe(true)
+    document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    expect(document.querySelector('.uipilot-context-action.is-active')?.textContent).toBe('Second')
+    document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    expect(run).toHaveBeenCalledOnce()
+  } finally { menu.close(false); focus.mockRestore() }
+})

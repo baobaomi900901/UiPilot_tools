@@ -1,3 +1,4 @@
+import { primaryModifierPressed } from './platform-shortcuts'
 import { App, Button, ConfigProvider, Input, Spin, Tooltip } from 'antd'
 import { File, FileSearch, Folder, ImageOff, Pin, X } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
@@ -165,7 +166,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         { id: 'find-input', title: '返回搜索框', shortcut: `${primary}+F`, icon: 'search',
           run() { if (current()) inputRef.current?.focus() } },
       ],
-    }, { origin, bottom: 42, onClose: () => setActionsOpen(false) })
+    }, { origin, primaryModifier: macos ? 'meta' : 'control', bottom: 42, onClose: () => setActionsOpen(false) })
     setActionsOpen(menu.isOpen)
   }, [core, cycleCategory, macos, primary])
 
@@ -227,7 +228,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
       if (macos && event.keyCode === 229) return
-      const primaryPressed = (event.ctrlKey && !event.metaKey) || (macos && event.metaKey && !event.ctrlKey)
+      const primaryPressed = primaryModifierPressed(event, macos ? 'macos' : 'windows')
       const shortcut = primaryPressed && !event.altKey && !event.shiftKey
       const menuShortcut = event.key.toLowerCase() === 'k' && shortcut
       if (menuShortcut && (event.repeat || event.isComposing)) {
@@ -236,14 +237,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         return
       }
       // Shared menu must receive arrows/Escape before the background Find list.
-      if (menuRef.current?.isOpen) {
-        if (macos && menuShortcut && event.metaKey) {
-          event.preventDefault()
-          event.stopPropagation()
-          menuRef.current.close()
-        }
-        return
-      }
+      if (menuRef.current?.isOpen) return
       if (event.defaultPrevented) return
       if (event.key === 'Tab' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
         event.preventDefault()
@@ -264,7 +258,7 @@ export function FindView({ core }: FindViewProps): React.JSX.Element {
         if (!event.repeat) core.setPinned(!core.getSnapshot().pinned)
         return
       }
-      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f' && (!macos || !event.isComposing)) {
+      if (shortcut && event.key.toLowerCase() === 'f' && (!macos || !event.isComposing)) {
         event.preventDefault()
         event.stopPropagation()
         inputRef.current?.focus()

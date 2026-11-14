@@ -1,3 +1,4 @@
+import { isPrimaryShortcut, primaryModifierPressed, primaryShortcutLabel } from './platform-shortcuts'
 import { MacPluginManagement, type MacPluginManagementHandle, type MacPluginManagementStatus, type MacPluginCommandTarget } from './macos-plugin-management'
 import { MacHotkeyStatusNotice } from './macos-hotkey-status'
 import { bindCompositionKeys, isCompositionKey } from './ime-keyboard'
@@ -397,7 +398,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   useEffect(() => {
     if (snapshot.view !== 'settings' || !['windows', 'macos'].includes(core.capabilities.platform)) return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (operationsMenu.current?.isOpen || hotkeyRecordingActive.current || !isWindowPinShortcut(event)) return
+      if (operationsMenu.current?.isOpen || hotkeyRecordingActive.current || !isWindowPinShortcut(event, core.capabilities.platform)) return
       event.preventDefault()
       event.stopPropagation()
       if (!event.repeat && !snapshot.hidePending && !pinPending) {
@@ -517,7 +518,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }, [onReady])
   const reportQueryBound = useCallback((input: HTMLInputElement) => {
     queryRef.current = input
-    if (snapshot.view === 'launcher' && snapshot.invocationId) queryRef.current?.focus()
+    if (snapshot.view === 'launcher' && snapshot.invocationId && !operationsMenu.current?.isOpen) queryRef.current?.focus()
     reportReady()
   }, [reportReady, snapshot.invocationId, snapshot.queryControl, snapshot.view])
 
@@ -918,14 +919,14 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       if (snapshot.resultActionRerun) context.push({ id: 'rerun', title: '重新运行', icon: 'arrow', run: owned(core.rerunResultCommand) })
     }
     if (quicklinks) {
-      global.push({ id: 'new-link', title: '新建快捷链接', shortcut: 'Ctrl+N', icon: 'plus', run: core.newQuicklink })
+      global.push({ id: 'new-link', title: '新建快捷链接', shortcut: primaryShortcutLabel(core.capabilities.platform, 'N'), icon: 'plus', run: core.newQuicklink })
       if (quicklinksDraftActive) context.push({ id: 'save-link', title: '保存快捷链接', icon: 'save', run: () => core.saveQuicklink() })
     }
     if (file) context.push({ id: 'open-file', title: '打开选中项', shortcut: 'Enter', icon: 'arrow', disabledReason: file.selected ? undefined : '没有选中项', run: () => core.keyDown('Enter', false) })
     global.push({ id: 'settings', title: snapshot.view === 'settings' ? '返回启动器' : '打开设置', icon: 'settings', run: () => { const navigate = () => core.navigate(snapshot.view === 'settings' ? 'launcher' : 'settings'); if (snapshot.view === 'settings' && activeSettingsTab === 'plugins' && macPluginManagementRef.current) macPluginManagementRef.current.requestLeave(navigate); else navigate() } },
       { id: 'hide', title: '隐藏窗口', shortcut: 'Esc', icon: 'close', run: () => { if (snapshot.view === 'settings' && activeSettingsTab === 'plugins' && macPluginManagementRef.current) macPluginManagementRef.current.requestLeave(core.requestHide); else core.requestHide() } })
     setOperationsOpen(true)
-    menu.open({ context, global }, { bottom: 44, onClose: () => setOperationsOpen(false) })
+    menu.open({ context, global }, { primaryModifier: core.capabilities.platform === 'macos' ? 'meta' : 'control', bottom: 44, onClose: () => setOperationsOpen(false) })
   }
   const settingsControl = (
     <Tooltip title="设置">
@@ -994,7 +995,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }
   const launcherTabKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (hotkeyRecordingActive.current || event.target instanceof Element && event.target.closest('dialog, [role="dialog"]')) return
-    if (event.key.toLowerCase() === 'k' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !composing(event)) {
+    if (isPrimaryShortcut(event.nativeEvent, 'k', core.capabilities.platform)) {
       event.preventDefault()
       event.stopPropagation()
       if (!event.repeat) openOperations()
@@ -1071,7 +1072,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
       target.getAttribute('aria-label') === '搜索快速链接目录'
     const fromQuicklinkItem = targetElement?.closest<HTMLButtonElement>('.quicklink-item') ?? null
     const fromQuicklinksEditor = targetElement?.closest('.quicklinks-editor') !== null
-    const primaryModifier = event.ctrlKey || event.metaKey
+    const primaryModifier = primaryModifierPressed(event, core.capabilities.platform)
     if (
       event.key === 'Tab' &&
       !event.ctrlKey &&
@@ -1219,7 +1220,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
   }
   const settingsKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const isComposing = composing(event)
-    const primaryModifier = event.ctrlKey || event.metaKey
+    const primaryModifier = primaryModifierPressed(event, core.capabilities.platform)
     if (
       activeSettingsTab === 'plugins' &&
       primaryModifier &&
@@ -2449,11 +2450,11 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             </Tooltip>
             <h1>设置</h1>
           </div>
-          {['windows', 'macos'].includes(core.capabilities.platform) && <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (Ctrl+T)`}>
+          {['windows', 'macos'].includes(core.capabilities.platform) && <Tooltip title={`${pinError ? '置顶设置失败，点击重试' : appliedPin ? '取消置顶' : '置顶设置窗口'} (${primaryShortcutLabel(core.capabilities.platform, 'T')})`}>
             <Button
               aria-label={pinError ? '重试置顶设置' : appliedPin ? '取消置顶' : '置顶设置窗口'}
               aria-pressed={appliedPin}
-              aria-keyshortcuts="Control+t"
+              aria-keyshortcuts={core.capabilities.platform === 'macos' ? 'Meta+t' : 'Control+t'}
               disabled={snapshot.hidePending || pinPending}
               icon={appliedPin ? <Pin size={17} aria-hidden /> : <PinOff size={17} aria-hidden />}
               type={appliedPin ? 'primary' : 'text'}
@@ -2551,9 +2552,9 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               </div>
               <div className="launcher-status-actions">
               {snapshot.view === 'settings' ? <AppVersion /> : null}
-              <button ref={actionsButtonRef} className="launcher-operations-trigger" type="button" aria-label="操作 Ctrl+K"
-                aria-haspopup="dialog" aria-expanded={panel ? undefined : operationsOpen} onPointerDown={(event) => event.preventDefault()} onClick={openOperations}>
-                操作 <kbd>Ctrl+K</kbd>
+              <button ref={actionsButtonRef} className="launcher-operations-trigger" type="button" aria-label={`操作 ${primaryShortcutLabel(core.capabilities.platform, 'K')}`}
+                aria-haspopup="dialog" aria-expanded={panel ? undefined : operationsOpen} aria-keyshortcuts={core.capabilities.platform === 'macos' ? 'Meta+k' : 'Control+k'} onPointerDown={(event) => event.preventDefault()} onClick={openOperations}>
+                操作 <kbd>{primaryShortcutLabel(core.capabilities.platform, 'K')}</kbd>
               </button>
               </div>
             </div>

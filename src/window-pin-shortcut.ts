@@ -1,6 +1,7 @@
-export function isWindowPinShortcut(event: KeyboardEvent): boolean {
-  return event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey &&
-    !event.isComposing && event.key.toLowerCase() === 't'
+import { isPrimaryShortcut } from './platform-shortcuts'
+
+export function isWindowPinShortcut(event: KeyboardEvent, platform = 'windows'): boolean {
+  return isPrimaryShortcut(event, 't', platform)
 }
 
 export const WINDOW_PIN_SHORTCUT_EVENT = 'uipilot-window-pin-shortcut'

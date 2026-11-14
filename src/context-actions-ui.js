@@ -138,7 +138,7 @@ export function createContextActionsMenu(document, onError = () => {}) {
         .uipilot-context-actions-track:hover .uipilot-context-actions-thumb { opacity:1; }
         .uipilot-context-actions h3 { margin:4px 8px; font:12px/24px system-ui,sans-serif; color:var(--uipilot-color-text-muted,var(--uipilot-ui-muted-foreground,#aaa)); }
         .uipilot-context-action { all:unset; box-sizing:border-box; display:flex; width:100%; align-items:center; gap:10px; padding:8px; border-radius:6px; cursor:pointer; }
-        .uipilot-context-action:focus-visible,.uipilot-context-action:hover { outline:none; background:var(--uipilot-color-selection,var(--uipilot-ui-selection,#5554)); }
+        .uipilot-context-action.is-active,.uipilot-context-action:focus-visible,.uipilot-context-action:hover { outline:none; background:var(--uipilot-color-selection,var(--uipilot-ui-selection,#5554)); }
         .uipilot-context-action[aria-disabled=true] { cursor:default; opacity:.5; }
         .uipilot-context-action svg { width:16px; height:16px; flex:none; }
         .uipilot-context-action-label { flex:1; min-width:0; overflow-wrap:anywhere; }
@@ -163,11 +163,27 @@ export function createContextActionsMenu(document, onError = () => {}) {
     const own = { root, origin, selection, ...options }
     current = own
     const enabled = []
+    let activeIndex = -1
+    const select = (index, focus = true) => {
+      if (!enabled.length) return
+      activeIndex = Math.max(0, Math.min(enabled.length - 1, index))
+      enabled.forEach((button, i) => {
+        button.tabIndex = i === activeIndex ? 0 : -1
+        button.classList.toggle('is-active', i === activeIndex)
+      })
+      if (focus) {
+        const button = enabled[activeIndex]
+        button.focus({ preventScroll: true })
+        button.scrollIntoView?.({ block: 'nearest' })
+        if (document.activeElement !== button) root.focus({ preventScroll: true })
+      }
+    }
     normalized.forEach((items, index) => {
       if (!items.length) return
       const heading = document.createElement('h3'); heading.textContent = index ? '通用操作' : '当前对象'; content.append(heading)
       items.forEach(action => {
         const button = document.createElement('button'); button.type = 'button'; button.className = 'uipilot-context-action'
+        button.tabIndex = -1
         button.setAttribute('aria-disabled', String(Boolean(action.disabledReason)))
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
         for (const [key, value] of Object.entries({ viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.6', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' })) svg.setAttribute(key, value)
@@ -182,21 +198,31 @@ export function createContextActionsMenu(document, onError = () => {}) {
           try { Promise.resolve(action.run()).catch(onError) } catch { onError() }
         })
         content.append(button)
-        if (!action.disabledReason) enabled.push(button)
+        if (!action.disabledReason) {
+          const index = enabled.length
+          enabled.push(button)
+          button.addEventListener('focus', () => select(index, false))
+          button.addEventListener('pointermove', () => select(index, false))
+        }
       })
     })
     own.keydown = event => {
-      if (current !== own || event.isComposing) return
+      if (current !== own || event.isComposing || event.keyCode === 229) return
       event.stopImmediatePropagation()
       const key = event.key
-      if (key === 'Escape' || key.toLowerCase() === 'k' && event.ctrlKey && !event.altKey && !event.metaKey) { event.preventDefault(); close(); return }
+      const primary = options.primaryModifier === 'meta' ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey
+      if (key === 'Escape' || key.toLowerCase() === 'k' && primary && !event.altKey && !event.shiftKey) {
+        event.preventDefault()
+        if (!event.repeat) close()
+        return
+      }
       if (['ArrowDown', 'ArrowUp', 'Home', 'End', 'Tab', 'Enter', ' '].includes(key)) {
         event.preventDefault()
         if (!enabled.length) return
-        const index = enabled.indexOf(document.activeElement)
+        const index = activeIndex
         if (key === 'Enter' || key === ' ') { if (index >= 0 && !event.repeat) enabled[index].click(); return }
         const next = key === 'Home' ? 0 : key === 'End' ? enabled.length - 1 : (index + (key === 'ArrowUp' || key === 'Tab' && event.shiftKey ? -1 : 1) + enabled.length) % enabled.length
-        enabled[next].focus()
+        select(next)
       } else if (event.ctrlKey || event.metaKey || event.altKey) event.preventDefault()
     }
     own.outside = event => { if (!root.contains(event.target)) close() }
@@ -204,7 +230,8 @@ export function createContextActionsMenu(document, onError = () => {}) {
     document.addEventListener('pointerdown', own.outside, true)
     document.body.append(root)
     own.disposeScrollbar = mountScrollbar(root, viewport, content)
-    ;(enabled[0] ?? root).focus()
+    if (enabled.length) select(0)
+    else root.focus()
   }
   return { open, close, handleKeydown(event) { current?.keydown(event) }, get isOpen() { return current !== null } }
 }

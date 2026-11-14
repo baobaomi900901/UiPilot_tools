@@ -13,7 +13,7 @@ export interface ContextActionGroups {
 }
 export interface ContextActionsMenu {
   readonly isOpen: boolean
-  open(groups: ContextActionGroups, options?: { origin?: Element | null; restoreFocus?: () => void; bottom?: number; onClose?: () => void }): void
+  open(groups: ContextActionGroups, options?: { primaryModifier?: 'control' | 'meta'; origin?: Element | null; restoreFocus?: () => void; bottom?: number; onClose?: () => void }): void
   close(restore?: boolean): void
 }
 export function createContextActionsMenu(document: Document, onError?: () => void): ContextActionsMenu
