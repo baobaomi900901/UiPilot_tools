@@ -1011,3 +1011,14 @@ Mac 生产插件 Runtime 仍关闭；本功能不代表插件双端运行、生�
 修复限定于 Mac Quicklinks 新建和编辑的单行字段：方向键移动插入点，Shift 扩展选区，Command 到首尾、Option 按词移动；按 Unicode 字素边界处理，避免拆开 emoji 和组合字符。只在这次导航期间阻止原生兜底插入方向键功能字符，不清洗已有链接，不过滤粘贴和中文组词。Windows 保留原生编辑行为。此为局部兼容处理；与 [Wry 已有方向键误输入问题](https://github.com/tauri-apps/wry/pull/769) 相似，但未在用户 GUI 中确认底层原生调用链。
 
 自动验证：新编辑测试 5 项与启动器 411 项全部通过（18 项既有跳过），新建和编辑界面均验证箭头只改变选区、不改变模板。TypeScript/Vite 通过。实际 WKWebView 键盘行为待修复包人工确认。
+
+
+修复候选 `17fda03` 已打包：`/Users/mobytang/Documents/UiPilot-Mac-quicklinks-keys-17fda03.zip`。arm64 App 构建、DMG 签名/架构/最低系统/资源校验及预检通过；ZIP 全条目 CRC 和 manifest 的 11 个文件哈希通过。
+
+| 产物 | SHA-256 |
+| --- | --- |
+| ZIP | `25ba53bac11993efb83a106e705d2a19ee7fddd2b2d162f76c142ebb5af4889c` |
+| DMG | `52b27adef592566f6f54dc7211d2c06d2d02e023ff3089b382b20ba024170c3d` |
+| 主程序 | `c830d75921d1dff6627552d16d060ff6772134a0927a09878697c64ea9eab4c3` |
+
+待用户替换后确认已有和新建链接输入框方向键、Shift 选区及中文组词。Mac 插件生产 Runtime 仍关闭；未合并 main。
