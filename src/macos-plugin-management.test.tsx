@@ -346,3 +346,45 @@ it('does not move focus back to a saved list switch after the user moves to the 
   expect(document.activeElement).toBe(filter)
   expect(toggle.getAttribute('aria-checked')).toBe('true')
 })
+
+it('manages supported Mac builtins separately, filters them, and keeps toggle focus after persistence', async () => {
+  let items = [
+    { feature: 'webSearch' as const, name: '网页搜索', command: '/web-search', enabled: true },
+    { feature: 'quicklinks' as const, name: '快速链接', command: '/quicklinks', enabled: true },
+  ]
+  const client = { ...fixture(), listBuiltins: vi.fn(async () => items), builtinEnabled: vi.fn(async (input: { feature: string; enabled: boolean }) => {
+    items = items.map(item => item.feature === input.feature ? { ...item, enabled: input.enabled } : item); return items
+  }) }
+  const { onStatusChange } = await render(client)
+  const toggle = button('启用内置功能：网页搜索')
+  expect(toggle).toBeDefined()
+  toggle.focus(); await act(async () => toggle.click())
+  expect(document.activeElement).toBe(toggle)
+  expect(toggle.getAttribute('aria-checked')).toBe('false')
+  expect(onStatusChange).toHaveBeenLastCalledWith({ message: '网页搜索已停用，配置已保留。', tone: 'success' })
+  expect(client.enabled).not.toHaveBeenCalled()
+  await act(async () => toggle.click())
+  expect(toggle.getAttribute('aria-checked')).toBe('true')
+  await input('搜索插件名称或启动命令', '/quicklinks')
+  expect(button('启用内置功能：网页搜索')).toBeUndefined()
+  expect(button('启用内置功能：快速链接')).toBeDefined()
+  expect(host.textContent).not.toContain('没有匹配的插件')
+})
+
+it('does not optimistically toggle or repeat a failed builtin write until an explicit refresh', async () => {
+  const items = [{ feature: 'webSearch' as const, name: '网页搜索', command: '/web-search', enabled: true }, { feature: 'quicklinks' as const, name: '快速链接', command: '/quicklinks', enabled: true }]
+  let fail!: (reason: unknown) => void
+  const client = { ...fixture(), listBuiltins: vi.fn(async () => items), builtinEnabled: vi.fn(() => new Promise<typeof items>((_, reject) => { fail = reject })) }
+  const { onStatusChange } = await render(client)
+  const toggle = button('启用内置功能：快速链接'); toggle.focus()
+  await act(async () => { toggle.click(); toggle.click() })
+  expect(client.builtinEnabled).toHaveBeenCalledTimes(1)
+  expect(toggle.getAttribute('aria-checked')).toBe('true')
+  expect(toggle.disabled).toBe(false); expect(toggle.getAttribute('aria-disabled')).toBe('true')
+  await act(async () => fail('disk failure'))
+  expect(onStatusChange).toHaveBeenLastCalledWith({ message: '无法读取或保存内置功能，请刷新核对。', tone: 'error' })
+  expect(toggle.disabled).toBe(true)
+  await click('刷新插件列表')
+  expect(button('启用内置功能：快速链接').disabled).toBe(false)
+  expect(client.builtinEnabled).toHaveBeenCalledTimes(1)
+})

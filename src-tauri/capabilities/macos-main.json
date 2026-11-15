@@ -27,6 +27,8 @@
     "allow-set-hotkey-recording",
     "allow-get-launcher-hotkey-status",
     "core:window:allow-start-dragging",
+    "allow-list-macos-builtin-features",
+    "allow-set-macos-builtin-enabled",
     "allow-list-macos-plugins",
     "allow-prepare-macos-plugin-install",
     "allow-commit-macos-plugin-install",

@@ -22,6 +22,8 @@ mod quick_evaluation;
 #[cfg(target_os = "macos")]
 mod macos_quick_evaluation;
 #[cfg(target_os = "macos")]
+mod macos_builtin_management;
+#[cfg(target_os = "macos")]
 mod web_search;
 #[cfg(target_os = "macos")]
 mod quicklinks;

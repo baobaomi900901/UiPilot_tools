@@ -11,7 +11,12 @@ export interface MacPluginRow {
 }
 export interface MacPluginSnapshot { revision: string; plugins: readonly MacPluginRow[] }
 export interface MacPluginPreview { token: string; expectedRevision: string; plugin: MacPluginRow; requiredPermissions: readonly 'clipboard.write'[] }
+export type MacBuiltinFeature = 'webSearch' | 'quicklinks'
+export interface MacBuiltinRow { feature: MacBuiltinFeature; name: string; command: string; enabled: boolean }
 export interface MacPluginManagementClient {
+  listBuiltins?(): Promise<readonly MacBuiltinRow[]>
+  builtinEnabled?(input: { feature: MacBuiltinFeature; enabled: boolean }): Promise<readonly MacBuiltinRow[]>
+
   list(): Promise<MacPluginSnapshot>
   prepare(input: { kind: 'archive' | 'directory'; expectedRevision: string }): Promise<MacPluginPreview | null>
   commit(input: { token: string; expectedRevision: string; approvedPermissions: readonly 'clipboard.write'[] }): Promise<MacPluginSnapshot>
@@ -57,6 +62,18 @@ export function parseMacPluginPreview(v: unknown): MacPluginPreview | null {
   if (!plugin || v.requiredPermissions.some(p => !plugin.permissions.some(allowed => allowed.permission === p))) return null
   return { token: v.token, expectedRevision: v.expectedRevision as string, plugin, requiredPermissions: v.requiredPermissions as 'clipboard.write'[] }
 }
+export function parseMacBuiltinRows(value: unknown): readonly MacBuiltinRow[] | null {
+  if (!Array.isArray(value) || value.length !== 2) return null
+  const names = { webSearch: ['网页搜索', '/web-search'], quicklinks: ['快速链接', '/quicklinks'] } as const
+  const seen = new Set<string>()
+  for (const item of value) {
+    if (!record(item) || !exact(item, ['feature', 'name', 'command', 'enabled']) ||
+        (item.feature !== 'webSearch' && item.feature !== 'quicklinks') || seen.has(item.feature) ||
+        item.name !== names[item.feature][0] || item.command !== names[item.feature][1] || typeof item.enabled !== 'boolean') return null
+    seen.add(item.feature)
+  }
+  return value as MacBuiltinRow[]
+}
 export function createMacPluginManagementClient(invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>): MacPluginManagementClient {
   // Shared by mounted pages. A new inventory read waits for an earlier write,
   // including a write whose initiating page has already unmounted.
@@ -67,7 +84,10 @@ export function createMacPluginManagementClient(invoke: (command: string, args?:
     return next
   }
   const snapshot = (v: unknown) => { const parsed = parseMacPluginSnapshot(v); if (!parsed) throw 'pluginManagementUnavailable'; return parsed }
+  const builtins = (v: unknown) => { const parsed = parseMacBuiltinRows(v); if (!parsed) throw 'builtinManagementUnavailable'; return parsed }
   return {
+    listBuiltins: () => call('list_macos_builtin_features', undefined, builtins),
+    builtinEnabled: input => call('set_macos_builtin_enabled', input, builtins),
     list: () => call('list_macos_plugins', undefined, snapshot),
     prepare: input => call('prepare_macos_plugin_install', input, v => { if (v === null) return null; const parsed = parseMacPluginPreview(v); if (!parsed) throw 'pluginManagementUnavailable'; return parsed }),
     commit: input => call('commit_macos_plugin_install', input, snapshot),

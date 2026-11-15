@@ -1,5 +1,5 @@
 import { expect, it, vi } from 'vitest'
-import { createMacPluginManagementClient, parseMacPluginSnapshot, parseMacPluginPreview } from './macos-plugin-management-client'
+import { createMacPluginManagementClient, parseMacPluginSnapshot, parseMacPluginPreview, parseMacBuiltinRows } from './macos-plugin-management-client'
 import { parseHostCapabilities, previewCapabilities, settingsTabAvailable, resultAvailable } from './host-capabilities'
 const plugin = { pluginId: 'com.test.plugin', name: 'Test', description: null, version: '1.0.0', enabled: false, commands: [{ id: 'default', name: 'test', defaultName: 'test', nameOverride: null, favorite: false }], permissions: [{ permission: 'clipboard.write', granted: false }], settings: [{ type: 'text', key: 'greeting', label: 'Text', default: 'Hello' }], values: { greeting: '你好' } }
 const snapshot = { revision: '9007199254740993', plugins: [plugin] }
@@ -45,4 +45,27 @@ it('rejects mismatched command names and untyped favorites, and sends stable ID 
   const input = { pluginId: plugin.pluginId, commandId: 'default', nameOverride: 'renamed', favorite: true, expectedRevision: snapshot.revision }
   expect(await createMacPluginManagementClient(invoke).command(input)).toEqual(snapshot)
   expect(invoke).toHaveBeenCalledWith('save_macos_plugin_command', { input })
+})
+
+const builtins = [
+  { feature: 'webSearch', name: '网页搜索', command: '/web-search', enabled: true },
+  { feature: 'quicklinks', name: '快速链接', command: '/quicklinks', enabled: false },
+]
+it('validates only the two supported builtin management rows', () => {
+  expect(parseMacBuiltinRows(builtins)).toEqual(builtins)
+  for (const invalid of [[], [builtins[0], builtins[0]], [...builtins, builtins[0]],
+    [{ ...builtins[0], enabled: 'yes' }, builtins[1]], [{ ...builtins[0], feature: 'screenshot' }, builtins[1]],
+    [{ ...builtins[0], command: '/injected' }, builtins[1]], [{ ...builtins[0], path: '/tmp' }, builtins[1]],
+  ]) expect(parseMacBuiltinRows(invalid)).toBeNull()
+})
+it('queues builtin reads behind in-flight writes across page lifetimes', async () => {
+  let finish!: (value: unknown) => void
+  const pending = new Promise(resolve => { finish = resolve })
+  const invoke = vi.fn(async (name: string) => name === 'set_macos_builtin_enabled' ? pending : builtins)
+  const client = createMacPluginManagementClient(invoke)
+  const write = client.builtinEnabled!({ feature: 'webSearch', enabled: false })
+  const read = client.listBuiltins!()
+  await Promise.resolve(); expect(invoke).toHaveBeenCalledTimes(1)
+  finish(builtins); await write; expect(await read).toEqual(builtins)
+  expect(invoke.mock.calls.map(c => c[0])).toEqual(['set_macos_builtin_enabled', 'list_macos_builtin_features'])
 })

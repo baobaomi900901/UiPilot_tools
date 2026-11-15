@@ -35,6 +35,8 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_host_capabilities",
+            "list_macos_builtin_features",
+            "set_macos_builtin_enabled",
             "list_macos_plugins",
             "prepare_macos_plugin_install",
             "commit_macos_plugin_install",

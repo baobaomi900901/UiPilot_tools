@@ -29,3 +29,6 @@
 
 .mac-plugin-command-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .mac-plugin-management .ant-btn:disabled { color: var(--uipilot-ui-muted-foreground); opacity: .55; cursor: not-allowed; }
+
+.mac-builtin-description { cursor: default; }
+.mac-builtin-description:hover { background: transparent; }

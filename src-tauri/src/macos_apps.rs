@@ -818,6 +818,27 @@ mod platform_app_commands {
         }
     }
     #[test]
+    fn quicklink_disabling_before_admission_rejects_old_result_and_preserves_links() {
+        for during in [false, true] {
+            let (f, service, settings) = fixture();
+            let link = quicklink_fixture(&service, &f.0);
+            let response = publish_quicklink(&service, &settings, &f.0, 1);
+            let disable = || settings.set_builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::Quicklinks, false).unwrap();
+            if !during { disable(); }
+            let result = execute_quicklink_registered(&service, &settings, &f.0, &response.request_id, &response.items[0].result_id, |_, admit| {
+                if during { disable(); }
+                assert!(!admit()); Err(crate::macos_browser_open::OpenError::Stale)
+            });
+            assert_eq!(result.err().unwrap().code, "staleRequest");
+            let links = service.management.quicklinks(&f.0).unwrap().list().items;
+            assert_eq!(links[0].id, link.id);
+            assert!(crate::macos_quicklinks::entries(&settings.snapshot(), "", &links).is_empty());
+            assert!(crate::macos_quicklinks::entries(&settings.snapshot(), "/test value", &links).is_empty());
+            settings.set_builtin_feature_enabled(crate::settings::ManagedBuiltinFeature::Quicklinks, true).unwrap();
+            assert!(!crate::macos_quicklinks::entries(&settings.snapshot(), "", &links).is_empty());
+        }
+    }
+    #[test]
     fn quicklink_admitted_before_delete_finishes_once_but_never_hides_new_query() {
         let (f, service, settings) = fixture();
         let link = quicklink_fixture(&service, &f.0);

@@ -15,6 +15,7 @@ test('Mac production enables only a local main capability and its core commands'
     'allow-get-host-capabilities', 'allow-hide-launcher', 'allow-set-settings-pinned', 'allow-load-settings', 'allow-set-theme-preference',
     'allow-search-apps', 'allow-execute-result', 'allow-set-web-search-engine', 'allow-save-hotkey', 'allow-set-hotkey-recording',
     'allow-get-macos-login-item', 'allow-set-macos-login-item', 'allow-open-macos-login-item-settings',
+    'allow-list-macos-builtin-features', 'allow-set-macos-builtin-enabled',
     'allow-list-macos-plugins', 'allow-prepare-macos-plugin-install', 'allow-commit-macos-plugin-install',
     'allow-cancel-macos-plugin-install', 'allow-set-macos-plugin-enabled', 'allow-set-macos-plugin-permission',
     'allow-save-macos-plugin-command', 'allow-set-plugin-favorite', 'allow-set-builtin-feature-favorite',
@@ -71,4 +72,18 @@ test('smoke requires both the trusted frontend marker and a clean exit', async (
   await run("console.error('[UiPilot] main frontend ready')");
   await assert.rejects(run('process.exit(0)'), /ready=false/);
   await assert.rejects(run("console.error('[UiPilot] main frontend ready'); process.exitCode = 2"), /status=2/);
+});
+
+test('Mac builtin management checks the main caller before settings access and is absent from other webviews', () => {
+  const source = readFileSync(new URL('../src-tauri/src/macos_builtin_management.rs', import.meta.url), 'utf8');
+  for (const name of ['list_macos_builtin_features', 'set_macos_builtin_enabled']) {
+    const body = source.slice(source.indexOf(`fn ${name}(`)).split('\n}')[0];
+    const authorization = body.indexOf('require_main(&window)?;');
+    const access = [body.indexOf('window.state'), body.indexOf('window.app_handle()')].filter(index => index >= 0);
+    assert.ok(authorization >= 0 && access.length > 0 && access.every(index => authorization < index));
+    const permission = 'allow-' + name.replaceAll('_', '-');
+    for (const file of ['main', 'find', 'plugin-runtime', 'plugin-panel-content', 'plugin-window-content', 'plugin-window-shell']) {
+      assert.ok(!read(`capabilities/${file}.json`).permissions.includes(permission));
+    }
+  }
 });

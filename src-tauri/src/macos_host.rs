@@ -410,6 +410,8 @@ pub fn run() {
         .manage(Mutex::new(Presentation::default()))
         .manage(std::sync::Arc::new(crate::public_plugins::management_macos::ManagementState::default()))
         .invoke_handler(tauri::generate_handler![
+            crate::macos_builtin_management::list_macos_builtin_features,
+            crate::macos_builtin_management::set_macos_builtin_enabled,
             crate::macos_plugin_management::list_macos_plugins,
             crate::macos_plugin_management::prepare_macos_plugin_install,
             crate::macos_plugin_management::commit_macos_plugin_install,

@@ -1,13 +1,14 @@
 import { Button, Input, Modal, Select, Switch, type SwitchProps } from 'antd'
 import { ArrowLeft, FolderOpen, RefreshCw, Star, Upload } from 'lucide-react'
 import { useEffect, useLayoutEffect, useImperativeHandle, useRef, useState, type KeyboardEvent, type Ref } from 'react'
-import type { MacPluginManagementClient, MacPluginPreview, MacPluginSnapshot, OrdinarySetting, SettingValues } from './macos-plugin-management-client'
+import type { MacBuiltinFeature, MacBuiltinRow, MacPluginManagementClient, MacPluginPreview, MacPluginSnapshot, OrdinarySetting, SettingValues } from './macos-plugin-management-client'
 import './macos-plugin-management.css'
 
 export interface MacPluginManagementStatus { message: string; tone: 'default' | 'success' | 'error' }
 export interface MacPluginCommandTarget { pluginId: string; commandId: string }
 export interface MacPluginManagementHandle { requestLeave: (action: () => void) => void; back: () => boolean; focusFilter: () => void }
 const errors: Record<string, string> = {
+  builtinManagementUnavailable: '无法读取或保存内置功能，请刷新核对。',
   pluginManagementStale: '插件配置已变化，请刷新后核对并重试。',
   pluginManagementCommitUncertain: '保存结果尚未确认，请刷新核对；不会自动重复提交。',
   pluginManagementInvalidPackage: '无法导入此插件，请检查插件包是否完整。',
@@ -45,6 +46,7 @@ function ConfigurationSwitch({ busy, disabled, onChange, ...props }: SwitchProps
     onChange={(checked, event) => { if (!disabled && !busy) onChange?.(checked, event) }} />
 }
 export function MacPluginManagement({ client, ref, onStatusChange, initialTarget, onTargetHandled }: { client?: MacPluginManagementClient; ref?: Ref<MacPluginManagementHandle>; onStatusChange?: (status: MacPluginManagementStatus) => void; initialTarget?: MacPluginCommandTarget; onTargetHandled?: () => void }) {
+  const [builtins, setBuiltins] = useState<readonly MacBuiltinRow[]>([])
   const [snapshot, setSnapshot] = useState<MacPluginSnapshot | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [selectedCommand, setSelectedCommand] = useState<string | null>(null)
@@ -86,12 +88,12 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
   const reload = async () => {
     if (!begin() || !client) return
     const epoch = generation.current
-    try { const value = await client.list(); if (owns(epoch)) { publish(value); setNotice('已刷新') } }
+    try { const value = await client.list(); const features = await client.listBuiltins?.() ?? []; if (owns(epoch)) { publish(value); setBuiltins(features); setNotice('已刷新') } }
     catch (e) { if (owns(epoch)) { setError(message(e)); setNeedsReview(true) } }
     finally { finish(epoch) }
   }
   useEffect(() => {
-    generation.current++; live.current = true; pending.current = false; setSnapshot(null); setSelected(null); clearDrafts(); setPrepared(null); setLeave(null); setRemoveOpen(false); setNeedsReview(false); void reload()
+    generation.current++; live.current = true; pending.current = false; setBuiltins([]); setSnapshot(null); setSelected(null); clearDrafts(); setPrepared(null); setLeave(null); setRemoveOpen(false); setNeedsReview(false); void reload()
     return () => { generation.current++; live.current = false; const p = preparedRef.current; preparedRef.current = null; if (p) void client?.cancel({ token: p.token }).catch(() => {}) }
     // The client is a stable host-owned instance with a cross-mount operation queue.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -162,7 +164,7 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     (commandDraft !== null && invalidCommand ? '启动名称无效：使用小写字母、数字或短横线，以字母开头，最多 32 个字符。' : '') ||
     (invalid ? '请检查设置值的类型、范围或选项。' : '') || notice
   const feedbackTone: MacPluginManagementStatus['tone'] = error || !client || (!busy && ((commandDraft !== null && invalidCommand) || invalid))
-    ? 'error' : !busy && (notice.includes('已保存') || notice.startsWith('插件已停用') || notice === '已刷新') ? 'success' : 'default'
+    ? 'error' : !busy && (notice.includes('已保存') || notice.startsWith('插件已停用') || notice === '已刷新' || notice.endsWith('已启用。') || notice.endsWith('已停用，配置已保留。')) ? 'success' : 'default'
   useEffect(() => {
     onStatusChange?.({ message: feedbackMessage, tone: feedbackTone })
     return () => onStatusChange?.({ message: '', tone: 'default' })
@@ -194,6 +196,20 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     void mutate(() => client.enabled({ pluginId, enabled, expectedRevision: snapshot.revision }),
       enabled ? '启用配置已保存；当前 Mac 插件暂不能运行。' : '插件已停用，命令和设置已保留。')
   }
+  const setBuiltinEnabled = async (feature: MacBuiltinFeature, enabled: boolean) => {
+    if (needsReview || !client?.builtinEnabled || !begin()) return
+    const epoch = generation.current
+    try {
+      const value = await client.builtinEnabled({ feature, enabled })
+      if (owns(epoch)) {
+        setBuiltins(value)
+        const name = value.find(item => item.feature === feature)?.name ?? '内置功能'
+        setNotice(enabled ? `${name}已启用。` : `${name}已停用，配置已保留。`)
+      }
+    } catch { if (owns(epoch)) { setError(errors.builtinManagementUnavailable); setNeedsReview(true) } }
+    finally { finish(epoch) }
+  }
+  const visibleBuiltins = builtins.filter(item => `${item.name} ${item.command}`.toLocaleLowerCase().includes(filter.toLocaleLowerCase()))
   const list = snapshot?.plugins.filter(p => `${p.name} ${p.commands.map(c => c.name).join(' ')}`.toLocaleLowerCase().includes(filter.toLocaleLowerCase())) ?? []
   const installed = prepared ? snapshot?.plugins.find(p => p.pluginId === prepared.plugin.pluginId) : undefined
   const listKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -216,13 +232,18 @@ export function MacPluginManagement({ client, ref, onStatusChange, initialTarget
     {!selected ? <>
       <Input aria-label="搜索插件名称或启动命令" placeholder="搜索插件名称或启动命令" value={filter} onChange={e => setFilter(e.target.value)} allowClear />
       <div className="mac-plugin-list" onKeyDown={listKeyDown}>
+        {visibleBuiltins.length ? <section aria-label="内置功能"><h3>内置功能</h3>{visibleBuiltins.map(item => <div className="mac-plugin-list-item" key={item.feature}>
+          <div className="mac-plugin-row mac-builtin-description"><span><strong>{item.name}</strong><small>{item.command}</small></span><span><small>{item.enabled ? '已启用' : '已停用'}</small></span></div>
+          <ConfigurationSwitch aria-label={`启用内置功能：${item.name}`} checked={item.enabled} busy={busy} disabled={configurationBlocked} onChange={enabled => void setBuiltinEnabled(item.feature, enabled)} />
+        </div>)}</section> : null}
+        {builtins.length && list.length ? <h3>已安装插件</h3> : null}
         {list.map(p => <div className="mac-plugin-list-item" key={p.pluginId}>
           <button className="mac-plugin-row" data-plugin-id={p.pluginId} disabled={busy} onClick={() => { setSelected(p.pluginId); setSelectedCommand(null); clearDrafts(); setNotice('') }}>
           <span><strong>{p.name}</strong><small>{p.commands.map(c => `/${c.name}`).join(' · ')}</small></span><span>{p.version}<small>{p.enabled ? '启用配置已保存' : '已停用'}</small></span>
           </button>
           <ConfigurationSwitch aria-label={`启用插件：${p.name}`} checked={p.enabled} busy={busy} disabled={configurationBlocked} onChange={enabled => setPluginEnabled(p.pluginId, enabled)} />
         </div>)}
-        {!list.length && snapshot ? <p className="mac-plugin-empty">{snapshot.plugins.length ? '没有匹配的插件。' : '尚未安装插件，请导入插件包或开发目录。'}</p> : null}
+        {!list.length && !visibleBuiltins.length && snapshot ? <p className="mac-plugin-empty">{snapshot.plugins.length ? '没有匹配的插件。' : '尚未安装插件，请导入插件包或开发目录。'}</p> : null}
       </div>
     </> : plugin && snapshot && client ? <div className="mac-plugin-detail">
       <h2 ref={heading} tabIndex={-1}>{plugin.name}</h2><p>{plugin.description || '暂无插件说明'}</p><p className="mac-plugin-metadata">{plugin.pluginId} · {plugin.version}</p>
