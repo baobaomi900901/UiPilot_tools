@@ -1,3 +1,4 @@
+import { bindMacTextNavigation } from './macos-text-navigation'
 import { isPrimaryShortcut, primaryModifierPressed, primaryShortcutLabel } from './platform-shortcuts'
 import { MacPluginManagement, type MacPluginManagementHandle, type MacPluginManagementStatus, type MacPluginCommandTarget } from './macos-plugin-management'
 import { MacHotkeyStatusNotice } from './macos-hotkey-status'
@@ -61,6 +62,17 @@ import type {
 } from './protocol'
 import { resolveUiColorScheme, uiThemeConfig } from './ui-theme'
 import { formatHotkeyDisplay } from './hotkey-recorder'
+
+// Keep native editing on other platforms; scope the WK navigation workaround to
+// editable Quicklinks fields, including the portaled creation dialog.
+function QuicklinkTextInput({ platform, ...props }: InputProps & { platform: string }) {
+  const ref = useRef<InputRef>(null)
+  useEffect(() => {
+    const input = ref.current?.input
+    if (platform === 'macos' && input) return bindMacTextNavigation(input)
+  }, [platform])
+  return <Input {...props} ref={ref} />
+}
 
 export interface LauncherViewProps {
   core: LauncherCore
@@ -1870,7 +1882,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                   <section ref={quicklinksEditorRef} className="quicklinks-editor">
                 <Form component="div" layout="vertical" className="quicklinks-form">
                   <Form.Item label="目录名称" className="quicklinks-form-row">
-                    <Input
+                    <QuicklinkTextInput platform={core.capabilities.platform}
                       aria-label="目录名称"
                       value={quicklinksDraft?.name ?? ''}
                       disabled={quicklinksBusy}
@@ -1880,7 +1892,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                   <Form.Item label="启动键" className="quicklinks-form-row">
                     <div className="quicklink-command-field">
                       <span aria-hidden="true">/</span>
-                      <Input
+                      <QuicklinkTextInput platform={core.capabilities.platform}
                         aria-label="启动键"
                         value={quicklinksDraft?.command ?? ''}
                         disabled={quicklinksBusy}
@@ -1917,7 +1929,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                     </div>
                   </Form.Item>
                   <Form.Item label="链接" className="quicklinks-form-row">
-                    <Input
+                    <QuicklinkTextInput platform={core.capabilities.platform}
                       aria-label="链接"
                       value={quicklinksDraft?.template ?? ''}
                       disabled={quicklinksBusy}
@@ -1992,7 +2004,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
             <h3 id="quicklink-create-title" className="dialog-title">新建快速链接</h3>
             <Form component="div" layout="vertical" className="quicklinks-form">
               <Form.Item label="目录名称">
-                <Input
+                <QuicklinkTextInput platform={core.capabilities.platform}
                   aria-label="目录名称"
                   autoFocus
                   value={quicklinksCreateDraft?.name ?? ''}
@@ -2003,7 +2015,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
               <Form.Item label="启动键">
                 <div className="quicklink-command-field">
                   <span aria-hidden="true">/</span>
-                  <Input
+                  <QuicklinkTextInput platform={core.capabilities.platform}
                     aria-label="启动键"
                     value={quicklinksCreateDraft?.command ?? ''}
                     disabled={quicklinksBusy}
@@ -2040,7 +2052,7 @@ export function LauncherView({ core, onReady, setSettingsPinned }: LauncherViewP
                 </div>
               </Form.Item>
               <Form.Item label="链接">
-                <Input
+                <QuicklinkTextInput platform={core.capabilities.platform}
                   aria-label="链接"
                   value={quicklinksCreateDraft?.template ?? ''}
                   disabled={quicklinksBusy}
