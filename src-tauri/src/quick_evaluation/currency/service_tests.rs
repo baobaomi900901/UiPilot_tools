@@ -19,7 +19,7 @@ use super::{
     CurrencyClassification, CurrencyCode, CurrencyFailure, CurrencyIntent, ExchangeRateError,
     ExchangeRateRequest, ExchangeRateResult,
 };
-use crate::atomic_file::{AtomicFileError, AtomicPaths};
+use super::persistence::{AtomicFileError, AtomicPaths};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -28,7 +28,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(label: &str) -> Self {
         let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "uipilot-exchange-rate-service-{label}-{}-{id}",
             std::process::id()
         ));

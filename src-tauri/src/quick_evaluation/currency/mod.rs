@@ -1,17 +1,24 @@
+#[cfg(target_os = "macos")]
+mod persistence_macos;
+#[cfg(target_os = "macos")]
+use persistence_macos as persistence;
 #[cfg(windows)]
+use crate::atomic_file as persistence;
+
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) mod cache;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) mod provider;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) mod service;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) mod transport;
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod cache_tests;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod service_tests;
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod transport_tests;
 
 use rust_decimal::{Decimal, RoundingStrategy};

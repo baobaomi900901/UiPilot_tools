@@ -58,6 +58,10 @@ impl AtomicPaths {
     pub(crate) fn backup(&self) -> &Path { &self.backup }
 
     pub(crate) fn read_optional(&self, name: &Path) -> io::Result<Option<Vec<u8>>> {
+        self.read_optional_bounded(name, usize::MAX)
+    }
+
+    pub(crate) fn read_optional_bounded(&self, name: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let fd = match openat(&self.directory, name, flags, Mode::empty()) {
             Ok(fd) => fd,
@@ -67,7 +71,9 @@ impl AtomicPaths {
         let mut file = File::from(fd);
         if !file.metadata()?.is_file() { return Err(io::Error::other("expected regular settings file")); }
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        if file.metadata()?.len() > limit as u64 { return Err(io::Error::other("file too large")); }
+        (&mut file).take((limit as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() > limit { return Err(io::Error::other("file too large")); }
         Ok(Some(bytes))
     }
 

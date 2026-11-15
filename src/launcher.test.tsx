@@ -9226,7 +9226,7 @@ describe('real adapter and startup', () => {
     tauriCapture.listen.mockReset()
   }
 
-  it('keeps Mac quick values and unavailable currency visible without enabling other builtins or plugins', async () => {
+  it('keeps Mac quick values and currency visible without enabling other builtins or plugins', async () => {
     const { client, emit } = fakeClient()
     const quickKinds = ['calculator', 'unit', 'date', 'timeZone'] as const
     vi.mocked(client.searchApps).mockResolvedValue({ requestId: 'mac-quick', replaceLocalResults: true, items: [
@@ -9246,12 +9246,12 @@ describe('real adapter and startup', () => {
       emit(shown('mac-quick'))
       core.text({ kind: 'ordinaryInput', control: core.getSnapshot().queryControl, value: '2+2', inputType: 'insertText' })
       await vi.waitFor(() => expect(core.getSnapshot().searchPending).toBe(false))
-      expect(core.getSnapshot().results.map(row => row.title)).toEqual([...quickKinds, '汇率暂不可用'])
+      expect(core.getSnapshot().results.map(row => row.title)).toEqual([...quickKinds, '汇率暂不可用', 'Currency action'])
       core.activateResult(4)
       expect(client.executeResult).not.toHaveBeenCalled()
-      core.selectResult(0)
+      core.selectResult(5)
       core.keyDown('Enter', false)
-      await vi.waitFor(() => expect(client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'mac-quick', resultId: 'calculator' }))
+      await vi.waitFor(() => expect(client.executeResult).toHaveBeenCalledExactlyOnceWith({ requestId: 'mac-quick', resultId: 'currency-action' }))
       expect(client.hideLauncher).not.toHaveBeenCalled()
     } finally { core.destroy() }
   })

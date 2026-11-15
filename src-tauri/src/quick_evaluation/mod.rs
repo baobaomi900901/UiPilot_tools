@@ -167,7 +167,7 @@ where
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) async fn evaluate_currency<R, F>(
     intent: currency::CurrencyIntent,
     resolver: R,
@@ -212,7 +212,7 @@ fn currency_unavailable() -> QuickFailure {
     QuickFailure {
         kind: QuickKind::Currency,
         title: "汇率暂不可用".into(),
-        explanation: if cfg!(target_os = "macos") { "此平台尚未启用汇率服务" } else { "请稍后重试" }.into(),
+        explanation: "请稍后重试".into(),
     }
 }
 

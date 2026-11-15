@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
+#[cfg(windows)]
+use std::fs;
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -7,7 +9,7 @@ use time::{
 };
 
 use super::{parse_decimal_exact, CurrencyCode, ExchangeRateRequest, ExchangeRateResult};
-use crate::atomic_file::{commit_with_backup, read_optional_bounded, AtomicFileError, AtomicPaths};
+use super::persistence::{commit_with_backup, read_optional_bounded, AtomicFileError, AtomicPaths};
 
 const CACHE_FILE_NAME: &str = "exchange-rate-cache.json";
 // A canonical 256-entry snapshot is below this conservative pre-parse read cap.
@@ -153,9 +155,13 @@ impl ExchangeRateCache {
         committer: Arc<dyn CacheCommitter>,
     ) -> Self {
         let paths = AtomicPaths::new(root, CACHE_FILE_NAME);
+        #[cfg(windows)]
         if fs::create_dir_all(root).is_err() {
             return Self::empty(paths, now, committer, false);
         }
+
+        #[cfg(target_os = "macos")]
+        if !paths.available() { return Self::empty(paths, now, committer, false); }
 
         let current = read_candidate(reader.as_ref(), paths.current(), now);
         if let Candidate::Valid { entries, raw } = current {
@@ -321,13 +327,17 @@ impl ExchangeRateCache {
             self.persistence_available = false;
             return None;
         };
+        #[cfg(windows)]
         let directory = self
             .paths
             .current()
             .parent()
             .expect("cache file has a parent directory");
         Some(CachePersistence {
+            #[cfg(windows)]
             paths: AtomicPaths::new(directory, CACHE_FILE_NAME),
+            #[cfg(target_os = "macos")]
+            paths: self.paths.clone(),
             previous: self.validated_current_raw.clone(),
             candidate,
             committer: self.committer.clone(),

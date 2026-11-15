@@ -15,6 +15,7 @@ use crate::{
 
 struct MacApplications {
     cache: Arc<AppCache>,
+    currency: std::sync::OnceLock<Arc<crate::quick_evaluation::currency::service::ExchangeRateService>>,
     registry: ResultRegistry,
     runtime: Arc<LauncherRuntime>,
     management: Arc<ManagementState>,
@@ -35,6 +36,7 @@ impl MacApplications {
         let runtime = LauncherRuntime::closed(management.clone(), registry.clone());
         Self {
             cache: Arc::new(cache),
+            currency: std::sync::OnceLock::new(),
             registry,
             runtime,
             management,
@@ -152,6 +154,17 @@ pub(crate) async fn search_apps(
     let Some(token) = service.registry.begin_query(QueryDomain::Application, &invocation_id, query_sequence) else {
         return Ok(None);
     };
+    if let crate::quick_evaluation::QuickClassification::Ready(crate::quick_evaluation::QuickIntent::Currency(intent)) = crate::quick_evaluation::classify(query.trim()) {
+        let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;
+        let owner = service.inner().clone();
+        // Cache IO and provider construction stay off the main thread. One service
+        // coalesces requests across amounts, queries and launcher invocations.
+        let currency = tauri::async_runtime::spawn_blocking(move || owner.currency.get_or_init(||
+            Arc::new(crate::quick_evaluation::currency::service::ExchangeRateService::load_or_unavailable(&root))
+        ).clone()).await.map_err(|_| Error::unavailable())?;
+        return Ok(crate::macos_quick_evaluation::publish_currency(&service.registry, token, intent,
+            |intent| async move { currency.resolve(intent).await }).await);
+    }
     if let Some(response) = quick_query(&service, token, &query) { return Ok(response); }
     let plugins = if !service.runtime.available() {
         let root = app.path().app_data_dir().map_err(|_| Error::unavailable())?;

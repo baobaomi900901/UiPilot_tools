@@ -52,11 +52,9 @@ export function resultAvailable(host: HostCapabilities, activation: LauncherResu
       item.hasDefaultAction === false && item.favorite?.target.kind === 'builtin' && item.favorite.target.feature === 'webSearch') return true
   if (host.webSearch && !item.favorite && item.iconKind === 'webSearch' && activation.kind === 'executeResult') return true
   // Mac supports query values before the full reusable built-in command system.
-  // Currency is an unavailable informational row until its service is enabled.
   if (host.platform === 'macos' && !item.favorite && (
-    (['calculator', 'unit', 'date', 'timeZone'].includes(item.iconKind ?? '') &&
-      (activation.kind === 'executeResult' || activation.kind === 'informational')) ||
-    (item.iconKind === 'currency' && activation.kind === 'informational')
+    (['calculator', 'unit', 'date', 'timeZone', 'currency'].includes(item.iconKind ?? '') &&
+      (activation.kind === 'executeResult' || activation.kind === 'informational'))
   )) return true
   if (!host.builtinFeatures && (item.iconKind || item.favorite?.target?.kind === 'builtin')) {
     if (activation.kind !== 'openFind' || !host.files || item.iconKind !== 'find' ||
