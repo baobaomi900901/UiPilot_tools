@@ -206,20 +206,20 @@ test('unreleased multi-package fixture adds tests and SDK contracts without rele
 
 test('release repository inventory includes the complete multi-command package', () => {
   const found = discover(repositoryRoot);
-  assert.equal(found.tests.length, 21);
-  assert.equal(found.contracts.length, 14);
-  assert.equal(found.packages.length, 17);
-  assert.ok(found.tests.some(file => file.includes('com.uipilot.auth-check')));
-  assert.ok(found.contracts.some(file => file.includes('com.uipilot.auth-check')));
-  assert.ok(found.packages.some(file => file.includes('com.uipilot.auth-check')));
+  assert.equal(found.tests.length, 20);
+  assert.equal(found.contracts.length, 13);
+  assert.equal(found.packages.length, 16);
+  assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-auth-check')));
+  assert.ok(found.contracts.some(file => file.includes('com.uipilot.demo-auth-check')));
+  assert.ok(found.packages.some(file => file.includes('com.uipilot.demo-auth-check')));
   assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-multi')));
   assert.ok(found.contracts.some(file => file.includes('com.uipilot.demo-multi')));
   assert.ok(found.packages.some(file => file.includes('com.uipilot.demo-multi')));
   assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-settings')));
   assert.ok(found.packages.some(file => file.includes('com.uipilot.demo-settings')));
-  assert.ok(found.tests.some(file => file.includes('com.uipilot.json-workbench')));
-  assert.ok(found.contracts.some(file => file.includes('com.uipilot.json-workbench')));
-  assert.ok(found.packages.some(file => file.includes('com.uipilot.json-workbench')));
+  assert.ok(found.tests.some(file => file.includes('com.uipilot.demo-json-workbench')));
+  assert.ok(found.contracts.some(file => file.includes('com.uipilot.demo-json-workbench')));
+  assert.ok(found.packages.some(file => file.includes('com.uipilot.demo-json-workbench')));
   assert.ok(found.tests.some(file => file.includes('com.uipilot.text-snippet')));
   assert.ok(found.contracts.some(file => file.includes('com.uipilot.text-snippet')));
   assert.ok(found.packages.some(file => file.includes('com.uipilot.text-snippet')));
@@ -230,12 +230,14 @@ test('Host release versions agree while the CLI package version stays independen
   const read = name => readFileSync(path.join(repositoryRoot, name), 'utf8').replaceAll('\r\n', '\n');
   const root = JSON.parse(read('package.json'));
   const lock = JSON.parse(read('package-lock.json'));
-  assert.equal(root.version, '0.14.0');
+  assert.match(root.version, /^\d+\.\d+\.\d+$/);
   assert.equal(lock.version, root.version);
   assert.equal(lock.packages[''].version, root.version);
   assert.equal(JSON.parse(read('src-tauri/tauri.conf.json')).version, root.version);
-  assert.match(read('src-tauri/Cargo.toml'), /\[package\][\s\S]*?\nversion = "0\.14\.0"/);
-  assert.match(read('src-tauri/Cargo.lock'), /name = "uipilot"\nversion = "0\.14\.0"/);
+  const cargoVersion = read('src-tauri/Cargo.toml').match(/\[package\][\s\S]*?\nversion = "([^"]+)"/);
+  const cargoLockVersion = read('src-tauri/Cargo.lock').match(/name = "uipilot"\nversion = "([^"]+)"/);
+  assert.equal(cargoVersion?.[1], root.version);
+  assert.equal(cargoLockVersion?.[1], root.version);
   const runtimeVersion = read('src-tauri/src/public_plugins.rs').match(/impl PublicPluginHost \{[\s\S]*?version: \[(\d+), (\d+), (\d+)\]/);
   assert.ok(runtimeVersion, 'real runtime Host version is missing');
   assert.equal(runtimeVersion.slice(1).join('.'), root.version);

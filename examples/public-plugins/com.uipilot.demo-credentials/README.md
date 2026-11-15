@@ -1,4 +1,4 @@
-# Credential Reference Demo
+# demo Credentials
 
 Windows Host `0.4.0+`, API v1, `submit + mainResult`. The package declares `service-token / api-token / api.example.com / bearer` and sends only `credential: 'service-token'`. It contains no token, dependencies, browser networking, panel, or window. `api.example.com` is a documentation placeholder, not a working provider. Never use a production token with this example.
 

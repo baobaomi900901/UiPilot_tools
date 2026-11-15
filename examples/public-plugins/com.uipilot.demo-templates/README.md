@@ -1,4 +1,6 @@
-# 文本模板（离线 Panel Runtime 示例）
+# demo 文本模板
+
+定位：插件基座能力参考，覆盖 Panel Runtime actions、表单、预览和持久化；不列为正式业务插件。选型见[示例索引](../../../docs/plugin-sdk/plugin-examples.md)。本例保留旧版包内 ActionPanel；面向 Host 0.16.0+ 的新 Panel 按 UI 规范使用 `onActions` 接入宿主菜单，参考 `notes`。
 
 插件 `com.uipilot.templates` **1.2.0**，要求 Windows UiPilot **0.6.0+**。默认启动键 `/templates`，只声明 `ui.panel`。使用 demo-panel 包结构和 Notes 的紧凑侧栏布局，无网络、远程资源或依赖安装。
 
@@ -46,10 +48,10 @@ Runtime 的 `onCommand` 只读取目录并返回列表元数据；按钮通过�
 ## 验证与人工验收
 
 ```powershell
-node --test packages/plugin-ui/tests/*.test.mjs examples/public-plugins/com.uipilot.templates/tests/*.test.js
+node --test packages/plugin-ui/tests/*.test.mjs examples/public-plugins/com.uipilot.demo-templates/tests/*.test.js
 node packages/plugin-ui/scripts/sync-templates.mjs --check
-node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.templates/tests/sdk-contract.ts
-node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.templates/package --platform windows
+node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.demo-templates/tests/sdk-contract.ts
+node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.demo-templates/package --platform windows
 ```
 
 自动检查覆盖解析、字面替换、缺值/空值、重复样例、冲突、失败保存、损坏目录、容量与回复上限，不替代真实 Host 操作。人工仍需检查安装入口、首次预览/保存、重启持久化、错误恢复、快速编辑/关闭、键盘/双主题，以及旧 Notes/多命令插件。人工结果在交付说明中单独登记，未收到用户反馈前均为待测试。

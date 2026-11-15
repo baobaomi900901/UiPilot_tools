@@ -1,4 +1,4 @@
-# Public Plugin Demo Panel
+# demo Panel
 
 Minimal `submit + panel` reference for UiPilot 0.3.0 and later.
 

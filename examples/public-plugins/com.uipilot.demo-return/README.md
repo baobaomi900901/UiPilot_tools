@@ -1,4 +1,4 @@
-# UiPilot Demo Return Plugin
+# demo Return
 
 This independently removable public plugin demonstrates an asynchronous main-window result and a host-owned copy action. UiPilot contains no host-side `/demo-return` implementation.
 

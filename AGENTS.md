@@ -60,14 +60,17 @@ could not be right-clicked as a favorite because its result had `favorite: None`
 ## UiPilot Public Plugin Development
 
 When creating, updating, or testing a UiPilot public plugin, first read
-`docs/plugin-sdk/public-plugin-developer-guide.md` and `docs/ui-guidelines.md`.
+the repository skill `skills/uipilot-public-plugin/SKILL.md`,
+`docs/plugin-sdk/public-plugin-developer-guide.md`, and `docs/ui-guidelines.md`.
 Apply the UI guidelines to every plugin-owned panel or window while keeping
 implementation inside the plugin package. Use
 `docs/plugin-sdk/public-plugin-v1.md`, `docs/plugin-sdk/uipilot-plugin-api-v1.d.ts`,
 and `docs/plugin-sdk/uipilot-plugin-v1.schema.json` as contract references when
 the task touches manifest fields, Runtime APIs, window/panel bridges, network,
 settings, permissions, packaging, or validation. Pick the closest tracked example
-under `examples/public-plugins/` before scaffolding new plugin code.
+under `examples/public-plugins/` before scaffolding new plugin code; use
+`docs/plugin-sdk/plugin-examples.md` to distinguish maintained business plugins,
+foundation references, focused demos, and acceptance fixtures.
 
 Plugin-development tasks keep UiPilot host/app sources read-only. Implement the
 plugin inside its package, tests, and plugin-owned docs; do not patch `src/`,

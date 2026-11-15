@@ -4,7 +4,7 @@
   "version": "1.2.0",
   "apiVersion": 1,
   "minimumHostVersion": "0.14.0",
-  "name": "文本片段",
+  "name": "demo 文本片段",
   "description": "转换文本，显式保存并读取最新片段。",
   "supportedPlatforms": ["windows"],
   "commands": [

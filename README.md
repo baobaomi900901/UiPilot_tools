@@ -39,7 +39,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib --offline
 cargo run --manifest-path src-tauri/Cargo.toml --offline --bin generate_public_plugin_schema -- --check
 npm run verify --workspace @uipilot/plugin-cli
 node --test examples/public-plugins/com.uipilot.demo-panel/tests/runtime.test.js
-npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.note/tests/sdk-contract.ts
+npm exec tsc -- --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.demo-win/tests/sdk-contract.ts
 ```
 
 部分 React 测试存在已知 `act(...)` 与 Ant Design 警告，应保留并结合断言结果检查。浏览器预览和单元测试不能替代真实 Windows 宿主的焦点、键盘、双主题、剪贴板粘贴、安装/升级/卸载以及 Everything 服务/安装器 VM 验收。
@@ -80,14 +80,14 @@ Windows Host `0.4.0+` 支持将已授权的 secret 作为精确 HTTPS host 的 b
 
 Host 与 CLI 校验目标为0.14.0，CLI npm包版本独立保持0.1.0。已交付本地打包安装、多命令与统一结果动作、逐命令全局快捷键、普通设置及凭据消费、Panel/Window到Runtime调用、标准插件UI、浏览器链接、选定文本导入、授权粘贴、升级卸载及恢复诊断。各切片核心人工验收和最终代表组合测试已通过，详见[交付清单与已知限制](docs/local-plugin-foundation-delivery.md)。
 
-开发者从[公开插件教程](docs/plugin-sdk/public-plugin-developer-guide.md)开始，选择最接近的参考插件：
+开发插件时，代理先读项目 [UiPilot 插件开发 skill](skills/uipilot-public-plugin/SKILL.md)，开发者从[公开插件教程](docs/plugin-sdk/public-plugin-developer-guide.md)开始。完整分类与选型见[插件与开发示例索引](docs/plugin-sdk/plugin-examples.md)：业务插件、基座能力参考、最小 Demo 和测试夹具分别维护。以下三个工具是基座开发时形成的参考示例，不列为正式业务插件；失效的独立窗口 `note` 已移除，笔记使用 `notes`。
 
 | 场景 | 示例 |
 | --- | --- |
 | 多命令、结果动作、共享存储 | [文本片段](examples/public-plugins/com.uipilot.text-snippet/README.md) |
-| 面板表单、预览、标准UI | [文本模板](examples/public-plugins/com.uipilot.templates/README.md) |
-| 独立窗口与用户选定文本导入 | [JSON工作台](examples/public-plugins/com.uipilot.json-workbench/README.md) |
-| 实际Host认证HTTPS | [认证链路验收](examples/public-plugins/com.uipilot.auth-check/README.md) |
+| 面板表单、预览、标准UI | [文本模板](examples/public-plugins/com.uipilot.demo-templates/README.md) |
+| 独立窗口与用户选定文本导入 | [JSON工作台](examples/public-plugins/com.uipilot.demo-json-workbench/README.md) |
+| 实际Host认证HTTPS | [认证链路验收](examples/public-plugins/com.uipilot.demo-auth-check/README.md) |
 | SDK组件复用 | [Plugin UI](packages/plugin-ui/README.md) |
 
 公开插件保持受控v1合同；能力最低Host版本、权限及平台要求以SDK和manifest为准。旧单命令包保持兼容。数据schema升级后的目录不保证可由更旧Host读取，不提供任意插件数据的自动迁移或旧schema回写。

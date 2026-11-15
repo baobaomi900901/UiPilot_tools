@@ -25,7 +25,7 @@ const invocation = Object.freeze({
 test('manifest declares the fixed demo-win window contract', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package/plugin.json', import.meta.url), 'utf8'))
   assert.equal(manifest.pluginId, 'com.uipilot.demo-win')
-  assert.equal(manifest.name, 'Public Plugin Demo Window')
+  assert.equal(manifest.name, 'demo Window')
   assert.equal(manifest.command.defaultName, 'demo-win')
   assert.equal(manifest.command.activationMode, 'submit')
   assert.equal(manifest.command.outputMode, 'window')

@@ -17,10 +17,14 @@ dist/
 !/examples/public-plugins/com.uipilot.demo-panel/package/dist/**
 !/examples/public-plugins/com.uipilot.demo-http/package/dist/
 !/examples/public-plugins/com.uipilot.demo-http/package/dist/**
-!/examples/public-plugins/com.uipilot.note/package/dist/
-!/examples/public-plugins/com.uipilot.note/package/dist/**
 !/examples/public-plugins/com.uipilot.notes/package/dist/
 !/examples/public-plugins/com.uipilot.notes/package/dist/**
+!/examples/public-plugins/com.uipilot.demo-json-workbench/package/dist/
+!/examples/public-plugins/com.uipilot.demo-json-workbench/package/dist/**
+!/examples/public-plugins/com.uipilot.demo-auth-check/package/dist/
+!/examples/public-plugins/com.uipilot.demo-auth-check/package/dist/**
+!/examples/public-plugins/com.uipilot.demo-templates/package/dist/
+!/examples/public-plugins/com.uipilot.demo-templates/package/dist/**
 downloads/
 eggs/
 .eggs/

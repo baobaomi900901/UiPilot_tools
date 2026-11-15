@@ -390,7 +390,7 @@ One physical picker is allowed globally. Each facade captures its exact session/
 
 Errors have sanitized names/messages: `FileOpenBusyError`, `ExpiredWindowSessionError`, `FileOpenPermissionError`, `FileOpenUnsupportedError`, `FileOpenTooLargeError`, `FileOpenEncodingError`, `FileOpenFailedError`. Passing any argument rejects `TypeError` before IPC. Host never logs the selected path, basename, text or native errors. Files outside ordinary local drives, reparse/device/directory/ADS targets and other platforms fail closed.
 
-See [JSON workbench](../../examples/public-plugins/com.uipilot.json-workbench/README.md) for an explicit import/format/save workflow with edit/session ownership and inline dirty-draft confirmation. Native Windows behavior remains user-operated acceptance.
+See [JSON workbench](../../examples/public-plugins/com.uipilot.demo-json-workbench/README.md) for an explicit import/format/save workflow with edit/session ownership and inline dirty-draft confirmation. Native Windows behavior remains user-operated acceptance.
 
 ## Text paste result actions (Windows Host 0.14.0+)
 

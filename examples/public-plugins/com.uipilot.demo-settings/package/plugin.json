@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "apiVersion": 1,
   "minimumHostVersion": "0.2.0",
-  "name": "普通设置示例",
+  "name": "demo 普通设置",
   "description": "离线读取四类普通设置，在主界面直接核对当前值。",
   "supportedPlatforms": ["windows", "macos"],
   "command": {

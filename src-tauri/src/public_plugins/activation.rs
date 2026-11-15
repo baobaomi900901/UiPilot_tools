@@ -11326,7 +11326,7 @@ mod tests {
         assert!(manager.icon_asset("main", &stale_path, now).is_none());
 
         let identity = manager.window_identity(&commit.mutation.plugin_id).unwrap();
-        assert_eq!(identity.name, "Public Plugin Demo Window");
+        assert_eq!(identity.name, "demo Window");
         assert_eq!(identity.icon_url.as_deref(), Some(installed_url.as_str()));
         assert_eq!(
             manager.message_icon_url(&commit.mutation.plugin_id),

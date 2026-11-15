@@ -1,6 +1,8 @@
-# 文本片段 1.1.0
+# demo 文本片段
 
-Windows UiPilot Host **0.12.0+** 的离线主结果动作示例。以 demo-multi 的双命令包为结构参考，借鉴 json-workbench 的完整记录校验与版本比较；图标原样复用仓库 notes 插件的固定 notebook PNG。声明 `clipboard.write` 与 `url.open`；合法 URL 可由用户显式在默认浏览器打开。插件不发起 Host 网络请求、不读取剪贴板，也没有窗口或面板。
+定位：插件基座能力参考，覆盖多命令、主结果动作、URL、粘贴和共享存储；不列为正式业务插件。选型见[示例索引](../../../docs/plugin-sdk/plugin-examples.md)。当前版本要求 Windows Host 0.14.0+，下文 1.1/1.2 段落保留各能力引入时的说明。
+
+Windows UiPilot Host **0.14.0+** 的离线主结果动作示例。以 demo-multi 的双命令包为结构参考，借鉴 json-workbench 的完整记录校验与版本比较；图标原样复用仓库 notes 插件的固定 notebook PNG。声明 `clipboard.write`、`url.open` 与 `clipboard.paste`；合法 URL 可由用户显式在默认浏览器打开，文本可显式粘贴到原应用。插件不发起 Host 网络请求、不读取剪贴板，也没有窗口或面板。
 
 ## 安装
 

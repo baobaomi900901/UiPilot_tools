@@ -110,7 +110,7 @@ test('manifest declares only the fixed Windows bearer binding and public test se
   assert.equal(manifest.apiVersion, 1)
   assert.equal(manifest.pluginId, 'com.uipilot.auth-check')
   assert.equal(manifest.version, '1.0.0')
-  assert.equal(manifest.name, '认证链路验收')
+  assert.equal(manifest.name, 'demo 认证链路验收')
   assert.match(manifest.description, /勿填真实密钥/)
   assert.equal(manifest.minimumHostVersion, '0.4.0')
   assert.deepEqual(manifest.supportedPlatforms, ['windows'])

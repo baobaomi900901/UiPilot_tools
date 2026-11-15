@@ -1,4 +1,4 @@
-# UiPilot Demo Window Plugin
+# demo Window
 
 This independently removable public plugin demonstrates UiPilot's host-owned singleton child window. UiPilot contains no host-side `/demo-win` implementation.
 

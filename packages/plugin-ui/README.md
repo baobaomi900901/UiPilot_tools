@@ -107,7 +107,7 @@ From repository root:
 
     node packages/plugin-ui/scripts/sync-templates.mjs
     node packages/plugin-ui/scripts/sync-templates.mjs --check
-    node --test packages/plugin-ui/tests/*.test.mjs examples/public-plugins/com.uipilot.templates/tests/*.test.js
+    node --test packages/plugin-ui/tests/*.test.mjs examples/public-plugins/com.uipilot.demo-templates/tests/*.test.js
 
 Only the four named files are synchronized to the fixed templates destination.
 --check is read-only and exits nonzero on a missing/different copy. Ordinary

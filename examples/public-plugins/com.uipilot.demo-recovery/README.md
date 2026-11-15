@@ -1,4 +1,4 @@
-# 开发恢复演示：独立离线夹具
+# demo 开发恢复
 
 `com.uipilot.demo-recovery` 用一条稳定命令 `recovery` 演示更新与私有数据的独立生命周期。采用 `demo-multi` 的 package 布局、一项 `commands` 和 `submit/mainResult`；最低 Host 0.5.0，manifest/API v1，无权限、复制动作、网络、凭据、Panel、窗口或后台任务。普通设置只有 manifest 默认值的只读展示，不新增设置编辑器。
 

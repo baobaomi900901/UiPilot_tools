@@ -1,4 +1,4 @@
-# 认证链路验收
+# demo 认证链路验收
 
 独立插件 `com.uipilot.auth-check` 1.0.0，Windows Host 0.4.0+、API/schema 1、`submit + mainResult`。本次人工验收复用已验收的 Host 0.14.0。实际安装目录是 `package/`，包内仅 manifest 和 Runtime，无依赖、面板、窗口或复制动作。
 
@@ -29,10 +29,10 @@ HTTP 200 显示“认证成功（HTTP 200）”，401 显示“认证被拒绝�
 从仓库根运行，使用已有依赖和已构建 CLI：
 
 ```powershell
-node --test examples/public-plugins/com.uipilot.auth-check/tests/runtime.test.js
-node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.auth-check/tests/sdk-contract.ts
+node --test examples/public-plugins/com.uipilot.demo-auth-check/tests/runtime.test.js
+node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.demo-auth-check/tests/sdk-contract.ts
 node --test scripts/verify-local-foundation.test.mjs
-node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.auth-check/package --platform windows --json
+node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.demo-auth-check/package --platform windows --json
 ```
 
 参考结构为既有 `com.uipilot.demo-credentials`；SDK 合同及 Host/CLI 源码保持只读。打包及真实 Host 人工结果由交付记录单独跟踪。

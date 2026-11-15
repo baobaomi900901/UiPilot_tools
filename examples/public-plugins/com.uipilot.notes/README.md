@@ -10,7 +10,7 @@
 - `version`: `1.2.8`
 - `minimumHostVersion`: `0.16.0`
 - `panel.hostKeys`: `ArrowDown`, `ArrowUp`, `Primary+N`
-- 业务参考: `com.uipilot.note`
+- 当前维护的笔记插件；旧独立窗口 `note` 已移除。独立窗口开发参考 `com.uipilot.demo-win`。
 - Panel 合同参考: `com.uipilot.demo-panel`
 
 ## 安装与使用

@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "apiVersion": 1,
   "minimumHostVersion": "0.4.0",
-  "name": "认证链路验收",
+  "name": "demo 认证链路验收",
   "description": "仅用公开测试值验收 httpbun.com 认证链路，勿填真实密钥。",
   "supportedPlatforms": ["windows"],
   "command": {

@@ -1,4 +1,6 @@
-# JSON 工作台 1.1.1
+# demo JSON 工作台
+
+定位：插件基座能力参考，覆盖 Window Runtime actions、用户选定文本导入和草稿恢复；不列为正式业务插件。选型见[示例索引](../../../docs/plugin-sdk/plugin-examples.md)。
 
 Windows UiPilot **0.13.0+** 的离线单例子窗口插件，默认命令 `/json-workbench`。申请 `ui.window` 与 `files.openText`，仅在显式导入时读取用户选择的本地文本文件；不访问网络、剪贴板或通知。安装目录是本目录下的 `package/`。
 
@@ -27,11 +29,11 @@ Runtime 只使用私有 key `workbench.draft`，完整记录为 `{schemaVersion:
 在仓库根目录运行（使用已有依赖，不安装新依赖）：
 
 ```powershell
-node --test examples/public-plugins/com.uipilot.json-workbench/tests/runtime.test.js examples/public-plugins/com.uipilot.json-workbench/tests/window.test.js
-node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.json-workbench/tests/sdk-contract.ts
+node --test examples/public-plugins/com.uipilot.demo-json-workbench/tests/runtime.test.js examples/public-plugins/com.uipilot.demo-json-workbench/tests/window.test.js
+node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --strict examples/public-plugins/com.uipilot.demo-json-workbench/tests/sdk-contract.ts
 npm run build --workspace @uipilot/plugin-cli
-node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.json-workbench/package --platform windows
-node packages/plugin-cli/dist/cli.mjs pack examples/public-plugins/com.uipilot.json-workbench/package --output <新文件.uipilot-plugin> --platform windows
+node packages/plugin-cli/dist/cli.mjs validate examples/public-plugins/com.uipilot.demo-json-workbench/package --platform windows
+node packages/plugin-cli/dist/cli.mjs pack examples/public-plugins/com.uipilot.demo-json-workbench/package --output <新文件.uipilot-plugin> --platform windows
 node packages/plugin-cli/dist/cli.mjs validate <新文件.uipilot-plugin> --platform windows
 ```
 

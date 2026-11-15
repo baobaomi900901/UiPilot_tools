@@ -1,7 +1,7 @@
 import { isWindowPinShortcut, WINDOW_PIN_SHORTCUT_EVENT } from './window-pin-shortcut'
 
 // The real plugin document and runtime run against an in-memory preview store.
-const base = '/examples/public-plugins/com.uipilot.json-workbench/package/dist/'
+const base = '/examples/public-plugins/com.uipilot.demo-json-workbench/package/dist/'
 const scheme = new URLSearchParams(window.location.search).get('theme') === 'light' ? 'light' : 'dark'
 document.documentElement.dataset.colorScheme = scheme
 const source = await fetch(`${base}window.html`).then(response => response.text())

@@ -28,7 +28,7 @@ const focusTaggedInput = async (api: Readonly<UiPilotPluginPanelApiV1>) => {
 
 const consumeHostKeysAndHide = (api: Readonly<UiPilotPluginPanelApiV1>) => {
   const unsubscribe = api.onHostKey(async (event: Readonly<PluginPanelHostKeyEvent>) => {
-    const key: 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter' = event.key
+    const key: 'ArrowDown' | 'ArrowUp' | 'n' | 'Tab' | 'Enter' | 'Delete' = event.key
     const sequence: string = event.routeSequence
     void key
     void sequence

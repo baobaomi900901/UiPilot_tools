@@ -1,5 +1,9 @@
 # UiPilot 第三方插件开发教程
 
+代理开发先读项目 [UiPilot 插件开发 skill](../../skills/uipilot-public-plugin/SKILL.md)，再按[插件与开发示例索引](plugin-examples.md)选择参考包。业务插件、基座能力参考、配套 Demo 和测试夹具有不同用途；`json-workbench`、`templates`、`text-snippet` 是基座参考，旧独立窗口 `note` 已移除。
+
+涉及插件 UI 时同时遵循 [UI 规范](../ui-guidelines.md)。下文按入门流程与能力版本组织，旧示例不替代最新 UI 规则。若当前 API 缺少所需能力，按项目 AGENTS.md 写宿主能力请求，不在插件任务中修改宿主或 SDK 来绕过边界。
+
 本教程面向第一次为 UiPilot 编写公开插件的开发者。示例使用原生 JavaScript，不需要前端框架或构建工具，并覆盖三种 MVP 插件：
 
 - **主界面结果型**：处理命令后在 UiPilot 主界面显示结果，用户再次按 Enter 执行复制。
@@ -18,6 +22,8 @@
 - [`com.uipilot.demo-http`](../../examples/public-plugins/com.uipilot.demo-http)：Host 托管 HTTPS 请求。
 - [`com.uipilot.pomodoro`](../../examples/public-plugins/com.uipilot.pomodoro)：窗口隐藏后仍由宿主计时的番茄钟。
 
+设置、恢复、结果动作、Panel/Window Runtime actions、文件导入与当前 Panel 菜单等进阶选型统一见[示例索引](plugin-examples.md)，不要只依据上面的入门列表选择。
+
 完整字段、上限和安全合同见 [`Public Plugin API v1`](./public-plugin-v1.md)、[`plugin.json` Schema](./uipilot-plugin-v1.schema.json) 和 [TypeScript API 类型](./uipilot-plugin-api-v1.d.ts)。
 
 主结果列表的底栏由宿主管理：右下固定“操作 Ctrl+K”，左侧显示结果数量和状态反馈。操作列表与快捷键收进动态面板；结果 `subtitle` 仅描述内容或状态。插件无需自行绘制底栏。
@@ -32,7 +38,8 @@
 | 按 Enter 后打开子窗口并延迟发布消息 | `submit` | `window` | `ui.window`、`notifications.publish`（仅 Windows） | `demo-win` |
 | 子窗口控制宿主持有的单计时器 | `submit` | `window` | `ui.window`、`notifications.publish`、`timer.control`（仅 Windows） | `pomodoro` |
 | 在启动器内挂载面板并提交参数 | `submit` | `panel` | `ui.panel`（使用基础 `hostKeys` 时 `minimumHostVersion` ≥ `0.3.1`；使用 `Tab` / `Shift+Tab` / `Enter` 或剪贴板历史时 ≥ `0.3.3`） | `demo-panel` |
-| 在面板中显示宿主管理的剪贴板历史摘要并粘贴一次 | `submit` | `panel` | `ui.panel`、`clipboard.history.read`、可选 `clipboard.history.paste`（仅 Windows，`minimumHostVersion` ≥ `0.3.3`） | 暂无产品 Demo |
+| 在面板中显示宿主管理的剪贴板历史摘要并粘贴一次 | `submit` | `panel` | `ui.panel`、`clipboard.history.read`、`clipboard.history.paste`（仅 Windows，`minimumHostVersion` ≥ `0.3.3`） | `tests/fixtures/public-plugins/clipboard-history-host-fixture`，仅作旧粘贴协议夹具 |
+| 在面板中搜索并复制剪贴板历史 | `submit` | `panel` | `ui.panel`、`clipboard.history.read`、`clipboard.history.copy`（仅 Windows，`minimumHostVersion` ≥ `0.17.0`） | `clipboard-history` |
 | 在 Runtime 中请求声明的 HTTPS 服务 | 任意现有模式 | 任意现有输出 | `network.https`（仅 Windows，`minimumHostVersion` ≥ `0.3.2`） | `demo-http` |
 | 输入时立即计算并预览 | `live` | `mainResult` | 按结果动作决定 | `demo-multi`（Host `0.5.0+`） |
 | 一个包提供多条独立搜索、改名和收藏的主结果命令 | 每项 `live` / `submit` | 每项 `mainResult` | 包级共享 | `demo-multi`（Host `0.5.0+`） |
@@ -68,7 +75,7 @@ package/
 
 UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 
-包内只允许 `plugin.json`、`.js`、`.html`、`.css`，以及包根目录唯一的 `icon.png`。不要放入 README、测试、源码映射、依赖目录或其他图片。
+包内只允许 `plugin.json`、`.js`、`.html`、`.css`，以及包根目录唯一的 `icon.png`。声明 `timer.control` 时还必须包含唯一的 `assets/sounds/timer-alarm.wav`；没有该权限时不允许 WAV。不要放入 README、测试、源码映射、依赖目录或其他图片。图标、WAV 和路径限制见 API v1 的 Package Layout。
 
 开发根目录的 `package.json` 不会被安装，只用于让 Node.js 按 ESM 加载 Runtime 及其相对导入：
 
@@ -95,7 +102,9 @@ UiPilot 安装时选择的是 `package` 目录，而不是它的父目录。
 - `version` 和 `minimumHostVersion` 必须是 `major.minor.patch`。
 - 旧 `command.defaultName` 不包含 `/`；新 `commands` 每项也使用相同名称规则。`command` / `commands` 必须二选一，显式 null 无效。
 - `runtime.entry` 必须指向包内 JavaScript 文件。
-- 当前真正可用的权限只有 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read`、`clipboard.history.paste`、`url.open` 、`files.openText` 和 Host 0.15.0+ 的 `credentials.youdaoTranslation`、`credentials.baiduOcr`、`credentials.deepseek`，以及 Host 0.16.0+ 的 `selection.read`（用户主动触发划词翻译时获取选区；宿主可临时复制并有条件恢复剪贴板）。`clipboard.read` 仍是保留权限，不等同于剪贴板历史。
+- 可用权限包括 `clipboard.write`、`ui.window`、`ui.panel`，以及仅 Windows 可用的 `network.https`、`notifications.publish`、`timer.control`、`clipboard.history.read`、`clipboard.history.paste`、`url.open`、`files.openText`、Host 0.14.0+ 的 `clipboard.paste` 和 Host 0.17.0+ 的 `clipboard.history.copy`。每项仍须满足对应输出形态、最低 Host 与组合权限，不能跨形态借用。
+- Host 0.15.0+ 另有 `credentials.youdaoTranslation`、`credentials.baiduOcr`、`credentials.deepseek` 三项服务授权；有道与 Host 0.20.0+ 百度 OCR 提供公开业务 API，DeepSeek 尚未提供。Host 0.16.0+ 的 `selection.read` 当前只有翻译专用宿主入口，不能视为任意插件的选区 API。细节见文末业务服务章节及 API v1 划词翻译章节。
+- `clipboard.read` 等预留项不代表能力已开放。以 API 合同与目标 Host/CLI 校验为准，不从 Schema 权限枚举推断可用方法。
 - `settings` 是可选字段；教程显式保留 `"settings": []` 只是为了让 Manifest 结构更直观。
 
 ### 分支 A：主界面结果型 Manifest
@@ -830,7 +839,7 @@ uipilot-plugin validate .\package --platform windows --json
 
 使用 `network.https` 时，CLI 会静态验证 Manifest 的 Windows 平台、权限配对和精确主机语法；普通 HTTPS 要求 `minimumHostVersion >= 0.3.2`。声明 `network.credentials` 时，还要求 `minimumHostVersion >= 0.4.0`，并验证凭据引用元数据：数组含 1–8 项、每项仅含规定字段、`id` 唯一、`id` / `settingKey` 语法合法、`settingKey` 精确引用 secret 设置、`host` 是 `httpsHosts` 的精确成员、`type` 为 `bearer`。CLI 不读取已保存的 secret 值、不验证 token 能否通过第三方服务认证，也不发送网络请求。
 
-使用 `clipboard.history.read` / `clipboard.history.paste` 时，CLI 只验证 Windows `submit + panel + ui.panel`、`minimumHostVersion >= 0.3.3`、`paste` 依赖 `read`、以及 `clipboard.read` 不能作为别名；真实剪贴板采集、持久化、粘贴和焦点恢复仍以 UiPilot 宿主验收为准。
+使用 `clipboard.history.read` / `clipboard.history.paste` 时，CLI 只验证 Windows `submit + panel + ui.panel`、`minimumHostVersion >= 0.3.3`、`paste` 依赖 `read`、以及 `clipboard.read` 不能作为别名。`clipboard.history.copy` 另外要求 `read` 与 Host 0.17.0+；它不等于粘贴授权。真实剪贴板采集、持久化、复制/粘贴和焦点恢复仍以 UiPilot 宿主验收为准。
 
 ## 11. 使用开发目录安装
 
@@ -856,9 +865,9 @@ uipilot-plugin validate .\package --platform windows --json
 
 修改插件后：
 
-1. 提高 `plugin.json` 的 `version`。
-2. 再次选择同一个开发目录。
-3. 确认更新。
+1. 同版本开发迭代：Host 0.7.0+ 在插件详情使用“重新载入开发目录”，重新选择同 ID、同版本的 `package` 并确认。
+2. 发布新版本：提高 `plugin.json` 的 `version`，在列表再次“选择开发目录”或“选择插件包”，确认更新。
+3. 重新运行命令核对新代码。仅刷新插件列表不会读取开发目录；安装后的资源是独立快照。
 
 更新会在完整候选与 Runtime ready 校验通过后原子发布。验证/名称冲突拒绝，或确定未提交且旧字节复核成功的持久化失败，保留旧配置；持久结果不确定或旧字节复核失败时遵循 fail-closed 恢复，不能承诺任何更新失败后旧版都可用。
 
@@ -938,7 +947,9 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权。未声�
 
 确认基础 panel 的 `minimumHostVersion` 至少为 `0.3.0`；使用基础 `hostKeys`、`onHostKey` 或 `requestHide` 时至少为 `0.3.1`；使用 `Tab`、`Shift+Tab`、`Enter` 或剪贴板历史时至少为 `0.3.3`；显式使用 `hostKeyFocus` 时至少为 `0.3.4`。Manifest 使用 `submit + panel + ui.panel`；`panel.js` 尽早注册 `onUpdate`，非空 `hostKeys` 还必须在 ready 前注册一次 `onHostKey`。面板会话不会跨主窗口隐藏保留；重新显示后需要再次执行命令。
 
-### 剪贴板历史为空或粘贴被拒绝
+### 剪贴板历史为空、复制或粘贴被拒绝
+
+当前业务 `clipboard-history` 使用 Host 0.17.0+ 的搜索与复制，需 `clipboard.history.read` 和 `clipboard.history.copy`。`copy({id})` 不需要 Enter 路由票据，不隐藏窗口、不自动粘贴；旧 paste 授权不会自动授予 copy。查询有内容时只匹配文本或文件名，不返回图片。处理错误时按所调用 API 的固定错误集合区分，不混用复制与粘贴协议。
 
 确认目标系统是 Windows、`minimumHostVersion` 至少为 `0.3.3`，Manifest 使用 `submit + panel + ui.panel` 并声明 `clipboard.history.read`；需要自动粘贴时还要声明并授权 `clipboard.history.paste`，且必须在收到声明的 `Enter` Host Key 后使用同一事件的 `routeSequence` 调用 `clipboardHistory.paste()`。查看 `Error.name` 区分 `PermissionDenied`、`ExpiredPanelSession`、`RecordNotFound`、`RecordUnavailable`、`PasteTargetUnavailable` 和 `ClipboardWriteFailed`。不要把剪贴板正文、完整路径、图片内容或系统窗口信息写入日志。
 
@@ -950,10 +961,10 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权。未声�
 
 当前不支持：
 
-- 多命令 panel/window、多个窗口、每命令快捷键或独立别名集合；Host `0.5.0+` 仅新增多 mainResult。
+- 多命令 panel/window、多个窗口或独立别名集合；Host `0.5.0+` 仅新增多 mainResult。用户已可在宿主设置中配置逐命令启动快捷键，但插件没有注册任意全局快捷键的公开 API；启动快捷键、Panel Host Key 和动作菜单 shortcut 文案是三种不同机制。
 - 插件代码长期后台运行、插件自建计时器或任意后台回调；单轮窗口计时必须交给宿主的 `timer.control`，延迟纯文本消息交给 `notifications.schedule()`。
 - 浏览器/WebView 网络、原始套接字、任意文件、原生二进制和 Shell；外部访问仅限 Runtime 请求期内的 Host 托管 HTTPS。
-- 输入模拟或控制鼠标键盘。
+- 任意输入模拟或控制鼠标键盘。受控例外是用户显式选择、授权后的主结果 `pasteText`，以及既有 Panel 剪贴板历史粘贴；它们不开放任意按键、目标窗口选择或输入 API。
 - HTML/Markdown 结果、未经声明的动作回调。
 - 插件间通信、远程资源、依赖安装、市场发布和自动更新。
 
@@ -966,17 +977,21 @@ Manifest 必须声明 `clipboard.write`，安装时用户必须授权。未声�
 - [ ] `description`、`summary`、`inputPlaceholder` 各司其职。
 - [ ] `outputMode`、权限和 `window` / `panel` 入口组合正确；基础面板要求 Windows 与宿主 `0.3.0+`，Host 按键与主动隐藏要求 `0.3.1+`，扩展 Host 按键和剪贴板历史要求 `0.3.3+`，显式 Host Key 焦点策略要求 `0.3.4+`。
 - [ ] 使用网络时，仅面向 Windows Host `0.3.2+`，同时声明 `network.https` 与完整精确的 `network.httpsHosts`，并处理 `api.network` 缺失、HTTP 非成功状态和固定错误名（包括 `CredentialUnavailableError`）。
-- [ ] 使用剪贴板历史时，仅面向 Windows Host `0.3.3+`，同时声明 `ui.panel` 和 `clipboard.history.read`，需要粘贴时再声明 `clipboard.history.paste`，并处理六种固定 `Error.name`。
+- [ ] 使用剪贴板历史时声明 `ui.panel` 和 `clipboard.history.read`；复制另需 Host `0.17.0+` 与 `clipboard.history.copy`，旧粘贴另需 `clipboard.history.paste` 及对应 Enter 票据。分别处理各 API 的固定错误名。
 - [ ] 网络插件未记录凭据或完整请求；生产 token 不打包，使用 bearer 引用时要求 Windows `0.4.0+`、完整绑定授权，并理解服务端回显、取消不能撤回远端请求、保存失败不回滚且后续核验可恢复网络的边界。
 - [ ] Runtime 始终原样返回 `requestId`；commands 包显式按 commandId 分派并拒绝未知/缺失 ID，重排或改启动名不改变身份。
 - [ ] 使用消息能力时，仅在 Windows Manifest 中声明并授权 `notifications.publish`，且每个请求只提交一次 `publish()` 或 `schedule()`。
 - [ ] 使用窗口计时时，同时声明 `ui.window`、`notifications.publish`、`timer.control`，并按十进制字符串 revision 合并状态。
 - [ ] `timer.control` 包只包含唯一的 `assets/sounds/timer-alarm.wav`，且 WAV 满足固定 PCM、大小与时长限制。
 - [ ] 内部空格不会被插件意外压缩。
-- [ ] 子窗口使用宿主 CSS 变量并只通过 `onUpdate` 接收数据。
-- [ ] 面板内容只通过 `uipilotPluginPanel.onUpdate`、`onHostKey`、`focusHostInput`、`requestHide`、`storage` 与授权后的 `clipboardHistory`，隐藏/停用/卸载/升级后不保留会话。
+- [ ] 子窗口使用宿主 CSS 变量，通过 `onUpdate` 接收更新；可选 `request` / `files.openText` 仅在已声明、授权且会话有效时使用。
+- [ ] Panel 使用公开桥；Runtime actions、`onActions`、`setStatus`、Delete Host Key 按所需 Host 版本接入。隐藏/停用/卸载/升级后不保留旧会话或覆盖新界面。
+- [ ] 启用 Runtime/Panel/Window actions 时有对应 handler；在 Ready 后调用，不在 update/ACK 中等待请求；处理 Busy、过期回复和保存结果待确认。
+- [ ] URL、文本粘贴、文件导入和有道服务按各自模式、权限与版本边界使用；不将它们视为通用 Shell、文件或输入 API。
+- [ ] 私有数据格式与版本经过校验，未知版本阻止写入；取消/失败后先重新读取再决定重试，不宣称自动回滚。
+- [ ] UI 已按统一规范核对双主题、键盘、IME、模态、草稿与焦点；当前 Panel 不重复绘制宿主菜单或状态栏。
 - [ ] `icon.png` 满足固定规则。
-- [ ] Runtime 测试通过。
+- [ ] Runtime 测试及相关 SDK 类型检查通过；假服务与真实供应商/宿主验收分别记录。
 - [ ] 开发目录和最终 `.uipilot-plugin` 均通过 `uipilot-plugin validate`。
 - [ ] 开发目录和最终 `.uipilot-plugin` 都完成安装验收。
 
@@ -1100,7 +1115,7 @@ One physical picker is allowed globally. Each facade captures its exact session/
 
 Errors have sanitized names/messages: `FileOpenBusyError`, `ExpiredWindowSessionError`, `FileOpenPermissionError`, `FileOpenUnsupportedError`, `FileOpenTooLargeError`, `FileOpenEncodingError`, `FileOpenFailedError`. Passing any argument rejects `TypeError` before IPC. Host never logs the selected path, basename, text or native errors. Files outside ordinary local drives, reparse/device/directory/ADS targets and other platforms fail closed.
 
-See [JSON workbench](../../examples/public-plugins/com.uipilot.json-workbench/README.md) for an explicit import/format/save workflow with edit/session ownership and inline dirty-draft confirmation. Native Windows behavior remains user-operated acceptance.
+See [JSON workbench](../../examples/public-plugins/com.uipilot.demo-json-workbench/README.md) for an explicit import/format/save workflow with edit/session ownership and inline dirty-draft confirmation. Native Windows behavior remains user-operated acceptance.
 
 ## Host 0.14.0：显式粘贴到原应用
 

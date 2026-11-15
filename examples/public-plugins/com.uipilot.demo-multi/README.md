@@ -1,4 +1,4 @@
-# UiPilot Demo Multi Plugin
+# demo Multi
 
 Two mainResult commands share one offline Runtime, one prefix setting and one plugin storage namespace. This example follows demo-return's copyText response contract. It contains no network, panel, window or background capability.
 
