@@ -22,7 +22,7 @@
 **Dependencies:** Task 1；设计「查询、界面与执行」。
 
 - [x] Mac currency 复制结果准入，不放行其他受限项。
-- [ ] 默认/preview all-targets、前端回归和 App/DMG 校验，交付人工候选。
+- [x] 默认/preview all-targets、前端回归和 App/DMG 校验，交付人工候选。
 
 **Distinct test coverage:** Mac 能力过滤后成功汇率可 Enter 复制，错误仍不可执行，插件及不相关 builtin 仍被过滤。
 
@@ -34,4 +34,6 @@
 
 共享汇率模块首次在 Mac 参与测试，聚焦计算测试 140 通过；最终 Rust 库 701 通过、22 项既有忽略。Mac 结果准入测试先确认失败，再启用 currency；最终前端 416 通过、18 项既有跳过。默认和 preview all-targets、TypeScript/Vite 构建通过。新增晚到成功/失败在同窗新查询、隐藏、新 invocation 三种转换均拒绝发布；缓存超限/符号链接及目录替换测试通过。
 
-代码自查：Windows 保持原 atomic_file 路径及运行逻辑；Mac 的待写入缓存克隆目录句柄，不重新解析可被替换的目录。caller 校验和查询票据早于缓存/网络访问；结果继续经私有复制动作与一次性执行入口。未使用 GUI、真实剪贴板或线上汇率请求。内部包与人工验收待交付。
+代码自查：Windows 保持原 atomic_file 路径及运行逻辑；Mac 的待写入缓存克隆目录句柄，不重新解析可被替换的目录。caller 校验和查询票据早于缓存/网络访问；结果继续经私有复制动作与一次性执行入口。未使用 GUI、真实剪贴板或线上汇率请求。内部包构建、DMG 校验及 ZIP CRC/11 个 manifest 文件哈希验证通过；真实联网和交互仍待人工。
+
+源码候选 `a8fe57f`，交付 `/Users/mobytang/Documents/UiPilot-Mac-currency-a8fe57f.zip`；产物哈希见设备验收单。下一步由用户完全退出旧版后替换包，逐动作验证。
