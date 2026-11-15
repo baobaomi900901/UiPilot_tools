@@ -2,6 +2,10 @@
 
 本规格依据[实施计划](../plans/2026-11-06-macos-port.md)及[逐步验收](../plans/2026-11-06-macos-port-steps.md)。状态：进入开发；原型和发布验收分别记录，未验证的平台不能标记通过。
 
+## 当前完整产品范围（2026-11-16）
+
+本文保留 Apple Silicon 首版宿主合同和历史证据；当前 Win/Mac 完整产品范围以[双平台最终需求](2026-11-16-desktop-final-requirements.md)为索引，加入 main Host 0.22 的图片输入、OCR Panel 与单 Panel 文本分享。具体协议沿用 main 最终设计，Mac 平台扩展仍需独立设计/验证，未因需求扩展立即开放 Runtime。当前用户要求只更新本地 main、不合入 Mac 开发分支，实施按总计划最新执行状态。
+
 ## 支持矩阵与部署下限
 
 目标为 M1 系列（包括 Pro/Max）及后续 Apple Silicon，单一原生 arm64 产物。候选下限 macOS 15.7.4，构建目标、Info.plist 与随包 Mach-O 均须相容。首版支持单实例主窗口、菜单栏、普通组合快捷键、应用结果、打开/激活、主题和快捷键持久化。文件搜索、凭据、插件、截图、输入注入、通知、登录项和进程工具仅在平台后端和负面测试通过后逐项开放。
@@ -12,18 +16,18 @@
 
 ## 插件共用范围与基线
 
-以当前 17 个公开参考包建立基线。下表按主要验证场景分组，具体权限以各包 manifest 为准。当前 Mac 生产宿主尚未开放插件，双端实机通过数为 0。
+原 0.19 的 17 包基线按当前 main 更新为新 17 包集合（3 个声明双平台，14 个仅 Windows）。下表按主要验证场景分组，具体权限以各包 manifest 为准。当前 Mac 生产宿主尚未开放插件，双端实机通过数为 0。
 
 | 参考插件（省略 `com.uipilot.`） | 当前声明 | 首要验收或待补能力 |
 | --- | --- | --- |
 | demo-settings | 双平台 | 无权限命令、普通设置、升级保留设置；最先验证 |
 | demo-return、demo-multi | 双平台 | 主结果、复制授权、多命令 |
-| note | 双平台 | 独立窗口、笔记写入与重开读回 |
+| ocr | Windows | 双入口图片 Panel、编辑全文、百度服务、分享来源；新包替代已删除源码的旧 note，用户已安装旧包不自动移除 |
 | demo-panel、notes、templates | Windows | 面板、键盘焦点；以实际笔记或模板操作检验可移植性 |
 | demo-http、auth-check、demo-credentials | Windows | 按包核对 HTTPS、授权和凭据需求 |
 | demo-recovery | Windows | 激活失败及恢复 |
 | demo-win、json-workbench、pomodoro | Windows | 分别核对窗口、通知、文件访问和计时器依赖 |
-| clipboard-history、text-snippet、translate | Windows | 分别核对历史读取/复制、粘贴/打开 URL、选区/凭据/语音等系统能力 |
+| clipboard-history、text-snippet、translate | Windows | 分别核对历史读取/复制、粘贴/打开 URL、选区/凭据/语音等系统能力，translate 增加文本分享接收与来源 |
 
 将日常使用的插件与其主要流程纳入同一张验收表。面板、窗口、剪贴板、网络及其他宿主能力分别验证，测试结果绑定包哈希、设备、宿主版本和具体验收动作。旧插件沿用独立的兼容与迁移审查。
 
