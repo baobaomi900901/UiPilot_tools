@@ -11,7 +11,7 @@
 - [x] 两种 feature 的 main-only IPC 与持久化。
 - [x] 列表分组、筛选、底栏提示、保留焦点的开关和跨页面队列。
 - [x] 回归与内部 App 构建。
-- [ ] DMG 校验与人工交付。
+- [x] DMG 校验与人工交付（实际交互待用户验收）。
 
 **Distinct test coverage:** 停用发生在浏览器最终准入前则旧结果零 dispatch，原链接保留；请求在途时第二次切换被阻止且原焦点不丢；写入失败时状态不乐观更新、刷新前禁止再写；新挂载读取排在旧挂载写入之后；未知 feature/额外字段与非 main caller 拒绝。
 
@@ -26,3 +26,7 @@ Rust 库最终全量 705 passed / 22 ignored；Mac management/client、launcher 
 首次全量的既有 DNS 取消测试出现一次 Busy/Timeout 时序失败；未修改网络代码，单项复跑和后续两次全量通过。保留原始与复跑日志，不将首次失败隐藏。
 
 合同/代码自查：仅 main 获得新 IPC，来源检查早于状态访问；后台写入复用原子 SettingsStore；未增加文件路径输入或开放其他功能。前端复用跨挂载串行队列及 generation，失败不发布乐观状态，不自动重试；开关保存期间使用 aria-disabled 保持焦点，底栏左侧统一反馈。新增分组复用主题 token，真实视觉和键盘操作由用户验收；浅色实机按用户要求跳过。未使用 GUI 自动化，未开放 Mac 生产插件运行，也未合并 main。
+
+## 交付
+
+源码 `75eff21`，内部包 `/Users/mobytang/Documents/UiPilot-Mac-builtins-75eff21.zip`。DMG 只读挂载、arm64/最低系统、签名与资源验证通过；预检通过，ZIP CRC 及 manifest 16 个文件 SHA-256 均通过。产物哈希记入设备验收单。当前到达下一人工节点：由用户完全退出后替换，并逐步验证内置开关、入口、重启和配置保留；未提前标记实机通过。
