@@ -1,6 +1,6 @@
 # macOS 截图接入 mac_acc
 
-目标：复用独立 mac_acc 的 AX 几何，不在 UiPilot 重写 AX 遍历，宿主管理冻结帧/选择/输出及 Windows 已有截图交互。遵循[消费设计与协作请求](../specs/2026-11-16-macos-screenshot-mac-acc-design.md)，具体新增 RPC 仍为待对方确认的提案。
+目标：复用独立 mac_acc 的 AX 几何，不在 UiPilot 重写 AX 遍历，宿主管理冻结帧/选择/输出及 Windows 已有截图交互。遵循[消费设计与协作请求](../specs/2026-11-16-macos-screenshot-mac-acc-design.md)，具体新增 RPC 已收到对方设计回复，消费方首轮取舍已确认；最终 schema/制品与 G0 仍待完成。
 
 技术为现有 Rust/Tauri2/AppKit 与独立 arm64 Swift/Rust Provider，Mac 最低 15.7.4。无新运行依赖决定，禁止 GUI 自动化或真实屏幕/权限操作；不合并 main。协议/签名门槛不阻塞纯模型和 fake-service；不能提前开放截图 capability。
 
@@ -17,12 +17,21 @@
 
 **Verify:** `gh issue view 1 --repo baobaomi900901/mac_acc --json number,title,body,url,state`，同命令查 2；文档 `git diff --check`。
 
+## 回传后的当前顺序
+
+先准备 UiPilot G0 宿主验证器和纯逻辑/模拟测试，同时等待 mac_acc 的最小开发包/schema；G0 遮罩与窗口关联实证完成后冻结新协议。G0 前不把自然语言字段写成生产 DTO，不要求对方先完成全量 G1–G6。Task 3 运行接线/交付另受内部许可及嵌入 TCC 门槛约束。
+
+- [x] 已读取两条回复，接受 API 命中、条件性唯一几何关联、冻结图尽力一致性；方法数组与 features 对象明确分开。
+- [x] 普通 CLI 首选 Helpers 目录，记录重签名前后 hash；生产许可由权利人明确。
+- [ ] 对方 schema、最小包及 source/hash 尚未回传，不把建议版本号计作交付。
+
 ### Task 2: 独立完成宿主截图基础及模拟 Provider
 
 **Files:** `src-tauri/src/screenshot/` 共享模型/geometry/service 与新增 macOS 后端测试，Mac 调用来源/能力门禁；具体采集 API 在实现前核对本地 SDK。
 
 **Dependencies:** Task 1；消费设计“双方分工”“可先推进与验收”。
 
+- [ ] 在真实 UiPilot Mac 宿主准备隔离 G0 验证器（默认产品截图仍关闭），只在用户动作下执行权限检查/遮罩；不读取业务正文，不自动运行 GUI。
 - [ ] 区分 AX point、AppKit point、每屏帧像素，固定显示器布局身份与跨屏合成策略；冻结帧不混入后续时刻。
 - [ ] 以 fake capture/probe/output 跑取消、迟到、最新点、按下锁定及拖动状态机；采用现有共享像素预算/输出逻辑，保持 Windows 不变。
 
@@ -34,7 +43,7 @@
 
 **Files:** 后续 `macos_acc` 客户端/协议测试、资源构建和校验脚本、Mac host、ACL/配置、版本化制品清单。
 
-**Dependencies:** Task 2；mac_acc #1/#2 回传最终 API、源码/制品哈希和部署身份；消费设计“请求的 Provider 合同”“打包、权限和安全门槛”。
+**Dependencies:** Task 2 的 G0 准备与实证；mac_acc #1/#2 回传最终 API、源码/制品哈希和部署身份、内部许可范围；消费设计“请求的 Provider 合同”“打包、权限和安全门槛”。
 
 - [ ] 按最终 schema 做私有 stdio、有界队列/超时/回收及严格响应校验；只接受目标身份匹配的几何。
 - [ ] 构建 staging/校验/资源定位和嵌套签名，验证无开发路径依赖；明确 ad-hoc 与生产 TCC 的实际边界。
