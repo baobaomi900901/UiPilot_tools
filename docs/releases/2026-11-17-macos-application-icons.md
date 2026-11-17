@@ -14,9 +14,11 @@
 - 最终本机目录扫描发现 151 个去重有效应用，151 个均有图标；此数字仅描述当前设备扫描，不表示所有外部应用均已实测。
 - 默认 all-targets 检查、TypeScript/Vite 和 arm64 release App 构建通过；实际 DMG 只读挂载检查通过，签名、书签 entitlement、资源、架构、版本及最低系统正确，ZIP CRC 与包内清单哈希通过。
 
-全屏置顶修复继续包含在候选内。未合并 main，截图开发仍等待 mac_acc；没有 GUI 自动化、权限变更或自动替换已安装应用。需要用户替换重启后，仅确认搜索 Tabby 时图标实际显示，不重复已通过的全屏及插件测试。
+全屏置顶修复继续包含在候选内。未合并 main，截图开发仍等待 mac_acc；没有 GUI 自动化、权限变更或自动替换已安装应用。
 
-候选源码：`859705a3d00a8f7a9bfb4b3112e28ec7ff660fe6`。交付 `/Users/mobytang/Documents/UiPilot-Mac-application-icons-859705a.zip`，内含 DMG、安装说明、源码提交和校验清单；内部 ad-hoc 签名，未公证。GUI 显示仍待用户确认，本机图标解码成功不代替界面验收。
+候选源码：`859705a3d00a8f7a9bfb4b3112e28ec7ff660fe6`。交付 `/Users/mobytang/Documents/UiPilot-Mac-application-icons-859705a.zip`，内含 DMG、安装说明、源码提交和校验清单；内部 ad-hoc 签名，未公证。
+
+2026-11-18 用户回传「可以看到 tabby 的图标了」，确认主界面的 Tabby 图标实际显示正常，本次报告的图标问题验收关闭。其它应用继续保留上述自动/只读验证证据，不扩大为已逐一完成 GUI 验收；不安排重复的全屏或插件测试。本次仅更新验收记录，不重新构建或改变交付包哈希。
 
 | 制品 | SHA-256 |
 | --- | --- |
