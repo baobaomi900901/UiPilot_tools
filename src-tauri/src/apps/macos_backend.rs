@@ -6,7 +6,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+#[path = "macos_icon.rs"]
+mod icon;
 use block2::RcBlock;
 use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
 use objc2_foundation::{NSError, NSString, NSURL};
@@ -91,27 +92,21 @@ fn inspect(root: &Path, path: &Path) -> Option<(BundleTarget, plist::Dictionary)
 }
 
 fn bundle_icon(path: &Path, plist: &plist::Dictionary) -> Option<String> {
-    let name = plist.get("CFBundleIconFile")?.as_string()?;
+    let Some(name) = plist.get("CFBundleIconFile") else {
+        // Asset-catalog applications need the system's named app-icon lookup.
+        // This is read-only and does not load the application executable.
+        let name = plist.get("CFBundleIconName")?.as_string()?;
+        if !component(name) { return None; }
+        return icon::asset(path);
+    };
+    let name = name.as_string()?;
     if !component(name) { return None; }
-    let name = if name.ends_with(".icns") { name.to_owned() } else { format!("{name}.icns") };
-    let (bytes, _) = bounded_file(&path.join("Contents/Resources").join(name), ICON_LIMIT)?;
-    if bytes.get(..4) != Some(b"icns") { return None; }
-    let end = u32::from_be_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
-    let mut entries = bytes.get(8..end)?;
-    while entries.len() >= 8 {
-        let size = u32::from_be_bytes(entries[4..8].try_into().ok()?) as usize;
-        let png = entries.get(8..size)?;
-        if png.starts_with(b"\x89PNG\r\n\x1a\n") && png.get(12..16) == Some(b"IHDR")
-            && png.len() <= MAX_PNG_BYTES {
-            let width = u32::from_be_bytes(png.get(16..20)?.try_into().ok()?);
-            let height = u32::from_be_bytes(png.get(20..24)?.try_into().ok()?);
-            if (1..=128).contains(&width) && (1..=128).contains(&height) {
-                return Some(format!("data:image/png;base64,{}", STANDARD.encode(png)));
-            }
-        }
-        entries = entries.get(size..)?;
-    }
-    None
+    // Honor the declared filename even when its extension is unconventional;
+    // decode by content. CFBundleIconFile may also omit the .icns extension.
+    let resources = path.join("Contents/Resources");
+    let (bytes, _) = bounded_file(&resources.join(name), ICON_LIMIT)
+        .or_else(|| bounded_file(&resources.join(format!("{name}.icns")), ICON_LIMIT))?;
+    icon::decode(&bytes)
 }
 
 pub(crate) fn application(root: &Path, path: &Path) -> Option<Application> {
@@ -241,6 +236,7 @@ pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use base64::{engine::general_purpose::STANDARD, Engine};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) struct Fixture(pub(crate) PathBuf);
@@ -269,6 +265,98 @@ pub(crate) mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    fn icon_fixture(bytes: &[u8], filename: &str) -> (Fixture, PathBuf) {
+        let f = Fixture::new();
+        let path = f.bundle("Icon.app", "com.fixture.icon", "Icon");
+        let resources = path.join("Contents/Resources");
+        fs::create_dir(&resources).unwrap();
+        fs::write(resources.join(filename), bytes).unwrap();
+        let info = path.join("Contents/Info.plist");
+        let mut plist = plist::Value::from_file(&info).unwrap().into_dictionary().unwrap();
+        plist.insert("CFBundleIconFile".into(), filename.into());
+        plist::Value::Dictionary(plist).to_file_binary(info).unwrap();
+        (f, path)
+    }
+
+    fn assert_normalized_icon(icon: &str) {
+        let bytes = STANDARD.decode(icon.strip_prefix("data:image/png;base64,").unwrap()).unwrap();
+        assert!(bytes.len() <= MAX_PNG_BYTES);
+        let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
+        assert!(image.width() > 0 && image.height() > 0);
+        assert!(image.width() <= 128 && image.height() <= 128);
+    }
+
+    #[test]
+    fn jpeg2000_only_icns_produces_a_launcher_icon() {
+        // Synthetic solid blue fixture; no third-party artwork or application data.
+        for name in ["icon.icns", "legacy-name.ico"] {
+            let (f, path) = icon_fixture(include_bytes!("../../tests/fixtures/macos-icons/jpeg2000.icns"), name);
+            let app = application(&f.0, &path).unwrap();
+            assert_normalized_icon(app.icon.as_deref().expect("JPEG 2000 ICNS must be decoded"));
+        }
+    }
+
+    #[test]
+    fn icns_extension_can_be_omitted_even_when_the_icon_name_contains_dots() {
+        for name in ["icon", "my.app.icon"] {
+            let (f, path) = icon_fixture(include_bytes!("../../tests/fixtures/macos-icons/jpeg2000.icns"), &format!("{name}.icns"));
+            let info = path.join("Contents/Info.plist");
+            let mut plist = plist::Value::from_file(&info).unwrap().into_dictionary().unwrap();
+            plist.insert("CFBundleIconFile".into(), name.into());
+            plist::Value::Dictionary(plist).to_file_binary(info).unwrap();
+            assert_normalized_icon(application(&f.0, &path).unwrap().icon.as_deref().unwrap());
+        }
+    }
+
+    #[test]
+    fn large_png_representations_and_direct_png_are_resized() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(512, 512, image::Rgba([36, 128, 220, 255])));
+        let mut output = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut output, image::ImageFormat::Png).unwrap();
+        let png = output.into_inner();
+        let mut icns = b"icns".to_vec();
+        icns.extend_from_slice(&((png.len() + 16) as u32).to_be_bytes());
+        icns.extend_from_slice(b"ic09");
+        icns.extend_from_slice(&((png.len() + 8) as u32).to_be_bytes());
+        icns.extend_from_slice(&png);
+        for (bytes, name) in [(&icns, "icon.icns"), (&png, "icon.png")] {
+            let (f, path) = icon_fixture(bytes, name);
+            assert_normalized_icon(application(&f.0, &path).unwrap().icon.as_deref().expect("large icon must be resized"));
+        }
+    }
+
+    #[test]
+    fn icon_resources_cannot_escape_through_names_or_symlinks() {
+        let (f, path) = icon_fixture(b"unused", "icon.icns");
+        let info = path.join("Contents/Info.plist");
+        let mut plist = plist::Value::from_file(&info).unwrap().into_dictionary().unwrap();
+        plist.insert("CFBundleIconFile".into(), "../outside.icns".into());
+        assert!(bundle_icon(&path, &plist).is_none());
+        let resources = path.join("Contents/Resources");
+        fs::remove_file(resources.join("icon.icns")).unwrap();
+        let outside = f.0.join("outside.icns");
+        fs::write(&outside, include_bytes!("../../tests/fixtures/macos-icons/jpeg2000.icns")).unwrap();
+        symlink(&outside, resources.join("icon.icns")).unwrap();
+        plist.insert("CFBundleIconFile".into(), "icon.icns".into());
+        assert!(bundle_icon(&path, &plist).is_none());
+        plist.remove("CFBundleIconFile");
+        plist.insert("CFBundleIconName".into(), "../outside".into());
+        assert!(bundle_icon(&path, &plist).is_none());
+    }
+
+    #[test]
+    #[ignore = "read-only installed Tabby and asset-catalog icon validation; no application launch"]
+    fn installed_jpeg2000_and_asset_catalog_icons_are_available() {
+        for (root, path) in [
+            ("/Applications", "/Applications/Tabby.app"),
+            ("/System/Applications", "/System/Applications/System Settings.app"),
+        ] {
+            let app = objc2::rc::autoreleasepool(|_| application(Path::new(root), Path::new(path))).unwrap();
+            assert_normalized_icon(app.icon.as_deref().expect("installed application must have an icon"));
+            eprintln!("Read-only application icon verified: {}", app.display_name);
+        }
     }
 
     #[test]
@@ -339,6 +427,9 @@ pub(crate) mod tests {
             if target.root == Path::new("/System/Applications"))));
         let icons = apps.iter().filter(|app| app.icon.is_some()).count();
         eprintln!("Mac application discovery returned {} unique bundles and {} icons", apps.len(), icons);
+        for app in apps.iter().filter(|app| app.icon.is_none()) {
+            eprintln!("No application icon: {}", app.display_name);
+        }
     }
 
     #[test]
