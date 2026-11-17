@@ -4,6 +4,9 @@ mod placement;
 #[path = "macos_hotkey.rs"]
 mod hotkey;
 
+#[path = "macos_window_spaces.rs"]
+mod window_spaces;
+
 use std::{sync::Mutex, time::Duration};
 use tauri_plugin_global_shortcut::Builder as ShortcutBuilder;
 use tauri::{
@@ -192,6 +195,18 @@ fn recheck_focus(app: &AppHandle, id: u64, delay: Duration) {
     });
 }
 
+fn configure_launcher_spaces(window: &WebviewWindow) -> tauri::Result<()> {
+    let _main_thread = objc2::MainThreadMarker::new()
+        .ok_or_else(|| std::io::Error::other("launcher space configuration requires the main thread"))?;
+    let native = window.ns_window()?.cast::<objc2_app_kit::NSWindow>();
+    // SAFETY: Tauri owns this NSWindow; present runs on the main thread and the
+    // borrow ends before any asynchronous work or window destruction can run.
+    let native = unsafe { native.as_ref() }
+        .ok_or_else(|| std::io::Error::other("missing launcher NSWindow"))?;
+    native.setCollectionBehavior(window_spaces::launcher_behavior(native.collectionBehavior()));
+    Ok(())
+}
+
 fn present(app: &AppHandle, id: u64) {
     let Some(window) = app.get_webview_window("main") else { return; };
     let state = app.state::<Mutex<Presentation>>();
@@ -199,7 +214,9 @@ fn present(app: &AppHandle, id: u64) {
     if let Err(error) = position_on_active_display(&window) {
         eprintln!("UiPilot: could not position launcher: {error}");
     }
-    let result = window.set_always_on_top(true).and_then(|_| window.unminimize()).and_then(|_| window.show()).and_then(|_| window.set_focus()).and_then(|_| {
+    // Window level alone cannot cross into another application's full-screen
+    // Space. Configure participation before show/focus so activation stays there.
+    let result = configure_launcher_spaces(&window).and_then(|_| window.set_always_on_top(true)).and_then(|_| window.unminimize()).and_then(|_| window.show()).and_then(|_| window.set_focus()).and_then(|_| {
         crate::macos_apps::begin_invocation(app, id);
         window.emit("launcher://shown", serde_json::json!({
             "invocationId": id.to_string(), "target": "launcher", "notice": null
